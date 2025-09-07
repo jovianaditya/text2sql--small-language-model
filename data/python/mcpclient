@@ -1,0 +1,32 @@
+FROM python:3.10-slim
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Install necessary system packages
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy all project files into the container
+COPY . .
+
+# Install MCP (mcp>=0.9.1 membutuhkan pydantic>=2)
+RUN pip install --no-cache-dir fastmcp
+
+# Install library tambahan
+RUN pip install --no-cache-dir \
+    pandas \
+    tabulate \
+    langchain \
+    langchain-core \
+    langchain-ollama \
+    langgraph
+
+# Install Jupyter
+RUN pip install --no-cache-dir notebook ipykernel
+EXPOSE 8888
+
+CMD ["jupyter", "notebook", "--ip=*", "--port=8888", "--no-browser", "--allow-root", "--NotebookApp.token=''", "--NotebookApp.password=''"]

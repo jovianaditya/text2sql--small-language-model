@@ -1,0 +1,22 @@
+FROM python:3.10-slim
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Install necessary system packages
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy all project files into the container
+COPY . .
+
+# Install library tambahan
+RUN pip install --no-cache-dir \
+    fastmcp \
+    psycopg2-binary \
+    python-dotenv
+
+CMD ["tail", "-f", "/dev/null"]
