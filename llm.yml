@@ -1,0 +1,56 @@
+networks:
+  default:
+    name: llm_network
+    driver: bridge
+
+  datahub_network:   # reference the existing network
+    external: true
+
+services:
+  ollama: 
+    image: ollama/ollama 
+    container_name: ollama 
+    ports: 
+      - "11434:11434" 
+    volumes: 
+      - ./data/ollama:/root/.ollama 
+      - ./data/ollama/entrypoint.sh:/entrypoint.sh
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    environment:
+      - OLLAMA_MODELS=${OLLAMA_MODELS}
+    deploy:
+      resources:
+        limits:
+          memory: 10g
+    networks:
+      - default
+      - datahub_network
+    restart: unless-stopped 
+    healthcheck: 
+      test: ["CMD", "ollama", "list"]
+      interval: 30s 
+      timeout: 10s 
+      retries: 5 
+      start_period: 30s
+
+  chroma: 
+    build: 
+      context: ./data/chroma 
+      dockerfile: Dockerfile 
+    container_name: chroma 
+    ports: 
+      - "8000:8000" 
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    networks:
+      - default
+      - datahub_network
+    healthcheck: 
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"] 
+      interval: 30s 
+      timeout: 5s 
+      retries: 3 
+    volumes: 
+      - ./data/chroma/persist:/chroma/persist:rw
