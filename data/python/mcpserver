@@ -3,20 +3,24 @@ FROM python:3.10-slim
 # Set the working directory inside the container
 WORKDIR /app
 
-# Install necessary system packages
+# Install necessary system packages (for psycopg2 build)
 RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
     gcc \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy all project files into the container
 COPY . .
 
-# Install library tambahan
+# Install Python dependencies
 RUN pip install --no-cache-dir \
     fastmcp \
-    psycopg2-binary \
-    python-dotenv
+    psycopg2 \
+    python-dotenv \
+    pandas \
+    numpy
 
+# Keep the container running (for debugging / dev)
 CMD ["tail", "-f", "/dev/null"]
