@@ -1,0 +1,5 @@
+FROM chromadb/chroma:latest 
+
+# Install curl untuk healthcheck 
+USER root 
+RUN apt-get update && apt-get install -y curl && apt-get clean
