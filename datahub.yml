@@ -276,16 +276,12 @@ services:
   mcp_server:
     build:
       context: ./data/python
-      dockerfile: Dockerfile
+      dockerfile: mcpserver
     container_name: mcp_server
     image: mcp-server:latest
     volumes:
-      - ./data/python:/app
+      - ./data/python/mcp_server:/app
       - ./data/python/ingestion:/app
-      - ./data/python/llm_integration:/app
-      - ./data/chroma/persist:/chroma/persist:rw
-    ports:
-      - "8888:8888"
     working_dir: /app
     environment:
       - PYTHONPATH=/app
