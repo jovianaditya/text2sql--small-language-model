@@ -36,8 +36,9 @@ services:
   chroma: 
     build: 
       context: ./data/chroma 
-      dockerfile: Dockerfile 
-    container_name: chroma 
+      dockerfile: chroma 
+    container_name: chroma
+    image: chroma
     ports: 
       - "8000:8000" 
     deploy:
@@ -53,4 +54,4 @@ services:
       timeout: 5s 
       retries: 3 
     volumes: 
-      - ./data/chroma/persist:/chroma/persist:rw
+      - ./data/python/mcp_client/chroma_db:/chroma/persist:rw
