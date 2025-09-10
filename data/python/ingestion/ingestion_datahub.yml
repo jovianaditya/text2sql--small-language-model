@@ -1,0 +1,25 @@
+pipeline_name: california_schools_ingestion
+
+source:
+  type: postgres
+  config:
+    username: datahub
+    password: datahub
+    host_port: postgresql:5432
+    database: california_schools
+    include_tables: true
+    include_views: false
+    schema_pattern:
+      allow:
+        - public    # <-- empty dict, means all schemas
+
+    stateful_ingestion:
+      enabled: true
+      remove_stale_metadata: false   # Set to true if you want to remove deleted tables from DataHub
+
+sink:
+  type: datahub-rest
+  config:
+    server: http://datahub-gms:8080
+    token: eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6ImRhdGFodWIiLCJ0eXBlIjoiUEVSU09OQUwiLCJ2ZXJzaW9uIjoiMiIsImp0aSI6ImNjOGZmMGQwLWVmMWUtNDE3Ny05NGRkLWU2NjIyY2Q5NzAyNCIsInN1YiI6ImRhdGFodWIiLCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.3fsUPZ1nxzn0pyKct-cZb3lkreNloKl67zEL6LA1zG0
+    #ubah token nya
