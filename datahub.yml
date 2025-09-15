@@ -65,42 +65,46 @@ services:
     ports:
       - ${DATAHUB_MAPPED_SCHEMA_REGISTRY_PORT:-8081}:8081
 
-  postgresql:
-    image: postgres:15
-    container_name: postgresql
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
     environment:
-      - POSTGRES_DB=datahub
-      - POSTGRES_USER=datahub
-      - POSTGRES_PASSWORD=datahub
-      - POSTGRES_INITDB_ARGS=--encoding=UTF-8
+      - MYSQL_DATABASE=classicmodels
+      - MYSQL_USER=datahub
+      - MYSQL_PASSWORD=datahub
+      - MYSQL_ROOT_PASSWORD=datahub
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --log_bin_trust_function_creators=1
     ports:
-      - ${DATAHUB_MAPPED_POSTGRES_PORT:-5432}:5432
+      - ${DATAHUB_MAPPED_MYSQL_PORT:-3306}:3306
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - ./data/mysql:/var/lib/mysql
     deploy:
       resources:
         limits:
           memory: 1g
     healthcheck:
-      test: pg_isready -U datahub -d datahub
+      test: ["CMD", "bash", "-lc", "mysqladmin ping -hmysql -uroot -p$MYSQL_ROOT_PASSWORD"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
     restart: on-failure
 
-  postgres-setup:
+  mysql-setup:
     depends_on:
-      postgresql:
+      mysql:
         condition: service_healthy
+    image: acryldata/datahub-mysql-setup:v1.2.0
+    container_name: mysql-setup
     environment:
-      - POSTGRES_HOST=postgresql
-      - POSTGRES_PORT=5432
-      - POSTGRES_USERNAME=datahub
-      - POSTGRES_PASSWORD=datahub
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USERNAME=datahub
+      - MYSQL_PASSWORD=datahub
       - DATAHUB_DB_NAME=datahub
-    container_name: postgres-setup
-    image: acryldata/datahub-postgres-setup:v1.2.0
     labels:
       datahub_setup_job: true
 
@@ -174,14 +178,14 @@ services:
         condition: service_completed_successfully
       kafka-setup:
         condition: service_completed_successfully
-      postgres-setup:
+      mysql-setup:
         condition: service_completed_successfully
     environment:
       - EBEAN_DATASOURCE_USERNAME=datahub
       - EBEAN_DATASOURCE_PASSWORD=datahub
-      - EBEAN_DATASOURCE_HOST=postgresql:5432
-      - EBEAN_DATASOURCE_URL=jdbc:postgresql://postgresql:5432/datahub
-      - EBEAN_DATASOURCE_DRIVER=org.postgresql.Driver
+      - EBEAN_DATASOURCE_HOST=mysql:3306
+      - EBEAN_DATASOURCE_URL=jdbc:mysql://mysql:3306/datahub?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&characterEncoding=UTF-8
+      - EBEAN_DATASOURCE_DRIVER=com.mysql.cj.jdbc.Driver
       - KAFKA_BOOTSTRAP_SERVER=kafka:9092
       - KAFKA_SCHEMAREGISTRY_URL=http://schema-registry:8081
       - ELASTICSEARCH_HOST=elasticsearch
@@ -208,10 +212,10 @@ services:
       - DATAHUB_SERVER_TYPE=${DATAHUB_SERVER_TYPE:-quickstart}
       - DATAHUB_TELEMETRY_ENABLED=${DATAHUB_TELEMETRY_ENABLED:-true}
       - DATAHUB_UPGRADE_HISTORY_KAFKA_CONSUMER_GROUP_ID=generic-duhe-consumer-job-client-gms
-      - EBEAN_DATASOURCE_DRIVER=org.postgresql.Driver
-      - EBEAN_DATASOURCE_HOST=postgresql:5432
+      - EBEAN_DATASOURCE_DRIVER=com.mysql.cj.jdbc.Driver
+      - EBEAN_DATASOURCE_HOST=mysql:3306
       - EBEAN_DATASOURCE_PASSWORD=datahub
-      - EBEAN_DATASOURCE_URL=jdbc:postgresql://postgresql:5432/datahub
+      - EBEAN_DATASOURCE_URL=jdbc:mysql://mysql:3306/datahub?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&characterEncoding=UTF-8
       - EBEAN_DATASOURCE_USERNAME=datahub
       - ELASTICSEARCH_HOST=elasticsearch
       - ELASTICSEARCH_INDEX_BUILDER_MAPPINGS_REINDEX=true
@@ -233,7 +237,6 @@ services:
       - PE_CONSUMER_ENABLED=true
       - THEME_V2_DEFAULT=true
       - UI_INGESTION_ENABLED=true
-      # Additional settings for better reliability
       - KAFKA_CONSUMER_MAX_POLL_RECORDS=100
       - KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS=300000
       - KAFKA_CONSUMER_SESSION_TIMEOUT_MS=30000
