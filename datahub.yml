@@ -104,7 +104,7 @@ services:
       - MYSQL_PORT=3306
       - MYSQL_USERNAME=datahub
       - MYSQL_PASSWORD=datahub
-      - DATAHUB_DB_NAME=datahub
+      - DATAHUB_DB_NAME=classicmodels
     labels:
       datahub_setup_job: true
 
@@ -184,7 +184,7 @@ services:
       - EBEAN_DATASOURCE_USERNAME=datahub
       - EBEAN_DATASOURCE_PASSWORD=datahub
       - EBEAN_DATASOURCE_HOST=mysql:3306
-      - EBEAN_DATASOURCE_URL=jdbc:mysql://mysql:3306/datahub?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&characterEncoding=UTF-8
+      - EBEAN_DATASOURCE_URL=jdbc:mysql://mysql:3306/classicmodels?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&characterEncoding=UTF-8
       - EBEAN_DATASOURCE_DRIVER=com.mysql.cj.jdbc.Driver
       - KAFKA_BOOTSTRAP_SERVER=kafka:9092
       - KAFKA_SCHEMAREGISTRY_URL=http://schema-registry:8081
@@ -215,7 +215,7 @@ services:
       - EBEAN_DATASOURCE_DRIVER=com.mysql.cj.jdbc.Driver
       - EBEAN_DATASOURCE_HOST=mysql:3306
       - EBEAN_DATASOURCE_PASSWORD=datahub
-      - EBEAN_DATASOURCE_URL=jdbc:mysql://mysql:3306/datahub?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&characterEncoding=UTF-8
+      - EBEAN_DATASOURCE_URL=jdbc:mysql://mysql:3306/classicmodels?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&characterEncoding=UTF-8
       - EBEAN_DATASOURCE_USERNAME=datahub
       - ELASTICSEARCH_HOST=elasticsearch
       - ELASTICSEARCH_INDEX_BUILDER_MAPPINGS_REINDEX=true
