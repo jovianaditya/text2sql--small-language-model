@@ -1,0 +1,73 @@
+customers:
+  "customerNumber": "Unique customer ID (primary key)."
+  "customerName": "Customer/company legal or trading name."
+  "contactLastName": "Surname of the primary contact person."
+  "contactFirstName": "Given/first name of the primary contact person."
+  "phone": "Primary contact phone number (stored as text to preserve formatting and leading zeros)."
+  "addressLine1": "Street address line 1 (building number, street, suite)."
+  "addressLine2": "Street address line 2 (apartment/floor/attention; optional)."
+  "city": "City or town of the customer's address."
+  "state": "State/province/region (optional, country-dependent)."
+  "postalCode": "Postal/ZIP code (text; may include leading zeros or letters)."
+  "country": "Country of the customer's address."
+  "salesRepEmployeeNumber": "Employee responsible for the account; foreign key to employees.employeeNumber."
+  "creditLimit": "Maximum approved credit for this customer in the billing currency."
+
+employees:
+  "employeeNumber": "Unique employee ID (primary key)."
+  "lastName": "Employee surname/family name."
+  "firstName": "Employee given/first name."
+  "extension": "Internal phone extension/direct dial code."
+  "email": "Work email address."
+  "officeCode": "Assigned office; foreign key to offices.officeCode."
+  "reportsTo": "employeeNumber of this employee's direct manager; references employees.employeeNumber (self-referencing FK). NULL if the employee has no manager (e.g., President/CEO)."
+  "jobTitle": "Official job title/role."
+
+offices:
+  "officeCode": "Unique office code (primary key)."
+  "city": "City where the office is located."
+  "phone": "Main office phone number (international format; stored as text)."
+  "addressLine1": "Street address line 1 (building number and street)."
+  "addressLine2": "Street address line 2 (suite/floor/apartment; optional)."
+  "state": "State/province/region (optional; may use abbreviations)."
+  "country": "Country where the office is located."
+  "postalCode": "Postal/ZIP code (text; may include leading zeros)."
+  "territory": "Sales region/territory code (e.g., NA, EMEA, APAC)."
+
+orderdetails:
+  "orderNumber": "Order ID; foreign key to orders.orderNumber. Part of the composite primary key with productCode."
+  "productCode": "Ordered product code; foreign key to products.productCode. Part of the composite primary key with orderNumber."
+  "quantityOrdered": "Number of units for this product on the line item (integer)."
+  "priceEach": "Unit selling price applied to this line at order time (decimal)."
+  "orderLineNumber": "Line sequence within the order (1..n) used for display/ordering."
+
+orders:
+  "orderNumber": "Unique order ID (primary key)."
+  "orderDate": "Date the order was placed/created."
+  "requiredDate": "Requested ship-by/fulfillment deadline from the customer."
+  "shippedDate": "Date the order was shipped; NULL if not yet shipped."
+  "status": "Current order status (e.g., Shipped, In Process, On Hold, Cancelled, Disputed, Resolved)."
+  "comments": "Free-form notes about the order (optional)."
+  "customerNumber": "Ordering customer; foreign key to customers.customerNumber."
+
+payments:
+  "customerNumber": "Paying customer; foreign key to customers.customerNumber."
+  "checkNumber": "Payment reference identifier (check/transfer number); part of the composite primary key with customerNumber."
+  "paymentDate": "Date the payment was recorded/received."
+  "amount": "Payment amount (decimal currency)."
+
+productlines:
+  "productLine": "Product line/category name (primary key)."
+  "textDescription": "Plain-text description of the product line (optional)."
+  "htmlDescription": "HTML-formatted description for web display (optional)."
+  "image": "Image or logo for the product line (binary/BLOB; optional)."
+
+products:
+  "productCode": "Unique product code (primary key)."
+  "productName": "Human-readable product name."
+  "productLine": "Owning product line/category; foreign key to productlines.productLine."
+  "productScale": "Model scale ratio as text (e.g., '1:10', '1:18')."
+  "productDescription": "Plain-text description of the product's features/details."
+  "quantityInStock": "Current on-hand inventory count (units)."
+  "buyPrice": "Unit purchase cost/standard cost."
+  "MSRP": "Manufacturer's Suggested Retail Price (list price)."
