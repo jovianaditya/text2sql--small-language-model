@@ -1,8 +1,8 @@
 -- docker exec -i mysql sh -lc 'MYSQL_PWD=datahub mysql -uroot < /var/lib/mysql/classicmodels.sql'
 
 /* Create the database */
-CREATE DATABASE IF NOT EXISTS datahub;
-USE datahub;
+CREATE DATABASE IF NOT EXISTS classicmodels;
+USE classicmodels;
 
 /* Drop existing tables (safe order) */
 SET FOREIGN_KEY_CHECKS = 0;
