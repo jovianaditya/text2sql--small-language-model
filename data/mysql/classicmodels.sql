@@ -1,125 +1,127 @@
-/*
-  Name: MySQL Sample Database classicmodels
-  Link: http://www.mysqltutorial.org/mysql-sample-database.aspx
-*/
-
+-- docker exec -i mysql sh -lc 'MYSQL_PWD=datahub mysql -uroot < /var/lib/mysql/classicmodels.sql'
 
 /* Create the database */
-CREATE DATABASE  IF NOT EXISTS classicmodels;
-
-/* Switch to the classicmodels database */
+CREATE DATABASE IF NOT EXISTS classicmodels;
 USE classicmodels;
 
-/* Drop existing tables  */
-DROP TABLE IF EXISTS productlines;
-DROP TABLE IF EXISTS products;
-DROP TABLE IF EXISTS offices;
-DROP TABLE IF EXISTS employees;
-DROP TABLE IF EXISTS customers; 
-DROP TABLE IF EXISTS payments;
-DROP TABLE IF EXISTS orders;
+/* Drop existing tables (safe order) */
+SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS orderdetails;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS payments;
+DROP TABLE IF EXISTS customers;
+DROP TABLE IF EXISTS employees;
+DROP TABLE IF EXISTS offices;
+DROP TABLE IF EXISTS products;
+DROP TABLE IF EXISTS productlines;
+SET FOREIGN_KEY_CHECKS = 1;
 
-/* Create the tables */
+/* ===== productlines ===== */
 CREATE TABLE productlines (
-  productLine varchar(50),
-  textDescription varchar(4000) DEFAULT NULL,
-  htmlDescription mediumtext,
-  image mediumblob,
+  productLine        varchar(50)   COMMENT 'Product line or category name (primary key).',
+  textDescription    varchar(4000) DEFAULT NULL COMMENT 'Plain text description (optional).',
+  htmlDescription    mediumtext     COMMENT 'HTML description for web display (optional).',
+  image              mediumblob     COMMENT 'Image or logo (BLOB; optional).',
   PRIMARY KEY (productLine)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+/* ===== products ===== */
 CREATE TABLE products (
-  productCode varchar(15),
-  productName varchar(70) NOT NULL,
-  productLine varchar(50) NOT NULL,
-  productScale varchar(10) NOT NULL,
-  productVendor varchar(50) NOT NULL,
-  productDescription text NOT NULL,
-  quantityInStock smallint(6) NOT NULL,
-  buyPrice decimal(10,2) NOT NULL,
-  MSRP decimal(10,2) NOT NULL,
+  productCode        varchar(15)   COMMENT 'Unique product code (primary key).',
+  productName        varchar(70)  NOT NULL COMMENT 'Human-readable product name.',
+  productLine        varchar(50)  NOT NULL COMMENT 'Owning product line; FK to productlines.productLine.',
+  productScale       varchar(10)  NOT NULL COMMENT 'Model scale ratio text (e.g., 1:10, 1:18).',
+  productVendor      varchar(50)  NOT NULL COMMENT 'Manufacturer or vendor name.',
+  productDescription text         NOT NULL COMMENT 'Plain-text description of features and details.',
+  quantityInStock    smallint(6)  NOT NULL COMMENT 'Current on-hand inventory (units).',
+  buyPrice           decimal(10,2) NOT NULL COMMENT 'Unit purchase cost.',
+  MSRP               decimal(10,2) NOT NULL COMMENT 'Manufacturer’s suggested retail price.',
   PRIMARY KEY (productCode),
   FOREIGN KEY (productLine) REFERENCES productlines (productLine)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+/* ===== offices ===== */
 CREATE TABLE offices (
-  officeCode varchar(10),
-  city varchar(50) NOT NULL,
-  phone varchar(50) NOT NULL,
-  addressLine1 varchar(50) NOT NULL,
-  addressLine2 varchar(50) DEFAULT NULL,
-  state varchar(50) DEFAULT NULL,
-  country varchar(50) NOT NULL,
-  postalCode varchar(15) NOT NULL,
-  territory varchar(10) NOT NULL,
+  officeCode   varchar(10)  COMMENT 'Unique office code (primary key).',
+  city         varchar(50) NOT NULL COMMENT 'City where the office is located.',
+  phone        varchar(50) NOT NULL COMMENT 'Main office phone (stored as text).',
+  addressLine1 varchar(50) NOT NULL COMMENT 'Street address line 1.',
+  addressLine2 varchar(50) DEFAULT NULL COMMENT 'Street address line 2 (suite/floor; optional).',
+  state        varchar(50) DEFAULT NULL COMMENT 'State/province/region (optional).',
+  country      varchar(50) NOT NULL COMMENT 'Country where the office is located.',
+  postalCode   varchar(15) NOT NULL COMMENT 'Postal/ZIP code (keep text to preserve leading zeros).',
+  territory    varchar(10) NOT NULL COMMENT 'Sales region/territory code (e.g., NA, EMEA, APAC).',
   PRIMARY KEY (officeCode)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+/* ===== employees ===== */
 CREATE TABLE employees (
-  employeeNumber int,
-  lastName varchar(50) NOT NULL,
-  firstName varchar(50) NOT NULL,
-  extension varchar(10) NOT NULL,
-  email varchar(100) NOT NULL,
-  officeCode varchar(10) NOT NULL,
-  reportsTo int DEFAULT NULL,
-  jobTitle varchar(50) NOT NULL,
+  employeeNumber int           COMMENT 'Unique employee ID (primary key).',
+  lastName       varchar(50) NOT NULL COMMENT 'Employee surname/family name.',
+  firstName      varchar(50) NOT NULL COMMENT 'Employee given/first name.',
+  extension      varchar(10) NOT NULL COMMENT 'Internal phone extension.',
+  email          varchar(100) NOT NULL COMMENT 'Work email address.',
+  officeCode     varchar(10)  NOT NULL COMMENT 'Assigned office; FK to offices.officeCode.',
+  reportsTo      int DEFAULT NULL COMMENT 'Direct manager’s employeeNumber; NULL if top-level.',
+  jobTitle       varchar(50) NOT NULL COMMENT 'Official job title or role.',
   PRIMARY KEY (employeeNumber),
   FOREIGN KEY (reportsTo) REFERENCES employees (employeeNumber),
   FOREIGN KEY (officeCode) REFERENCES offices (officeCode)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+/* ===== customers ===== */
 CREATE TABLE customers (
-  customerNumber int,
-  customerName varchar(50) NOT NULL,
-  contactLastName varchar(50) NOT NULL,
-  contactFirstName varchar(50) NOT NULL,
-  phone varchar(50) NOT NULL,
-  addressLine1 varchar(50) NOT NULL,
-  addressLine2 varchar(50) DEFAULT NULL,
-  city varchar(50) NOT NULL,
-  state varchar(50) DEFAULT NULL,
-  postalCode varchar(15) DEFAULT NULL,
-  country varchar(50) NOT NULL,
-  salesRepEmployeeNumber int DEFAULT NULL,
-  creditLimit decimal(10,2) DEFAULT NULL,
+  customerNumber int            COMMENT 'Unique customer ID (primary key).',
+  customerName   varchar(50)  NOT NULL COMMENT 'Customer/company legal or trading name.',
+  contactLastName varchar(50) NOT NULL COMMENT 'Last name of the primary contact.',
+  contactFirstName varchar(50) NOT NULL COMMENT 'First name of the primary contact.',
+  phone          varchar(50)  NOT NULL COMMENT 'Primary contact phone (stored as text).',
+  addressLine1   varchar(50)  NOT NULL COMMENT 'Street address line 1.',
+  addressLine2   varchar(50)           DEFAULT NULL COMMENT 'Street address line 2 (optional).',
+  city           varchar(50)  NOT NULL COMMENT 'Customer city.',
+  state          varchar(50)           DEFAULT NULL COMMENT 'State/province/region (optional).',
+  postalCode     varchar(15)           DEFAULT NULL COMMENT 'Postal/ZIP code (may include leading zeros).',
+  country        varchar(50)  NOT NULL COMMENT 'Customer country.',
+  salesRepEmployeeNumber int  DEFAULT NULL COMMENT 'Account manager; FK to employees.employeeNumber.',
+  creditLimit    decimal(10,2)         DEFAULT NULL COMMENT 'Approved credit limit for this customer.',
   PRIMARY KEY (customerNumber),
   FOREIGN KEY (salesRepEmployeeNumber) REFERENCES employees (employeeNumber)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+/* ===== payments ===== */
 CREATE TABLE payments (
-  customerNumber int,
-  checkNumber varchar(50) NOT NULL,
-  paymentDate date NOT NULL,
-  amount decimal(10,2) NOT NULL,
-  PRIMARY KEY (customerNumber,checkNumber),
+  customerNumber int            COMMENT 'Paying customer; FK to customers.customerNumber.',
+  checkNumber    varchar(50)  NOT NULL COMMENT 'Payment reference; composite PK with customerNumber.',
+  paymentDate    date         NOT NULL COMMENT 'Date the payment was recorded.',
+  amount         decimal(10,2) NOT NULL COMMENT 'Payment amount in billing currency.',
+  PRIMARY KEY (customerNumber, checkNumber),
   FOREIGN KEY (customerNumber) REFERENCES customers (customerNumber)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+/* ===== orders ===== */
 CREATE TABLE orders (
-  orderNumber int,
-  orderDate date NOT NULL,
-  requiredDate date NOT NULL,
-  shippedDate date DEFAULT NULL,
-  status varchar(15) NOT NULL,
-  comments text,
-  customerNumber int NOT NULL,
+  orderNumber   int            COMMENT 'Unique order ID (primary key).',
+  orderDate     date         NOT NULL COMMENT 'Date the order was created.',
+  requiredDate  date         NOT NULL COMMENT 'Requested ship-by/fulfillment deadline.',
+  shippedDate   date                  DEFAULT NULL COMMENT 'Actual ship date; NULL if not yet shipped.',
+  status        varchar(15) NOT NULL COMMENT 'Order status (e.g., Shipped, In Process, On Hold, Cancelled, Disputed, Resolved).',
+  comments      text                          COMMENT 'Free-form order notes (optional).',
+  customerNumber int        NOT NULL COMMENT 'Ordering customer; FK to customers.customerNumber.',
   PRIMARY KEY (orderNumber),
   FOREIGN KEY (customerNumber) REFERENCES customers (customerNumber)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+/* ===== orderdetails ===== */
 CREATE TABLE orderdetails (
-  orderNumber int,
-  productCode varchar(15) NOT NULL,
-  quantityOrdered int NOT NULL,
-  priceEach decimal(10,2) NOT NULL,
-  orderLineNumber smallint(6) NOT NULL,
-  PRIMARY KEY (orderNumber,productCode),
+  orderNumber      int            COMMENT 'Order ID; FK to orders.orderNumber. Part of composite PK.',
+  productCode      varchar(15)  NOT NULL COMMENT 'Product code; FK to products.productCode. Part of composite PK.',
+  quantityOrdered  int          NOT NULL COMMENT 'Units ordered on this line item.',
+  priceEach        decimal(10,2) NOT NULL COMMENT 'Unit selling price at order time.',
+  orderLineNumber  smallint(6)  NOT NULL COMMENT 'Line sequence number within the order (1..n).',
+  PRIMARY KEY (orderNumber, productCode),
   FOREIGN KEY (orderNumber) REFERENCES orders (orderNumber),
   FOREIGN KEY (productCode) REFERENCES products (productCode)
-);
-
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 /* Inserting data  */
 insert  into productlines(productLine,textDescription,htmlDescription,image) values 
