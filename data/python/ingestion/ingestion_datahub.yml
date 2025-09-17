@@ -11,6 +11,24 @@ source:
     include_tables: true
     include_views: false
 
+    # ✅ Enable profiling (supported keys)
+    profiling:
+      enabled: true
+      limit: 5000
+      field_sample_values_limit: 25
+      include_field_null_count: true
+      include_field_min_value: true
+      include_field_max_value: true
+      include_field_distinct_count: true
+      include_field_histogram: false
+      include_field_sample_values: true
+      include_field_mean_value: true
+      include_field_median_value: true
+      include_field_stddev_value: true
+      # Optional speed-ups for MySQL:
+      profile_table_row_count_estimate_only: false
+      max_workers: 4
+
     stateful_ingestion:
       enabled: true
       remove_stale_metadata: false
@@ -19,5 +37,6 @@ sink:
   type: datahub-rest
   config:
     server: http://datahub-gms:8080
-    token: eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6ImRhdGFodWIiLCJ0eXBlIjoiUEVSU09OQUwiLCJ2ZXJzaW9uIjoiMiIsImp0aSI6IjY0ZTRhNWQzLTFkNmItNDA3OS1iYzU5LWM4MTk3YjU3NTc1NCIsInN1YiI6ImRhdGFodWIiLCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.V1zlxhipkWBnoxQvynNQTAOLVSo43Ikxp7yuljl1p9g
-    #ubah token nya
+    token: ${DATAHUB_TOKEN}
+
+# docker compose -f datahub.yml up -d --force-recreate
