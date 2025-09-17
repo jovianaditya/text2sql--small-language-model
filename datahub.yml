@@ -292,7 +292,7 @@ services:
       - PYTHONUNBUFFERED=1
       - DATAHUB_TOKEN=${DATAHUB_TOKEN}
     env_file:
-      - .env
+      - ./.env
     deploy:
       resources:
         limits:
