@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install DataHub CLI for ingestion metadata
-RUN pip install --no-cache-dir 'acryl-datahub[postgres]>=1.2.0.2'
+RUN pip install --no-cache-dir 'acryl-datahub[mysql]>=1.2.0.2'
 
 # Copy all project files into the container
 COPY . .
