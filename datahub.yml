@@ -30,7 +30,7 @@ services:
     ports:
       - ${DATAHUB_KAFKA_BROKER_PORT:-9092}:9092
     volumes:
-      - kafka_data:/bitnami/kafka
+      - ./data/kafka:/bitnami/kafka
     deploy:
       resources:
         limits:
@@ -137,7 +137,7 @@ services:
     ports:
       - ${DATAHUB_MAPPED_ELASTIC_PORT:-9200}:9200
     volumes:
-      - esdata:/usr/share/elasticsearch/data
+      - ./data/elasticsearch:/usr/share/elasticsearch/data
 
   elasticsearch-setup:
     depends_on:
@@ -330,7 +330,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-
-volumes:
-  kafka_data:
-  esdata:
