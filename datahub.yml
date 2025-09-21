@@ -284,8 +284,8 @@ services:
     container_name: mcp_server
     image: mcp-server:latest
     volumes:
-      - ./data/python/mcp_server:/app
-      - ./data/python/ingestion:/app
+      - ./data/python/mcp_server:/app/mcp_server
+      - ./data/python/ingestion:/app/ingestion
     working_dir: /app
     environment:
       - PYTHONPATH=/app
