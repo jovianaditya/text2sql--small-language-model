@@ -14,13 +14,11 @@ RUN apt-get update && apt-get install -y \
 # Install DataHub CLI for ingestion metadata
 RUN pip install --no-cache-dir 'acryl-datahub[mysql]>=1.2.0.2'
 
-# Copy all project files into the container
-COPY . .
-
 # Install Python dependencies
 RUN pip install --no-cache-dir \
     fastmcp \
-    psycopg2 \
+    pymysql \
+    sqlparse \
     python-dotenv \
     pandas \
     numpy
