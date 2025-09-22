@@ -19,9 +19,11 @@ RUN pip install --no-cache-dir \
     tabulate \
     langchain \
     langchain-community \
+    langchain_chroma \
     chromadb \
     langchain-ollama \
-    langgraph
+    langgraph \
+    grandalf
 
 # Install Jupyter
 RUN pip install --no-cache-dir notebook ipykernel
