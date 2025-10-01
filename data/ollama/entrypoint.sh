@@ -2,7 +2,7 @@
 set -e
 
 # Gunakan variabel dari environment, atau fallback ke model default
-MODEL_LIST="${OLLAMA_MODELS:-mistral:7b-instruct-q4}"
+MODEL_LIST="${OLLAMA_MODELS:-qwen2.5:3b nomic-embed-text}"
 
 echo "Menjalankan ollama serve di background..."
 ollama serve &
