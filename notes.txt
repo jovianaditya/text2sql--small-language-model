@@ -1,0 +1,4 @@
+docker pull confluentinc/cp-kafka:8.0.0
+docker run --rm confluentinc/cp-kafka:8.0.0 /bin/kafka-storage random-uuid
+# copy the UUID it prints, then:
+echo "KAFKA_CLUSTER_ID=<PASTE_UUID_HERE>" >> .env
