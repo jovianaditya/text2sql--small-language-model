@@ -5,65 +5,69 @@ networks:
 
 services:
   kafka:
-    image: bitnami/kafka:3.6
+    image: confluentinc/cp-kafka:8.0.0    # KRaft (no ZooKeeper)
     container_name: kafka
     environment:
-      # KRaft mode configuration
-      - KAFKA_CFG_NODE_ID=1
-      - KAFKA_CFG_PROCESS_ROLES=controller,broker
-      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
-      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://:${DATAHUB_KAFKA_BROKER_PORT},CONTROLLER://:9093
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:${DATAHUB_KAFKA_BROKER_PORT}
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      # Additional Kafka settings
-      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
-      - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
-      - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
-      - KAFKA_CFG_MESSAGE_MAX_BYTES=5242880
-      - KAFKA_CFG_REPLICA_FETCH_MAX_BYTES=5242880
-      - KAFKA_HEAP_OPTS=-Xms256m -Xmx256m
-      # Auto-create topics
-      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
-      - KAFKA_CFG_NUM_PARTITIONS=3
-      - KAFKA_CFG_DEFAULT_REPLICATION_FACTOR=1
+      # ---- KRaft required ----
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_NODE_ID: "1"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:${DATAHUB_KAFKA_BROKER_PORT:-9092}"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      CLUSTER_ID: "${KAFKA_CLUSTER_ID}"
+
+      # ---- Single broker conveniences ----
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_MESSAGE_MAX_BYTES: "5242880"
+      KAFKA_REPLICA_FETCH_MAX_BYTES: "5242880"
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx256m"
     ports:
-      - ${DATAHUB_KAFKA_BROKER_PORT:-9092}:9092
+      - "${DATAHUB_KAFKA_BROKER_PORT:-9092}:9092"
     volumes:
-      - ./data/kafka:/bitnami/kafka
+      - ./data/kafka:/var/lib/kafka/data
     deploy:
       resources:
         limits:
           memory: 2g
     healthcheck:
-      test: kafka-topics.sh --bootstrap-server kafka:${DATAHUB_KAFKA_BROKER_PORT} --list
+      test: ["CMD", "bash", "-lc", "kafka-topics --bootstrap-server kafka:${DATAHUB_KAFKA_BROKER_PORT:-9092} --list >/dev/null 2>&1"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 60s
 
   schema-registry:
+    image: confluentinc/cp-schema-registry:8.0.0
+    container_name: schema-registry
     depends_on:
       kafka:
         condition: service_healthy
     environment:
-      - SCHEMA_REGISTRY_HOST_NAME=schema-registry
-      - SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL=PLAINTEXT
-      - SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=kafka:${DATAHUB_KAFKA_BROKER_PORT}
-    healthcheck:
-      interval: 30s
-      retries: 3
-      start_period: 60s
-      test: nc -z schema-registry ${DATAHUB_SCHEMA_REGISTRY_PORT:-8081}
-      timeout: 5s
-    container_name: schema-registry
-    image: confluentinc/cp-schema-registry:7.4.0
+      SCHEMA_REGISTRY_HOST_NAME: "schema-registry"
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "kafka:${DATAHUB_KAFKA_BROKER_PORT:-9092}"
+      # PLAINTEXT is default; include if you prefer explicit:
+      # SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL: "PLAINTEXT"
+    ports:
+      - "${DATAHUB_SCHEMA_REGISTRY_PORT:-8081}:8081"
     deploy:
       resources:
         limits:
           memory: 512m
-    ports:
-      - ${DATAHUB_MAPPED_SCHEMA_REGISTRY_PORT:-8081}:8081
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "nc -z schema-registry ${DATAHUB_SCHEMA_REGISTRY_PORT:-8081}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   mysql:
     image: mysql:8.0
@@ -81,7 +85,8 @@ services:
       - ${MYSQL_PORT:-3306}:3306
     volumes:
       - ./data/mysql:/var/lib/mysql
-      - ./classicmodels.sql:/docker-entrypoint-initdb.d/classicmodels.sql:ro
+      - ./data/sql_init/classicmodels.sql:/docker-entrypoint-initdb.d/classicmodels.sql:ro
+      - ./data/sql_init/permission.sql:/docker-entrypoint-initdb.d/permission.sql:ro
     deploy:
       resources:
         limits:
@@ -115,7 +120,6 @@ services:
       - ${XPACK_SECURITY_ENABLED:-xpack.security.enabled=false}
       - ES_JAVA_OPTS=-Xms384m -Xmx384m -Dlog4j2.formatMsgNoLookups=true
       - OPENSEARCH_JAVA_OPTS=-Xms384m -Xmx384m -Dlog4j2.formatMsgNoLookups=true
-      # Additional ES settings for better performance
       - cluster.routing.allocation.disk.threshold_enabled=false
       - bootstrap.memory_lock=true
     ulimits:
@@ -135,7 +139,7 @@ services:
         limits:
           memory: 2g
     ports:
-      - ${DATAHUB_MAPPED_ELASTIC_PORT:-9200}:9200
+      - ${DATAHUB_ELASTIC_PORT:-9200}:9200
     volumes:
       - ./data/elasticsearch:/usr/share/elasticsearch/data
 
@@ -283,6 +287,7 @@ services:
       dockerfile: mcpserver
     container_name: mcp_server
     image: mcp-server:latest
+    pull_policy: never 
     volumes:
       - ./data/python/mcp_server:/app/mcp_server
       - ./data/python/ingestion:/app/ingestion
@@ -311,6 +316,7 @@ services:
       dockerfile: mcpclient
     container_name: mcp_client
     image: mcp-client:latest
+    pull_policy: never 
     volumes:
       - ./data/python/mcp_client:/app
     ports:
