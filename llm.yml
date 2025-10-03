@@ -16,8 +16,8 @@ services:
       - ./data/ollama:/root/.ollama 
       - ./data/ollama/entrypoint.sh:/entrypoint.sh
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
-    environment:
-      - OLLAMA_MODELS=${OLLAMA_MODELS}
+    env_file:
+      - ./data/ollama/.env
     deploy:
       resources:
         limits:
