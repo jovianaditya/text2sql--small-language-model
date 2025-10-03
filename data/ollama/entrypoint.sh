@@ -1,36 +1,57 @@
 #!/bin/sh
 set -e
 
-# Gunakan variabel dari environment, atau fallback ke model default
-MODEL_LIST="${OLLAMA_MODELS:-qwen2.5:3b nomic-embed-text}"
+# Ambil env; fallback bila kosong
+RAW="${OLLAMA_MODELS:-qwen2.5:3b,nomic-embed-text}"
+
+# Normalisasi: hapus kutip jika ada, ganti pemisah koma/spasi ganda jadi newline
+# (juga aman untuk CRLF karena tr -d '\r')
+MODEL_LIST=$(printf '%s' "$RAW" | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" -e 's/[[:space:]]\+/,/g' | tr ',' '\n')
 
 echo "Menjalankan ollama serve di background..."
 ollama serve &
-
-# Simpan PID proses ollama serve
 OLLAMA_PID=$!
 
 echo "Menunggu Ollama service tersedia..."
-
-# Tunggu sampai ollama list berhasil dijalankan
-until ollama list > /dev/null 2>&1; do
+until ollama list >/dev/null 2>&1; do
   echo "Ollama belum siap, tunggu sebentar lagi..."
   sleep 2
 done
-
 echo "Ollama sudah tersedia."
+echo "Daftar model (RAW) : '$RAW'"
+printf ' - %s\n' $MODEL_LIST
 
-# Loop untuk semua model yang ditentukan
-for MODEL_NAME in $MODEL_LIST; do
-  if ! ollama list | grep -q "$MODEL_NAME"; then
-    echo "Model $MODEL_NAME belum ditemukan. Menjalankan pull..."
-    ollama pull "$MODEL_NAME"
-  else
+pull_with_retry() {
+  name="$1"
+  tries=3
+  i=1
+  while [ $i -le $tries ]; do
+    echo "Pull $name (attempt $i/$tries)..."
+    if ollama pull "$name"; then
+      return 0
+    fi
+    echo "Pull $name gagal. Retry 5s..."
+    sleep 5
+    i=$((i+1))
+  done
+  echo "WARNING: Gagal pull $name setelah $tries percobaan. Lanjut ke model berikutnya."
+  return 1
+}
+
+# Loop per baris (satu model per baris)
+echo "$MODEL_LIST" | while IFS= read -r MODEL_NAME; do
+  # skip baris kosong
+  [ -z "$MODEL_NAME" ] && continue
+
+  # cek kolom pertama dari 'ollama list' (nama model)
+  if ollama list | awk '{print $1}' | grep -Fqw "$MODEL_NAME"; then
     echo "Model $MODEL_NAME sudah tersedia."
+  elif ollama list | awk '{print $1}' | grep -Fqw "${MODEL_NAME}:latest"; then
+    echo "Model ${MODEL_NAME}:latest sudah tersedia."
+  else
+    pull_with_retry "$MODEL_NAME" || true
   fi
 done
 
-echo "Semua model siap. Menjaga container tetap hidup..."
-
-# Tunggu proses ollama serve agar container tetap berjalan
-wait $OLLAMA_PID
+echo "Semua model dicek. Menjaga container tetap hidup..."
+wait "$OLLAMA_PID"
