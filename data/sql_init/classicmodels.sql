@@ -38,7 +38,7 @@ CREATE TABLE products (
   productDescription text         NOT NULL COMMENT 'Plain-text description of features and details.',
   quantityInStock    smallint(6)  NOT NULL COMMENT 'Current on-hand inventory (units).',
   buyPrice           decimal(10,2) NOT NULL COMMENT 'Unit purchase cost.',
-  MSRP               decimal(10,2) NOT NULL COMMENT 'Manufacturer’s suggested retail price.',
+  MSRP               decimal(10,2) NOT NULL COMMENT "Manufacturer's suggested retail price.",
   PRIMARY KEY (productCode),
   FOREIGN KEY (productLine) REFERENCES productlines (productLine)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -65,7 +65,7 @@ CREATE TABLE employees (
   extension      varchar(10) NOT NULL COMMENT 'Internal phone extension.',
   email          varchar(100) NOT NULL COMMENT 'Work email address.',
   officeCode     varchar(10)  NOT NULL COMMENT 'Assigned office; FK to offices.officeCode.',
-  reportsTo      int DEFAULT NULL COMMENT 'Direct manager’s employeeNumber; NULL if top-level.',
+  reportsTo      int DEFAULT NULL COMMENT "Direct manager's employeeNumber; NULL if top-level.",
   jobTitle       varchar(50) NOT NULL COMMENT 'Official job title or role.',
   PRIMARY KEY (employeeNumber),
   FOREIGN KEY (reportsTo) REFERENCES employees (employeeNumber),
