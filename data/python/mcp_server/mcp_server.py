@@ -1,3 +1,4 @@
+# mcp_server.py
 import os
 from dotenv import load_dotenv
 import pymysql
@@ -7,13 +8,10 @@ from datetime import datetime
 import time
 import uuid
 import re
-import sqlparse
-from sqlparse.sql import Identifier, IdentifierList
-from sqlparse.tokens import Keyword, DML
 from difflib import get_close_matches
 
 # -----------------------------
-# Env & logging (minimal tweaks)
+# Env & logging
 # -----------------------------
 load_dotenv()
 logging.basicConfig(
@@ -21,7 +19,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 logger = logging.getLogger("MCPServer")
-logging.getLogger("pymysql").setLevel(logging.WARNING)  # keep driver noise down
+logging.getLogger("pymysql").setLevel(logging.WARNING)
 
 def _req_id() -> str:
     return uuid.uuid4().hex[:8]
@@ -48,81 +46,131 @@ DB_CONFIG = {
     "charset": "utf8mb4",
     "cursorclass": pymysql.cursors.Cursor,  # plain tuples
     "autocommit": True,
+    # Optional: stabilitas sesi awal (boleh dihapus kalau tak perlu)
+    "init_command": "SET time_zone = '+00:00'",
 }
 
 # Preview sizing (server-side)
 PREVIEW_ROW_LIMIT = int(os.getenv("PREVIEW_ROW_LIMIT", "5"))
 PREVIEW_COL_LIMIT = int(os.getenv("PREVIEW_COL_LIMIT", "5"))
-STATEMENT_TIMEOUT_MS = int(os.getenv("STATEMENT_TIMEOUT_MS", "5000"))  # 5s (MySQL: max_execution_time)
+STATEMENT_TIMEOUT_MS = int(os.getenv("STATEMENT_TIMEOUT_MS", "5000"))  # 5s
 MAX_EXPORT_ROWS = int(os.getenv("MAX_EXPORT_ROWS", "200000"))
 
 # -----------------------------
-# SQL helpers (MySQL-flavored)
+# SQL normalization helpers
 # -----------------------------
-def quote_identifiers(sql: str) -> str:
+# Daftar keyword untuk deteksi “nempel” (LIMIT/WHERE/ORDER BY, dll.)
+_SQL_KW = r"(?:SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|INNER\s+JOIN|FULL\s+JOIN|ON|VALUES|SET)"
+
+# NEW: segment regex to skip literals/backticked identifiers during normalization
+_SEG_LITERALS = re.compile(r"(`[^`]*`|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")", re.DOTALL)
+
+def _strip_sql_comments(sql: str) -> str:
+    s = re.sub(r'--.*?$', '', sql, flags=re.M)
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+    return s
+
+def _insert_space_before_sql_keywords(sql: str) -> str:
     """
-    Best-effort quoting of identifiers using sqlparse.
-    Convert a.b -> `a`.`b`. Leaves literals/keywords untouched.
+    Insert one space immediately before a SQL clause keyword ONLY when:
+      - we're NOT inside quotes/backticks, and
+      - there is no whitespace already, and
+      - the previous character is NOT an identifier char ([A-Za-z0-9_])
+    Prevents splitting identifiers like 'creditLimit' -> 'credit Limit'.
     """
-    parsed = sqlparse.parse(sql)
-    if not parsed:
-        return sql
-    stmt = parsed[0]
+    def _fix(segment: str) -> str:
+        pattern = rf"(?i)(?<!\s)(?<![A-Za-z0-9_])(?={_SQL_KW}\b)"
+        return re.sub(pattern, " ", segment)
 
-    def q(name: str) -> str:
-        # strip existing quotes/backticks then wrap with backticks
-        clean = name.strip().strip('`').strip('"')
-        return f'`{clean}`' if clean else clean
+    out, i = [], 0
+    for m in _SEG_LITERALS.finditer(sql):
+        out.append(_fix(sql[i:m.start()]))   # process code
+        out.append(m.group(0))               # keep literal/backtick intact
+        i = m.end()
+    out.append(_fix(sql[i:]))
+    return "".join(out)
 
-    def process_identifier(identifier: Identifier) -> str:
-        parts = [p.strip().strip('`').strip('"') for p in identifier.value.split(".")]
-        parts = [q(p) for p in parts if p]
-        return ".".join(parts) if parts else str(identifier)
+def _fix_missing_space_before_clauses(sql: str) -> str:
+    """
+    Ensure a space exists before a clause keyword, with the same safeguards as above.
+    """
+    CLAUSES = r"(SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|INNER\s+JOIN|FULL\s+JOIN|ON|VALUES|SET)"
 
-    def recurse(token_list):
-        parts = []
-        for token in token_list.tokens:
-            if token.is_group:
-                if isinstance(token, IdentifierList):
-                    parts.append(", ".join(process_identifier(i) for i in token.get_identifiers()))
-                elif isinstance(token, Identifier):
-                    parts.append(process_identifier(token))
-                else:
-                    parts.append(recurse(token))
-            else:
-                parts.append(token.value)
-        return " ".join(p.strip() for p in parts if p and p.strip())
+    def _fix(segment: str) -> str:
+        pattern = rf"(?i)(?<!\s)(?<![A-Za-z0-9_])\b{CLAUSES}\b"
+        return re.sub(pattern, r" \1", segment)
 
-    return recurse(stmt)
+    out, i = [], 0
+    for m in _SEG_LITERALS.finditer(sql):
+        out.append(_fix(sql[i:m.start()]))
+        out.append(m.group(0))
+        i = m.end()
+    out.append(_fix(sql[i:]))
+    return "".join(out)
 
+def _collapse_spaces(sql: str) -> str:
+    return re.sub(r"[ \t]{2,}", " ", sql)
+
+def _normalize_sql_for_wrapping(sql: str) -> str:
+    """
+    Normalisasi ringan supaya query aman dibungkus jadi subquery:
+    - hapus komentar
+    - rapikan spasi, sisipkan spasi sebelum keyword (safely)
+    - hapus ';' di akhir (subquery tidak boleh ada ';')
+    """
+    s = _strip_sql_comments(sql or "")
+    s = s.strip().rstrip(";").strip()
+    s = _insert_space_before_sql_keywords(s)
+    s = _fix_missing_space_before_clauses(s)
+    s = _collapse_spaces(s)
+    return s
+
+# -----------------------------
+# SQL helpers (no rewriting beyond normalization)
+# -----------------------------
 def is_single_select(sql: str) -> bool:
-    """True if exactly one statement and it starts with SELECT."""
-    statements = [s for s in sqlparse.parse(sql) if str(s).strip()]
-    if len(statements) != 1:
+    """
+    True if the SQL is exactly one SELECT statement.
+    """
+    if not isinstance(sql, str):
         return False
-    s = statements[0]
-    for tok in s.tokens:
-        if tok.is_whitespace:
-            continue
-        if tok.ttype in (Keyword, DML) and tok.value.upper().startswith("SELECT"):
-            return True
+    s = _strip_sql_comments(sql).strip()
+    if not s:
         return False
-    return False
+    # Split by semicolons; if more than one non-empty statement → reject
+    parts = [p.strip() for p in re.split(r';\s*', s) if p.strip()]
+    if len(parts) != 1:
+        return False
+    # Must start with SELECT
+    return bool(re.match(r'^\s*select\b', parts[0], flags=re.I))
 
 def extract_base_query_without_limit(sql: str) -> str:
-    """Strip trailing LIMIT/OFFSET from SQL."""
-    sql_clean = sql.strip().rstrip(";").strip()
+    """
+    Strip trailing LIMIT/OFFSET dari SQL.
+    Penting: lakukan setelah normalisasi supaya pola '...productCodeLIMIT 5' sudah diperbaiki.
+    """
+    normalized = _normalize_sql_for_wrapping(sql)
+    # Hapus LIMIT/OFFSET di bagian paling akhir kalau ada (opsional)
     sql_no_limit = re.sub(
-        r'\s+(LIMIT\s+\d+(\s+OFFSET\s+\d+)?|OFFSET\s+\d+(\s+LIMIT\s+\d+)?)\s*$',
+        r'(?is)\s+(LIMIT\s+\d+(\s+OFFSET\s+\d+)?|OFFSET\s+\d+(\s+LIMIT\s+\d+)?)\s*$',
         "",
-        sql_clean,
-        flags=re.IGNORECASE
+        normalized
     )
     return sql_no_limit.strip()
 
 def wrap_with_limit(sql: str, limit: int) -> str:
-    # MySQL requires alias (AS optional). This works fine:
-    return f'SELECT * FROM ({sql}) subq LIMIT {int(limit)}'
+    # MySQL perlu alias (AS opsional), LIMIT di luar subquery
+    core = _normalize_sql_for_wrapping(sql)
+    return f"SELECT * FROM ({core}) AS subq LIMIT {int(limit)}"
+
+def _conn():
+    """Open connection + ping to ensure healthy session."""
+    c = pymysql.connect(**DB_CONFIG)
+    try:
+        c.ping(reconnect=True)
+    except Exception:
+        pass
+    return c
 
 def list_all_tables(conn):
     with conn.cursor() as cur:
@@ -143,17 +191,70 @@ def suggest_tables(conn, missing_name: str, max_suggestions: int = 3):
         suggestions = [f"{DB_CONFIG.get('db','classicmodels')}.{m}" for m in get_close_matches(missing_name, bare, n=max_suggestions, cutoff=0.6)]
     return tables, suggestions
 
+def suggest_columns(conn, table_fqn: str, missing_col: str, max_suggestions: int = 5):
+    """
+    Given a table (possibly schema-qualified) and a missing column name, return closest columns.
+    """
+    schema = DB_CONFIG.get("db")
+    table = table_fqn
+    if "." in table_fqn:
+        schema, table = table_fqn.split(".", 1)
+    schema = schema.strip("`")
+    table = table.strip("`")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema=%s AND table_name=%s
+            """, (schema, table))
+            cols = [r[0] for r in cur.fetchall()]
+    except Exception:
+        cols = []
+    return get_close_matches(missing_col, cols, n=max_suggestions, cutoff=0.5)
+
 def set_statement_timeout(conn, timeout_ms: int):
-    """
-    MySQL 8 has session variable max_execution_time (ms).
-    We'll try to set it; if not supported, just continue silently.
-    """
+    """Try to set MySQL 8 session max_execution_time (ms)."""
     try:
         with conn.cursor() as cur:
             cur.execute(f"SET SESSION max_execution_time = {int(timeout_ms)};")
         logger.debug(f"max_execution_time set to {timeout_ms} ms")
     except Exception as e:
         logger.warning(f"max_execution_time not settable: {e}")
+
+def _preflight_explain(conn, sql: str):
+    """
+    Optional: EXPLAIN to fail-fast on schema errors.
+    We don't use the plan; it's only to surface clearer messages early.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("EXPLAIN " + sql)
+    except pymysql.err.ProgrammingError as e:
+        # Re-raise for the normal handler to categorize
+        raise
+    except Exception:
+        # Ignore non-programming errors (e.g., permissions); not critical
+        pass
+
+def _build_count_sql(base_sql: str) -> str:
+    """
+    Bangun query hitung total yang aman: normalisasi dulu, lalu wrap.
+    Tidak perlu hapus ORDER BY / LIMIT agresif; MySQL bisa menghitung dari subquery.
+    """
+    core = _normalize_sql_for_wrapping(base_sql)
+    return f"SELECT COUNT(*) AS total_rows FROM ({core}) AS count_subquery"
+
+# (Optional) Guardrail: warn if an identifier/keyword split is detected
+def _warn_identifier_keyword_split(tag: str, sql: str):
+    m = re.search(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\.\s*([A-Za-z_][A-Za-z0-9_]*)\s+"
+        r"(SELECT|FROM|WHERE|GROUP|BY|HAVING|ORDER|LIMIT|JOIN|LEFT|RIGHT|INNER|FULL|ON)\b",
+        sql, flags=re.I
+    )
+    if m:
+        logger.warning("[%s] Possible identifier/keyword split near: ...%s...",
+                       tag, sql[max(0, m.start()-30):m.end()+30])
 
 # -----------------------------
 # Tools
@@ -166,7 +267,7 @@ def list_tables() -> dict:
     logger.info(f"[{req}] list_tables CALLED host={DB_CONFIG.get('host')} db={DB_CONFIG.get('db')}")
     conn = None
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = _conn()
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT table_schema, table_name
@@ -200,13 +301,25 @@ def query_db(sql: str) -> dict:
 
     conn = None
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = _conn()
         set_statement_timeout(conn, STATEMENT_TIMEOUT_MS)
 
-        quoted_sql = quote_identifiers(sql)
-        base_query = extract_base_query_without_limit(quoted_sql)
-        count_sql = f"SELECT COUNT(*) FROM ({base_query}) count_subquery"
-        _log_sql(req, quoted_query=quoted_sql, base_query=base_query, count_sql=count_sql)
+        # Normalize terlebih dahulu (safe)
+        normalized_sql = _normalize_sql_for_wrapping(sql)
+        base_query = extract_base_query_without_limit(normalized_sql)
+
+        # Guardrail log (optional)
+        _warn_identifier_keyword_split(req, base_query)
+
+        count_sql = _build_count_sql(base_query)
+        _log_sql(req, normalized_sql=normalized_sql, base_query=base_query, count_sql=count_sql)
+
+        # Optional: fail-fast preflight
+        try:
+            _preflight_explain(conn, base_query)
+        except Exception:
+            # ignore; normal execution will surface the same error
+            pass
 
         # true count
         total_rows = 0
@@ -218,6 +331,8 @@ def query_db(sql: str) -> dict:
             code = e.args[0] if e.args else None
             msg = e.args[1] if len(e.args) > 1 else str(e)
             logger.warning(f"[{req}] count failed code={code} msg={msg}")
+
+            # Table missing
             if code == 1146 or "doesn't exist" in msg:
                 m = re.search(r"Table '([^']+)' doesn't exist", msg)
                 missing = m.group(1) if m else ""
@@ -229,10 +344,29 @@ def query_db(sql: str) -> dict:
                     "suggestions": suggestions,
                     "available_tables": tables
                 }
-            return {"success": False, "error": f"Count failed: {msg}"}
+
+            # Unknown column → coba kasih saran kolom
+            if code == 1054 or "Unknown column" in msg:
+                # MySQL biasanya: Unknown column 'X' in 'field list'
+                col_m = re.search(r"Unknown column '([^']+)' in '([^']+)'", msg)
+                missing_col = col_m.group(1) if col_m else ""
+                # upaya kasar deteksi table di FROM pertama
+                tbl_m = re.search(r"\bfrom\s+([`\"\w\.]+)", base_query, flags=re.I)
+                table_fqn = tbl_m.group(1).strip('`"') if tbl_m else ""
+                col_sug = suggest_columns(conn, table_fqn, missing_col, 5) if (table_fqn and missing_col) else []
+                return {
+                    "success": False,
+                    "error": f"Unknown column: {missing_col or 'unknown'}",
+                    "table": table_fqn,
+                    "column_suggestions": col_sug
+                }
+
+            # Fallback: jangan gagalkan seluruh request hanya karena count gagal
+            logger.warning(f"[{req}] Count failed; continuing without total. msg={msg}")
+            total_rows = None
         except Exception as e:
             logger.warning(f"[{req}] count failed generic: {e}")
-            return {"success": False, "error": f"Count failed: {str(e)}"}
+            total_rows = None
 
         # preview with limit
         preview_sql = wrap_with_limit(base_query, PREVIEW_ROW_LIMIT)
@@ -248,10 +382,10 @@ def query_db(sql: str) -> dict:
 
         logger.info(
             f"[{req}] query_db DONE rows_preview={len(preview_rows_limited)} "
-            f"cols_total={total_cols} rows_total={total_rows} elapsed_ms={_elapsed_ms(t0):.1f}"
+            f"cols_total={total_cols} rows_total={total_rows if total_rows is not None else 'n/a'} "
+            f"elapsed_ms={_elapsed_ms(t0):.1f}"
         )
 
-        duration = (datetime.now() - datetime.now()).total_seconds()  # kept for compatibility (unused)
         return {
             "success": True,
             "preview_rows": preview_rows_limited,
@@ -261,7 +395,7 @@ def query_db(sql: str) -> dict:
             "duration_seconds": _elapsed_ms(t0) / 1000.0,
             "_debug_info": {
                 "original_query": sql,
-                "quoted_query": quoted_sql,
+                "normalized_query": normalized_sql,
                 "base_query": base_query,
                 "preview_sql": preview_sql,
                 "query_returned_rows": len(preview_rows_limited),
@@ -286,18 +420,17 @@ def query_db_full(sql: str) -> dict:
     logger.info(f"[{req}] query_db_full CALLED host={DB_CONFIG.get('host')} db={DB_CONFIG.get('db')}")
     logger.info(f"[{req}] 📥 Input SQL: {sql}")
 
-    if not is_single_select(sql):
+    if not is_single_select(sql:=str(sql)):
         logger.warning(f"[{req}] rejected: not a single SELECT")
         return {"success": False, "error": "Only a single SELECT statement is allowed."}
 
     conn = None
     try:
-        conn = pymysql.connect(**DB_CONFIG)
+        conn = _conn()
         set_statement_timeout(conn, STATEMENT_TIMEOUT_MS)
 
-        quoted_sql = quote_identifiers(sql)
-        base_query = extract_base_query_without_limit(quoted_sql)
-        _log_sql(req, quoted_query=quoted_sql, base_query=base_query)
+        normalized_sql = _normalize_sql_for_wrapping(sql)
+        base_query = extract_base_query_without_limit(normalized_sql)
 
         with conn.cursor() as data_cur:
             data_cur.execute(base_query)
@@ -323,7 +456,7 @@ def query_db_full(sql: str) -> dict:
             "truncated": truncated,
             "_debug_info": {
                 "original_query": sql,
-                "quoted_query": quoted_sql,
+                "normalized_query": normalized_sql,
                 "base_query": base_query,
                 "max_export_rows": MAX_EXPORT_ROWS,
                 "duration_seconds": _elapsed_ms(t0) / 1000.0
@@ -333,6 +466,7 @@ def query_db_full(sql: str) -> dict:
         code = e.args[0] if e.args else None
         msg = e.args[1] if len(e.args) > 1 else str(e)
         logger.warning(f"[{req}] ProgrammingError code={code} msg={msg}")
+
         if code == 1146 or "doesn't exist" in msg:
             m = re.search(r"Table '([^']+)' doesn't exist", msg)
             missing = m.group(1) if m else ""
@@ -347,6 +481,20 @@ def query_db_full(sql: str) -> dict:
                 "suggestions": suggestions,
                 "available_tables": tables
             }
+
+        if code == 1054 or "Unknown column" in msg:
+            col_m = re.search(r"Unknown column '([^']+)' in '([^']+)'", msg)
+            missing_col = col_m.group(1) if col_m else ""
+            tbl_m = re.search(r"\bfrom\s+([`\"\w\.]+)", base_query, flags=re.I)
+            table_fqn = tbl_m.group(1).strip('`"') if tbl_m else ""
+            col_sug = suggest_columns(conn, table_fqn, missing_col, 5) if (table_fqn and missing_col) else []
+            return {
+                "success": False,
+                "error": f"Unknown column: {missing_col or 'unknown'}",
+                "table": table_fqn,
+                "column_suggestions": col_sug
+            }
+
         logger.error("❌ Error exporting full query", exc_info=True)
         return {"success": False, "error": msg}
     except Exception as e:
@@ -357,7 +505,7 @@ def query_db_full(sql: str) -> dict:
             conn.close()
 
 # -----------------------------
-# Run MCP Server (unchanged)
+# Run MCP Server
 # -----------------------------
 if __name__ == "__main__":
     logger.info("🚀 Starting MySQL MCP Server...")
