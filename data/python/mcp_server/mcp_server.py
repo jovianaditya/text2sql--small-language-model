@@ -46,7 +46,7 @@ DB_CONFIG = {
     "charset": "utf8mb4",
     "cursorclass": pymysql.cursors.Cursor,  # plain tuples
     "autocommit": True,
-    # Optional: stabilitas sesi awal (boleh dihapus kalau tak perlu)
+    # Optional: stabilitas sesi awal
     "init_command": "SET time_zone = '+00:00'",
 }
 
@@ -59,10 +59,10 @@ MAX_EXPORT_ROWS = int(os.getenv("MAX_EXPORT_ROWS", "200000"))
 # -----------------------------
 # SQL normalization helpers
 # -----------------------------
-# Daftar keyword untuk deteksi “nempel” (LIMIT/WHERE/ORDER BY, dll.)
+# Keyword set (for spacing detection)
 _SQL_KW = r"(?:SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|INNER\s+JOIN|FULL\s+JOIN|ON|VALUES|SET)"
 
-# NEW: segment regex to skip literals/backticked identifiers during normalization
+# Segment regex to skip quotes/backticks while normalizing
 _SEG_LITERALS = re.compile(r"(`[^`]*`|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")", re.DOTALL)
 
 def _strip_sql_comments(sql: str) -> str:
@@ -113,10 +113,10 @@ def _collapse_spaces(sql: str) -> str:
 
 def _normalize_sql_for_wrapping(sql: str) -> str:
     """
-    Normalisasi ringan supaya query aman dibungkus jadi subquery:
+    Normalisasi ringan supaya query aman:
     - hapus komentar
     - rapikan spasi, sisipkan spasi sebelum keyword (safely)
-    - hapus ';' di akhir (subquery tidak boleh ada ';')
+    - hapus ';' di akhir
     """
     s = _strip_sql_comments(sql or "")
     s = s.strip().rstrip(";").strip()
@@ -129,28 +129,24 @@ def _normalize_sql_for_wrapping(sql: str) -> str:
 # SQL helpers (no rewriting beyond normalization)
 # -----------------------------
 def is_single_select(sql: str) -> bool:
-    """
-    True if the SQL is exactly one SELECT statement.
-    """
+    """True if the SQL is exactly one SELECT statement."""
     if not isinstance(sql, str):
         return False
     s = _strip_sql_comments(sql).strip()
     if not s:
         return False
-    # Split by semicolons; if more than one non-empty statement → reject
     parts = [p.strip() for p in re.split(r';\s*', s) if p.strip()]
     if len(parts) != 1:
         return False
-    # Must start with SELECT
     return bool(re.match(r'^\s*select\b', parts[0], flags=re.I))
 
 def extract_base_query_without_limit(sql: str) -> str:
     """
     Strip trailing LIMIT/OFFSET dari SQL.
-    Penting: lakukan setelah normalisasi supaya pola '...productCodeLIMIT 5' sudah diperbaiki.
+    Lakukan setelah normalisasi supaya pola '...productCodeLIMIT 5' sudah benar.
     """
     normalized = _normalize_sql_for_wrapping(sql)
-    # Hapus LIMIT/OFFSET di bagian paling akhir kalau ada (opsional)
+    # Hapus LIMIT/OFFSET paling akhir jika ada
     sql_no_limit = re.sub(
         r'(?is)\s+(LIMIT\s+\d+(\s+OFFSET\s+\d+)?|OFFSET\s+\d+(\s+LIMIT\s+\d+)?)\s*$',
         "",
@@ -159,9 +155,30 @@ def extract_base_query_without_limit(sql: str) -> str:
     return sql_no_limit.strip()
 
 def wrap_with_limit(sql: str, limit: int) -> str:
-    # MySQL perlu alias (AS opsional), LIMIT di luar subquery
+    """Legacy helper (unused in preview now) — kept for reference."""
     core = _normalize_sql_for_wrapping(sql)
     return f"SELECT * FROM ({core}) AS subq LIMIT {int(limit)}"
+
+def _build_preview_sql(normalized_sql: str, limit: int) -> str:
+    """
+    Build a simple preview statement: NEVER wrap in a subquery.
+    - If the incoming normalized SQL already ends with LIMIT (optionally OFFSET),
+      keep it if <= limit; cap it if it's larger; otherwise append LIMIT {limit}.
+    """
+    q = normalized_sql.strip()
+    m = re.search(r'(?is)\blimit\s+(\d+)(\s+offset\s+\d+)?\s*$', q)
+    if m:
+        try:
+            existing = int(m.group(1))
+        except Exception:
+            existing = None
+        if existing is not None and existing > limit:
+            # cap the limit but keep any trailing OFFSET
+            # rebuild the tail
+            capped_tail = f"LIMIT {limit}{m.group(2) or ''}"
+            return q[:m.start()] + capped_tail
+        return q
+    return f"{q} LIMIT {int(limit)}"
 
 def _conn():
     """Open connection + ping to ensure healthy session."""
@@ -192,9 +209,7 @@ def suggest_tables(conn, missing_name: str, max_suggestions: int = 3):
     return tables, suggestions
 
 def suggest_columns(conn, table_fqn: str, missing_col: str, max_suggestions: int = 5):
-    """
-    Given a table (possibly schema-qualified) and a missing column name, return closest columns.
-    """
+    """Given a table and a missing column name, return closest columns."""
     schema = DB_CONFIG.get("db")
     table = table_fqn
     if "." in table_fqn:
@@ -223,25 +238,19 @@ def set_statement_timeout(conn, timeout_ms: int):
         logger.warning(f"max_execution_time not settable: {e}")
 
 def _preflight_explain(conn, sql: str):
-    """
-    Optional: EXPLAIN to fail-fast on schema errors.
-    We don't use the plan; it's only to surface clearer messages early.
-    """
+    """Optional: EXPLAIN to fail-fast on schema errors."""
     try:
         with conn.cursor() as cur:
             cur.execute("EXPLAIN " + sql)
-    except pymysql.err.ProgrammingError as e:
+    except pymysql.err.ProgrammingError:
         # Re-raise for the normal handler to categorize
         raise
     except Exception:
-        # Ignore non-programming errors (e.g., permissions); not critical
+        # Ignore non-programming errors
         pass
 
 def _build_count_sql(base_sql: str) -> str:
-    """
-    Bangun query hitung total yang aman: normalisasi dulu, lalu wrap.
-    Tidak perlu hapus ORDER BY / LIMIT agresif; MySQL bisa menghitung dari subquery.
-    """
+    """Count total rows by wrapping the LIMIT-less, normalized base query."""
     core = _normalize_sql_for_wrapping(base_sql)
     return f"SELECT COUNT(*) AS total_rows FROM ({core}) AS count_subquery"
 
@@ -280,9 +289,9 @@ def list_tables() -> dict:
             table_list = [f"{schema}.{name}" for schema, name in tables]
         logger.info(f"[{req}] list_tables DONE total={len(table_list)} elapsed_ms={_elapsed_ms(t0):.1f}")
         return {"success": True, "total_tables": len(table_list), "tables": table_list}
-    except Exception as e:
+    except Exception:
         logger.exception(f"[{req}] ❌ list_tables ERROR elapsed_ms={_elapsed_ms(t0):.1f}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": "Failed to list tables."}
     finally:
         if conn:
             conn.close()
@@ -311,17 +320,9 @@ def query_db(sql: str) -> dict:
         # Guardrail log (optional)
         _warn_identifier_keyword_split(req, base_query)
 
+        # true count (wrapped, LIMIT-less)
         count_sql = _build_count_sql(base_query)
         _log_sql(req, normalized_sql=normalized_sql, base_query=base_query, count_sql=count_sql)
-
-        # Optional: fail-fast preflight
-        try:
-            _preflight_explain(conn, base_query)
-        except Exception:
-            # ignore; normal execution will surface the same error
-            pass
-
-        # true count
         total_rows = 0
         try:
             with conn.cursor() as count_cur:
@@ -345,12 +346,10 @@ def query_db(sql: str) -> dict:
                     "available_tables": tables
                 }
 
-            # Unknown column → coba kasih saran kolom
+            # Unknown column → column suggestions
             if code == 1054 or "Unknown column" in msg:
-                # MySQL biasanya: Unknown column 'X' in 'field list'
                 col_m = re.search(r"Unknown column '([^']+)' in '([^']+)'", msg)
                 missing_col = col_m.group(1) if col_m else ""
-                # upaya kasar deteksi table di FROM pertama
                 tbl_m = re.search(r"\bfrom\s+([`\"\w\.]+)", base_query, flags=re.I)
                 table_fqn = tbl_m.group(1).strip('`"') if tbl_m else ""
                 col_sug = suggest_columns(conn, table_fqn, missing_col, 5) if (table_fqn and missing_col) else []
@@ -361,15 +360,14 @@ def query_db(sql: str) -> dict:
                     "column_suggestions": col_sug
                 }
 
-            # Fallback: jangan gagalkan seluruh request hanya karena count gagal
             logger.warning(f"[{req}] Count failed; continuing without total. msg={msg}")
             total_rows = None
         except Exception as e:
             logger.warning(f"[{req}] count failed generic: {e}")
             total_rows = None
 
-        # preview with limit
-        preview_sql = wrap_with_limit(base_query, PREVIEW_ROW_LIMIT)
+        # PREVIEW (NO WRAP) — keeps the query simple
+        preview_sql = _build_preview_sql(normalized_sql, PREVIEW_ROW_LIMIT)
         _log_sql(req, preview_sql=preview_sql)
 
         with conn.cursor() as data_cur:
@@ -420,7 +418,7 @@ def query_db_full(sql: str) -> dict:
     logger.info(f"[{req}] query_db_full CALLED host={DB_CONFIG.get('host')} db={DB_CONFIG.get('db')}")
     logger.info(f"[{req}] 📥 Input SQL: {sql}")
 
-    if not is_single_select(sql:=str(sql)):
+    if not is_single_select(sql := str(sql)):
         logger.warning(f"[{req}] rejected: not a single SELECT")
         return {"success": False, "error": "Only a single SELECT statement is allowed."}
 
