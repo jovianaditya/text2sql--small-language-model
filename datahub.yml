@@ -257,7 +257,7 @@ services:
     ports:
       - ${DATAHUB_GMS_PORT:-8080}:8080
     volumes:
-      - ${HOME}/.datahub/plugins:/etc/datahub/plugins
+      - ./data/datahub/plugins:/etc/datahub/plugins
 
   datahub-frontend-react:
     depends_on:
@@ -279,7 +279,7 @@ services:
     ports:
       - ${DATAHUB_FRONTEND_PORT:-9002}:9002
     volumes:
-      - ${HOME}/.datahub/plugins:/etc/datahub/plugins
+      - ./data/datahub/plugins:/etc/datahub/plugins
 
   mcp_server:
     build:
