@@ -1,3 +1,4 @@
+# EASY
 1. List all customer names (alphabetical).
 - SELECT customerName FROM customers ORDER BY customerName;
 2. Show distinct customer countries.
@@ -5,12 +6,21 @@
 3. How many orders exist?
 - SELECT COUNT(*) FROM orders;
 4. List customer names with their credit limits at least 100,000, sorted by credit limit (highest first), then by name.
-- SELECT customerName, creditLimit FROM customers WHERE creditLimit >= 100000 ORDER BY creditLimit DESC, customerName ASC
+- SELECT customerName, creditLimit FROM customers WHERE creditLimit >= 100000 ORDER BY creditLimit DESC, customerName ASC;
 5. List all customers from Japan. Include only their ID, name, and country; sort by name.
 - SELECT customerNumber, customerName, country FROM customers WHERE country = 'Japan' ORDER BY customerName ASC;
 6. Show all of the order numbers made between January 16, 2003 and Mar 7, 2003
 - SELECT orderNumber FROM orders WHERE orderDate BETWEEN '2003-01-16' AND '2003-03-07';
 7. Show the five most expensive products. Include only each product's unique code, name, and list price.
-- SELECT productCode, productName, MSRP FROM products ORDER BY MSRP DESC LIMIT 5
-8. Show all product names
-- SELECT productName FROM product
+- SELECT productCode, productName, MSRP FROM products ORDER BY MSRP DESC LIMIT 5;
+8. Display all products with stock levels below 100 units.
+- SELECT productName, quantityInStock FROM products WHERE quantityInStock < 100
+9. Show all product lines and their descriptions that have no HTML description.
+- SELECT productLine, textDescription FROM productlines WHERE htmlDescription IS NULL;
+
+
+
+
+# HARD
+1. List all customers and the total number of orders they have placed.
+- SELECT customerName, COUNT(orderNumber) FROM customers LEFT JOIN orders ON customerNumber = customerNumber GROUP BY customerName
