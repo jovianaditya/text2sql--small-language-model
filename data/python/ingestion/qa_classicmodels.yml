@@ -11,4 +11,6 @@
 6. Show all of the order numbers made between January 16, 2003 and Mar 7, 2003
 - SELECT orderNumber FROM orders WHERE orderDate BETWEEN '2003-01-16' AND '2003-03-07';
 7. Show the five most expensive products. Include only each product's unique code, name, and list price.
-- SELECT productCode, productName, MSRP FROM products ORDER BY MSRP DESC LIMIT 5;
+- SELECT productCode, productName, MSRP FROM products ORDER BY MSRP DESC LIMIT 5
+8. Show all product names
+- SELECT productName FROM product
