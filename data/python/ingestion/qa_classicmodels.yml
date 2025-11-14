@@ -17,10 +17,6 @@
 - SELECT productName, quantityInStock FROM products WHERE quantityInStock < 100
 9. Show all product lines and their descriptions that have no HTML description.
 - SELECT productLine, textDescription FROM productlines WHERE htmlDescription IS NULL;
-
-
-
-
 # HARD
 1. List all customers and the total number of orders they have placed.
 - SELECT customerName, COUNT(orderNumber) FROM customers LEFT JOIN orders ON customerNumber = customerNumber GROUP BY customerName
