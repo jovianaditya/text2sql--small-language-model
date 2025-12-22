@@ -1,0 +1,21 @@
+EASY
+1. List all customers in Japan, showing their names and cities, sorted by city.
+- SELECT customerName, city FROM customers WHERE country = 'Japan' ORDER BY city;
+2. Show the 10 products with the highest stock levels. Display the product code, name, and quantity in stock.
+- SELECT productCode, productName, quantityInStock FROM products ORDER BY quantityInStock DESC LIMIT 10;
+3. List all orders placed in the year 2004. Show the order number and order date, ordered by order date.
+- SELECT orderNumber, orderDate FROM orders WHERE YEAR(orderDate) = 2004 ORDER BY orderDate;
+4. Find all payments with an amount greater than 10,000. Show the customer number, check number, and amount, ordered by amount from highest to lowest.
+- SELECT customerNumber, checkNumber, amount FROM payments WHERE amount > 10000 ORDER BY amount DESC;
+5. Find offices where the state information is missing. Show the office code, city, country, and state.
+- SELECT officeCode, city, country, state FROM offices WHERE state IS NULL;
+6. Find all products whose names start with “196”. Show their product codes and names.
+- SELECT productCode, productName FROM products WHERE productName LIKE '196%';
+7. Find employees who work in offices with codes 1, 2, or 3. Show their employee numbers, first names, last names, and office codes.
+- SELECT employeeNumber, firstName, lastName, officeCode FROM employees WHERE officeCode IN ('1', '2', '3');
+8. Find employees whose phone extension starts with the letter "x" followed by exactly three digits. Show their employee numbers, first names, last names, and extensions.
+- SELECT employeeNumber, firstName, lastName, extension FROM employees WHERE extension REGEXP '^x[0-9]{3}$';
+9. Show orders that are either in status “Cancelled” or “On Hold”. Display the order number, order date, and status.
+SELECT orderNumber, orderDate, status FROM orders WHERE status IN('Cancelled','On Hold');
+10. Find products whose stock quantity is at least 500 and at most 1000 units. Show their product codes, names, and stock quantities.
+- SELECT productCode, productName, quantityInStock FROM products WHERE quantityInStock BETWEEN 500 AND 1000;
