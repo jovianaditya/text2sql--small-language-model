@@ -301,7 +301,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1g
+          memory: 2g
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import os; assert os.path.exists('/app')"]
@@ -321,6 +321,7 @@ services:
       - ./data/python/mcp_client:/app
     ports:
       - "8888:8888"
+      - "8501:8501"
     working_dir: /app
     environment:
       - PYTHONPATH=/app
@@ -328,7 +329,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1g
+          memory: 2g
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import os; assert os.path.exists('/app')"]
