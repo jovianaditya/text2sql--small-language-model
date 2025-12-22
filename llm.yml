@@ -54,4 +54,4 @@ services:
       timeout: 5s 
       retries: 3 
     volumes: 
-      - ./data/python/mcp_client/chroma_db:/chroma/persist:rw
+      - ./data/python/mcp_client/chroma_db:/data:rw 
