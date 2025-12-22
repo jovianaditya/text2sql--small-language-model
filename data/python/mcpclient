@@ -15,15 +15,15 @@ RUN pip install --no-cache-dir fastmcp
 
 # Install library tambahan
 RUN pip install --no-cache-dir \
-    pandas \
+    fastmcp \
+    python-dotenv \
+    requests \
     tabulate \
-    langchain \
-    langchain-community \
-    langchain_chroma \
+    rank_bm25 \
+    scikit-learn \
     chromadb \
-    langchain-ollama \
     langgraph \
-    grandalf
+    langchain-ollama
 
 # Install Jupyter
 RUN pip install --no-cache-dir notebook ipykernel
