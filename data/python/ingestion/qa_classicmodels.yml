@@ -1,22 +1,362 @@
-# EASY
-1. List all customer names (alphabetical).
-- SELECT customerName FROM customers ORDER BY customerName;
-2. Show distinct customer countries.
-- SELECT DISTINCT country FROM customers;
-3. How many orders exist?
-- SELECT COUNT(*) FROM orders;
-4. List customer names with their credit limits at least 100,000, sorted by credit limit (highest first), then by name.
-- SELECT customerName, creditLimit FROM customers WHERE creditLimit >= 100000 ORDER BY creditLimit DESC, customerName ASC;
-5. List all customers from Japan. Include only their ID, name, and country; sort by name.
-- SELECT customerNumber, customerName, country FROM customers WHERE country = 'Japan' ORDER BY customerName ASC;
-6. Show all of the order numbers made between January 16, 2003 and Mar 7, 2003
-- SELECT orderNumber FROM orders WHERE orderDate BETWEEN '2003-01-16' AND '2003-03-07';
-7. Show the five most expensive products. Include only each product's unique code, name, and list price.
-- SELECT productCode, productName, MSRP FROM products ORDER BY MSRP DESC LIMIT 5;
-8. Display all products with stock levels below 100 units.
-- SELECT productName, quantityInStock FROM products WHERE quantityInStock < 100
-9. Show all product lines and their descriptions that have no HTML description.
-- SELECT productLine, textDescription FROM productlines WHERE htmlDescription IS NULL;
-# HARD
-1. List all customers and the total number of orders they have placed.
-- SELECT customerName, COUNT(orderNumber) FROM customers LEFT JOIN orders ON customerNumber = customerNumber GROUP BY customerName
+cases:
+    - id: E1
+      difficulty: easy
+      question: "List all customer names (alphabetical)."
+      groundtruth_sql: |
+        SELECT customerName FROM customers ORDER BY customerName;
+    - id: E2
+      difficulty: easy
+      question: "List customer names with their credit limits at least 100,000, sorted by credit limit (highest first), then by name."
+      groundtruth_sql: |
+        SELECT customerName, creditLimit 
+        FROM customers 
+        WHERE creditLimit >= 100000 
+        ORDER BY creditLimit DESC, customerName ASC;
+    - id: E3
+      difficulty: easy
+      question: "Show all of the order numbers made between January 16, 2003 and Mar 7, 2003"
+      groundtruth_sql: |
+        SELECT orderNumber
+        FROM orders
+        WHERE orderDate BETWEEN '2003-01-16' AND '2003-03-07';
+    - id: E4
+      difficulty: easy
+      question: "Show the five most expensive products. Include only each product's unique code, name, and list price."
+      groundtruth_sql: |
+        SELECT productCode, productName, MSRP 
+        FROM products 
+        ORDER BY MSRP DESC LIMIT 5;
+    - id: E5
+      difficulty: easy
+      question: "Display all products with stock levels below 100 units."
+      groundtruth_sql: |
+        SELECT productName, quantityInStock 
+        FROM products 
+        WHERE quantityInStock < 100;
+    - id: E6
+      difficulty: easy
+      question: Show all product lines and their descriptions that have no HTML description."
+      groundtruth_sql: |
+        SELECT productLine, textDescription 
+        FROM productlines 
+        WHERE htmlDescription IS NULL;
+    - id: E7
+      difficulty: easy
+      question: "Find all products whose names contain the word “Ford.” Show their product codes and names"
+      groundtruth_sql: |
+        SELECT productCode, productName 
+        FROM products 
+        WHERE productName LIKE '%Ford%';
+    - id: E8
+      difficulty: easy
+      question: "Find the customers and their countries who are located in France, Germany, or Spain."
+      groundtruth_sql: |
+        SELECT customerName, country 
+        FROM customers 
+        WHERE country IN ('France', 'Germany', 'Spain');
+    - id: E9
+      difficulty: easy
+      question: "Show all orders with status “Shipped”. Display the order number, order date, and status."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate, status 
+        FROM orders 
+        WHERE status = 'Shipped';
+    - id: E10
+      difficulty: easy
+      question: "Find the order numbers and order dates of orders that have not been shipped yet."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate, status 
+        FROM orders 
+        WHERE shippedDate IS NULL;
+    - id: E11
+      difficulty: easy
+      question: "Find offices in the territories “EMEA” or “APAC”."
+      groundtruth_sql: |
+        SELECT officeCode, city, territory 
+        FROM offices 
+        WHERE territory IN ('EMEA', 'APAC');
+    - id: E12
+      difficulty: easy
+      question: "Show order details where the product code begins with “S”."
+      groundtruth_sql: |
+        SELECT orderNumber, productCode, quantityOrdered, priceEach 
+        FROM orderdetails 
+        WHERE productCode LIKE 'S%';
+    - id: E13
+      difficulty: easy
+      question: "Find employees who report to employee number 1143."
+      groundtruth_sql: |
+        SELECT employeeNumber, firstName, lastName, reportsTo 
+        FROM employees 
+        WHERE reportsTo = 1143;
+    - id: E14
+      difficulty: easy
+      question: "Find customers whose names contain a word that starts with “Co”. Show their customer number and name."
+      groundtruth_sql: |
+        SELECT customerNumber, customerName 
+        FROM customers 
+        WHERE customerName REGEXP '(^|[[:space:]])Co';
+    - id: E15
+      difficulty: easy
+      question: "Find payments that were made in the first quarter of 2004 (January to March). Show their customer numbers, payment dates, and amounts."
+      groundtruth_sql: |
+        SELECT customerNumber, paymentDate, amount 
+        FROM payments 
+        WHERE YEAR(paymentDate) = 2004 AND MONTH(paymentDate) BETWEEN 1 AND 3;
+    - id: E16
+      difficulty: easy
+      question: "List order details where the quantity ordered is between 20 and 40 and the product code starts with “S”. Show the order number, product code, and quantity ordered."
+      groundtruth_sql: |
+        SELECT orderNumber, productCode, quantityOrdered 
+        FROM orderdetails 
+        WHERE quantityOrdered BETWEEN 20 AND 40 AND productCode LIKE 'S%';
+    - id: E17
+      difficulty: easy
+      question: "Find offices whose city name consists of two words (separated by a space)"
+      groundtruth_sql: |
+        SELECT officeCode, city 
+        FROM offices 
+        WHERE city REGEXP '^[A-Za-z]+[[:space:]][A-Za-z]+$';
+    - id: E18
+      difficulty: easy
+      question: "Find employees whose last names contain the letter “e”, but do not end with “e”."
+      groundtruth_sql: |
+        SELECT employeeNumber, firstName, lastName 
+        FROM employees 
+        WHERE lastName LIKE '%e%' AND lastName NOT LIKE '%e';
+    - id: E19
+      difficulty: easy
+      question: "Find offices not located in the USA, France, or Australia."
+      groundtruth_sql: |
+        SELECT officeCode, city, country 
+        FROM offices 
+        WHERE country NOT IN ('USA', 'France', 'Australia');
+    - id: E20
+      difficulty: easy
+      question: "Find orders that were placed on Friday."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate 
+        FROM orders 
+        WHERE DAYOFWEEK(orderDate) = 6;
+    - id: M1
+      difficulty: medium
+      question: "Show how many orders exist in total on June 2003."
+      groundtruth_sql: |
+        SELECT COUNT(*) 
+        FROM orders 
+        WHERE MONTH(orderDate) = 6 AND YEAR(orderDate) = 2003;
+    - id: M2
+      difficulty: medium
+      question: "Show the average payment amount for all payments made in 2004."
+      groundtruth_sql: |
+        SELECT AVG(amount) 
+        FROM payments 
+        WHERE YEAR(paymentDate) = 2004;
+    - id: M3
+      difficulty: medium
+      question: "Display the average buy price of products for each product line."
+      groundtruth_sql: |
+        SELECT productLine, AVG(buyPrice) AS average_price 
+        FROM products 
+        GROUP BY productLine;
+    - id: M4
+      difficulty: medium
+      question: "For each product line, show how many products it has, along with the minimum and maximum list price (MSRP)."
+      groundtruth_sql: |
+        SELECT  productLine, COUNT(*), MIN(MSRP), MAX(MSRP) 
+        FROM products 
+        GROUP BY productLine;
+    - id: M5
+      difficulty: medium
+      question: "For each customer, show the date of their first order."
+      groundtruth_sql: |
+        SELECT customerNumber, MIN(orderDate) AS first_order_date 
+        FROM orders 
+        GROUP BY customerNumber;
+    - id: M6
+      difficulty: medium
+      question: "For each payment year, show the total payment amount made in that year."
+      groundtruth_sql: |
+        SELECT YEAR(paymentDate), SUM(amount) FROM payments GROUP BY YEAR(paymentDate);
+    - id: M7
+      difficulty: medium
+      question: "For each customer, show how many payments they have made, and only include customers with more than 3 payments."
+      groundtruth_sql: |
+        SELECT customerNumber, COUNT(*) AS payment_count 
+        FROM payments 
+        GROUP BY customerNumber HAVING COUNT(*) > 3;
+    - id: M8
+      difficulty: medium
+      question: "For each customer, show the maximum single payment amount they have made."
+      groundtruth_sql: |
+        SELECT customerNumber, MAX(amount) 
+        FROM payments 
+        GROUP BY customerNumber;
+    - id: M9
+      difficulty: medium
+      question: "For each office code, show how many employees work in that office."
+      groundtruth_sql: |
+        SELECT officeCode, COUNT(*) 
+        FROM employees 
+        GROUP BY officeCode;
+    - id: M10
+      difficulty: medium
+      question: "Classify products into three price bands (Low, Medium, High) based on their buy price, and show the number of products in each band: Low (< 30), Medium (30-60), and High (> 60)."
+      groundtruth_sql: |
+        SELECT 
+          CASE
+              WHEN buyPrice < 30 THEN 'Low'
+              WHEN buyPrice BETWEEN 30 AND 60 THEN 'Medium'
+              ELSE 'High'
+          END AS price_band,
+          COUNT(*) AS product_count
+        FROM products
+        GROUP BY 
+          CASE
+              WHEN buyPrice < 30 THEN 'Low'
+              WHEN buyPrice BETWEEN 30 AND 60 THEN 'Medium'
+              ELSE 'High'
+          END;
+    - id: M11
+      difficulty: medium
+      question: "For each order status, show how many orders have that status."
+      groundtruth_sql: |
+        SELECT status, COUNT(*) 
+        FROM orders 
+        GROUP BY status;
+    - id: M12
+      difficulty: medium
+      question: "For each country, show how many customers are in that country, and only include countries that have at least 5 customers."
+      groundtruth_sql: |
+        SELECT country, COUNT(*) 
+        FROM customers 
+        GROUP BY country HAVING COUNT(*) >= 5;
+    - id: M13
+      difficulty: medium
+      question: "For each order, show the total quantity ordered across all its order details."
+      groundtruth_sql: |
+        SELECT  orderNumber, SUM(quantityOrdered) 
+        FROM orderdetails 
+        GROUP BY orderNumber;
+    - id: M14
+      difficulty: medium
+      question: "For each product line, show the number of products whose names contain the word “car”, case-insensitive."
+      groundtruth_sql: |
+        SELECT 
+          productLine,
+          SUM(
+              CASE 
+                  WHEN LOWER(productName) LIKE '%car%' THEN 1 
+                  ELSE 0 
+              END
+          )
+        FROM products
+        GROUP BY productLine;
+    - id: M15
+      difficulty: medium
+      question: "For each order status, show how many orders have that status and what percentage of all orders that status represents."
+      groundtruth_sql: |
+         SELECT status, COUNT(*) AS order_count, 100.0 * COUNT(*) / SUM(COUNT(*)) OVER () AS percentage_of_orders 
+         FROM orders 
+         GROUP BY status;
+    - id: M16
+      difficulty: medium
+      question: "For each customer, show their total payment amount and their rank based on total payments (1 = highest total). Customers with the same total payment amount should have the same rank."
+      groundtruth_sql: |
+         WITH customer_totals AS (
+            SELECT 
+                customerNumber,
+                SUM(amount) AS total_payments
+            FROM payments
+            GROUP BY customerNumber
+          )
+          SELECT
+              customerNumber,
+              total_payments,
+              DENSE_RANK() OVER (ORDER BY total_payments DESC) AS payment_rank
+          FROM customer_totals;
+    - id: M17
+      difficulty: medium
+      question: "For each year, show how many orders were placed in that year."
+      groundtruth_sql: |
+         SELECT YEAR(orderDate) AS order_year, COUNT(*) AS order_count
+         FROM orders
+         GROUP BY YEAR(orderDate);
+    - id: M18
+      difficulty: medium
+      question: "For each customer, show how many orders they have placed."
+      groundtruth_sql: |
+         SELECT  customerNumber, COUNT(*) AS order_count
+         FROM orders
+         GROUP BY customerNumber;
+    - id: M19
+      difficulty: medium
+      question: "For each product, show the total quantity that has been ordered across all order details, and only include products whose total ordered quantity exceeds 1,000 units."
+      groundtruth_sql: |
+         SELECT productCode, SUM(quantityOrdered) AS total_quantity_ordered
+         FROM orderdetails
+         GROUP BY productCode
+         HAVING SUM(quantityOrdered) > 1000;
+    - id: M20
+      difficulty: medium
+      question: "For each country where there is at least one office, show how many offices are located in that country."
+      groundtruth_sql: |
+         SELECT country, COUNT(*) AS office_count
+         FROM offices
+         GROUP BY country;
+    - id: M21
+      difficulty: medium
+      question: "For each job title, show how many employees have that job title."
+      groundtruth_sql: |
+         SELECT jobTitle, COUNT(*) AS employee_count
+         FROM employees
+         GROUP BY jobTitle;
+    - id: M22
+      difficulty: medium
+      question: "For each country, show the average credit limit of its customers, and only include countries whose average credit limit is greater than 75,000."
+      groundtruth_sql: |
+         SELECT country, AVG(creditLimit) AS average_credit_limit
+         FROM customers
+         GROUP BY country
+         HAVING AVG(creditLimit) > 75000;
+    - id: M23
+      difficulty: medium
+      question: "For each customer, show each of their payments together with a running total of payments for that customer, ordered by payment date."
+      groundtruth_sql: |
+         SELECT customerNumber, paymentDate, amount, SUM(amount) OVER (PARTITION BY customerNumber ORDER BY paymentDate) AS running_total
+         FROM payments
+         ORDER BY customerNumber, paymentDate;
+    - id: M24
+      difficulty: medium
+      question: "For each customer, show how many orders they placed in 2004, and only include customers with more than 2 orders in that year."
+      groundtruth_sql: |
+         SELECT customerNumber, COUNT(*) AS orders_2004
+         FROM orders
+         WHERE YEAR(orderDate) = 2004
+         GROUP BY customerNumber
+         HAVING COUNT(*) > 2;
+    - id: M25
+      difficulty: medium
+      question: "For each product line, show the average quantity in stock of its products."
+      groundtruth_sql: |
+         SELECT 
+            productLine,
+            AVG(quantityInStock) AS average_quantity_in_stock
+         FROM products
+         GROUP BY productLine;
+    - id: H1
+      difficulty: hard
+      question: "List all customers and the total number of orders they have placed."
+      groundtruth_sql: |
+         SELECT c.customerName, COUNT(o.orderNumber) 
+         FROM customers c
+         LEFT JOIN orders o ON o.customerNumber = c.customerNumber 
+         GROUP BY c.customerName;
+    - id: H2
+      difficulty: hard
+      question: "Total payment amount for each customer on October 28, 2004."
+      groundtruth_sql: |
+        SELECT c.customerName, SUM(p.amount) 
+        FROM payments p LEFT JOIN customers c ON p.customerNumber = c.customerNumber 
+        WHERE p.paymentDate = '2004-10-28' 
+        GROUP BY c.customerName;
