@@ -1,50 +1,8 @@
 import os
-import requests
 import chromadb
-from typing import Dict, Any
-from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 
 from .config import CHROMA_DIR, COLLECTION_NAME, OLLAMA_BASE_URL
-
-# --- FIXED: OllamaEmbeddingFunction (indent + clean config methods) ---
-class OllamaEmbeddingFunction(EmbeddingFunction):
-    def __init__(self, base_url: str, model: str = "bge-m3:latest", timeout: int = 60):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout = int(timeout)
-
-    def __call__(self, texts: Documents) -> Embeddings:
-        out: Embeddings = []
-        for t in texts:
-            resp = requests.post(
-                f"{self.base_url}/api/embeddings",
-                json={"model": self.model, "prompt": t},
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            out.append(resp.json()["embedding"])
-        return out
-
-    @classmethod
-    def name(cls) -> str:
-        return "ollama"
-
-    @classmethod
-    def build_from_config(cls, config: dict) -> "OllamaEmbeddingFunction":
-        return cls(
-            base_url=str(config.get("base_url", "http://localhost:11434")),
-            model=str(config.get("model", "bge-m3:latest")),
-            timeout=int(config.get("timeout", 60)),
-        )
-
-    # new: allow Chroma to serialize EF config
-    def get_config(self) -> Dict[str, Any]:
-        return {
-            "name": self.name(),
-            "base_url": self.base_url,
-            "model": self.model,
-            "timeout": self.timeout,
-        }
+from .llm_utils import OllamaEmbeddingFunction
 
 _CHROMA_COL = None
 
