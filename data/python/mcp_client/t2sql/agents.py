@@ -1,80 +1,8 @@
-import json
-import re
-from typing import Any, Dict, Optional, Tuple
-from langchain_ollama import ChatOllama
-from .config import *
 from .state import RAGState
-from .utils import _get_qtype, _get_requires_regex
-# fungsi SQL dipakai agent
-from .generation import (
-    _make_generation_prompt,
-    _sanitize_notes,
-    _normalize_sql_pipeline,
-    _has_join,
-)
-from .helpers import _question_requires_regex, _get_single_allowed_table, _validate_identifiers
-
-def _dbg_print_two(label: str, sql: str):
-    if SQL_DEBUG:
-        print(f"\n{label}")
-        print(sql)
-
-# ======================================================================
-# ======================== GENERATION ROBUSTNESS =======================
-# ======================================================================
-def _try_llm_json_three_times(llm: ChatOllama, base_prompt: str) -> Optional[Dict[str, Any]]:
-    prompts = [
-        base_prompt,
-        base_prompt + "\n\nReturn ONLY the JSON object. Do not add explanation.",
-        base_prompt + "\n\nReturn ONLY JSON with keys \"sql\" and \"notes\". No extra text. Example: {\"sql\":\"SELECT 1;\",\"notes\":\"No joins used.\"}",
-    ]
-    for p in prompts:
-        resp = llm.invoke(p)
-        content = getattr(resp, "content", None) or str(resp)
-        try:
-            obj = json.loads(content)
-            if isinstance(obj, dict) and ("sql" in obj or "notes" in obj):
-                return obj
-        except Exception:
-            m = re.search(r"\{.*\}", content, flags=re.S)
-            if m:
-                try:
-                    obj = json.loads(m.group(0))
-                    if isinstance(obj, dict) and ("sql" in obj or "notes" in obj):
-                        return obj
-                except Exception:
-                    pass
-    return None
-
-def _build_llm(temp: float = 0.0) -> ChatOllama:
-    """
-    Helper standar untuk membuat LLM ChatOllama.
-    Kalau nanti mau ganti model/param, cukup ubah di sini.
-    """
-    return ChatOllama(
-        model=CHAT_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        temperature=temp,
-    )
-
-def _regenerate_with_extra_constraint(
-    llm: ChatOllama,
-    ctx: str,
-    question: str,
-    extra_msg: str,
-) -> tuple[str, str]:
-    """
-    Helper untuk minta LLM regen SQL dengan constraint tambahan:
-    - ctx akan digabung dengan extra_msg
-    - return: (draft_sql_baru, notes_baru)
-    """
-    strict_prompt = _make_generation_prompt(ctx + "\n\n" + extra_msg, question)
-    obj = _try_llm_json_three_times(llm, strict_prompt)
-    if obj is None:
-        return "", ""
-    draft2 = (obj.get("sql") or "").strip()
-    notes2 = (obj.get("notes") or "").strip()
-    return draft2, notes2
+from .llm_utils import build_llm, try_llm_json_three_times, regenerate_with_extra_constraint
+from .utils import _get_qtype, _dbg_print_two
+from .generation import make_generation_prompt, sanitize_notes, normalize_sql_pipeline, has_join
+from .helpers import get_single_allowed_table, validate_identifiers, _get_requires_regex
 
 # ======================================================================
 # ======================== SQL AGENT 1 (DRAFTER) =======================
@@ -87,7 +15,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     - Memanggil LLM sekali untuk membuat draft SQL + notes
     - Menyimpan hasil ke state['draft_sql'] dan state['notes']
     """
-    llm = _build_llm()
+    llm = build_llm()
 
     ctx = state.get("context", "")
     question = state.get("question", "")
@@ -96,12 +24,12 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     _ = _get_qtype(state)          # set state["qtype"] kalau belum ada
     _ = _get_requires_regex(state) # set state["requires_regex"] kalau belum ada
 
-    base_prompt = _make_generation_prompt(ctx, question)
+    base_prompt = make_generation_prompt(ctx, question)
 
     draft_sql = ""
     notes = ""
 
-    obj = _try_llm_json_three_times(llm, base_prompt)
+    obj = try_llm_json_three_times(llm, base_prompt)
     if obj is not None:
         draft_sql = (obj.get("sql") or "").strip()
         notes = (obj.get("notes") or "").strip()
@@ -119,20 +47,20 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     return state
 
 # ======================================================================
-# ======================== SQL AGENT 1 (REFINER) =======================
+# ======================== SQL AGENT 2 (REFINER) =======================
 # ======================================================================
 def refine_sql_agent(state: RAGState) -> RAGState:
     """
     Agent 2:
     - Ambil draft_sql + notes dari Agent 1
-    - Jalankan heuristic pipeline (_normalize_sql_pipeline)
+    - Jalankan heuristic pipeline (normalize_sql_pipeline)
     - Kalau perlu, minta LLM regenerate dengan constraint tambahan:
         * single-table only (kalau ALLOWED cuma 1 tabel & qtype lookup)
         * REGEXP wajib (kalau requires_regex True)
         * whitelist identifer (ALLOWED IDENTIFIERS)
     - Simpan final_sql, notes yang sudah disanitasi, validation_errors, dan critic_feedback.
     """
-    llm = _build_llm()
+    llm = build_llm()
 
     ctx = state.get("context", "")
     question = state.get("question", "")
@@ -149,20 +77,20 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         corrections.append("Draft SQL missing, fallback to SELECT 1;")
 
     # 1) Normalisasi awal (postprocess + alias repair + postprocess)
-    final_sql = _normalize_sql_pipeline(draft_sql, question, ctx)
+    final_sql = normalize_sql_pipeline(draft_sql, question, ctx)
     if final_sql:
         _dbg_print_two("[Agent2 SQL] After initial normalization:", final_sql)
 
     # 2) RULE: kalau ALLOWED cuma 1 tabel & qtype 'lookup' → paksa tanpa JOIN
-    single_tbl = _get_single_allowed_table(ctx)
-    if single_tbl and qtype == "lookup" and _has_join(final_sql or ""):
+    single_tbl = get_single_allowed_table(ctx)
+    if single_tbl and qtype == "lookup" and has_join(final_sql or ""):
         extra = (
             f"The question is a simple lookup and ALLOWED IDENTIFIERS only lists a single table `{single_tbl}`.\n"
             "Rewrite the SQL so that it uses ONLY that single table and does NOT use any JOIN at all."
         )
-        draft2, notes2 = _regenerate_with_extra_constraint(llm, ctx, question, extra)
-        sql2 = _normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
-        if sql2 and not _has_join(sql2):
+        draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
+        sql2 = normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
+        if sql2 and not has_join(sql2):
             corrections.append(
                 f"Removed unnecessary JOINs because only single table `{single_tbl}` is allowed."
             )
@@ -179,8 +107,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             "Do NOT use LIKE-only or numeric/substr tricks (e.g. RIGHT(...), CAST(...), BETWEEN ...) "
             "for the main pattern condition."
         )
-        draft2, notes2 = _regenerate_with_extra_constraint(llm, ctx, question, extra)
-        sql2 = _normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
+        draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
+        sql2 = normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
         if sql2 and "regexp" in sql2.lower():
             corrections.append("Enforced REGEXP usage for strict pattern requirement.")
             final_sql = sql2
@@ -189,7 +117,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 notes = notes2
 
     # 4) RULE: whitelist check (ALLOWED IDENTIFIERS)
-    violations = _validate_identifiers(final_sql or "", ctx)
+    violations = validate_identifiers(final_sql or "", ctx)
     state["validation_errors"] = violations  # NEW: simpan list error pertama
 
     if violations:
@@ -201,10 +129,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             + "\nRewrite the SQL using ONLY identifiers listed in ALLOWED IDENTIFIERS. "
               "If a synonym appears, choose the canonical column."
         )
-        draft2, notes2 = _regenerate_with_extra_constraint(llm, ctx, question, extra)
-        sql2 = _normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
+        draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
+        sql2 = normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
 
-        new_count = len(_validate_identifiers(sql2 or "", ctx))
+        new_count = len(validate_identifiers(sql2 or "", ctx))
 
         # HANYA terima kalau pelanggaran berkurang atau jadi 0
         if sql2 and (new_count == 0 or new_count < old_count):
@@ -216,11 +144,11 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             if notes2:
                 notes = notes2
             # update violations ke hasil terakhir
-            state["validation_errors"] = _validate_identifiers(final_sql or "", ctx)
+            state["validation_errors"] = validate_identifiers(final_sql or "", ctx)
 
 
     # 5) sanitasi notes berdasarkan ada/tidaknya JOIN
-    notes = _sanitize_notes(final_sql or "", notes or "")
+    notes = sanitize_notes(final_sql or "", notes or "")
 
     # 6) simpan final result ke state
     if final_sql:
