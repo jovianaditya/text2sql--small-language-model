@@ -3,6 +3,7 @@ import json
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
 from .config import *
+from .helpers import _wants_customer_name_only, _wants_product_name_only, _parse_allowed_identifiers, _parse_from_join_aliases
 
 # ======================================================================
 # ========================== REGEX HEURISTIC ===========================
@@ -38,7 +39,7 @@ def _looks_like_mask_example(s: str) -> bool:
 # ======================================================================
 # ======================== CONTEXT PROMPT ==============================
 # ======================================================================
-def _make_generation_prompt(ctx: str, question: str) -> str:
+def make_generation_prompt(ctx: str, question: str) -> str:
     return f"""
 You are a senior SQL assistant for MySQL 8.0.
 
@@ -88,10 +89,10 @@ Question:
 {question}
 """.strip()
 
-def _sanitize_notes(sql: str, notes: str) -> str:
+def sanitize_notes(sql: str, notes: str) -> str:
     if not notes:
         return notes
-    if not _has_join(sql or ""):
+    if not has_join(sql or ""):
         return "No joins used."
     return notes.strip()
 
@@ -100,7 +101,7 @@ def _sanitize_notes(sql: str, notes: str) -> str:
 # ======================================================================
 _JOIN_KW = r"(?:inner\s+join|left\s+join|right\s+join|full\s+join|join)"
 
-def _has_join(sql: str) -> bool:
+def has_join(sql: str) -> bool:
     return re.search(rf"\b{_JOIN_KW}\b", sql, flags=re.I) is not None
 
 def _should_use_backtick(identifier: str) -> bool:
@@ -291,30 +292,6 @@ def _prefer_name_over_id_generic(
 
     return sql
 
-def _wants_name_only(question: str, entity_words: List[str]) -> bool:
-    """
-    Generic helper: True kalau user ngomongin entity (customer/product/...) 
-    tapi tidak eksplisit minta id/number/code.
-    """
-    q = (question or "").lower()
-    # buang "number of" supaya tidak dianggap id-like
-    q = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
-
-    mention_entity = any(w in q for w in entity_words)
-    mention_id_like = (
-        re.search(r"\b(id|number|nomor|no|code|kode)\b", q)
-        or any(f"{w} code" in q for w in entity_words)
-    )
-    return mention_entity and not mention_id_like
-
-def _wants_customer_name_only(question: str) -> bool:
-    # pelanggan/customer tapi tidak minta id/number/code
-    return _wants_name_only(question, ["customer", "customers", "pelanggan"])
-
-def _wants_product_name_only(question: str) -> bool:
-    # produk/product tapi tidak minta id/number/code
-    return _wants_name_only(question, ["product", "products", "produk"])
-
 def _prefer_friendly_names(sql: str, question: str) -> str:
     """
     DRY: apply rule yang sama untuk beberapa entity sekaligus.
@@ -368,7 +345,7 @@ def _dynamic_prune_joins_if_single_table_possible(sql: str, question: str, ctx: 
 
     Hanya aktif untuk query jenis 'lookup' dan 'aggregate_all' (lebih aman).
     """
-    if not sql or not _has_join(sql):
+    if not sql or not has_join(sql):
         return sql
 
     allowed = _parse_allowed_identifiers(ctx)
@@ -505,7 +482,7 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
     s = _strip_unneeded_count_distinct(s)
     return s
 
-def _normalize_sql_pipeline(raw_sql: str, question: str, ctx: str) -> str:
+def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str) -> str:
     """
     Pipeline standar untuk normalisasi SQL:
     - postprocess (normalize keyword, limit, distinct, dsb)
