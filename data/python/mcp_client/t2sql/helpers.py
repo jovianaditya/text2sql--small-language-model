@@ -1,8 +1,10 @@
-# t2sql/helpers.py
 from __future__ import annotations
 
 import re
-from typing import Dict
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
+
+if TYPE_CHECKING:
+    from .state import RAGState
 
 def _is_productline_lookup(question: str) -> bool:
     """
@@ -114,8 +116,8 @@ def _parse_from_join_aliases(sql: str) -> Dict[str, str]:
 # ======================================================================
 # ============================ WHITELIST ===============================
 # ======================================================================
-def _parse_allowed_identifiers(ctx: str) -> Dict[str, set]:
-    tables: Dict[str, set] = {}
+def _parse_allowed_identifiers(ctx: str) -> Dict[str, Set[str]]:
+    tables: Dict[str, Set[str]] = {}
     m = re.search(r"### ALLOWED IDENTIFIERS(.*?)(?:\n### |\Z)", ctx, flags=re.S)
     if not m:
         return tables
@@ -133,7 +135,7 @@ def _parse_allowed_identifiers(ctx: str) -> Dict[str, set]:
             tables.setdefault(table, set()).update(cols)
     return tables
 
-def _get_single_allowed_table(ctx: str) -> Optional[str]:
+def get_single_allowed_table(ctx: str) -> Optional[str]:
     """
     Jika ALLOWED IDENTIFIERS hanya berisi 1 tabel, return nama tabel itu.
     Kalau >1 atau 0 tabel, return None.
@@ -143,20 +145,20 @@ def _get_single_allowed_table(ctx: str) -> Optional[str]:
         return next(iter(allowed.keys()))
     return None
 
-def _extract_tables_from_sql(sql: str) -> set:
-    tables = set()
+def _extract_tables_from_sql(sql: str) -> Set[str]:
+    tables: Set[str] = set()
     for m in re.finditer(r"\bfrom\s+([A-Za-z_][A-Za-z0-9_]*)", sql, flags=re.I):
         tables.add(m.group(1))
     for m in re.finditer(r"\bjoin\s+([A-Za-z_][A-Za-z0-9_]*)", sql, flags=re.I):
         tables.add(m.group(1))
     return tables
 
-def _identify_used_identifiers(sql: str) -> Dict[Optional[str], set]:
+def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
     qualified = re.findall(
         r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
         sql,
     )
-    out: Dict[Optional[str], set] = {}
+    out: Dict[Optional[str], Set[str]] = {}
     for t, c in qualified:
         out.setdefault(t, set()).add(c)
 
@@ -180,7 +182,7 @@ def _identify_used_identifiers(sql: str) -> Dict[Optional[str], set]:
 
     return out
 
-def _validate_identifiers(sql: str, ctx: str) -> List[str]:
+def validate_identifiers(sql: str, ctx: str) -> List[str]:
     allowed = _parse_allowed_identifiers(ctx)
     used = _identify_used_identifiers(sql)
     errs: List[str] = []
@@ -210,3 +212,41 @@ def _validate_identifiers(sql: str, ctx: str) -> List[str]:
                 errs.append(f"{single_table} -> invalid column (unqualified): {col}")
 
     return errs
+
+def _wants_name_only(question: str, entity_words: List[str]) -> bool:
+    """
+    Generic helper: True kalau user ngomongin entity (customer/product/...) 
+    tapi tidak eksplisit minta id/number/code.
+    """
+    q = (question or "").lower()
+    # buang "number of" supaya tidak dianggap id-like
+    q = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
+
+    mention_entity = any(w in q for w in entity_words)
+    mention_id_like = (
+        re.search(r"\b(id|number|nomor|no|code|kode)\b", q)
+        or any(f"{w} code" in q for w in entity_words)
+    )
+    return mention_entity and not mention_id_like
+
+def _wants_customer_name_only(question: str) -> bool:
+    # pelanggan/customer tapi tidak minta id/number/code
+    return _wants_name_only(question, ["customer", "customers", "pelanggan"])
+
+def _wants_product_name_only(question: str) -> bool:
+    # produk/product tapi tidak minta id/number/code
+    return _wants_name_only(question, ["product", "products", "produk"])
+
+def _get_requires_regex(state: "RAGState") -> bool:
+    """
+    Hitung satu kali apakah pertanyaan butuh REGEXP,
+    lalu simpan ke state['requires_regex'].
+    """
+    val = state.get("requires_regex")
+    if isinstance(val, bool):
+        return val
+
+    q = state.get("question", "")
+    needs = _question_requires_regex(q)
+    state["requires_regex"] = needs
+    return needs
