@@ -3,8 +3,8 @@ EASY
 - SELECT customerName, city FROM customers WHERE country = 'Japan' ORDER BY city;
 2. Show the 10 products with the highest stock levels. Display the product code, name, and quantity in stock.
 - SELECT productCode, productName, quantityInStock FROM products ORDER BY quantityInStock DESC LIMIT 10;
-3. List all orders placed in the year 2004. Show the order number and order date, ordered by order date.
-- SELECT orderNumber, orderDate FROM orders WHERE YEAR(orderDate) = 2004 ORDER BY orderDate;
+3. List all orders placed in the year 2004. Show the order number and order date, ordered by order date from the latest.
+- SELECT orderNumber, orderDate FROM orders WHERE YEAR(orderDate) = 2004 ORDER BY orderDate DESC;
 4. Find all payments with an amount greater than 10,000. Show the customer number, check number, and amount, ordered by amount from highest to lowest.
 - SELECT customerNumber, checkNumber, amount FROM payments WHERE amount > 10000 ORDER BY amount DESC;
 5. Find offices where the state information is missing. Show the office code, city, country, and state.
