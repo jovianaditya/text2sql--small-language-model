@@ -2,18 +2,28 @@ import os
 import re
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional, Iterable, List
+from typing import Dict, Any, Optional, List
 from collections import defaultdict
 
 from rank_bm25 import BM25Okapi
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
-from .config import * 
+from .config import (
+    TOP_K,
+    SPARSE_BONUS,
+    NAME_QUERY_BONUS,
+    ID_QUERY_BONUS,
+    MAX_CTX_DOCS,
+    SPARSE_MAX_HITS,
+    SPARSE_DEBUG,
+    RETRIEVE_DEBUG,
+    COLUMN_PRIORITY_CONFIG,
+)
+
 from .state import RAGState
 from .chroma_embedding import build_vector_store
-from .ingestion import _meta_table, _meta_column, read_jsonl
-from .utils import _print_banner, _get_qtype
-from .helpers import _question_requires_regex, _is_productline_lookup, _is_simple_orders_lookup
+from .utils import _print_banner, _get_qtype, _meta_table, _meta_column, read_jsonl
+from .helpers import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _wants_product_name_only
 
 # ======================================================================
 # ========================== CONTEXT BUILDER ===========================
@@ -177,15 +187,6 @@ def _tokenize_bm25_query(q: str) -> List[str]:
 
     return toks
 
-def _jsonl_iter_records(jsonl_paths: List[str]) -> Iterable[Dict[str, Any]]:
-    for path in jsonl_paths:
-        p = Path(path)
-        if not p.exists():
-            continue
-        for _, obj in read_jsonl(path):
-            if isinstance(obj, dict):
-                yield obj
-
 def build_sparse_query_from_question(q: str) -> str:
     """
     Build query string untuk BM25 dari pertanyaan user.
@@ -200,21 +201,9 @@ def build_sparse_query_from_question(q: str) -> str:
 
     return " ".join(toks)
 
-def _meta_table(md: Dict[str, Any]) -> str:
-    """
-    Ambil nama table dari metadata (table / tableName) dalam bentuk trimmed.
-    """
-    return str(md.get("table") or md.get("tableName") or "").strip()
-
-def _meta_column(md: Dict[str, Any]) -> str:
-    """
-    Ambil nama column dari metadata (column / columnName) dalam bentuk trimmed.
-    """
-    return str(md.get("column") or md.get("columnName") or "").strip()
-
 def _doc_tokens_from_meta(meta: Dict[str, Any]) -> List[str]:
-    table = _meta_table(meta).lower()
-    column = _meta_column(meta).lower()
+    table = (_meta_table(meta) or "").lower()
+    column = (_meta_column(meta) or "").lower()
     desc = str(meta.get("description") or "").lower()
 
     # aliases/roles dari DataHub → parse dengan benar (string JSON / list)
@@ -301,8 +290,8 @@ def jsonl_sparse_search(q: str, jsonl_paths: List[str], max_hits: int = 20) -> L
                         for i, item in enumerate(maybe):
                             if not isinstance(item, dict):
                                 continue
-                            table = _meta_table(item).lower()
-                            column = _meta_column(item).lower()
+                            table  = (_meta_table(item) or "").lower()
+                            column = (_meta_column(item) or "").lower()
 
                             doc_id_raw = (
                                 item.get("field_urn")
@@ -318,8 +307,8 @@ def jsonl_sparse_search(q: str, jsonl_paths: List[str], max_hits: int = 20) -> L
                     continue
 
                 # ---- CASE 2: obj sudah dict normal ----
-                table = _meta_table(obj).lower()
-                column = _meta_column(obj).lower()
+                table  = (_meta_table(obj) or "").lower()
+                column = (_meta_column(obj) or "").lower()
 
                 doc_id_raw = (
                     obj.get("field_urn")
@@ -377,8 +366,8 @@ def _doc_matches_sparse(md: Dict[str, Any], sparse_ids: List[str]) -> bool:
     if urn and urn in sid_lower:
         return True
 
-    table = _meta_table(md).lower()
-    column = _meta_column(md).lower()
+    table  = (_meta_table(md) or "").lower()
+    column = (_meta_column(md) or "").lower()
     if table and column:
         suffix = f":{table}::{column}"
         return any(x.lower().endswith(suffix) for x in sparse_ids)
@@ -552,7 +541,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     # CASE E: query tentang customers + ada pola "from <negara>"
     # misal: "customers from Japan", "pelanggan dari USA"
     if mentions_customer:
-        if re.search(r"\bfrom\s+[A-Z][A-Za-z]+\b", q_raw):  # very simple heuristic
+        if re.search(r"\bfrom\s+\w+\b", q_raw, flags=re.I):
             if "country" not in geo_tokens:
                 geo_tokens.append("country")
 
@@ -589,49 +578,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     probe_tail = " ".join(tokens).strip()
     return f"{q_raw.strip()} {probe_tail}".strip()
 
-# ======================================================================
-# ============================ CLASSIFIER ==============================
-# ======================================================================
-def _wants_name_only(question: str, entity_words: List[str]) -> bool:
-    """
-    Generic helper: True kalau user ngomongin entity (customer/product/...) 
-    tapi tidak eksplisit minta id/number/code.
-    """
-    q = (question or "").lower()
-    # buang "number of" supaya tidak dianggap id-like
-    q = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
-
-    mention_entity = any(w in q for w in entity_words)
-    mention_id_like = (
-        re.search(r"\b(id|number|nomor|no|code|kode)\b", q)
-        or any(f"{w} code" in q for w in entity_words)
-    )
-    return mention_entity and not mention_id_like
-
-
-def _wants_customer_name_only(question: str) -> bool:
-    # pelanggan/customer tapi tidak minta id/number/code
-    return _wants_name_only(question, ["customer", "customers", "pelanggan"])
-
-
-def _wants_product_name_only(question: str) -> bool:
-    # produk/product tapi tidak minta id/number/code
-    return _wants_name_only(question, ["product", "products", "produk"])
-    
-def _get_requires_regex(state: RAGState) -> bool:
-    """
-    Hitung satu kali apakah pertanyaan butuh REGEXP,
-    lalu simpan ke state['requires_regex'].
-    """
-    val = state.get("requires_regex")
-    if isinstance(val, bool):
-        return val  # True atau False → langsung pakai
-
-    q = state.get("question", "")
-    needs = _question_requires_regex(q)
-    state["requires_regex"] = needs
-    return needs
-
+ 
 # =========================
 # ======= SCORING =========
 # =========================
@@ -809,33 +756,43 @@ def retrieve_node(state: RAGState) -> RAGState:
 
     sparse_field_urns = jsonl_sparse_search(sparse_query_clean, jsonl_paths, max_hits=SPARSE_MAX_HITS)
 
-    # --- pretty print untuk hasil SPARSE ---
+    # --- get sparse metas sekali, lalu pakai untuk pretty + flags ---
     sparse_docs_pretty: List[str] = []
-    try:
-        if sparse_field_urns:
-            got = col.get(ids=sparse_field_urns, include=["metadatas"])
-            ids   = (got.get("ids") or [])
-            metas = (got.get("metadatas") or [])
+    sparse_metas: List[Dict[str, Any]] = []
 
-            # Penting: bikin mapping id -> meta, lalu iterasi sesuai urutan sparse_field_urns
+    if sparse_field_urns:
+        try:
+            got = col.get(ids=sparse_field_urns, include=["metadatas"])
+            ids = got.get("ids") or []
+            metas = got.get("metadatas") or []
+
+            # Chroma kadang balikin list-of-list; normalisasi jadi flat list
+            if metas and isinstance(metas[0], list):
+                metas = metas[0]
+
             meta_by_id = {i: (m or {}) for i, m in zip(ids, metas)}
 
             for doc_id in sparse_field_urns:
                 md = meta_by_id.get(doc_id, {}) or {}
-                tbl = _meta_table(md) or "?"
-                c   = _meta_column(md) or "?"
-                sparse_docs_pretty.append(f"table={tbl}  column={c}")
-    except Exception as e:
-        # fallback: kalau gagal ambil meta dari Chroma, tampilkan ID-nya saja
-        sparse_docs_pretty = list(sparse_field_urns or [])
-        if RETRIEVE_DEBUG:
-            print(f"[WARN] Sparse meta fetch failed: {e!r}")
-            
-    sparse_has_customername = any(
-        u.lower().endswith("::customername") and ".customers," in u.lower()
-        for u in sparse_field_urns
-    )
+                sparse_metas.append(md)
 
+                tbl = _meta_table(md) or "?"
+                c = _meta_column(md) or "?"
+                sparse_docs_pretty.append(f"table={tbl}  column={c}")
+
+        except Exception as e:
+            sparse_docs_pretty = list(sparse_field_urns or [])
+            sparse_metas = []
+            if RETRIEVE_DEBUG:
+                print(f"[WARN] Sparse meta fetch failed: {e!r}")
+
+    # flag customerName dari metadata (lebih stabil daripada parsing URN)
+    sparse_has_customername = any(
+        ((_meta_table(m) or "").lower() == "customers")
+        and ((_meta_column(m) or "").lower() == "customername")
+        for m in sparse_metas
+        if isinstance(m, dict)
+    )
     base_k = max(12, TOP_K)
     dense_k = base_k
     if wants_customer_no_id and not sparse_has_customername:
@@ -849,9 +806,17 @@ def retrieve_node(state: RAGState) -> RAGState:
     )
 
     dense_docs   = (res.get("documents")  or [[]])[0]
+    if dense_docs and isinstance(dense_docs[0], list):
+        dense_docs = dense_docs[0]
     dense_metas  = (res.get("metadatas")  or [[]])[0]
+    if dense_metas and isinstance(dense_metas[0], list):
+        dense_metas = dense_metas[0]
     dense_dists  = (res.get("distances")  or [[]])[0]
+    if dense_dists and isinstance(dense_dists[0], list):
+        dense_dists = dense_dists[0]
     dense_ids    = (res.get("ids")        or [[]])[0]
+    if dense_ids and isinstance(dense_ids[0], list):
+        dense_ids = dense_ids[0]
 
     n = min(
         len(dense_docs),
@@ -865,9 +830,9 @@ def retrieve_node(state: RAGState) -> RAGState:
     dense_ids   = (dense_ids or [""] * n)[:n]
 
     dense_has_customername = any(
-        (_meta_table(md).lower() == "customers")
-        and (_meta_column(md).lower() in ("customername", "customer_name"))
-        for md in dense_metas
+    ((_meta_table(md) or "").lower() == "customers")
+    and ((_meta_column(md) or "").lower() in ("customername", "customer_name"))
+    for md in dense_metas
     )
 
     scored = []
@@ -875,8 +840,9 @@ def retrieve_node(state: RAGState) -> RAGState:
         base = -float(dist) if dist is not None else 0.0
         sparse_hit = _doc_matches_sparse(md, sparse_field_urns)
 
-        table_name = _meta_table(md)
-        col_name   = _meta_column(md).lower()
+        table_name = _meta_table(md) or ""
+        col_raw = _meta_column(md) or ""
+        col_name = col_raw.lower()
 
         # parse roles & aliases (DRY helper)
         roles, aliases = _extract_roles_aliases(md)
@@ -918,8 +884,9 @@ def retrieve_node(state: RAGState) -> RAGState:
 
                     roles, aliases = _extract_roles_aliases(md)
 
-                    table_name = _meta_table(md)
-                    col_name   = _meta_column(md).lower()
+                    table_name = _meta_table(md) or ""
+                    col_raw = _meta_column(md) or ""
+                    col_name = col_raw.lower()
 
                     max_boost = max((x["boosted"] for x in scored), default=0.0)
                     boosted = max_boost + 0.05
@@ -1038,7 +1005,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                 if al:
                     alias_map[t][al] = c   # al sudah lowercase dari helper
 
-    token_for_score = _tokenize_bm25_query(q)
+    token_for_score = _tokenize_bm25_query(sparse_query_clean)
     table_scores = score_tables_from_reranked(reranked, token_for_score)
 
     if qtype == "lookup" and wants_customer_no_id:
