@@ -1,54 +1,13 @@
-# NOTE:
-# Jangan ubah logic. Cut-paste fungsi-fungsi dari monolith ke sini apa adanya.
-# Kunci: variabel global yang dipakai ingestion akan tetap tersedia via `from .config import *`.
-
-import os
 import re
 import json
-import glob
 import hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional, Iterable, List
+from typing import Dict, Any, List
 
-from .config import *  # noqa: F403,F401 (intentionally keep same global names)
+from .config import *
 from .state import RAGState
 from .chroma_embedding import build_vector_store
-
-# =========================
-# === UTIL (JSONL) ========
-# =========================
-def resolve_jsonl_paths(spec: str) -> List[str]:
-    paths: List[str] = []
-    if not spec:
-        return paths
-    p = Path(spec)
-    if any(ch in spec for ch in "*?[]"):
-        paths.extend(glob.glob(spec))
-    elif p.is_dir():
-        paths.extend(str(x) for x in p.glob("*.jsonl"))
-    elif p.is_file():
-        paths.append(str(p))
-    else:
-        paths.extend(glob.glob(spec))
-    out, seen = [], set()
-    for x in paths:
-        xp = str(Path(x))
-        if xp.lower().endswith(".jsonl") and xp not in seen:
-            seen.add(xp)
-            out.append(xp)
-    return sorted(out)
-
-def read_jsonl(path: str) -> Iterable[tuple[str, Optional[Dict[str, Any]]]]:
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except Exception:
-                obj = None
-            yield s, obj
+from .utils import _meta_table, _meta_column, read_jsonl
 
 # =========================
 # === INGEST (PURE CHROMA)
@@ -140,13 +99,6 @@ def _compute_canon_hash(doc: str, meta: Dict[str, Any]) -> str:
     b = _canon_meta(meta or {})
     payload = f"{a}\n{b}".encode("utf-8")
     return hashlib.sha1(payload).hexdigest()
-
-# helper meta table/column (dipakai ingestion & retrieval)
-def _meta_table(md: Dict[str, Any]) -> str:
-    return str(md.get("table") or md.get("tableName") or "").strip()
-
-def _meta_column(md: Dict[str, Any]) -> str:
-    return str(md.get("column") or md.get("columnName") or "").strip()
 
 def _print_meta_doc_diff(doc_id: str, old_doc: str, new_doc: str, old_meta: Dict[str, Any], new_meta: Dict[str, Any]):
     if not COMPARE_DEBUG:
@@ -265,6 +217,7 @@ def _ingest_one_json(col, meta: dict, source_name: str, debug_id: str):
     return 0, 1, 0
 
 def ingest_node(state: RAGState) -> RAGState:
+    from .retrieval import jsonl_sparse_search
     paths = state["jsonl_paths"]
     col = build_vector_store()
 
