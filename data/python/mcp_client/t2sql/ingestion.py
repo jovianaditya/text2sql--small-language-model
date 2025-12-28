@@ -1,104 +1,11 @@
-import re
 import json
-import hashlib
 from pathlib import Path
 from typing import Dict, Any, List
 
 from .config import *
 from .state import RAGState
 from .chroma_embedding import build_vector_store
-from .utils import _meta_table, _meta_column, read_jsonl
-
-# =========================
-# === INGEST (PURE CHROMA)
-# =========================
-
-# kunci yang sering berubah & memicu upsert palsu → kita buang
-VOLATILE_KEYS = {
-    "_source", "updated_at", "lastModified", "timestamp", "ts"
-}
-
-def _norm_str(s: Any) -> str:
-    s = "" if s is None else str(s)
-    # rapikan whitespace tanpa mengubah isi
-    s = "\n".join(re.sub(r"[ \t]{2,}", " ", line.rstrip()) for line in s.splitlines())
-    return s.strip()
-
-def _norm_list(x: Any) -> List[str]:
-    # list stabil: json->list bila string JSON, trim, dedup casefold, lalu sort
-    if isinstance(x, str):
-        try:
-            j = json.loads(x)
-            x = j if isinstance(j, list) else [x]
-        except Exception:
-            x = [x]
-    elif not isinstance(x, list):
-        x = [x]
-    cleaned, seen = [], set()
-    for v in x:
-        s = _norm_str(v)
-        k = s.casefold()
-        if s and k not in seen:
-            seen.add(k)
-            cleaned.append(s)
-    return sorted(cleaned, key=str.casefold)
-
-def _stable_json(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-def _coerce_json_like(v: Any) -> Any:
-    if isinstance(v, str):
-        s = v.strip()
-        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-            try:
-                v = json.loads(s)
-            except Exception:
-                return v
-        else:
-            return v
-    if isinstance(v, list):
-        return _norm_list(v)
-    return v
-
-def _sanitize_for_compare(meta: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in (meta or {}).items():
-        if k in VOLATILE_KEYS or k == "_canon_hash":
-            continue
-        vv = _coerce_json_like(v)
-        out[k] = vv
-    return out
-
-def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in (meta or {}).items():
-        if k in VOLATILE_KEYS:
-            continue
-        if isinstance(v, (str, int, float, bool)) or v is None:
-            out[k] = _norm_str(v) if isinstance(v, str) else v
-        elif isinstance(v, list):
-            out[k] = _stable_json(_norm_list(v))
-        elif isinstance(v, dict):
-            out[k] = _stable_json(v)
-        else:
-            out[k] = _norm_str(v)
-    return out
-
-def _canon_doc(s: str) -> str:
-    return "\n".join(line.rstrip() for line in (s or "").splitlines()).strip()
-
-def _canon_meta(d: Dict[str, Any]) -> str:
-    try:
-        normalized = _sanitize_for_compare(d or {})
-        return _stable_json(normalized)
-    except Exception:
-        return str(d or {})
-
-def _compute_canon_hash(doc: str, meta: Dict[str, Any]) -> str:
-    a = _canon_doc(doc or "")
-    b = _canon_meta(meta or {})
-    payload = f"{a}\n{b}".encode("utf-8")
-    return hashlib.sha1(payload).hexdigest()
+from .utils import _meta_table, _meta_column, read_jsonl, _norm_str, _norm_list, _stable_json ,_coerce_json_like, _sanitize_for_compare, _sanitize_metadata, _canon_doc, _canon_meta, _compute_canon_hash
 
 def _print_meta_doc_diff(doc_id: str, old_doc: str, new_doc: str, old_meta: Dict[str, Any], new_meta: Dict[str, Any]):
     if not COMPARE_DEBUG:
