@@ -6,31 +6,12 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 from .config import MCP_BASE, CHROMA_DIR, COLLECTION_NAME
-from .state import RAGState
+from .state import RAGState, make_state
 from .graph import build_app
 from .chroma_embedding import build_vector_store
-from .mcp_execution import _mcp_call, _extract_payload, _ensure_json, query_db
-from .utils import _now, _log_total, _print_banner
+from .mcp_execution import query_db
+from .utils import _now, _log_total, _print_banner, display_table_from_json
 from tabulate import tabulate
-
-def _make_state(paths, question: str) -> RAGState:
-    # Kalau kamu set state.py menjadi total=False, ini bisa diperkecil
-    return {
-        "jsonl_paths": paths,
-        "question": question,
-        "added": 0,
-        "updated": 0,
-        "skipped": 0,
-        "context": "",
-        "answer": "",
-        "draft_sql": "",
-        "final_sql": "",
-        "qtype": "",
-        "requires_regex": False,
-        "notes": "",
-        "validation_errors": [],
-        "critic_feedback": "",
-    }
 
 async def _exec_via_mcp(mcp: Client, sql_block: str, final_sql: str | None = None):
     # Ambil SQL saja (kalau answer berisi SQL + notes)
@@ -70,7 +51,7 @@ async def repl(paths):
             return
 
         t0_total = _now()
-        init_state = _make_state(paths, first_q)
+        init_state = make_state(paths, first_q)
         state = app.invoke(init_state)
 
         # Reporting ingestion status
@@ -96,40 +77,7 @@ async def repl(paths):
                 break
 
             t0_total = _now()
-            s2 = _make_state(paths, q)
+            s2 = make_state(paths, q)
             out = app.invoke(s2)
             await _exec_via_mcp(mcp, out.get("answer", ""), out.get("final_sql"))
             _log_total("End-to-end total time (this question)", t0_total)
-
-def display_table_from_json(data, max_cell_len: int = 80):
-    preview_rows = data.get("preview_rows", [])
-    preview_cols = data.get("preview_columns", [])
-    total_rows = data.get("total_rows", len(preview_rows))
-    total_cols = data.get("total_columns", len(preview_cols))
-
-    def _shorten(val, max_len: int) -> str:
-        if not isinstance(val, str):
-            return val
-        s = val.replace("\n", " ").strip()
-        if len(s) <= max_len:
-            return s
-        return s[: max_len - 3] + "..."
-
-    truncated_rows = [[_shorten(cell, max_cell_len) for cell in row] for row in preview_rows]
-
-    if truncated_rows and preview_cols:
-        print("\nQuery Result (preview):")
-        print(
-            tabulate(
-                truncated_rows,
-                headers=preview_cols,
-                tablefmt="github",
-                showindex=range(1, len(truncated_rows) + 1),
-            )
-        )
-        print(
-            f"\nShowing preview: {len(preview_rows)} rows × {len(preview_cols)} columns "
-            f"(full result: {total_rows} rows × {total_cols} columns)"
-        )
-    else:
-        print("Query executed but returned no rows.")
