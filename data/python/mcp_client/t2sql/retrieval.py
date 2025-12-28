@@ -17,61 +17,39 @@ from .config import (
     SPARSE_MAX_HITS,
     SPARSE_DEBUG,
     RETRIEVE_DEBUG,
-    COLUMN_PRIORITY_CONFIG,
 )
 
 from .state import RAGState
 from .chroma_embedding import build_vector_store
-from .utils import _print_banner, _get_qtype, _meta_table, _meta_column, read_jsonl
-from .helpers import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _wants_product_name_only
+from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
+from .helpers import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _wants_product_name_only, _get_qtype, build_dynamic_probe
+
+# ======================================================================
+# ========================== RETRIEVAL POLICY ==========================
+# ======================================================================
+COLUMN_PRIORITY_CONFIG = [
+    {
+        "id": "customers.primary_name",
+        "tables": ["customers"],
+        "role_any": ["name"],
+        "alias_any": [
+            "customer name",
+            "nama customer",
+            "nama pelanggan",
+            "company name",
+            "nama perusahaan",
+            "account name",
+        ],
+        "column_contains": ["customername"],
+        "query_terms_any": ["name", "nama"],
+        "query_terms_also_any": ["customer", "customers", "pelanggan"],
+        "boost": 0.4,
+    },
+]
 
 # ======================================================================
 # ========================== CONTEXT BUILDER ===========================
 # ======================================================================
-def _extract_aliases_for_map(md: Dict[str, Any]) -> List[str]:
-    """
-    Ambil aliases dari metadata (aliases/tags_alias/synonyms),
-    pastikan bentuknya List[str] lowercase.
-    """
-    return _parse_str_or_list_lower(
-        md.get("aliases") or md.get("tags_alias") or md.get("synonyms") or []
-    )
-
-def _parse_str_or_list_lower(x: Any) -> List[str]:
-    """
-    Normalisasi input yang bisa berupa:
-    - list → jadikan list string lower-case
-    - string JSON list → parse, lalu lower
-    - string biasa → jadikan [string.lower()]
-    - lainnya → []
-    """
-    if isinstance(x, str):
-        s = x.strip()
-        # coba parse JSON list kalau cocok
-        try:
-            j = json.loads(s)
-            if isinstance(j, list):
-                return [str(v).lower() for v in j]
-            # kalau bukan list, fallback ke string itu sendiri
-            return [s.lower()]
-        except Exception:
-            return [s.lower()]
-    elif isinstance(x, list):
-        return [str(v).lower() for v in x]
-    elif x is None:
-        return []
-    else:
-        return [str(x).lower()]
-
-def _extract_roles_aliases(md: Dict[str, Any]) -> tuple[List[str], List[str]]:
-    """
-    Helper untuk ambil roles & aliases dalam bentuk list lowercase.
-    Dipakai supaya nggak duplikasi pola get(tags_role/roles) & get(tags_alias/aliases).
-    """
-    roles = _parse_str_or_list_lower(md.get("tags_role") or md.get("roles") or [])
-    aliases = _parse_str_or_list_lower(md.get("tags_alias") or md.get("aliases") or [])
-    return roles, aliases
-
 def _build_allowed_block(filtered_allowed: Dict[str, List[str]]) -> str:
     """
     Build blok ### ALLOWED IDENTIFIERS dari dict table -> list kolom.
@@ -374,212 +352,7 @@ def _doc_matches_sparse(md: Dict[str, Any], sparse_ids: List[str]) -> bool:
 
     return False
 
-# ======================================================================
-# =========================== DENSE PROBE ==============================
-# ======================================================================
-def _mentions_id_like_for_probe(text: str) -> bool:
-    """
-    Versi khusus untuk probe:
-    - Abaikan frasa 'number of' supaya tidak dianggap ID-like.
-      Contoh: 'total number of orders' → bukan minta id.
-    """
-    t = (text or "").lower()
-    # buang pola 'number of', 'total number of', dll
-    t = re.sub(r"\b(total\s+)?number\s+of\b", "", t)
-    return bool(re.search(r"\b(id|identifier|nomor|no|code|kode)\b", t))
-
-def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: int = 16) -> str:
-    """
-    Bangun dense probe untuk embedding query, tapi:
-    - Tail dibuat SESINGKAT mungkin.
-    - Token ekstra hanya yang benar-benar relevan dengan pertanyaan.
-    - Tidak lagi hardcode list panjang 'id date status sum total amount revenue ...'.
-    """
-    q_raw = question or ""
-    q = q_raw.lower()
-    toks_q = q.split()
-
-    # ---- fitur dasar ----
-    has_metric_word = any(k in q for k in [
-    "amount", "revenue", "sales", "omset", "price", "harga",
-    "gross", "net"
-    ])
-    has_count_word = any(k in q for k in [
-        "count", "berapa banyak", "how many"
-    ])
-    has_time_word = any(k in q for k in [
-        "today", "yesterday", "last", "this", "bulan", "minggu", "tahun",
-        "quarter", "month", "week", "year", "tanggal", "hari",
-        "mingguan", "bulanan", "202", "201"
-    ])
-
-    # entity utama classicmodels
-    mentions_customer = any(k in q for k in ["customer", "customers", "pelanggan"])
-    mentions_product  = any(k in q for k in ["product", "products", "produk"])
-    mentions_order    = any(k in q for k in ["order", "orders", "pesanan"])
-    mentions_employee = any(k in q for k in ["employee", "employees", "karyawan"])
-
-    # entity tambahan (tabel lain)
-    mentions_productline = any(
-        k in q
-        for k in [
-            "product line", "product lines",
-            "lini produk", "line produk",
-            "kategori", "category"
-        ]
-    )
-    mentions_office = any(
-        k in q
-        for k in [
-            "office", "offices", "kantor",
-            "territory", "territories", "region", "regional"
-        ]
-    )
-    mentions_payment = any(
-        k in q
-        for k in [
-            "payment", "payments", "pembayaran",
-            "check ", "cheque", "cheques"
-        ]
-    )
-    mentions_orderdetails = any(
-        k in q
-        for k in [
-            "order detail", "order details",
-            "line item", "line items",
-            "item pesanan", "detail pesanan"
-        ]
-    )
-
-    id_like = _mentions_id_like_for_probe(q)
-
-    # -------------------------
-    # 1) Tentukan base tokens
-    # -------------------------
-    base: List[str] = []
-
-    # a) Untuk lookup murni → jangan banyak tambahan
-    if qtype == "lookup":
-        # Biasanya cukup entity hints saja (di bawah)
-        base = []
-
-    # b) Untuk agregasi → tambahkan sedikit metric/time hints
-    elif qtype in {"aggregate_by", "aggregate_all"}:
-        if has_metric_word:
-            base += ["amount", "revenue", "price"]
-        if has_count_word:
-            base += ["count"]
-        if has_time_word:
-            base += ["date", "year", "month"]
-
-    else:
-        # qtype other: minimal hints
-        if has_time_word:
-            base += ["date"]
-
-    # -------------------------
-    # 2) Entity-specific hints
-    # -------------------------
-    if mentions_customer:
-        base += ["customer"]
-        if not id_like:
-            base += ["customerName"]
-        else:
-            base += ["customerNumber"]
-
-    if mentions_product:
-        base += ["product"]
-        if not id_like:
-            base += ["productName"]
-        else:
-            base += ["productCode"]
-
-    if mentions_order:
-        base += ["order", "orderNumber"]
-
-    if mentions_employee:
-        base += ["employee", "employeeNumber"]
-
-    if mentions_productline:
-        base += ["productLine"]
-
-    if mentions_office:
-        base += ["officeCode", "city", "country", "territory"]
-
-    if mentions_payment:
-        base += ["payments", "amount", "paymentDate"]
-
-    if mentions_orderdetails:
-        base += ["orderdetails", "quantityOrdered", "priceEach"]
-
-    # -------------------------
-    # 2b) Geo hints (lebih dinamis)
-    # -------------------------
-    mentions_country_word = any(k in q for k in ["country", "negara"])
-    mentions_city_word    = any(k in q for k in ["city", "kota"])
-    mentions_region_word  = any(k in q for k in ["region", "wilayah", "territory", "territories"])
-
-    geo_tokens: List[str] = []
-
-    # CASE A: query sebut "country" tapi tidak sebut "city" → fokus ke country saja
-    if mentions_country_word and not mentions_city_word:
-        geo_tokens.append("country")
-
-    # CASE B: query sebut "city" tapi tidak sebut "country" → fokus ke city saja
-    elif mentions_city_word and not mentions_country_word:
-        geo_tokens.append("city")
-
-    # CASE C: sebut dua-duanya → boleh tambahin dua-duanya
-    elif mentions_country_word and mentions_city_word:
-        geo_tokens += ["country", "city"]
-
-    # CASE D: nggak sebut city/country, tapi konteks-nya offices / region
-    elif mentions_office or mentions_region_word:
-        # offices biasanya lebih nyambung ke city, tapi country juga masih relevan
-        geo_tokens += ["city", "country"]
-
-    # CASE E: query tentang customers + ada pola "from <negara>"
-    # misal: "customers from Japan", "pelanggan dari USA"
-    if mentions_customer:
-        if re.search(r"\bfrom\s+\w+\b", q_raw, flags=re.I):
-            if "country" not in geo_tokens:
-                geo_tokens.append("country")
-
-    # Tambahkan ke base, tapi tetap hormati max_tokens di bawah
-    base += geo_tokens
-
-    # Name-specific hints (generic)
-    if any(k in q for k in ["name", "nama"]):
-        base += ["name"]
-
-    # Super pendek → beri sedikit “bumbu” supaya embedding nggak terlalu kosong
-    if len(toks_q) <= 2 and not base:
-        base += ["amount", "date"]
-
-    # -------------------------
-    # 3) Dedup + truncate
-    # -------------------------
-    seen = set()
-    tokens: List[str] = []
-    for t in base:
-        t_norm = t.strip()
-        if not t_norm:
-            continue
-        if t_norm not in seen:
-            seen.add(t_norm)
-            tokens.append(t_norm)
-        if len(tokens) >= max_tokens:
-            break
-
-    # Kalau akhirnya tidak ada token tambahan, pakai question apa adanya
-    if not tokens:
-        return q_raw.strip()
-
-    probe_tail = " ".join(tokens).strip()
-    return f"{q_raw.strip()} {probe_tail}".strip()
-
- 
-# =========================
+ # =========================
 # ======= SCORING =========
 # =========================
 def apply_column_priority_boost(
@@ -1041,5 +814,5 @@ def retrieve_node(state: RAGState) -> RAGState:
     context = (allowed_block + "\n\n" + cards_text).strip()
     context += f"\n\n### _INTERNAL_HINT\n{json.dumps({'alias_map': alias_map}, ensure_ascii=False)}"
 
-    state["context"] = context
+    state["retrieved_context"] = context
     return state
