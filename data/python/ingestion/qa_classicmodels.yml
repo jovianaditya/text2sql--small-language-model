@@ -95,7 +95,7 @@ cases:
       groundtruth_sql: |
         SELECT customerNumber, customerName 
         FROM customers 
-        WHERE customerName REGEXP '(^|[[:space:]])Co';
+        WHERE customerName REGEXP '(^|[^[:alnum:]_])Co[[:alnum:]_]*';
     - id: E15
       difficulty: easy
       question: "Find payments that were made in the first quarter of 2004 (January to March). Show their customer numbers, payment dates, and amounts."
