@@ -1,4 +1,3 @@
-# t2sql/mcp_execution.py
 import asyncio
 import json
 from typing import Any, Optional
@@ -7,7 +6,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 from .config import MCP_TIMEOUT, MCP_BASE
-
+from .utils import _extract_payload, _ensure_json
 
 async def _mcp_call(
     client: Client,
@@ -17,28 +16,6 @@ async def _mcp_call(
 ):
     coro = client.call_tool(tool, payload or {})
     return await asyncio.wait_for(coro, timeout=timeout)
-
-
-def _extract_payload(result) -> Any:
-    if hasattr(result, "data") and result.data is not None:
-        return result.data
-    if hasattr(result, "structuredContent") and result.structuredContent is not None:
-        return result.structuredContent
-    if hasattr(result, "content") and result.content:
-        return result.content[0].text if isinstance(result.content, list) else str(result.content)
-    return result
-
-
-def _ensure_json(d: Any) -> Optional[dict]:
-    if isinstance(d, dict):
-        return d
-    if isinstance(d, str):
-        try:
-            return json.loads(d)
-        except Exception:
-            return None
-    return None
-
 
 async def query_db(sql: str, mcp: Client | None = None) -> dict:
     """
