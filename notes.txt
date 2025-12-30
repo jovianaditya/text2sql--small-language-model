@@ -7,6 +7,9 @@ echo "KAFKA_CLUSTER_ID=<PASTE_UUID_HERE>" >> .env
 #recreate container after add datahub token or change .env
 docker compose -f datahub.yml up -d --force-recreate
 
+create domain dulu yang di script domain_tags_datahub.ipynb baru cli setelah itu create tags
+
+
 #delete datahub datasets
 for d in customers employees products productlines orders orderdetails payments offices; do
   URN="urn:li:dataset:(urn:li:dataPlatform:mysql,classicmodels.${d},PROD)"
