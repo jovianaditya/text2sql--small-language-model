@@ -16,7 +16,7 @@ def build_vector_store():
     client = chromadb.PersistentClient(path=CHROMA_DIR)
     emb_fn = OllamaEmbeddingFunction(
         base_url=OLLAMA_URL,
-        model="bge-m3:latest",
+        model="snowflake-arctic-embed2:568m",
     )
     _CHROMA_COL = client.get_or_create_collection(
         COLLECTION_NAME,
@@ -25,7 +25,7 @@ def build_vector_store():
     return _CHROMA_COL
 
 class OllamaEmbeddingFunction(EmbeddingFunction):
-    def __init__(self, base_url: str, model: str = "bge-m3:latest", timeout: int = 60):
+    def __init__(self, base_url: str, model: str = "snowflake-arctic-embed2:568m", timeout: int = 60):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = int(timeout)
@@ -50,7 +50,7 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
     def build_from_config(cls, config: dict) -> "OllamaEmbeddingFunction":
         return cls(
             base_url=str(config.get("base_url", "http://localhost:11434")),
-            model=str(config.get("model", "bge-m3:latest")),
+            model=str(config.get("model", "snowflake-arctic-embed2:568m")),
             timeout=int(config.get("timeout", 60)),
         )
 
