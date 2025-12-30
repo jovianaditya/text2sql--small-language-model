@@ -1,0 +1,7 @@
+data/elasticsearch/
+data/kafka/
+data/mysql/
+data/ollama/id_ed25519
+data/ollama/id_ed25519.pub
+data/python/mcp_client/.ipynb_checkpoints/
+data/python/mcp_client/chroma_db/
