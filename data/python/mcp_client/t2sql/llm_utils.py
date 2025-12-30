@@ -6,4 +6,8 @@ def build_llm(model: str | None = None, base_url: str | None = None, temp: float
         model=(model or CHAT_MODEL),
         base_url=(base_url or OLLAMA_URL),
         temperature=temp,
+        keep_alive="10m",
+        options={
+            "num_predict": 384
+        }
     )
