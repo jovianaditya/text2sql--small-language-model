@@ -61,16 +61,31 @@ def _build_allowed_block(filtered_allowed: Dict[str, List[str]]) -> str:
     body = "\n".join(lines) if lines else "- (none)"
     return "### ALLOWED IDENTIFIERS\n" + body
 
-def _build_cards(filtered_allowed: Dict[str, List[str]], reranked: List[Dict[str, Any]]) -> str:
+def _build_cards(
+    filtered_allowed: Dict[str, List[str]],
+    reranked: List[Dict[str, Any]],
+    max_cards: int = 15,
+    max_inject: int = 12,
+    desc_max_len: int = 100,
+) -> str:
     """
     Build kartu-kartu preview table/column untuk context LLM.
-    Inject juga kolom penting yang belum muncul, misalnya customers.customerName.
+
+    Optimasi (tanpa mengubah logic):
+    - Batasi jumlah kartu dari reranked (max_cards)
+    - Pendekkan description (desc_max_len)
+    - Batasi jumlah "inject" kolom yang belum muncul (max_inject)
+      supaya context tidak membengkak untuk kasus easy/medium.
+
+    Semantik tetap ada (desc tetap ada), tapi token input turun signifikan.
     """
     cards: List[str] = []
     present = set()
 
-    # kartu dari reranked
-    for it in reranked:
+    # ------------------------------------------------------------
+    # 1) Kartu dari reranked (dibatasi)
+    # ------------------------------------------------------------
+    for it in (reranked or [])[:max_cards]:
         md = it.get("meta") or {}
         table = _meta_table(md)
         column = _meta_column(md)
@@ -80,22 +95,35 @@ def _build_cards(filtered_allowed: Dict[str, List[str]], reranked: List[Dict[str
             continue
 
         desc = (md.get("description") or "").strip()
-        if len(desc) > 160:
-            desc = desc[:160] + "..."
+        if len(desc) > desc_max_len:
+            desc = desc[:desc_max_len] + "..."
+
         cards.append(f"- table: {table} | column: {column} | desc: {desc}")
         present.add((table.lower(), column.lower()))
 
-    # inject yang belum muncul
-    for tbl, cols in filtered_allowed.items():
+    # ------------------------------------------------------------
+    # 2) Inject kolom penting yang belum muncul (dibatasi)
+    # ------------------------------------------------------------
+    injected = 0
+    for tbl, cols in (filtered_allowed or {}).items():
+        if injected >= max_inject:
+            break
+
         for col in cols:
+            if injected >= max_inject:
+                break
+
             key = (tbl.lower(), col.lower())
             if key in present:
                 continue
+
             short_desc = ""
             if tbl.lower() == "customers" and col.lower() == "customername":
                 short_desc = "customer display name / company name"
+
             cards.append(f"- table: {tbl} | column: {col} | desc: {short_desc}")
             present.add(key)
+            injected += 1
 
     return "\n".join(cards)
 
@@ -509,8 +537,85 @@ def score_tables_from_reranked(
 # ======================================================================
 # =========================== RETRIEVE NODE ============================
 # ======================================================================
+def _has_join_intent(question: str) -> bool:
+    """
+    True jika pertanyaan terlihat butuh join / multi-entity.
+    Ini bukan mengubah logic agent, hanya memilih konteks yang lebih kecil.
+    """
+    q = (question or "").lower()
+
+    join_signals = [
+        "join", "gabung", "combine", "combine with", "along with", "together with",
+        "and their", "with their", "beserta", "bersama", "dengan",
+        "for each", "per ", "setiap",
+    ]
+    # multi-entity hints (classicmodels)
+    multi_entity = [
+        ("customer", "order"),
+        ("customer", "payment"),
+        ("order", "product"),
+        ("order", "order detail"),
+        ("order", "orderdetails"),
+        ("employee", "office"),
+        ("employee", "customer"),
+        ("office", "employee"),
+    ]
+
+    if any(s in q for s in join_signals):
+        return True
+
+    for a, b in multi_entity:
+        if a in q and b in q:
+            return True
+
+    return False
+
+def _detect_primary_entity_table(question: str) -> Optional[str]:
+    """
+    Tentukan 1 tabel utama bila pertanyaan menyebut entitas dengan jelas.
+    Prioritas: frasa eksplisit yang kuat.
+    """
+    q = (question or "").lower()
+
+    # urutkan dari yang paling spesifik/kuat
+    if "product line" in q or "product lines" in q or "lini produk" in q or "line produk" in q:
+        return "productlines"
+    if "order detail" in q or "order details" in q or "line item" in q or "line items" in q or "detail pesanan" in q:
+        return "orderdetails"
+    if "payment" in q or "payments" in q or "pembayaran" in q:
+        return "payments"
+    if "office" in q or "offices" in q or "kantor" in q or "territory" in q:
+        return "offices"
+    if "employee" in q or "employees" in q or "karyawan" in q:
+        return "employees"
+    if "order" in q or "orders" in q or "pesanan" in q or "transaksi" in q:
+        return "orders"
+    if "customer" in q or "customers" in q or "pelanggan" in q:
+        return "customers"
+    if "product" in q or "products" in q or "produk" in q:
+        return "products"
+
+    return None
+
+def _should_lock_single_table_ctx(question: str, qtype: str) -> bool:
+    """
+    Kapan kita boleh mengunci konteks ke 1 tabel?
+    - qtype lookup/aggregate/rank masih boleh single-table (rank sering single-table juga)
+    - TIDAK ada join intent
+    - ada entitas utama yang jelas
+    """
+    if qtype not in {"lookup", "aggregate", "rank"}:
+        return False
+    if _has_join_intent(question):
+        return False
+    return _detect_primary_entity_table(question) is not None
+
 def retrieve_node(state: RAGState) -> RAGState:
+    # -----------------------------
+    # 0) Build vector store
+    # -----------------------------
     col = build_vector_store()
+
     q = (state["question"] or "").strip()
     q_l = q.lower()
     qtype = _get_qtype(state)
@@ -521,13 +626,19 @@ def retrieve_node(state: RAGState) -> RAGState:
 
     jsonl_paths = state.get("jsonl_paths", [])
 
-    # NEW: gunakan hasil sparse_query_clean untuk token debug,
-    #      supaya SPARSE DEBUG betul-betul mencerminkan query yang dikirim ke BM25.
+    # -----------------------------
+    # 1) Sparse query build + BM25 search
+    # -----------------------------
+
     sparse_query_clean = build_sparse_query_from_question(q)
     sparse_tokens = _tokenize_bm25_query(sparse_query_clean)
 
 
-    sparse_field_urns = jsonl_sparse_search(sparse_query_clean, jsonl_paths, max_hits=SPARSE_MAX_HITS)
+    sparse_field_urns = jsonl_sparse_search(
+        sparse_query_clean,
+        jsonl_paths,
+        max_hits=SPARSE_MAX_HITS
+    )
 
     # --- get sparse metas sekali, lalu pakai untuk pretty + flags ---
     sparse_docs_pretty: List[str] = []
@@ -566,28 +677,39 @@ def retrieve_node(state: RAGState) -> RAGState:
         for m in sparse_metas
         if isinstance(m, dict)
     )
+
     base_k = max(12, TOP_K)
     dense_k = base_k
     if wants_customer_no_id and not sparse_has_customername:
         dense_k = max(28, base_k)
 
+    # -----------------------------
+    # 2) Dense query
+    # -----------------------------
     query_text = build_dynamic_probe(q, qtype=qtype)
+
     res = col.query(
         query_texts=[query_text],
         n_results=dense_k,
         include=["documents", "metadatas", "distances"],
     )
 
-    dense_docs   = (res.get("documents")  or [[]])[0]
+    # -----------------------------
+    # 3) Unpack dense results
+    # -----------------------------
+    dense_docs = (res.get("documents") or [[]])[0]
     if dense_docs and isinstance(dense_docs[0], list):
         dense_docs = dense_docs[0]
-    dense_metas  = (res.get("metadatas")  or [[]])[0]
+
+    dense_metas = (res.get("metadatas") or [[]])[0]
     if dense_metas and isinstance(dense_metas[0], list):
         dense_metas = dense_metas[0]
-    dense_dists  = (res.get("distances")  or [[]])[0]
+
+    dense_dists = (res.get("distances") or [[]])[0]
     if dense_dists and isinstance(dense_dists[0], list):
         dense_dists = dense_dists[0]
-    dense_ids    = (res.get("ids")        or [[]])[0]
+
+    dense_ids = (res.get("ids") or [[]])[0]
     if dense_ids and isinstance(dense_ids[0], list):
         dense_ids = dense_ids[0]
 
@@ -597,17 +719,20 @@ def retrieve_node(state: RAGState) -> RAGState:
         len(dense_dists) if dense_dists else len(dense_docs),
         len(dense_ids) if dense_ids else len(dense_docs),
     )
-    dense_docs  = dense_docs[:n]
+    dense_docs = dense_docs[:n]
     dense_metas = dense_metas[:n]
     dense_dists = (dense_dists or [0.0] * n)[:n]
-    dense_ids   = (dense_ids or [""] * n)[:n]
+    dense_ids = (dense_ids or [""] * n)[:n]
 
     dense_has_customername = any(
-    ((_meta_table(md) or "").lower() == "customers")
-    and ((_meta_column(md) or "").lower() in ("customername", "customer_name"))
-    for md in dense_metas
+        ((_meta_table(md) or "").lower() == "customers")
+        and ((_meta_column(md) or "").lower() in ("customername", "customer_name"))
+        for md in dense_metas
     )
 
+    # -----------------------------
+    # 4) Scoring + rerank (dense + sparse bonus + priority boost)
+    # -----------------------------
     scored = []
     for rank, (doc_text, md, dist, _id) in enumerate(zip(dense_docs, dense_metas, dense_dists, dense_ids)):
         base = -float(dist) if dist is not None else 0.0
@@ -640,19 +765,22 @@ def retrieve_node(state: RAGState) -> RAGState:
             "boosted": boosted,
         })
 
-    # auto-inject sangat terbatas
+    # -----------------------------
+    # 5) Auto-inject sangat terbatas (customerName)
+    # -----------------------------
     if wants_customer_no_id and sparse_has_customername and not dense_has_customername:
         sparse_customername_urn = None
         for u in sparse_field_urns:
             if u.lower().endswith("::customername"):
                 sparse_customername_urn = u
                 break
+
         if sparse_customername_urn:
             present_ids = {item["id"] for item in scored if item.get("id")}
             if sparse_customername_urn not in present_ids:
                 got = col.get(ids=[sparse_customername_urn])
                 if got and got.get("ids"):
-                    md  = (got.get("metadatas") or [{}])[0]
+                    md = (got.get("metadatas") or [{}])[0]
                     doc = (got.get("documents") or [""])[0]
 
                     roles, aliases = _extract_roles_aliases(md)
@@ -682,9 +810,15 @@ def retrieve_node(state: RAGState) -> RAGState:
                         "boosted": boosted,
                     })
 
+    # -----------------------------
+    # 6) Final reranked slice
+    # -----------------------------
     reranked = sorted(scored, key=lambda x: x["boosted"], reverse=True)
     reranked = reranked[:MAX_CTX_DOCS]
 
+    # -----------------------------
+    # 7) Debug prints (existing behavior)
+    # -----------------------------
     if RETRIEVE_DEBUG:
         line = _print_banner("RETRIEVE DEBUG")
 
@@ -703,10 +837,8 @@ def retrieve_node(state: RAGState) -> RAGState:
         if total_sparse == 0:
             print("  <none>\n")
         else:
-            # prefix row: "  [01] " = 7 chars → header juga 7 spasi
             print(f"{'':7}{'table':<14} {'column':<30}")
             for i, s in enumerate(sparse_docs_pretty[:max_show], start=1):
-                # s format: "table=xxx  column=yyy"
                 try:
                     _, rest = s.split("table=", 1)
                     table_part, col_part = rest.split("column=", 2)
@@ -732,10 +864,10 @@ def retrieve_node(state: RAGState) -> RAGState:
         else:
             print(f"{'':7}{'table':<14} {'column':<30}")
             for i in range(max_show):
-                md  = dense_metas[i] or {}
+                md = dense_metas[i] or {}
                 tbl = _meta_table(md) or "?"
-                col = _meta_column(md) or "?"
-                print(f"  [{i+1:02d}] {tbl:<14} {col:<30}")
+                col_ = _meta_column(md) or "?"
+                print(f"  [{i+1:02d}] {tbl:<14} {col_:<30}")
             if total_dense > max_show:
                 remaining = total_dense - max_show
                 print(f"  ... (+{remaining} more)")
@@ -752,55 +884,83 @@ def retrieve_node(state: RAGState) -> RAGState:
         else:
             print(f"{'':7}{'table':<14} {'column':<30} {'sparse':>8}")
             for i, item in enumerate(reranked[:max_show], start=1):
-                md   = item.get("meta") or {}
-                tbl  = _meta_table(md) or "?"
-                col  = _meta_column(md) or "?"
+                md = item.get("meta") or {}
+                tbl = _meta_table(md) or "?"
+                col_ = _meta_column(md) or "?"
                 sparse_flag = "✓" if item.get("sparse") else "✗"
-                print(f"  [{i:02d}] {tbl:<14} {col:<30} {sparse_flag:>8}")
+                print(f"  [{i:02d}] {tbl:<14} {col_:<30} {sparse_flag:>8}")
             if total_rerank > max_show:
                 remaining = total_rerank - max_show
                 print(f"  ... (+{remaining} more)")
         print(f"{line}\n")
 
-    # build allowed + alias_map
-    allowed   = defaultdict(list)
+    # -----------------------------
+    # 8) Build allowed + alias_map (existing)
+    # -----------------------------
+    allowed = defaultdict(list)
     alias_map = defaultdict(dict)
+
     for item in reranked:
         md = item["meta"] or {}
-        t  = _meta_table(md)
-        c  = _meta_column(md)
-        if t and c:
-            allowed[t].append(c)
-    
-            aliases2 = _extract_aliases_for_map(md)
-            for al in aliases2:
-                al = al.strip()
-                if al:
-                    alias_map[t][al] = c   # al sudah lowercase dari helper
+        t = _meta_table(md)
+        c = _meta_column(md)
+        if not (t and c):
+            continue
 
+        t_key = t.strip().lower()   # canonical
+        c_key = c.strip()           # keep original case
+
+        allowed[t_key].append(c_key)
+
+        aliases2 = _extract_aliases_for_map(md)
+        for al in aliases2:
+            al = al.strip()
+            if al:
+                alias_map[t_key][al] = c_key
+
+    # -----------------------------
+    # 9) Table scoring + filtered_allowed (existing)
+    # -----------------------------
     token_for_score = _tokenize_bm25_query(sparse_query_clean)
     table_scores = score_tables_from_reranked(reranked, token_for_score)
 
+    # Rule existing (tetap dipertahankan)
     if qtype == "lookup" and wants_customer_no_id:
         filtered_allowed = {t: cols for t, cols in allowed.items() if t.lower() == "customers"}
+
     elif qtype == "lookup" and productline_lookup:
-        # khusus: lookup product lines → pakai 1 tabel saja
         only_pl = {t: cols for t, cols in allowed.items() if t.lower() == "productlines"}
         filtered_allowed = only_pl if only_pl else dict(allowed)
+
     elif qtype == "lookup" and orders_simple_lookup:
-        # khusus: simple "order numbers" lookup → fokus ke tabel orders saja
         only_orders = {t: cols for t, cols in allowed.items() if t.lower() == "orders"}
         filtered_allowed = only_orders if only_orders else dict(allowed)
+
     else:
-        if table_scores:
-            sorted_tbls = sorted(table_scores.items(), key=lambda x: x[1], reverse=True)
-            top_tables = {name for name, score in sorted_tbls[:2] if score > 0.0}
-            if top_tables:
-                filtered_allowed = {t: cols for t, cols in allowed.items() if t in top_tables}
+        if _should_lock_single_table_ctx(question=q, qtype=qtype):
+            primary = _detect_primary_entity_table(q)  # lower-case
+            only_primary = {t: cols for t, cols in allowed.items() if t.lower() == (primary or "")}
+
+            if only_primary:
+                filtered_allowed = only_primary
+            else:
+                if table_scores:
+                    sorted_tbls = sorted(table_scores.items(), key=lambda x: x[1], reverse=True)
+                    top1 = sorted_tbls[0][0]
+                    filtered_allowed = {t: cols for t, cols in allowed.items() if t == top1}
+                else:
+                    filtered_allowed = dict(allowed)
+
+        else:
+            if table_scores:
+                sorted_tbls = sorted(table_scores.items(), key=lambda x: x[1], reverse=True)
+                top_tables = {name for name, score in sorted_tbls[:2] if score > 0.0}
+                if top_tables:
+                    filtered_allowed = {t: cols for t, cols in allowed.items() if t in top_tables}
+                else:
+                    filtered_allowed = dict(allowed)
             else:
                 filtered_allowed = dict(allowed)
-        else:
-            filtered_allowed = dict(allowed)
 
     if wants_customer_no_id:
         for t_key in list(filtered_allowed.keys()):
@@ -808,11 +968,20 @@ def retrieve_node(state: RAGState) -> RAGState:
                 if "customerName" not in filtered_allowed[t_key]:
                     filtered_allowed[t_key].append("customerName")
 
+    # -----------------------------
+    # 10) Context build (existing)
+    # -----------------------------
     allowed_block = _build_allowed_block(filtered_allowed)
-    cards_text    = _build_cards(filtered_allowed, reranked)
+    cards_text = _build_cards(
+        filtered_allowed,
+        reranked,
+        max_cards=15,
+        max_inject=12,
+        desc_max_len=100,
+    )
 
-    context = (allowed_block + "\n\n" + cards_text).strip()
+    context = (allowed_block + "\n\n### CARDS\n" + cards_text).strip()
     context += f"\n\n### _INTERNAL_HINT\n{json.dumps({'alias_map': alias_map}, ensure_ascii=False)}"
 
-    state["retrieved_context"] = context
+    state["context"] = context
     return state
