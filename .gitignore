@@ -5,4 +5,8 @@ data/ollama/id_ed25519
 data/ollama/id_ed25519.pub
 data/python/mcp_client/.ipynb_checkpoints/
 data/python/mcp_client/chroma_db/
-data/python/mcp_client/t2sql/__pycache__
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
