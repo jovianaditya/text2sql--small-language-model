@@ -8,7 +8,7 @@ JSON_INPUT       = os.getenv("EXPORT_JSONL_OUTPUT", "./datahub_metadata/*.jsonl"
 CHROMA_DIR       = os.getenv("CHROMA_DIR", "./chroma_db").strip()
 COLLECTION_NAME  = os.getenv("COLLECTION_NAME", "classicmodels").strip()
 OLLAMA_URL  = os.getenv("OLLAMA_URL", "http://localhost:11434").strip()
-CHAT_MODEL       = os.getenv("CHAT_MODEL", "HridaAI/hrida-t2sql:q8_0").strip()
+CHAT_MODEL       = os.getenv("CHAT_MODEL", "qwen2.5:7b-instruct").strip()
 
 # ============================ RETRIEVAL ===============================
 TOP_K            = int(os.getenv("TOP_K", "5"))
