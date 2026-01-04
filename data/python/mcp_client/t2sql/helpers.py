@@ -531,52 +531,29 @@ def make_generation_prompt(ctx: str, question: str) -> str:
     return fr"""
 You are a senior SQL assistant for MySQL 8.0.
 
-Return a runnable query using ONLY tables/columns listed in the ALLOWED IDENTIFIERS section of Context.
-If a needed column name appears as an alias in Context, use its canonical column name.
-If the query is about customers and the user does NOT explicitly ask for an id/number/code, prefer customerName over customerNumber AND also prefer customerName over contactFirstName/contactLastName when both are available in ALLOWED IDENTIFIERS.
+Use ONLY tables/columns listed under ALLOWED IDENTIFIERS in Context.
+If Context lists aliases, use the canonical column name.
 
-IMPORTANT JOIN RULE:
-- If all required columns live in a SINGLE table from ALLOWED IDENTIFIERS, DO NOT use any JOIN at all. Select only from that single table.
-- Only introduce JOINs when you really need columns from more than one table.
+Customer naming preference:
+If the query is about customers and the user does NOT explicitly ask for an id/number/code, prefer customerName over customerNumber (and over contactFirstName/contactLastName).
 
-PATTERN / REGEXP RULES (VERY IMPORTANT):
-1) Use LIKE for simple wildcard intent only:
-   - starts with X  -> col LIKE 'X%'
-   - ends with X    -> col LIKE '%X'
-   - contains X     -> col LIKE '%X%'
-   IMPORTANT: LIKE does NOT support regex anchors (^, $). Never put ^ or $ inside LIKE.
+JOIN rule:
+- If all needed columns exist in ONE allowed table: do NOT JOIN.
+- JOIN only when needed to fetch columns from multiple tables.
 
-2) Use REGEXP (MySQL 8) only when:
-   A) Word-boundary intent: "contains a word that starts with X" / "kata yang diawali X"
-   B) Strict structure/format: "exactly N digits/chars", "letter + digits", masks, "only digits"
-   C) User explicitly requests regex/regexp.
+LIKE vs REGEXP:
+- Use LIKE only for simple wildcard intent: starts with -> 'X%', ends with -> '%X', contains -> '%X%'. Do NOT put ^ or $ inside LIKE.
+- Use REGEXP only if: (a) word-boundary intent (word starts with X), (b) strict structure/format (exact length/digits), or (c) user explicitly requests regex.
+  - Word-boundary REGEXP must use: (^|[^[:alnum:]_]) as left boundary and [[:alnum:]_]* after prefix. Do NOT use \b or \w.
+  - Strict-structure REGEXP must be anchored with ^ and $.
 
-3) REGEXP word-boundary style (do NOT use \b or \w):
-   - Use boundary: (^|[^[:alnum:]_]) as the left word boundary.
-   - After the prefix, use word chars: [[:alnum:]_]* (NOT '.*').
-   Example: col REGEXP '(^|[^[:alnum:]_])Xy[[:alnum:]_]*'
+Output:
+Return EXACTLY one JSON object:
+{{"sql":"<final MySQL query>","notes":"<brief rationale; for EACH JOIN, name the column it contributes>"}}
+No Markdown. End SQL with a semicolon.
+If NO JOINs, notes MUST be exactly: "No joins used."
 
-   Note: '^Xy' matches only the beginning of the full string, not the beginning of a word inside the string.
-
-4) REGEXP strict structure:
-   - Always anchor with ^ and $ to enforce full-string structure.
-   Example: col REGEXP '^x[0-9]{3}$'
-
-########################
-# STRICT OUTPUT FORMAT #
-########################
-{{ "sql": "<final MySQL query>", "notes": "<brief rationale; for EACH JOIN, name the exact selected/grouped/filtered column it contributes>" }}
-# No extra keys. No Markdown. End SQL with a semicolon.
-# If the final SQL has NO JOINs, set "notes" exactly to: "No joins used."
-
-##################
-# SQL CONSTRAINT #
-##################
-- MySQL 8.0; backticks only when needed; ANSI joins.
-
-################
-# CONTEXT
-################
+Context:
 {ctx}
 
 Question:
@@ -590,6 +567,48 @@ _JOIN_KW = r"(?:inner\s+join|left\s+join|right\s+join|full\s+join|join)"
 
 def has_join(sql: str) -> bool:
     return re.search(rf"\b{_JOIN_KW}\b", sql, flags=re.I) is not None
+
+def _canonicalize_table_names(sql: str, ctx: str) -> str:
+    """
+    Rewrite nama table di FROM/JOIN agar sesuai persis dengan ALLOWED IDENTIFIERS (termasuk casing).
+    Ini mengatasi kasus LLM menulis Orders padahal tabelnya orders.
+    """
+    if not sql or not ctx:
+        return sql
+
+    allowed = _parse_allowed_identifiers(ctx)
+    if not allowed:
+        return sql
+
+    # lower(table) -> canonical table name dari ALLOWED
+    canon_by_lower = {t.lower(): t for t in allowed.keys()}
+
+    # Match FROM/JOIN <db.?>table <alias?>
+    pat = re.compile(
+        r"(\bFROM\s+|\bJOIN\s+)"
+        r"((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)"
+        r"(\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*\b)?",
+        flags=re.IGNORECASE,
+    )
+
+    def repl(m: re.Match) -> str:
+        kw = m.group(1)
+        full = m.group(2)
+        alias = m.group(3) or ""
+
+        if "." in full:
+            db, tbl = full.split(".", 1)
+            canon = canon_by_lower.get(tbl.lower())
+            if not canon:
+                return m.group(0)
+            return f"{kw}{db}.{canon}{alias}"
+
+        canon = canon_by_lower.get(full.lower())
+        if not canon:
+            return m.group(0)
+        return f"{kw}{canon}{alias}"
+
+    return pat.sub(repl, sql)
 
 def sanitize_notes(sql: str, notes: str) -> str:
     if not notes:
@@ -1148,6 +1167,63 @@ def _dynamic_prune_joins_if_single_table_possible(sql: str, question: str, ctx: 
 # ======================================================================
 # ===================== SQL NORMALIZATION PIPELINE =====================
 # ======================================================================
+def _strip_table_prefix_if_single_table(sql: str) -> str:
+    """
+    Hapus prefix table/alias (e.g., payments.amount -> amount) HANYA jika:
+    - tidak ada JOIN
+    - tidak ada CTE (WITH ...)
+    - FROM hanya 1 table biasa (bukan subquery / derived table)
+    Aman untuk kasus single-table lookup/rank sederhana.
+    """
+    if not sql:
+        return sql
+
+    # 1) Jangan sentuh kalau ada JOIN
+    if has_join(sql):
+        return sql
+
+    # 2) Jangan sentuh kalau ada CTE
+    if re.match(r"^\s*with\b", sql, flags=re.I):
+        return sql
+
+    # 3) Pastikan FROM table biasa (bukan FROM (SELECT ...))
+    m_from = re.search(
+        r"\bfrom\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*))?\b",
+        sql,
+        flags=re.I,
+    )
+    if not m_from:
+        return sql
+
+    table = m_from.group(1)
+    alias = m_from.group(2)
+
+    # 4) Pastikan cuma 1 tabel (tidak ada join/extra from table lain)
+    tables = _extract_tables_from_sql(sql)  # ini sudah ada di file kamu
+    if len(tables) != 1:
+        return sql
+
+    # 5) Strip qualifier hanya untuk table/alias ini, dan hanya di code segment (bukan string/backtick)
+    qualifiers = [table]
+    if alias:
+        qualifiers.append(alias)
+
+    # split supaya tidak merusak string literal / quoted identifiers
+    parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`[^`]*`)", sql)
+    out = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            out.append(part)  # quoted segment: biarkan
+            continue
+
+        seg = part
+        for q in qualifiers:
+            # hapus "payments." atau "p." (opsional ada whitespace)
+            seg = re.sub(rf"\b{re.escape(q)}\s*\.\s*", "", seg, flags=re.I)
+        out.append(seg)
+
+    return "".join(out)
+
 def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
     if not sql:
         return sql
@@ -1184,6 +1260,7 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
         s += ";"
 
     s = _fix_bad_backticks(s)
+    s = _canonicalize_table_names(s, context)
     s = _guardrail_fix_like_regex_anchors(s, question)
     s = _rewrite_simple_regexp_to_like(s, question)
     s = _guardrail_fix_mysql_regexp_literals(s)
@@ -1195,7 +1272,8 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
 
     # dynamic join pruning
     s = _dynamic_prune_joins_if_single_table_possible(s, question, context)
-
+    # strip qualifier kalau benar-benar single-table tanpa JOIN/CTE
+    s = _strip_table_prefix_if_single_table(s)
     s = _maybe_add_limit(question, s)
     s = _fix_missing_space_before_clauses(s)
     s = _collapse_spaces_outside_quotes(s)
@@ -1269,6 +1347,15 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
             "id_customer": "customerNumber",
             "kodecustomer": "customerNumber",
             "kode_pelanggan": "customerNumber",
+        },
+        "employees": {
+            "contactfirstname": "firstName",
+            "contactlastname": "lastName",
+            "phoneextension": "extension",
+            "firstname": "firstName",
+            "lastname": "lastName",
+            "extension": "extension",
+            "employeenumber": "employeeNumber",
         },
     }
     for _t, amap in classic_fallback.items():
