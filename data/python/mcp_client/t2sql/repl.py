@@ -1,29 +1,30 @@
-# repl.py
-import asyncio
+# import asyncio
 from pathlib import Path
 
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 from .config import MCP_BASE, CHROMA_DIR, COLLECTION_NAME
-from .state import RAGState, make_state
+from .state import make_state
 from .graph import build_app
 from .chroma_embedding import build_vector_store
 from .mcp_execution import query_db
 from .utils import _now, _log_total, _print_banner, display_table_from_json
-from tabulate import tabulate
 
-async def _exec_via_mcp(mcp: Client, sql_block: str, final_sql: str | None = None):
-    # Ambil SQL saja (kalau answer berisi SQL + notes)
-    sql_only = sql_block.split("\n\n-- notes:")[0].strip()
+
+async def _exec_via_mcp(
+    mcp: Client,
+    sql_block: str,
+    final_sql: str | None = None,
+):
+    sql_only = (sql_block or "").split("\n\n-- notes:")[0].strip()
     sql_clean = (final_sql or sql_only).rstrip(";").strip()
 
     print("\n[SQL EXEC] Final query sent to MCP:")
     print(sql_clean + ";")
 
     try:
-        res = await query_db(sql_clean, mcp=mcp)
-        payload = res
+        payload = await query_db(sql_clean, mcp=mcp)
 
         if isinstance(payload, dict) and payload.get("success"):
             display_table_from_json(payload)
@@ -40,6 +41,7 @@ async def _exec_via_mcp(mcp: Client, sql_block: str, final_sql: str | None = Non
         print(f"MCP query_db error: {e}")
         return None
 
+
 async def repl(paths):
     app = build_app()
     transport = StreamableHttpTransport(MCP_BASE)
@@ -50,11 +52,13 @@ async def repl(paths):
             print("No question entered. Exiting.")
             return
 
+        # ---------- FIRST RUN (end-to-end only) ----------
         t0_total = _now()
+
         init_state = make_state(paths, first_q)
         state = app.invoke(init_state)
 
-        # Reporting ingestion status
+        # ingestion report
         col = build_vector_store()
         total = col.count()
         line = _print_banner("Collection Ingestion Report")
@@ -66,10 +70,12 @@ async def repl(paths):
         print(f"{line}\n")
 
         await _exec_via_mcp(mcp, state.get("answer", ""), state.get("final_sql"))
+
         _log_total("End-to-end total time (first run)", t0_total)
 
         print("\nAsk me more questions! (type 'exit' to quit')")
 
+        # ---------- LOOP (end-to-end only) ----------
         while True:
             q = input("\nQuestion> ").strip()
             if not q or q.lower() in {"exit", "quit", "q"}:
@@ -77,7 +83,10 @@ async def repl(paths):
                 break
 
             t0_total = _now()
+
             s2 = make_state(paths, q)
             out = app.invoke(s2)
+
             await _exec_via_mcp(mcp, out.get("answer", ""), out.get("final_sql"))
+
             _log_total("End-to-end total time (this question)", t0_total)
