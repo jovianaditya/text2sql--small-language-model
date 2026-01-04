@@ -6,32 +6,31 @@ class RAGState(TypedDict, total=False):
     added: int
     updated: int
     skipped: int
-    # retrieval output
-    retrieved_context: str
+    # retrieval output (context untuk LLM)
+    context: str
     # generation outputs
     answer: str
     draft_sql: str
     final_sql: str
-    # >>> Jenis query hasil classifier ('lookup', 'aggregate_by', etc.)
+    # Jenis query hasil classifier ('lookup', 'aggregate', 'rank', dst.)
     qtype: str
-    # >>> Flag apakah pertanyaan ini butuh REGEXP/pattern handling
+    # Flag apakah pertanyaan ini butuh REGEXP/pattern handling
     requires_regex: bool
-    # >>> Catatan dari LLM (Agent 1/2) tentang alasan join, dll.
+    # Catatan dari LLM (Agent 1/2) tentang alasan join, dll.
     agent_notes: str
-    # >>> Daftar error whitelist (identifier tidak ada di ALLOWED IDENTIFIERS)
+    # Daftar error whitelist (identifier tidak ada di ALLOWED IDENTIFIERS)
     validation_errors: List[str]
-    # >>> Ringkasan apa saja yang dikoreksi Agent 2 (join/regex/whitelist)
+    # Ringkasan apa saja yang dikoreksi Agent 2 (join/regex/whitelist)
     critic_feedback: str
 
 def make_state(paths, question: str) -> RAGState:
-    # Kalau kamu set state.py menjadi total=False, ini bisa diperkecil
     return {
         "jsonl_paths": paths,
         "question": question,
         "added": 0,
         "updated": 0,
         "skipped": 0,
-        "retrieved_context": "",
+        "context": "",
         "answer": "",
         "draft_sql": "",
         "final_sql": "",
