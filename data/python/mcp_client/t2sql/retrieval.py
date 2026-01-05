@@ -817,6 +817,16 @@ def retrieve_node(state: RAGState) -> RAGState:
     reranked = reranked[:MAX_CTX_DOCS]
 
     # -----------------------------
+    # 6b) Final reranked slice
+    # -----------------------------
+    state["ranked_cols"] = [
+    ((_meta_table(it.get("meta") or {}) or "").strip().lower(),
+     (_meta_column(it.get("meta") or {}) or "").strip())
+    for it in (reranked or [])
+    if (_meta_table(it.get("meta") or {}) and _meta_column(it.get("meta") or {}))
+    ]
+    
+    # -----------------------------
     # 7) Debug prints (existing behavior)
     # -----------------------------
     if RETRIEVE_DEBUG:
