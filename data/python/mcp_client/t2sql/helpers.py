@@ -170,23 +170,178 @@ def _get_qtype(state: "RAGState") -> str:
 # ======================================================================
 # ==================== SQL ALIAS EXTRACTION (FROM/JOIN) ================
 # ======================================================================
+_ALIAS_OVERRIDES = {
+    "payments": "p",
+    "employees": "e",
+    "customers": "c",
+    "orderdetails": "od",
+    "orders": "o",
+    "offices": "of",
+    "products": "pr",
+    "productlines": "pl",
+}
+
+_RESERVED_ALIASES = {
+    "or", "and", "on", "as", "in", "is", "by", "from", "join", "where",
+    "group", "order", "limit", "select", "left", "right", "inner", "outer",
+    "having", "union", "cross", "natural"
+}
+
+def _split_outside_quotes(sql: str) -> List[str]:
+    # reuse your existing approach (same regex style you already use)
+    return re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`[^`]*`)", sql)
+
+
+def _alias_for_table(table: str, used: set[str]) -> str:
+    """
+    Deterministic alias:
+    - use overrides first
+    - fallback: 1-2 letters from table name, increasing until unique
+    """
+    t = (table or "").strip("`").split(".")[-1]  # drop schema if any
+    tl = t.lower()
+
+    base = _ALIAS_OVERRIDES.get(tl)
+    if base and base not in used:
+        used.add(base)
+        return base
+
+    # generic fallback
+    # e.g. products -> pr, productlines -> pl, etc.
+    # keep it short but avoid collisions
+    for k in range(1, min(4, len(tl)) + 1):
+        cand = tl[:k]
+        if cand not in used:
+            used.add(cand)
+            return cand
+
+    # last resort
+    i = 2
+    while f"{tl[0]}{i}" in used:
+        i += 1
+    cand = f"{tl[0]}{i}"
+    used.add(cand)
+    return cand
+
+
+def ensure_join_aliases(sql: str) -> str:
+    """
+    Enforce: if query has JOIN, every FROM/JOIN table must have an alias.
+    Also rewrite qualifiers: table.col -> alias.col (outside quotes).
+    Safe-only: no CTE, no subqueries/derived tables.
+    """
+    if not sql:
+        return sql
+
+    # Only enforce if there is a join
+    if not has_join(sql):
+        return sql
+
+    # Skip complex forms (keep it non-brittle)
+    if re.match(r"^\s*with\b", sql, flags=re.I):
+        return sql
+    if re.search(r"\bfrom\s*\(", sql, flags=re.I) or re.search(r"\bjoin\s*\(", sql, flags=re.I):
+        return sql
+
+    # Find FROM/JOIN tables + aliases (if present)
+    # Matches: FROM table [AS] alias
+    #          JOIN table [AS] alias
+    tj_pat = re.compile(
+        r"(?P<kw>\bFROM\b|\bJOIN\b)\s+"
+        r"(?P<table>`?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?`?)"
+        r"(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?",
+        flags=re.I,
+    )
+
+    # 1) First pass: collect existing aliases & decide missing aliases
+    used_aliases: set[str] = set()
+    table_to_alias: dict[str, str] = {}   # lower(table)->alias
+    spans_to_patch: list[tuple[int, int, str]] = []
+
+    for m in tj_pat.finditer(sql):
+        kw = m.group("kw")
+        table_raw = m.group("table")
+        alias = m.group("alias")
+
+        table_norm = table_raw.strip("`")
+        table_key = table_norm.split(".")[-1].lower()
+
+        if alias and alias.lower() in _RESERVED_ALIASES:
+            alias = None
+
+        if alias:
+            used_aliases.add(alias)
+            table_to_alias[table_key] = alias
+        else:
+            spans_to_patch.append((m.start(), m.end(), table_raw))
+
+    # 2) Second pass: assign aliases for missing ones
+    # We need stable alias assignment order: FROM first, then JOINs in appearance order.
+    used_aliases = set(used_aliases)  # ensure mutable
+    patches: list[tuple[int, int, str]] = []
+
+    for start, end, table_raw in spans_to_patch:
+        table_key = table_raw.strip("`").split(".")[-1].lower()
+        if table_key in table_to_alias:
+            continue
+        alias = _alias_for_table(table_key, used_aliases)
+        table_to_alias[table_key] = alias
+
+        # Inject " <alias>" right after table token (no AS needed)
+        # We patch by reconstructing the matched segment.
+        seg = sql[start:end]
+        # seg looks like: "FROM customers" or "JOIN payments"
+        seg_patched = re.sub(
+            rf"(\b(?:FROM|JOIN)\b\s+{re.escape(table_raw)})(?!\s+\bAS\b|\s+[A-Za-z_])",
+            rf"\1 {alias}",
+            seg,
+            flags=re.I,
+        )
+        patches.append((start, end, seg_patched))
+
+    # Apply patches from the back to keep indices valid
+    out = sql
+    for start, end, seg_patched in sorted(patches, key=lambda x: x[0], reverse=True):
+        out = out[:start] + seg_patched + out[end:]
+
+    # 3) Rewrite qualifiers table.col -> alias.col (outside quotes/backticks/strings)
+    parts = _split_outside_quotes(out)
+    for i in range(0, len(parts), 2):  # code segments only
+        seg = parts[i]
+        for tbl, al in table_to_alias.items():
+            # rewrite schema.tbl.col and tbl.col forms conservatively:
+            # - if already alias.col, leave it
+            seg = re.sub(rf"\b{re.escape(tbl)}\s*\.\s*", f"{al}.", seg, flags=re.I)
+        parts[i] = seg
+
+    return "".join(parts)
+
 def _parse_from_join_aliases(sql: str) -> Dict[str, str]:
     """
-    Parse alias dari FROM/JOIN:
-    - FROM products p  -> {"p": "products"}
-    - JOIN orders o    -> {"o": "orders"}
-    Return: mapping alias -> table_name
+    FROM `products` pr  -> {"pr": "products"}
+    JOIN db.orders `or` -> {"or": "orders"}
     """
     if not sql:
         return {}
 
-    pattern = re.compile(
-        r"\b(?:from|join)\s+([a-zA-Z_][\w\.]*)\s+(?:as\s+)?([a-zA-Z_]\w*)\b",
-        re.IGNORECASE,
+    pat = re.compile(
+        r"\b(?:from|join)\s+"
+        r"(?P<table>`?[A-Za-z_][\w]*`?(?:\.`?[A-Za-z_][\w]*`?)?)"
+        r"\s+(?:as\s+)?(?P<alias>[A-Za-z_]\w*)\b",
+        flags=re.I,
     )
+
     out: Dict[str, str] = {}
-    for table, alias in pattern.findall(sql):
-        out[alias] = table
+    for m in pat.finditer(sql):
+        table_raw = m.group("table")
+        alias = m.group("alias")
+        # normalize: drop schema and backticks
+        if alias and alias.lower() in _RESERVED_ALIASES:
+            continue
+        tbl = table_raw.replace("`", "")
+        tbl = tbl.split(".")[-1]
+        out[alias] = tbl
+        out[alias.lower()] = tbl  # convenience
     return out
 
 # ======================================================================
@@ -266,6 +421,31 @@ def validate_identifiers(sql: str, ctx: str) -> List[str]:
     allowed = _parse_allowed_identifiers(ctx)
     used = _identify_used_identifiers(sql)
     errs: List[str] = []
+
+    alias2table = _parse_from_join_aliases(sql)  # alias -> table (canonical)
+    # build reverse: table names set (lower) to help mapping
+    allowed_lower = {t.lower(): t for t in allowed.keys()}
+
+    # Remap used qualifiers (aliases) to real tables
+    remapped: Dict[Optional[str], Set[str]] = {}
+    for q, cols in used.items():
+        if q is None:
+            remapped.setdefault(None, set()).update(cols)
+            continue
+
+        q_norm = q.strip("`")
+        # if qualifier is alias -> table
+        t = alias2table.get(q_norm) or alias2table.get(q_norm.lower())
+        if t:
+            # normalize to ALLOWED canonical casing if possible
+            canon = allowed_lower.get(t.lower(), t)
+            remapped.setdefault(canon, set()).update(cols)
+        else:
+            # qualifier might already be a table name
+            canon = allowed_lower.get(q_norm.lower(), q_norm)
+            remapped.setdefault(canon, set()).update(cols)
+
+    used = remapped
 
     explicit_tables = {t for t in used.keys() if t is not None}
 
@@ -534,17 +714,35 @@ You are a senior SQL assistant for MySQL 8.0.
 Use ONLY tables/columns listed under ALLOWED IDENTIFIERS in Context.
 If Context lists aliases, use the canonical column name.
 
-Customer naming preference:
-If the query is about customers and the user does NOT explicitly ask for an id/number/code, prefer customerName over customerNumber (and over contactFirstName/contactLastName).
+Customer naming preference (OUTPUT ONLY):
+When selecting customer attributes, prefer customerName over customerNumber unless the user explicitly asks for an id/number/code.
+This preference does NOT determine the anchor (driving) table.
+
+ANCHOR (driving table) rule:
+1) Row-preservation override:
+   If the user asks to include entities with zero related rows (e.g., "including customers with no payments", "never ordered"),
+   anchor the entity table (e.g., customers/products) and use LEFT JOIN or NOT EXISTS as appropriate.
+2) Otherwise choose anchor by primary measure/filter (use reranked Context evidence when possible):
+   - payments if the main filter/measure is payments.paymentDate or payments.amount
+   - orderdetails if computing sales/revenue or using orderdetails.quantityOrdered/priceEach
+   - orders if filtering by orders.orderDate/status/shippedDate/requiredDate
+3) "For each <entity>" implies GROUP BY that entity, not necessarily anchoring that entity.
 
 JOIN rule:
 - If all needed columns exist in ONE allowed table: do NOT JOIN.
 - JOIN only when needed to fetch columns from multiple tables.
 
+JOIN TYPE DEFAULT (IMPORTANT):
+- Use INNER JOIN by default.
+- Use LEFT JOIN ONLY when the question explicitly requires keeping entities with zero related rows
+  (e.g., "including customers with no payments", "all customers even if no payments", "never ordered/paid", "termasuk yang tidak punya").
+- Selecting customerName / grouping by customerName does NOT mean you should keep all customers.
+  Anchor is determined by the primary filter/measure (see ANCHOR rule).
+
 LIKE vs REGEXP:
 - Use LIKE only for simple wildcard intent: starts with -> 'X%', ends with -> '%X', contains -> '%X%'. Do NOT put ^ or $ inside LIKE.
 - Use REGEXP only if: (a) word-boundary intent (word starts with X), (b) strict structure/format (exact length/digits), or (c) user explicitly requests regex.
-  - Word-boundary REGEXP must use: (^|[^[:alnum:]_]) as left boundary and [[:alnum:]_]* after prefix. Do NOT use \b or \w.
+  - Word-boundary REGEXP must use: (^|[^[:alnum:]_]) as left boundary and [[:alnum:]_]* after prefix. Do NOT use \\b or \\w.
   - Strict-structure REGEXP must be anchored with ^ and $.
 
 Output:
@@ -567,6 +765,163 @@ _JOIN_KW = r"(?:inner\s+join|left\s+join|right\s+join|full\s+join|join)"
 
 def has_join(sql: str) -> bool:
     return re.search(rf"\b{_JOIN_KW}\b", sql, flags=re.I) is not None
+
+def join_count(sql: str) -> int:
+    if not sql:
+        return 0
+    return len(re.findall(r"\bjoin\b", sql, flags=re.I))
+
+def has_non_inner_join(sql: str) -> bool:
+    if not sql:
+        return False
+    return re.search(r"\b(left|right|full)\s+join\b", sql, flags=re.I) is not None
+
+TRANSACTION_TABLES = {"payments", "orderdetails", "orders"}
+
+_ANCHOR_SIGNALS = {
+    "payments": {"amount", "paymentDate", "customerNumber"},
+    "orderdetails": {"quantityOrdered", "priceEach", "orderLineNumber", "orderNumber", "productCode"},
+    "orders": {"orderDate", "status", "shippedDate", "requiredDate", "customerNumber"},
+}
+
+def pick_preferred_anchor_from_ranked_cols(
+    ranked_cols: List[tuple[str, str]],
+    top_n: int = 12,
+) -> Optional[str]:
+    if not ranked_cols:
+        return None
+
+    head = ranked_cols[:max(1, top_n)]
+
+    # 1) signal-based (lebih kuat)
+    for tbl in ("payments", "orderdetails", "orders"):
+        sig = _ANCHOR_SIGNALS[tbl]
+        for t, c in head:
+            if (t or "").lower() == tbl and c in sig:
+                return tbl
+
+    # 2) fallback: first transaction table in head
+    for t, _ in head:
+        tl = (t or "").lower()
+        if tl in TRANSACTION_TABLES:
+            return tl
+
+    return None
+
+def normalize_anchor_for_simple_inner_join(sql: str, preferred_anchor: Optional[str]) -> str:
+    if not sql or not preferred_anchor:
+        return sql
+
+    if not has_join(sql):
+        return sql
+    if has_non_inner_join(sql):
+        return sql
+    if join_count(sql) != 1:
+        return sql
+
+    pat = re.compile(
+        r"""
+        ^(?P<prefix>.*?)
+        \bFROM\s+(?P<t1>`?[A-Za-z_][A-Za-z0-9_]*`?)\s+(?:AS\s+)?(?P<a1>[A-Za-z_][A-Za-z0-9_]*)
+        \s+\b(?:INNER\s+)?JOIN\s+(?P<t2>`?[A-Za-z_][A-Za-z0-9_]*`?)\s+(?:AS\s+)?(?P<a2>[A-Za-z_][A-Za-z0-9_]*)
+        \s+\bON\s+(?P<on>.*?)
+        (?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*?|;?\s*)$
+        """,
+        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    )
+    m = pat.match(sql.strip())
+    if not m:
+        return sql
+
+    def _strip_ticks(x: str) -> str:
+        return (x or "").strip().strip("`")
+
+    t1 = _strip_ticks(m.group("t1")).lower()
+    t2 = _strip_ticks(m.group("t2")).lower()
+    pref = preferred_anchor.lower()
+
+    if pref == t1:
+        return sql
+    if pref != t2:
+        return sql
+
+    prefix = m.group("prefix")
+    t1_raw, a1 = m.group("t1"), m.group("a1")
+    t2_raw, a2 = m.group("t2"), m.group("a2")
+    on_clause = m.group("on").strip()
+    tail = m.group("tail") or ""
+
+    return f"{prefix}FROM {t2_raw} {a2} JOIN {t1_raw} {a1} ON {on_clause}{tail}"
+
+def _rewrite_left_join_to_inner_if_rhs_filtered(sql: str, question: str) -> str:
+    """
+    Generic Fix 2:
+    If a LEFT JOIN's RHS is filtered in WHERE, it is semantically an INNER JOIN.
+    Convert LEFT JOIN -> JOIN, unless the question explicitly wants include-zero rows.
+    Works with or without aliases.
+    """
+    if not sql:
+        return sql
+    if _question_wants_include_zero(question):
+        return sql
+
+    # Only handle the simplest, safest case: exactly one JOIN, and it's a LEFT JOIN.
+    if join_count(sql) != 1:
+        return sql
+    if not re.search(r"\bleft\s+join\b", sql, flags=re.I):
+        return sql
+
+    # Capture: FROM <t1> [a1] LEFT JOIN <t2> [a2] ON ... (tail includes WHERE/etc.)
+    pat = re.compile(
+        r"""
+        ^(?P<prefix>.*?)
+        \bFROM\s+(?P<t1>`?[A-Za-z_][A-Za-z0-9_]*`?)
+        (?:\s+(?:AS\s+)?(?P<a1>[A-Za-z_][A-Za-z0-9_]*))?
+        \s+LEFT\s+JOIN\s+(?P<t2>`?[A-Za-z_][A-Za-z0-9_]*`?)
+        (?:\s+(?:AS\s+)?(?P<a2>[A-Za-z_][A-Za-z0-9_]*))?
+        \s+\bON\s+(?P<on>.*?)
+        (?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*?|;?\s*)$
+        """,
+        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    )
+    m = pat.match(sql.strip())
+    if not m:
+        return sql
+
+    t2 = (m.group("t2") or "").strip().strip("`")
+    a2 = (m.group("a2") or "").strip()
+    tail = m.group("tail") or ""
+
+    # Determine RHS qualifier candidates: alias if exists, else table name.
+    rhs_qualifiers = []
+    if a2:
+        rhs_qualifiers.append(a2)
+    if t2:
+        rhs_qualifiers.append(t2)
+
+    # Must have WHERE, and WHERE must reference RHS (alias/table). Otherwise keep LEFT JOIN.
+    where_m = re.search(r"\bWHERE\b", tail, flags=re.I)
+    if not where_m:
+        return sql
+
+    # Check RHS usage in WHERE (e.g., "p.paymentDate", "payments.paymentDate")
+    rhs_referenced = any(
+        re.search(rf"\b{re.escape(q)}\s*\.", tail, flags=re.I) for q in rhs_qualifiers
+    )
+    if not rhs_referenced:
+        return sql
+
+    # Safe rewrite: LEFT JOIN -> JOIN (results preserved due to WHERE filtering RHS)
+    prefix = m.group("prefix")
+    t1_raw = m.group("t1")
+    a1 = m.group("a1")
+    t2_raw = m.group("t2")
+    on_clause = m.group("on").strip()
+
+    from_part = f"FROM {t1_raw}" + (f" {a1}" if a1 else "")
+    join_part = f" JOIN {t2_raw}" + (f" {a2}" if a2 else "")
+
+    return f"{prefix}{from_part}{join_part} ON {on_clause}{tail}"
 
 def _canonicalize_table_names(sql: str, ctx: str) -> str:
     """
@@ -751,12 +1106,20 @@ def _question_requests_ordering(question: str) -> bool:
 def _strip_unneeded_count_distinct(sql: str) -> str:
     low = sql.lower()
     if "from customers" in low and "join orders" in low:
-        sql = re.sub(
-            r"COUNT\s*\(\s*DISTINCT\s+o\.orderNumber\s*\)",
-            "COUNT(o.orderNumber)",
-            sql,
-            flags=re.IGNORECASE,
-        )
+        a2t = _parse_from_join_aliases(sql)
+        # cari alias untuk orders
+        orders_alias = None
+        for a, t in a2t.items():
+            if t.lower() == "orders" and a.islower():  # ambil versi normal
+                orders_alias = a
+                break
+        if orders_alias:
+            sql = re.sub(
+                rf"COUNT\s*\(\s*DISTINCT\s+{re.escape(orders_alias)}\.orderNumber\s*\)",
+                f"COUNT({orders_alias}.orderNumber)",
+                sql,
+                flags=re.I,
+            )
     return sql
 
 def _should_prefer_like_over_regexp(question: str) -> bool:
@@ -786,14 +1149,6 @@ def _rewrite_simple_regexp_to_like(sql: str, question: str) -> str:
     """
     if not sql or not _should_prefer_like_over_regexp(question):
         return sql
-
-    # REGEXP '^196' => LIKE '196%'
-    sql = re.sub(
-        r"(\bWHERE\b.*?\b([A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+REGEXP\s+)'\^([A-Za-z0-9 _-]+)'",
-        r"\1'\3%'".replace("REGEXP", "LIKE"),  # aman karena group(1) masih mengandung REGEXP
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
 
     # REGEXP '^196' di atas: replace("REGEXP","LIKE") belum terjadi karena r"\1" literal.
     # Jadi kita lakukan rewrite yang lebih eksplisit agar tidak ambigu:
@@ -827,29 +1182,31 @@ def _guardrail_fix_like_regex_anchors(sql: str, question: str) -> str:
     q = (question or "").lower()
 
     starts = any(k in q for k in [
-    "starts with", "start with",
-    "begins with", "begin with",
-    "diawali", "awalan", "awal", "prefix"])
+        "starts with", "start with",
+        "begins with", "begin with",
+        "diawali", "awalan", "awal", "prefix"
+    ])
     ends = any(k in q for k in [
         "ends with", "end with",
-        "diakhiri", "akhir", "suffix"])
+        "diakhiri", "akhir", "suffix"
+    ])
     contains = any(k in q for k in [
         "contains", "contain",
-        "mengandung"])
+        "mengandung"
+    ])
 
     # Rewrite LIKE '^X' -> LIKE 'X%'
     def repl_starts(m: re.Match) -> str:
         col = m.group(1)
         val = m.group(2)
-        return f"{col} LIKE '{val}%'"
+        return f"{col}LIKE '{val}%'"
 
     # Rewrite LIKE 'X$' -> LIKE '%X'
     def repl_ends(m: re.Match) -> str:
         col = m.group(1)
         val = m.group(2)
-        return f"{col} LIKE '%{val}'"
+        return f"{col}LIKE '%{val}'"
 
-    # Generic: kalau question "starts with" tapi pattern like '^...' muncul
     if starts:
         sql = re.sub(
             r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+)LIKE\s+'\^([^']*)'",
@@ -866,7 +1223,6 @@ def _guardrail_fix_like_regex_anchors(sql: str, question: str) -> str:
             flags=re.IGNORECASE,
         )
 
-    # Optional: kalau "contains" tapi dia bikin '^X$' atau '^X'
     if contains:
         sql = re.sub(
             r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+)LIKE\s+'\^([^']*)\$'",
@@ -882,6 +1238,16 @@ def _guardrail_fix_like_regex_anchors(sql: str, question: str) -> str:
         )
 
     return sql
+
+def _question_wants_include_zero(question: str) -> bool:
+    q = (question or "").lower()
+    signals = [
+        "including customers with no", "customers with no", "with no payments", "never paid",
+        "all customers", "even if no", "include those without",
+        "termasuk", "meskipun tidak", "walaupun tidak", "yang tidak punya", "tanpa pembayaran",
+        "pelanggan yang belum", "customer yang belum",
+    ]
+    return any(s in q for s in signals)
 
 def _rewrite_regexp_literal_to_posix_if_needed(lit: str) -> str:
     r"""
@@ -921,7 +1287,6 @@ def _rewrite_regexp_literal_to_posix_if_needed(lit: str) -> str:
     out = re.sub(r"(?<!\\)\\(?!\\)", r"\\\\", out)
 
     return out
-
 
 def _guardrail_fix_mysql_regexp_literals(sql: str) -> str:
     r"""
@@ -1064,105 +1429,483 @@ def _collect_alias_column_usage(sql: str) -> Dict[str, set]:
         usage[alias].add(col)
     return usage
 
-def _dynamic_prune_joins_if_single_table_possible(sql: str, question: str, ctx: str = "") -> str:
+def _question_wants_existence(question: str) -> bool:
+    q = (question or "").lower()
+
+    eng = [
+        "who have", "who has", "that have", "that has",
+        "with at least one", "having at least one",
+        "have at least one", "has at least one",
+        "with any", "have any", "has any",
+    ]
+
+    return any(p in q for p in eng)
+
+
+def _question_wants_anti_existence(question: str) -> bool:
+    q = (question or "").lower()
+
+    eng = [
+        "with no", "without any", "who have no", "who has no",
+        "that have no", "that has no",
+        "never", "have never", "has never",
+        "no orders", "no payments",
+    ]
+
+    return any(p in q for p in eng)
+
+def _rewrite_inner_join_existence_to_exists(sql: str, question: str) -> str:
+    if not sql:
+        return sql
+    if join_count(sql) != 1:
+        return sql
+    if re.search(r"\b(left|right|full)\s+join\b", sql, flags=re.I):
+        return sql
+    if _question_wants_anti_existence(question):
+        return sql
+    if not _question_wants_existence(question):
+        return sql
+
+    s0 = sql.strip()
+
+    pat = re.compile(
+        r"""
+        ^(?P<prefix>.*?)
+        \bFROM\s+(?P<t1>`?[A-Za-z_][A-Za-z0-9_]*`?)\s+(?:AS\s+)?(?P<a1>[A-Za-z_][A-Za-z0-9_]*)
+        \s+\b(?:INNER\s+)?JOIN\s+(?P<t2>`?[A-Za-z_][A-Za-z0-9_]*`?)\s+(?:AS\s+)?(?P<a2>[A-Za-z_][A-Za-z0-9_]*)
+        \s+\bON\s+(?P<on>.*?)
+        (?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*?|;?\s*)$
+        """,
+        flags=re.I | re.S | re.VERBOSE,
+    )
+    m = pat.match(s0)
+    if not m:
+        return sql
+
+    prefix = m.group("prefix")
+    t1, a1 = m.group("t1"), m.group("a1")
+    t2, a2 = m.group("t2"), m.group("a2")
+    on_clause = (m.group("on") or "").strip()
+    tail = m.group("tail") or ""
+
+    # RHS alias must not be used outside ON (mask ON on s0, not sql)
+    start_on = m.start("on")
+    end_on = m.end("on")
+    masked = s0[:start_on] + (" " * (end_on - start_on)) + s0[end_on:]
+    if re.search(rf"\b{re.escape(a2)}\s*\.", masked, flags=re.I):
+        return sql
+
+    exists_expr = f"EXISTS (SELECT 1 FROM {t2} {a2} WHERE {on_clause})"
+
+    if re.search(r"\bWHERE\b", tail, flags=re.I):
+        tail2 = re.sub(r"\bWHERE\b", f"WHERE {exists_expr} AND ", tail, count=1, flags=re.I)
+        return f"{prefix}FROM {t1} {a1}{tail2}"
+    else:
+        return f"{prefix}FROM {t1} {a1} WHERE {exists_expr}{tail}"
+
+def _split_where_and_rest(tail: str) -> tuple[Optional[str], str]:
     """
-    Coba hilangkan JOIN yang tidak perlu secara dinamis:
-    - Lihat alias -> table dari FROM/JOIN
-    - Lihat kolom yang dipakai per alias
-    - Lihat schema dari ALLOWED IDENTIFIERS
-    - Kalau semua kolom yang dipakai lewat alias lain juga ada di 1 tabel anchor,
-      alias itu dianggap redundant dan JOIN-nya bisa dihapus.
-
-    Hanya aktif untuk query jenis 'lookup' dan 'aggregate_all' (lebih aman).
+    tail mulai dari WHERE/GROUP/ORDER/HAVING/LIMIT atau kosong.
+    Return: (where_body_or_None, rest_after_where)
     """
-    if not sql or not has_join(sql):
-        return sql
+    if not tail:
+        return None, ""
+    m = re.search(r"\bWHERE\b\s+(.*)$", tail, flags=re.I | re.S)
+    if not m:
+        return None, tail
 
-    allowed = _parse_allowed_identifiers(ctx)
-    if not allowed:
-        return sql
+    after_where = m.group(1)
 
-    alias2table = _parse_from_join_aliases(sql)
-    if len(alias2table) <= 1:
-        return sql  # nggak ada join beneran
+    # potong saat ketemu clause berikutnya (GROUP BY/ORDER BY/HAVING/LIMIT)
+    m2 = re.search(r"\b(GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b", after_where, flags=re.I)
+    if not m2:
+        return after_where.strip(), ""
 
-    usage = _collect_alias_column_usage(sql)
+    where_body = after_where[:m2.start()].strip()
+    rest = after_where[m2.start():]  # include keyword
+    return where_body, " " + rest.strip()
 
-    # Pilih alias anchor: yang paling banyak dipakai kolomnya
-    alias_counts = {a: len(cols) for a, cols in usage.items() if a in alias2table}
-    if not alias_counts:
-        return sql
 
-    primary_alias = max(alias_counts.items(), key=lambda x: x[1])[0]
-    primary_table = alias2table.get(primary_alias)
-    if not primary_table or primary_table not in allowed:
-        return sql
+def _split_top_level_and(expr: str) -> List[str]:
+    """
+    Split expr by AND di level top (tidak di dalam tanda kutip / kurung).
+    Kalau ada OR top-level, kita abort di caller (biar safe).
+    """
+    if not expr:
+        return []
 
-    # schema lower-case
-    allowed_lower = {t.lower(): {c.lower() for c in cols} for t, cols in allowed.items()}
-    primary_cols = allowed_lower.get(primary_table.lower())
-    if not primary_cols:
-        return sql
+    s = expr.strip()
+    parts = []
+    buf = []
+    depth = 0
+    in_sq = False
+    in_dq = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
 
-    redundant_aliases: List[tuple[str, str]] = []
-
-    for alias, cols in usage.items():
-        if alias == primary_alias:
+        # handle quotes
+        if ch == "'" and not in_dq:
+            # handle escaped '' (double single quote)
+            if in_sq and i + 1 < len(s) and s[i + 1] == "'":
+                buf.append("''")
+                i += 2
+                continue
+            in_sq = not in_sq
+            buf.append(ch)
+            i += 1
             continue
-        table = alias2table.get(alias)
-        if not table:
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            buf.append(ch)
+            i += 1
             continue
-        if table not in allowed:
-            continue  # kita nggak tahu schema-nya, jangan diutak-atik
 
-        # semua kolom yang dipakai via alias ini harus tersedia juga di tabel anchor
-        if all(col.lower() in primary_cols for col in cols):
-            redundant_aliases.append((alias, table))
+        if in_sq or in_dq:
+            buf.append(ch)
+            i += 1
+            continue
 
-    if not redundant_aliases:
+        # parentheses nesting
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+
+        # detect AND at top-level
+        if depth == 0 and s[i:i+3].lower() == "and":
+            # boundary check
+            left_ok = (i == 0) or not s[i-1].isalnum()
+            right_ok = (i+3 >= len(s)) or not s[i+3].isalnum()
+            if left_ok and right_ok:
+                parts.append("".join(buf).strip())
+                buf = []
+                i += 3
+                continue
+
+        buf.append(ch)
+        i += 1
+
+    last = "".join(buf).strip()
+    if last:
+        parts.append(last)
+    return [p for p in parts if p]
+
+
+def _has_top_level_or(expr: str) -> bool:
+    # konservatif: jika ada OR di luar quote/paren, kita tidak rewrite
+    s = expr.strip()
+    depth = 0
+    in_sq = False
+    in_dq = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_dq:
+            if in_sq and i + 1 < len(s) and s[i + 1] == "'":
+                i += 2
+                continue
+            in_sq = not in_sq
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            i += 1
+            continue
+        if in_sq or in_dq:
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0 and s[i:i+2].lower() == "or":
+            left_ok = (i == 0) or not s[i-1].isalnum()
+            right_ok = (i+2 >= len(s)) or not s[i+2].isalnum()
+            if left_ok and right_ok:
+                return True
+        i += 1
+    return False
+
+
+def _rewrite_inner_join_filter_to_exists(sql: str) -> str:
+    """
+    Rewrite filter-only INNER JOIN -> EXISTS.
+    Syarat aman:
+    - exactly 1 JOIN
+    - join inner/join (bukan LEFT/RIGHT/FULL)
+    - RHS alias tidak dipakai di SELECT/GROUP/ORDER/HAVING (boleh dipakai di WHERE)
+    - WHERE tidak punya top-level OR (hanya AND)
+    - ada minimal 1 predicate RHS-only di WHERE yang bisa dipindah
+    """
+    if not sql:
+        return sql
+    if join_count(sql) != 1:
+        return sql
+    if re.search(r"\b(left|right|full)\s+join\b", sql, flags=re.I):
         return sql
 
-    new_sql = sql
+    s0 = sql.strip()
 
-    for alias, table in redundant_aliases:
-        # ----------------------------------------------------------------------------
-        # 1) ganti alias.col -> primary_alias.col untuk kolom yang ada di tabel anchor
-        # ----------------------------------------------------------------------------
-        pattern = re.compile(
-            rf"\b{re.escape(alias)}\.\s*([A-Za-z_][A-Za-z0-9_]*)",
-            flags=re.IGNORECASE,
-        )
+    pat = re.compile(
+        r"""
+        ^(?P<prefix_select>.*?)
+        \bFROM\s+(?P<t1>`?[A-Za-z_][A-Za-z0-9_]*`?)\s+(?:AS\s+)?(?P<a1>[A-Za-z_][A-Za-z0-9_]*)
+        \s+\b(?:INNER\s+)?JOIN\s+(?P<t2>`?[A-Za-z_][A-Za-z0-9_]*`?)\s+(?:AS\s+)?(?P<a2>[A-Za-z_][A-Za-z0-9_]*)
+        \s+\bON\s+(?P<on>.*?)
+        (?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*?|;?\s*)$
+        """,
+        flags=re.I | re.S | re.VERBOSE,
+    )
+    m = pat.match(s0)
+    if not m:
+        return sql
 
-        def _repl(m: re.Match) -> str:
-            col = m.group(1)
-            if col.lower() in primary_cols:
-                return f"{primary_alias}.{col}"
-            return m.group(0)
+    prefix_select = m.group("prefix_select")
+    t1, a1 = m.group("t1"), m.group("a1")
+    t2, a2 = m.group("t2"), m.group("a2")
+    on_clause = (m.group("on") or "").strip()
+    tail = m.group("tail") or ""
 
-        new_sql = pattern.sub(_repl, new_sql)
-        # ----------------------------------------------------------------------------
-        # 2) hapus JOIN <table> <alias> ON ...
-        # ----------------------------------------------------------------------------
-        join_pat = re.compile(
-            rf"""
+    where_body, rest_after_where = _split_where_and_rest(tail)
+
+    # kalau tidak ada WHERE, berarti bukan filter-only join -> skip
+    if not where_body:
+        return sql
+
+    # jangan rewrite kalau ada OR top-level (biar tidak salah distribusi)
+    if _has_top_level_or(where_body):
+        return sql
+
+    # Pastikan RHS alias tidak dipakai di SELECT/GROUP/ORDER/HAVING
+    # Cek bagian SELECT (prefix_select) dan rest_after_where
+    if re.search(rf"\b{re.escape(a2)}\s*\.", prefix_select, flags=re.I):
+        return sql
+    if re.search(rf"\b{re.escape(a2)}\s*\.", rest_after_where, flags=re.I):
+        return sql
+
+    # Ambil conjunct AND top-level
+    conjuncts = _split_top_level_and(where_body)
+
+    rhs_only = []
+    keep = []
+    for c in conjuncts:
+        c0 = c.strip()
+        has_rhs = re.search(rf"\b{re.escape(a2)}\s*\.", c0, flags=re.I) is not None
+        has_lhs = re.search(rf"\b{re.escape(a1)}\s*\.", c0, flags=re.I) is not None
+
+        # rhs-only: refer RHS, tidak refer LHS, dan bukan subquery SELECT (konservatif)
+        if has_rhs and (not has_lhs) and (re.search(r"\bselect\b", c0, flags=re.I) is None):
+            rhs_only.append(c0)
+        else:
+            keep.append(c0)
+
+    if not rhs_only:
+        return sql
+
+    rhs_filters = " AND ".join(rhs_only)
+    on_has_rhs_filter = _on_clause_has_rhs_filter(on_clause, a2)
+
+    # Kalau tidak ada rhs_only dari WHERE, tapi ON sudah filter-like, tetap boleh rewrite
+    if (not rhs_only) and (not on_has_rhs_filter):
+        return sql
+
+    exists_where = on_clause
+    if rhs_filters:
+        exists_where = f"{on_clause} AND {rhs_filters}"
+        
+    exists_expr = f"EXISTS (SELECT 1 FROM {t2} {a2} WHERE {on_clause} AND {rhs_filters})"
+
+    new_where_parts = []
+    if keep:
+        new_where_parts.append(" AND ".join(keep))
+    new_where_parts.append(exists_expr)
+
+    new_where = " WHERE " + " AND ".join(new_where_parts)
+
+    return f"{prefix_select}FROM {t1} {a1}{new_where}{(' ' + rest_after_where.strip()) if rest_after_where.strip() else ''}"
+
+def _strip_string_literals(s: str) -> str:
+    s = re.sub(r"'(?:''|[^'])*'", "''", s)
+    s = re.sub(r'"(?:""|[^"])*"', '""', s)
+    return s
+
+def _on_clause_has_rhs_filter(on_clause: str, rhs_alias: str) -> bool:
+    if not on_clause or not rhs_alias:
+        return False
+
+    oc = _strip_string_literals(on_clause)
+
+    # 1) operator non-equality yang jelas filter-like
+    if re.search(rf"\b{re.escape(rhs_alias)}\.\w+\s*(>=|<=|<>|!=|>|<)\s*", oc, flags=re.I):
+        return True
+    if re.search(rf"\b{re.escape(rhs_alias)}\.\w+\s+\b(BETWEEN|LIKE|IN|REGEXP|RLIKE)\b", oc, flags=re.I):
+        return True
+    if re.search(rf"\b{re.escape(rhs_alias)}\.\w+\s+IS\s+(NOT\s+)?NULL\b", oc, flags=re.I):
+        return True
+
+    # 2) equality ke literal/angka/param/fungsi juga filter-like
+    # rhs.col = 'X' / 123 / (subexpr) / func(...)
+    if re.search(rf"\b{re.escape(rhs_alias)}\.\w+\s*=\s*('|\d|\(|\bNULL\b)", oc, flags=re.I):
+        return True
+    if re.search(rf"\b{re.escape(rhs_alias)}\.\w+\s*=\s*\w+\s*\(", oc, flags=re.I):
+        return True
+
+    return False
+
+def _drop_redundant_inner_join_same_key(sql: str) -> str:
+    """
+    Drop INNER JOIN jika:
+    - hanya 1 JOIN
+    - ON adalah equality join-key sederhana: a1.k = a2.k (nama kolom sama)
+    - RHS alias/table tidak dipakai untuk kolom lain di SELECT/WHERE/GROUP/ORDER/HAVING (kecuali join key)
+    Lalu rewrite: rhs.k -> lhs.k di luar ON, dan buang JOIN.
+    """
+    if not sql or join_count(sql) != 1:
+        return sql
+    if has_non_inner_join(sql):
+        return sql
+
+    pat = re.compile(
+        r"""
+        ^(?P<prefix>.*?)
+        \bFROM\s+(?P<t1>`?[A-Za-z_][A-Za-z0-9_]*`?)
+        (?:\s+(?:AS\s+)?(?P<a1>[A-Za-z_][A-Za-z0-9_]*))?
+        \s+\b(?:INNER\s+)?JOIN\s+(?P<t2>`?[A-Za-z_][A-Za-z0-9_]*`?)
+        (?:\s+(?:AS\s+)?(?P<a2>[A-Za-z_][A-Za-z0-9_]*))?
+        \s+\bON\s+(?P<on>.*?)
+        (?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*?|;?\s*)$
+        """,
+        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    )
+    m = pat.match(sql.strip())
+    if not m:
+        return sql
+
+    a1 = (m.group("a1") or "").strip()
+    a2 = (m.group("a2") or "").strip()
+    t1 = (m.group("t1") or "").strip().strip("`")
+    t2 = (m.group("t2") or "").strip().strip("`")
+    on_txt = (m.group("on") or "").strip()
+    tail = m.group("tail") or ""
+
+    lhs = a1 or t1
+    rhs = a2 or t2
+
+    # ON harus bentuk sederhana: lhs.k = rhs.k (atau kebalik), dengan k sama
+    on_clean = _strip_string_literals(on_txt)
+    on_m = re.search(
+        rf"\b{re.escape(lhs)}\.(?P<k1>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*{re.escape(rhs)}\.(?P<k2>[A-Za-z_][A-Za-z0-9_]*)\b"
+        rf"|\b{re.escape(rhs)}\.(?P<k3>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*{re.escape(lhs)}\.(?P<k4>[A-Za-z_][A-Za-z0-9_]*)\b",
+        on_clean,
+        flags=re.I,
+    )
+    if not on_m:
+        return sql
+
+    k_left = (on_m.group("k1") or on_m.group("k4") or "")
+    k_right = (on_m.group("k2") or on_m.group("k3") or "")
+    if not k_left or not k_right:
+        return sql
+
+    # konservatif: hanya kalau nama kolom sama (case-insensitive)
+    if k_left.lower() != k_right.lower():
+        return sql
+
+    join_key = k_left  # canonical from lhs side
+
+    # Cari semua rhs.<col> di tail (dan select/prefix) kecuali join_key
+    # Pakai sql full (di luar ON) dengan masking berbasis segment:
+    sql_no_strings = _strip_string_literals(sql)
+    # ambil bagian di luar ON untuk cek penggunaan RHS
+    outside_on = (m.group("prefix") or "") + (m.group("tail") or "")
+    outside_on = _strip_string_literals(outside_on)
+
+    # Jika RHS dipakai untuk kolom lain selain join_key → tidak aman drop
+    bad_rhs_use = re.search(
+        rf"\b{re.escape(rhs)}\.(?!{re.escape(join_key)}\b)[A-Za-z_][A-Za-z0-9_]*\b",
+        outside_on,
+        flags=re.I,
+    )
+    if bad_rhs_use:
+        return sql
+
+    # Rewrite rhs.join_key -> lhs.join_key di luar ON
+    def _rewrite_outside_on(text: str) -> str:
+        parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`[^`]*`)", text)
+        for i in range(0, len(parts), 2):
+            parts[i] = re.sub(
+                rf"\b{re.escape(rhs)}\s*\.\s*{re.escape(join_key)}\b",
+                f"{lhs}.{join_key}",
+                parts[i],
+                flags=re.I,
+            )
+        return "".join(parts)
+
+    prefix = (m.group("prefix") or "")
+    t1_raw = m.group("t1")
+    from_part = f"FROM {t1_raw}" + (f" {a1}" if a1 else "")
+    new_tail = _rewrite_outside_on(tail)
+
+    return f"{prefix}{from_part}{new_tail}"
+
+def _prune_ornamental_joins_safe(sql: str, question: str = "") -> str:
+    if not sql:
+        return sql
+
+    out = sql
+
+    join_pat = re.compile(
+        r"""
+        (?P<full>
             \s+
-            (?:INNER\s+|LEFT\s+|RIGHT\s+|FULL\s+OUTER\s+|FULL\s+)?JOIN
-            \s+{re.escape(table)}\s+{re.escape(alias)}
-            \s+ON
+            (?P<jtype>(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN))
             \s+
-            .*?
-            (?=(\s+(?:INNER\s+|LEFT\s+|RIGHT\s+|FULL\s+OUTER\s+)?JOIN\b
-                |\s+WHERE\b
-                |\s+GROUP\s+BY\b
-                |\s+ORDER\s+BY\b
-                |\s+LIMIT\b
-                |;|$))
-            """,
-            flags=re.IGNORECASE | re.VERBOSE | re.DOTALL,
+            (?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)
+            (?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?
+            \s+\bON\b\s+(?P<on>.*?)
         )
-        new_sql = join_pat.sub(" ", new_sql, count=1)
+        (?=
+            \b(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN)\b
+            |\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b
+            |;|$
+        )
+        """,
+        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    )
 
-    return new_sql
+    # ...lanjutkan logic kamu yang existing,
+    # tapi pakai m.group("table") bila alias None
+    matches = list(join_pat.finditer(out))
+    for m in reversed(matches):
+        alias = m.group("alias") or (m.group("table") or "").strip("`")
+        jtype = (m.group("jtype") or "").upper()
+        on_txt = m.group("on") or ""
+
+        start_on = m.start("on")
+        end_on = m.end("on")
+        masked = out[:start_on] + (" " * (end_on - start_on)) + out[end_on:]
+
+        if re.search(rf"\b{re.escape(alias)}\s*\.", masked, flags=re.I):
+            continue
+
+        is_inner = ("LEFT" not in jtype and "RIGHT" not in jtype and "FULL" not in jtype)
+        if is_inner:
+            if _on_clause_has_rhs_filter(on_txt, alias):
+                continue
+
+        out = out[:m.start("full")] + " " + out[m.end("full"):]
+    return out
 
 # ======================================================================
 # ===================== SQL NORMALIZATION PIPELINE =====================
@@ -1261,6 +2004,14 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
 
     s = _fix_bad_backticks(s)
     s = _canonicalize_table_names(s, context)
+    s = ensure_join_aliases(s)
+    s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question)
+    s = _rewrite_inner_join_filter_to_exists(s)
+    s = _rewrite_inner_join_existence_to_exists(s, question)
+    s = _drop_redundant_inner_join_same_key(s)
+    s = _prune_ornamental_joins_safe(s, question)
+    
+
     s = _guardrail_fix_like_regex_anchors(s, question)
     s = _rewrite_simple_regexp_to_like(s, question)
     s = _guardrail_fix_mysql_regexp_literals(s)
@@ -1271,7 +2022,6 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
         s = _remove_order_by_clause(s)
 
     # dynamic join pruning
-    s = _dynamic_prune_joins_if_single_table_possible(s, question, context)
     # strip qualifier kalau benar-benar single-table tanpa JOIN/CTE
     s = _strip_table_prefix_if_single_table(s)
     s = _maybe_add_limit(question, s)
@@ -1280,7 +2030,7 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
     s = _strip_unneeded_count_distinct(s)
     return s
 
-def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str) -> str:
+def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=None) -> str:
     """
     Pipeline standar untuk normalisasi SQL:
     - postprocess (normalize keyword, limit, distinct, dsb)
@@ -1289,7 +2039,13 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str) -> str:
     """
     if not raw_sql:
         return raw_sql
+
     s = _postprocess_sql(raw_sql, question, ctx)
+
+    if ranked_cols:
+        pref = pick_preferred_anchor_from_ranked_cols(ranked_cols, top_n=12)
+        s = normalize_anchor_for_simple_inner_join(s, pref)
+
     s = _repair_with_aliases(s, ctx)
     s = _postprocess_sql(s, question, ctx)
     return s
