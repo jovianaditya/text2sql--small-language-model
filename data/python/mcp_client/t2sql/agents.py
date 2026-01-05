@@ -65,7 +65,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     question = state.get("question", "")
     draft_sql = (state.get("draft_sql") or "").strip()
     notes = state.get("agent_notes") or ""
-
+    ranked_cols = state.get("ranked_cols") or []
     qtype = _get_qtype(state)
     requires_regex = _get_requires_regex(state)
     requires_boundary = _question_requires_word_boundary_regex(question)
@@ -76,7 +76,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         draft_sql = "SELECT 1;"
         corrections.append("Draft SQL missing, fallback to SELECT 1;")
 
-    final_sql = normalize_sql_pipeline(draft_sql, question, ctx)
+    final_sql = normalize_sql_pipeline(draft_sql, question, ctx, ranked_cols=ranked_cols)
 
     if final_sql:
         _dbg_print_two("[Agent2 SQL] After initial normalization:", final_sql)
@@ -90,7 +90,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         )
 
         draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
-        sql2 = normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
+        sql2 = normalize_sql_pipeline(draft2 or "", question, ctx, ranked_cols=ranked_cols) if draft2 else ""
 
         if sql2 and not has_join(sql2):
             corrections.append(f"Removed unnecessary JOINs because only single table `{single_tbl}` is allowed.")
@@ -114,7 +114,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             )
 
             draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
-            sql2 = normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
+            sql2 = normalize_sql_pipeline(draft2 or "", question, ctx, ranked_cols=ranked_cols) if draft2 else ""
 
             if sql2 and (("regexp" in sql2.lower()) or ("rlike" in sql2.lower())):
                 corrections.append("Enforced REGEXP usage for word-boundary requirement.")
@@ -131,7 +131,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         )
 
         draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
-        sql2 = normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
+        sql2 = normalize_sql_pipeline(draft2 or "", question, ctx, ranked_cols=ranked_cols) if draft2 else ""
 
         if sql2 and (("regexp" in sql2.lower()) or ("rlike" in sql2.lower())):
             corrections.append("Enforced REGEXP usage for strict structure requirement.")
@@ -157,7 +157,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             extra += "\nAdditionally: preserve REGEXP with ^ and $ anchors for strict pattern. Do NOT switch to LIKE."
 
         draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
-        sql2 = normalize_sql_pipeline(draft2 or "", question, ctx) if draft2 else ""
+        sql2 = normalize_sql_pipeline(draft2 or "", question, ctx, ranked_cols=ranked_cols) if draft2 else ""
 
         new_count = len(validate_identifiers(sql2 or "", ctx))
 
