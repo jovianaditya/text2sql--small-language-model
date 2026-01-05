@@ -357,6 +357,6 @@ cases:
       question: "Total payment amount for each customer on October 28, 2004."
       groundtruth_sql: |
         SELECT c.customerName, SUM(p.amount) 
-        FROM payments p LEFT JOIN customers c ON p.customerNumber = c.customerNumber 
+        FROM payments p INNER JOIN customers c ON p.customerNumber = c.customerNumber 
         WHERE p.paymentDate = '2004-10-28' 
         GROUP BY c.customerName;
