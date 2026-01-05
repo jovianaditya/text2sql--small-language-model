@@ -11,6 +11,7 @@ class RAGState(TypedDict, total=False):
     # generation outputs
     answer: str
     draft_sql: str
+    ranked_cols: List[tuple[str, str]]
     final_sql: str
     # Jenis query hasil classifier ('lookup', 'aggregate', 'rank', dst.)
     qtype: str
@@ -33,6 +34,7 @@ def make_state(paths, question: str) -> RAGState:
         "context": "",
         "answer": "",
         "draft_sql": "",
+        "ranked_cols": [],
         "final_sql": "",
         "qtype": "",
         "requires_regex": False,
