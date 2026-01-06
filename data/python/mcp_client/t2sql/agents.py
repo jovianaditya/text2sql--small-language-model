@@ -60,7 +60,6 @@ def _regex_requirement_ok(sql: str, requires_regex: bool, requires_boundary: boo
 
 def refine_sql_agent(state: RAGState) -> RAGState:
     llm = build_llm_repair()
-
     ctx = state.get("context", "")
     question = state.get("question", "")
     draft_sql = (state.get("draft_sql") or "").strip()
@@ -69,13 +68,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     qtype = _get_qtype(state)
     requires_regex = _get_requires_regex(state)
     requires_boundary = _question_requires_word_boundary_regex(question)
+    _dbg_print_two("[Agent2] Flags:", f"qtype={qtype} requires_regex={requires_regex} requires_boundary={requires_boundary}")
+
 
     corrections: list[str] = []
 
     if not draft_sql:
         draft_sql = "SELECT 1;"
         corrections.append("Draft SQL missing, fallback to SELECT 1;")
-
+    _dbg_print_two("[Agent2] Draft SQL (raw):", draft_sql)
     final_sql = normalize_sql_pipeline(draft_sql, question, ctx, ranked_cols=ranked_cols)
 
     if final_sql:
@@ -88,7 +89,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             f"The question is a simple lookup and ALLOWED IDENTIFIERS only lists a single table `{single_tbl}`.\n"
             "Rewrite the SQL so that it uses ONLY that single table and does NOT use any JOIN at all."
         )
-
+        _dbg_print_two("[Agent2] Repair LLM called because:", extra)
         draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
         sql2 = normalize_sql_pipeline(draft2 or "", question, ctx, ranked_cols=ranked_cols) if draft2 else ""
 
@@ -112,7 +113,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "(^|[^[:alnum:]_])X[[:alnum:]_]* . "
                 "Do NOT use \\b or \\w. Do NOT use LIKE for this case."
             )
-
+            _dbg_print_two("[Agent2] Repair LLM called because:", extra)
             draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
             sql2 = normalize_sql_pipeline(draft2 or "", question, ctx, ranked_cols=ranked_cols) if draft2 else ""
 
@@ -129,7 +130,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             "Rewrite using MySQL REGEXP with ^ and $ anchors. "
             "Do NOT use LIKE-only or numeric/substr tricks for the main pattern."
         )
-
+        _dbg_print_two("[Agent2] Repair LLM called because:", extra)
         draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
         sql2 = normalize_sql_pipeline(draft2 or "", question, ctx, ranked_cols=ranked_cols) if draft2 else ""
 
@@ -141,6 +142,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 notes = notes2
 
     violations = validate_identifiers(final_sql or "", ctx)
+    _dbg_print_two("[Agent2] Whitelist violations:", "\n".join(violations) if violations else "None")
     state["validation_errors"] = violations
 
     if violations:
@@ -155,7 +157,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             extra += "\nAdditionally: preserve REGEXP word-boundary style using (^|[^[:alnum:]_])X[[:alnum:]_]*. Do NOT switch to LIKE."
         elif requires_regex:
             extra += "\nAdditionally: preserve REGEXP with ^ and $ anchors for strict pattern. Do NOT switch to LIKE."
-
+        _dbg_print_two("[Agent2] Repair LLM called because:", extra)
         draft2, notes2 = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra)
         sql2 = normalize_sql_pipeline(draft2 or "", question, ctx, ranked_cols=ranked_cols) if draft2 else ""
 
