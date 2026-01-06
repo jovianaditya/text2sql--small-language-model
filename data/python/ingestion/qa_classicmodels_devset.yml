@@ -1,21 +1,133 @@
-EASY
-1. List all customers in Japan, showing their names and cities, sorted by city.
-- SELECT customerName, city FROM customers WHERE country = 'Japan' ORDER BY city;
-2. Show the 10 products with the highest stock levels. Display the product code, name, and quantity in stock.
-- SELECT productCode, productName, quantityInStock FROM products ORDER BY quantityInStock DESC LIMIT 10;
-3. List all orders placed in the year 2004. Show the order number and order date, ordered by order date from the latest.
-- SELECT orderNumber, orderDate FROM orders WHERE YEAR(orderDate) = 2004 ORDER BY orderDate DESC;
-4. Find all payments with an amount greater than 10,000. Show the customer number, check number, and amount, ordered by amount from highest to lowest.
-- SELECT customerNumber, checkNumber, amount FROM payments WHERE amount > 10000 ORDER BY amount DESC;
-5. Find offices where the state information is missing. Show the office code, city, country, and state.
-- SELECT officeCode, city, country, state FROM offices WHERE state IS NULL;
-6. Find all products whose names start with “196”. Show their product codes and names.
-- SELECT productCode, productName FROM products WHERE productName LIKE '196%';
-7. Find employees who work in offices with codes 1, 2, or 3. Show their employee numbers, first names, last names, and office codes.
-- SELECT employeeNumber, firstName, lastName, officeCode FROM employees WHERE officeCode IN ('1', '2', '3');
-8. Find employees whose phone extension starts with the letter "x" followed by exactly three digits. Show their employee numbers, first names, last names, and extensions.
-- SELECT employeeNumber, firstName, lastName, extension FROM employees WHERE extension REGEXP '^x[0-9]{3}$';
-9. Show orders that are either in status “Cancelled” or “On Hold”. Display the order number, order date, and status.
-SELECT orderNumber, orderDate, status FROM orders WHERE status IN('Cancelled','On Hold');
-10. Find products whose stock quantity is at least 500 and at most 1000 units. Show their product codes, names, and stock quantities.
-- SELECT productCode, productName, quantityInStock FROM products WHERE quantityInStock BETWEEN 500 AND 1000;
+cases:
+    - id: E1
+      difficulty: easy
+      question: "List all customers in Japan, showing their names and cities, sorted by city."
+      groundtruth_sql: |
+        SELECT customerName, city 
+        FROM customers 
+        WHERE country = 'Japan' 
+        ORDER BY city; 
+    - id: E2
+      difficulty: easy
+      question: "Show the 10 products with the highest stock levels. Display the product code, name, and quantity in stock."
+      groundtruth_sql: |
+        SELECT productCode, productName, quantityInStock 
+        FROM products 
+        ORDER BY quantityInStock 
+        DESC LIMIT 10;
+    - id: E3
+      difficulty: easy
+      question: "List all orders placed in the year 2004. Show the order number and order date, ordered by order date from the latest."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate 
+        FROM orders 
+        WHERE YEAR(orderDate) = 2004 
+        ORDER BY orderDate DESC;
+    - id: E4
+      difficulty: easy
+      question: "Find all payments with an amount greater than 10,000. Show the customer number, check number, and amount, ordered by amount from highest to lowest."
+      groundtruth_sql: |
+        SELECT customerNumber, checkNumber, amount 
+        FROM payments 
+        WHERE amount > 10000 
+        ORDER BY amount DESC;
+    - id: E5
+      difficulty: easy
+      question: "Find offices where the state information is missing. Show the office code, city, country, and state."
+      groundtruth_sql: |
+        SELECT officeCode, city, country, state 
+        FROM offices 
+        WHERE (state IS NULL OR state = '');
+    - id: E6
+      difficulty: easy
+      question: "Find all products whose names start with “196”. Show their product codes and names."
+      groundtruth_sql: |
+        SELECT productCode, productName 
+        FROM products 
+        WHERE productName LIKE '196%';
+    - id: E7
+      difficulty: easy
+      question: "Find employees who work in offices with codes 1, 2, or 3. Show their employee numbers, first names, last names, and office codes."
+      groundtruth_sql: |
+        SELECT employeeNumber, firstName, lastName, officeCode 
+        FROM employees 
+        WHERE officeCode IN ('1', '2', '3');
+    - id: E8
+      difficulty: easy
+      question: "Find employees whose phone extension starts with the letter ”x” followed by exactly three digits. Show their employee numbers, first names, last names, and extensions."
+      groundtruth_sql: |
+        SELECT employeeNumber, firstName, lastName, extension 
+        FROM employees 
+        WHERE REGEXP_LIKE(extension, '^x[0-9]{3}$');;
+    - id: E9
+      difficulty: easy
+      question: "Show orders that are either in status “Cancelled” or “On Hold”. Display the order number, order date, and status."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate, status 
+        FROM orders 
+        WHERE status IN('Cancelled','On Hold');
+    - id: E10
+      difficulty: easy
+      question: "Find products whose stock quantity is at least 500 and at most 1000 units. Show their product codes, names, and stock quantities."
+      groundtruth_sql: |
+        SELECT productCode, productName, quantityInStock 
+        FROM products 
+        WHERE quantityInStock BETWEEN 500 AND 1000;
+    - id: M1
+      difficulty: medium
+      question: "For each month in 2004, show the month name and the number of orders placed in that month, ordered from the latest month to the earliest."
+      groundtruth_sql: |
+        SELECT 
+          DATE_FORMAT(orderDate, %M) AS month_name,
+          COUNT(*) AS num_orders
+        FROM orders
+        WHERE YEAR(orderDate) = 2004
+        GROUP BY MONTH(orderDate), DATE_FORMAT(orderDate, '%M')
+        ORDER BY MONTH(orderDate) DESC
+    - id: M2
+      difficulty: medium
+      question: "Classify products into three MSRP bands (Low: < 50, Mid: 50–150, High: > 150) and show the number of products in each band, ordered by product count in descending order."
+      groundtruth_sql: |
+        SELECT
+          CASE
+            WHEN MSRP < 50 THEN 'Low'
+            WHEN MSRP >= 50 AND MSRP <= 150 THEN 'Mid'
+            ELSE 'High'
+          END AS msrp_band,
+          COUNT(*) AS product_count
+        FROM products
+        GROUP BY
+          CASE
+            WHEN MSRP < 50 THEN 'Low'
+            WHEN MSRP >= 50 AND MSRP <= 150 THEN 'Mid'
+            ELSE 'High'
+          END
+        ORDER BY product_count DESC;
+    - id: M3
+      difficulty: medium
+      question: "For each customer id, return the payment record with the largest payment amount. If multiple payments have the same amount, choose the one with the latest payment date. Include the payment amount and the payment date in the result."
+      groundtruth_sql: |
+          SELECT
+            customerNumber,
+            amount,
+            paymentDate
+          FROM (
+          SELECT 
+            customerNumber, 
+            amount, 
+            paymentDate,
+            ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC, paymentDate DESC) AS rn
+          FROM payments) t
+          WHERE rn = 1;
+    - id: H1
+      difficulty: hard
+      question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."
+      groundtruth_sql: |
+        SELECT
+          c.customerNumber,
+          c.customerName,
+          SUM(p.amount) AS total_payment_amount
+        FROM customers c
+        LEFT JOIN payments p ON c.customerNumber = p.customerNumber AND YEAR(p.paymentDate) = 2004
+        GROUP BY customerNumber, customerName
+        HAVING SUM(amount) > 50000;
