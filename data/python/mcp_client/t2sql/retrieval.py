@@ -163,29 +163,29 @@ def _normalize_text(txt: str) -> str:
     return txt.strip()
 
 def _tokenize_bm25_query(q: str) -> List[str]:
-    """
-    Normalisasi + tokenisasi untuk BM25:
-    - lowercase + bersihkan non-alfanumerik
-    - buang stopword
-    - stem plural sederhana:
-      * countries -> country
-      * customers -> customer
-      (hanya kalau panjang > 3 supaya 'as' / 'is' nggak ke-cut)
-    """
     s = _normalize_text(q)
     raw_tokens = s.split()
     toks: List[str] = []
+
+    # Daftar kata yang TIDAK boleh dipotong akhiran 's'-nya
+    # Tambahkan 'status' di sini
+    STEM_EXCEPTIONS = {"status", "address", "business", "orders", "sales"} 
 
     for t in raw_tokens:
         if not t:
             continue
 
+        # Jika kata ada di pengecualian, jangan di-stem
+        if t in STEM_EXCEPTIONS:
+            if t not in _STOPWORDS:
+                toks.append(t)
+            continue
+
         # --- plural stemming ringan ---
         if len(t) > 4 and t.endswith("ies"):
-            # countries -> country
             t = t[:-3] + "y"
         elif len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
-            # customers -> customer, orders -> order
+            # Sekarang 'status' tidak akan masuk ke sini karena sudah kena filter di atas
             t = t[:-1]
 
         if t and t not in _STOPWORDS:
