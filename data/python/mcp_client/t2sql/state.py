@@ -23,6 +23,9 @@ class RAGState(TypedDict, total=False):
     validation_errors: List[str]
     # Ringkasan apa saja yang dikoreksi Agent 2 (join/regex/whitelist)
     critic_feedback: str
+    # Benchmark policy / audit trail
+    group_by_policy: str
+    group_by_added_exprs: List[str]
 
 def make_state(paths, question: str) -> RAGState:
     return {
@@ -41,4 +44,7 @@ def make_state(paths, question: str) -> RAGState:
         "agent_notes": "",
         "validation_errors": [],
         "critic_feedback": "",
+        # Benchmark policy / audit trail
+        "group_by_policy": "explicit_select_cols",
+        "group_by_added_exprs": [],
     }
