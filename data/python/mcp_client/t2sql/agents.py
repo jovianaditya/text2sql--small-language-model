@@ -2,18 +2,20 @@ from .state import RAGState
 from .llm_utils import build_llm_json, build_llm_repair
 from .utils import _dbg_print_two
 from .generation import try_llm_json, regenerate_with_extra_constraint
-from .helpers import (
+from .helpers_main import (
     get_single_allowed_table,
     validate_identifiers,
     _get_requires_regex,
     _get_qtype,
     make_generation_prompt,
     sanitize_notes,
-    normalize_sql_pipeline,
-    has_join,
-    _question_requires_word_boundary_regex,
+    normalize_sql_pipeline
 )
 
+from .helpers_core import(
+    has_join,
+    _question_requires_word_boundary_regex
+)
 
 def draft_sql_agent(state: RAGState) -> RAGState:
     llm = build_llm_json()
