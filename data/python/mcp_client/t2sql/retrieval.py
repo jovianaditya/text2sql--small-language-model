@@ -22,7 +22,7 @@ from .config import (
 from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
-from .helpers import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _wants_product_name_only, _get_qtype, build_dynamic_probe
+from .helpers_main import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _wants_product_name_only, _get_qtype, build_dynamic_probe
 
 # ======================================================================
 # ========================== RETRIEVAL POLICY ==========================
