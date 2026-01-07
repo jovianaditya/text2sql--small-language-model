@@ -6,7 +6,6 @@ load_dotenv(find_dotenv(), override=False)
 from .config import JSON_INPUT
 from .utils import resolve_jsonl_paths
 from .repl import repl
-from .helpers import _get_requires_regex
 
 def main():
     paths = resolve_jsonl_paths(JSON_INPUT)
