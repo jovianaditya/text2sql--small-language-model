@@ -1,4 +1,4 @@
-from typing import TypedDict, List
+from typing import TypedDict, List, Dict, Any
 
 class RAGState(TypedDict, total=False):
     jsonl_paths: List[str]
@@ -8,6 +8,10 @@ class RAGState(TypedDict, total=False):
     skipped: int
     # retrieval output (context untuk LLM)
     context: str
+    # ROUTING
+    router_decision: Dict[str, Any]  # Output JSON Router
+    router_tables: List[str]
+    target_model: str
     # generation outputs
     answer: str
     draft_sql: str
@@ -35,6 +39,9 @@ def make_state(paths, question: str) -> RAGState:
         "updated": 0,
         "skipped": 0,
         "context": "",
+        "router_decision": {},
+        "router_tables": [],
+        "target_model": "",
         "answer": "",
         "draft_sql": "",
         "ranked_cols": [],
