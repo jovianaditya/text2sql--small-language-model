@@ -10,11 +10,10 @@
 # - CLI display helpers (tabulate preview)
 # ============================================================
 
-from __future__ import annotations
-
 # --------------------------------------------------
 # Standard library imports
 # --------------------------------------------------
+from __future__ import annotations
 import re
 import hashlib
 import glob
@@ -22,12 +21,12 @@ import json
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
-
+from langchain_core.messages import BaseMessage
+from collections import defaultdict
 # --------------------------------------------------
 # Third-party imports
 # --------------------------------------------------
 from tabulate import tabulate
-
 # --------------------------------------------------
 # Local imports
 # --------------------------------------------------
@@ -35,7 +34,6 @@ from .config import SQL_DEBUG
 
 if TYPE_CHECKING:
     from .state import RAGState
-
 # ======================================================================
 # ======================= RUNTIME / DEBUG UTILITIES ====================
 # ======================================================================
@@ -304,3 +302,150 @@ def display_table_from_json(data, max_cell_len: int = 80):
         )
     else:
         print("Query executed but returned no rows.")
+    
+# Helper wajib untuk extract JSON dari teks LLM yang kotor
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        # Cari pattern {...} termasuk nested braces
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            return json.loads(json_str)
+    except json.JSONDecodeError:
+        return None
+    return None
+
+def try_llm_json(
+    llm: Any,  # ChatOllama atau tipe LLM lain
+    prompt: str,
+    max_attempts: int = 1
+) -> Optional[Dict[str, Any]]:
+    """
+    Generic function untuk memanggil LLM dan mengharapkan return JSON.
+    Tidak ada validasi key spesifik di sini (supaya bisa dipakai Router & SQL Generator).
+    """
+    
+    # Debug: Cek apakah model LLM valid
+    if not llm:
+        print("[LLM Error] LLM Object is None.")
+        return None
+
+    for attempt in range(max_attempts):
+        try:
+            # 1. Invoke LLM
+            # print(f"[LLM Debug] Attempt {attempt+1}: Invoking LLM...") # Uncomment for verbose
+            resp = llm.invoke(prompt)
+            
+            # Handle response types (String or Object)
+            content = getattr(resp, "content", None) or str(resp)
+            
+            # 2. Extract JSON (Gunakan regex yang kuat)
+            obj = _extract_json_object(content)
+            
+            if obj:
+                return obj
+            else:
+                print(f"[LLM Warning] Gagal extract JSON dari response:\n{content[:100]}...")
+                
+        except Exception as e:
+            # INI PENTING: Print error asli supaya tidak 'silent fail'
+            print(f"[LLM CRITICAL ERROR] Attempt {attempt+1} failed: {e}")
+
+    return None
+
+def build_router_schema(context_input) -> str:
+    """
+    Versi Hybrid:
+    1. Support JSON (jika retrieval mengembalikan raw JSONL).
+    2. Support Text Format: "- table: X | column: Y | desc: Z".
+    """
+    table_columns = defaultdict(list)
+    
+    # Normalisasi Input ke List of Strings
+    lines = []
+    if isinstance(context_input, str):
+        lines = context_input.split("\n")
+    elif isinstance(context_input, list):
+        # Handle jika list of objects/dicts
+        for item in context_input:
+            if isinstance(item, str):
+                lines.append(item)
+            elif hasattr(item, 'page_content'): # Langchain Document
+                lines.append(item.page_content)
+            elif isinstance(item, dict):
+                # Kalau sudah dict, convert balik ke string json biar seragam diproses loop bawah
+                lines.append(json.dumps(item))
+    
+    # Regex untuk menangkap format teks kamu:
+    # "- table: products | column: productCode | desc: Unique product code..."
+    text_pattern = re.compile(r"table:\s*(?P<table>\w+)\s*\|\s*column:\s*(?P<col>\w+)\s*\|\s*desc:\s*(?P<desc>.*)", re.IGNORECASE)
+
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        
+        # Variabel penampung hasil ekstraksi
+        t_name, c_name, tags, description = None, None, [], ""
+        
+        # --- CARA 1: COBA PARSE JSON ---
+        if line.startswith("{"):
+            try:
+                data = json.loads(line)
+                t_name = data.get("table")
+                c_name = data.get("column")
+                tags = data.get("tags_role") or []
+                description = data.get("description", "")
+            except:
+                pass # Lanjut ke cara 2
+        
+        # --- CARA 2: COBA PARSE TEXT REGEX (Sesuai format kamu) ---
+        if not t_name: 
+            match = text_pattern.search(line)
+            if match:
+                t_name = match.group("table")
+                c_name = match.group("col")
+                description = match.group("desc")
+                # Di format teks, tags_role hilang, jadi kita andalkan description
+                tags = [] 
+
+        # --- LOGIC SELEKSI (AMBIL JIKA PENTING) ---
+        if t_name and c_name:
+            is_important = False
+            
+            # Normalisasi string untuk pengecekan
+            desc_lower = description.lower() if description else ""
+            col_lower = c_name.lower()
+            
+            # Cek 1: Primary Key
+            if "id" in tags or "primary key" in desc_lower or "(pk)" in desc_lower:
+                is_important = True
+                
+            # Cek 2: Foreign Key
+            elif any(str(t).startswith("fk:") for t in tags) or "fk" in desc_lower or "foreign key" in desc_lower:
+                is_important = True
+            
+            # Cek 3: Fallback Nama Kolom (Code, ID, Number)
+            elif "code" in col_lower or "id" in col_lower or "number" in col_lower or "key" in col_lower:
+                is_important = True
+
+            if is_important:
+                table_columns[t_name].append(c_name)
+
+    # Format Output
+    schema_parts = []
+    for table, cols in table_columns.items():
+        unique_cols = sorted(list(set(cols)))
+        if unique_cols:
+            schema_parts.append(f"{table}({', '.join(unique_cols)})")
+            
+    result = ", ".join(schema_parts)
+    
+    # Fallback jika kosong sama sekali (misal format context berubah total)
+    if not result and len(lines) > 0:
+        print("[Router Warning] Schema parsing return empty. Using simplified table listing.")
+        # Coba ambil nama tabel aja dari baris "table: ..."
+        tables_found = set(re.findall(r"table:\s*(\w+)", "\n".join(lines)))
+        if tables_found:
+            return ", ".join(list(tables_found))
+            
+    return result
