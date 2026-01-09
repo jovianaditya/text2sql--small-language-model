@@ -58,7 +58,7 @@ cases:
       groundtruth_sql: |
         SELECT employeeNumber, firstName, lastName, extension 
         FROM employees 
-        WHERE REGEXP_LIKE(extension, '^x[0-9]{3}$');;
+        WHERE REGEXP_LIKE(extension, '^x[0-9]{3}$');
     - id: E9
       difficulty: easy
       question: "Show orders that are either in status “Cancelled” or “On Hold”. Display the order number, order date, and status."
@@ -79,7 +79,7 @@ cases:
       groundtruth_sql: |
         SELECT 
           DATE_FORMAT(orderDate, %M) AS month_name,
-          COUNT(*) AS num_orders
+          COUNT(orderNumber) AS order_count
         FROM orders
         WHERE YEAR(orderDate) = 2004
         GROUP BY MONTH(orderDate), DATE_FORMAT(orderDate, '%M')
@@ -91,15 +91,15 @@ cases:
         SELECT
           CASE
             WHEN MSRP < 50 THEN 'Low'
-            WHEN MSRP >= 50 AND MSRP <= 150 THEN 'Mid'
+            WHEN MSRP BETWEEN 50 AND 150 THEN 'Mid'
             ELSE 'High'
-          END AS msrp_band,
+          END AS price_band,
           COUNT(*) AS product_count
         FROM products
         GROUP BY
           CASE
             WHEN MSRP < 50 THEN 'Low'
-            WHEN MSRP >= 50 AND MSRP <= 150 THEN 'Mid'
+            WHEN MSRP BETWEEN 50 AND 150 THEN 'Mid'
             ELSE 'High'
           END
         ORDER BY product_count DESC;
@@ -108,26 +108,26 @@ cases:
       question: "For each customer id, return the payment record with the largest payment amount. If multiple payments have the same amount, choose the one with the latest payment date. Include the payment amount and the payment date in the result."
       groundtruth_sql: |
           SELECT
-            customerNumber,
-            amount,
-            paymentDate
+            pmt.customerNumber,
+            pmt.amount,
+            pmt.paymentDate
           FROM (
           SELECT 
             customerNumber, 
             amount, 
             paymentDate,
             ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC, paymentDate DESC) AS rn
-          FROM payments) t
-          WHERE rn = 1;
+          FROM payments) AS pmt
+          WHERE pmt.rn = 1;
     - id: H1
       difficulty: hard
       question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."
       groundtruth_sql: |
         SELECT
-          c.customerNumber,
-          c.customerName,
-          SUM(p.amount) AS total_payment_amount
-        FROM customers c
-        LEFT JOIN payments p ON c.customerNumber = p.customerNumber AND YEAR(p.paymentDate) = 2004
-        GROUP BY customerNumber, customerName
+          cust.customerNumber,
+          cust.customerName,
+          SUM(pmt.amount) AS total_payment_amount
+        FROM customers AS cust
+        LEFT JOIN payments AS pmt ON c.customerNumber = pmt.customerNumber AND YEAR(pmt.paymentDate) = 2004
+        GROUP BY cust.customerNumber, cust.customerName
         HAVING SUM(amount) > 50000;
