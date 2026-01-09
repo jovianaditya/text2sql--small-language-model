@@ -44,7 +44,7 @@ _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _guardrail_fi
 # phase 6 
 _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _strip_unneeded_count_distinct, _parse_from_join_aliases,
 # phase 7
-_remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
+_remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes, _ALIAS_OVERRIDES
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -81,31 +81,134 @@ def get_single_allowed_table(ctx: str) -> Optional[str]:
 # -------------------- HELPER CROSS MODULE ------------------
 # ------------------------- agents.py -----------------------
 # -----------------------------------------------------------
+# def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
+#     """
+#     Return mapping:
+#       - qualifier -> set(columns)  e.g. {"p": {"amount","paymentDate"}}
+#       - None      -> set(unqualified tokens) e.g. {None: {"amount"}}
+
+#     Konservatif:
+#     - Strip string literals dari scanning.
+#     - Exclude keywords, table names, aliases (FROM/JOIN/derived/output).
+#     - Skip token yang terlihat seperti function call: token(...).
+#     """
+#     if not sql:
+#         return {}
+
+#     out: Dict[Optional[str], Set[str]] = {}
+#     # ---------------------------------------------------------------------------
+#     # 1) Hapus string literals/double quotes supaya token scan tidak ke-distract
+#     # ---------------------------------------------------------------------------
+#     code_only = re.sub(r"'(?:''|[^'])*'", "''", sql)
+#     code_only = re.sub(r'"(?:""|[^"])*"', '""', code_only)
+#     keywords = _SQL_KEYWORDS
+#     # ---------------------------------------------------------------------------
+#     # 2) Ambil table names yang muncul di FROM/JOIN (untuk exclude)
+#     #    Support schema.table dan backticks secara sederhana.
+#     # ---------------------------------------------------------------------------
+#     table_names: Set[str] = set()
+#     for m in re.finditer(
+#         r"\b(?:from|join)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)",
+#         code_only,
+#         flags=re.I,
+#     ):
+#         raw = (m.group(1) or "").replace("`", "")
+#         tbl = raw.split(".")[-1]
+#         if tbl:
+#             table_names.add(tbl.lower())
+#     # Exclude aliases (table + derived + output)
+#     exclude: Set[str] = set()
+#     # ---------------------------------------------------------------------------
+#     # 3) table aliases from FROM/JOIN
+#     # ---------------------------------------------------------------------------
+#     a2t = _parse_from_join_aliases(sql)  # alias -> table
+#     exclude.update({a.lower() for a in a2t.keys() if a})
+#     # ---------------------------------------------------------------------------
+#     # 4) derived-table aliases: FROM ( ... ) AS t / JOIN ( ... ) AS t
+#     # ---------------------------------------------------------------------------
+#     for m in re.finditer(
+#         r"\b(?:from|join)\s*\([^)]*\)\s*(?:as\s+)?([A-Za-z_]\w*)\b",
+#         code_only,
+#         flags=re.I | re.S,
+#     ):
+#         exclude.add(m.group(1).lower())
+#     # ---------------------------------------------------------------------------
+#     # 5) output aliases: SELECT ... AS alias (hanya area SELECT ... FROM)
+#     # ---------------------------------------------------------------------------
+#     m_sel = re.search(r"\bselect\b(.*?)\bfrom\b", code_only, flags=re.I | re.S)
+#     if m_sel:
+#         select_part = m_sel.group(1)
+#         for m in re.finditer(r"\bas\s+([A-Za-z_]\w*)\b", select_part, flags=re.I):
+#             exclude.add(m.group(1).lower())
+#     # ---------------------------------------------------------------------------
+#     # 6) Collect qualified usages: alias.col / table.col
+#     # ---------------------------------------------------------------------------
+#     # Simpan dulu semua pattern qualifier.column
+#     for m in re.finditer(
+#         r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+#         code_only,
+#         flags=re.I,
+#     ):
+#         qual = m.group(1)
+#         col = m.group(2)
+#         ql = (qual or "").lower()
+
+#         if not qual or not col:
+#             continue
+#         if ql in keywords:
+#             continue
+#         if ql in exclude:
+#             continue
+
+#         out.setdefault(qual, set()).add(col)
+#     # Remove qualified occurrences so they don't pollute unqualified scan
+#     code_no_qual = re.sub(
+#         r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\b",
+#         " ",
+#         code_only,
+#         flags=re.I,
+#     )
+#     # ---------------------------------------------------------------------------
+#     # 7) Unqualified token scan (konservatif)
+#     # ---------------------------------------------------------------------------
+#     tok_pat = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+#     for m in tok_pat.finditer(code_no_qual):
+#         tok = m.group(1)
+#         low = tok.lower()
+
+#         if low in keywords:
+#             continue
+#         if low in table_names:
+#             continue
+#         if low in exclude:
+#             continue
+#         # skip jika terlihat seperti function call: tok(...)
+#         j = m.end()
+#         while j < len(code_no_qual) and code_no_qual[j].isspace():
+#             j += 1
+#         if j < len(code_no_qual) and code_no_qual[j] == "(":
+#             continue
+
+#         out.setdefault(None, set()).add(tok)
+
+#     return out
 def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
     """
     Return mapping:
       - qualifier -> set(columns)  e.g. {"p": {"amount","paymentDate"}}
       - None      -> set(unqualified tokens) e.g. {None: {"amount"}}
-
-    Konservatif:
-    - Strip string literals dari scanning.
-    - Exclude keywords, table names, aliases (FROM/JOIN/derived/output).
-    - Skip token yang terlihat seperti function call: token(...).
     """
     if not sql:
         return {}
 
     out: Dict[Optional[str], Set[str]] = {}
-    # ---------------------------------------------------------------------------
-    # 1) Hapus string literals/double quotes supaya token scan tidak ke-distract
-    # ---------------------------------------------------------------------------
+    
+    # 1) Hapus string literals
     code_only = re.sub(r"'(?:''|[^'])*'", "''", sql)
     code_only = re.sub(r'"(?:""|[^"])*"', '""', code_only)
     keywords = _SQL_KEYWORDS
-    # ---------------------------------------------------------------------------
+
     # 2) Ambil table names yang muncul di FROM/JOIN (untuk exclude)
-    #    Support schema.table dan backticks secara sederhana.
-    # ---------------------------------------------------------------------------
     table_names: Set[str] = set()
     for m in re.finditer(
         r"\b(?:from|join)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)",
@@ -116,34 +219,46 @@ def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
         tbl = raw.split(".")[-1]
         if tbl:
             table_names.add(tbl.lower())
+
     # Exclude aliases (table + derived + output)
     exclude: Set[str] = set()
-    # ---------------------------------------------------------------------------
-    # 3) table aliases from FROM/JOIN
-    # ---------------------------------------------------------------------------
-    a2t = _parse_from_join_aliases(sql)  # alias -> table
+
+    # 3) Table aliases from FROM/JOIN (Simple Table)
+    #    Contoh: FROM payments p -> p is alias
+    a2t = _parse_from_join_aliases(sql) 
     exclude.update({a.lower() for a in a2t.keys() if a})
-    # ---------------------------------------------------------------------------
-    # 4) derived-table aliases: FROM ( ... ) AS t / JOIN ( ... ) AS t
-    # ---------------------------------------------------------------------------
-    for m in re.finditer(
-        r"\b(?:from|join)\s*\([^)]*\)\s*(?:as\s+)?([A-Za-z_]\w*)\b",
-        code_only,
-        flags=re.I | re.S,
-    ):
-        exclude.add(m.group(1).lower())
-    # ---------------------------------------------------------------------------
-    # 5) output aliases: SELECT ... AS alias (hanya area SELECT ... FROM)
-    # ---------------------------------------------------------------------------
+
+    # =======================================================================
+    # PERBAIKAN: DETEKSI DERIVED TABLE ALIASES (Subquery Alias)
+    # =======================================================================
+    # Strategi: Cari pola tutup kurung ')' diikuti oleh sebuah kata (alias).
+    # Regex ini menangkap:
+    #   ) alias
+    #   ) AS alias
+    # Kita abaikan keyword SQL (WHERE, GROUP, ORDER, ON, LEFT, JOIN, dll)
+    
+    potential_aliases = re.finditer(r"\)\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\b", code_only, flags=re.I)
+    
+    forbidden_alias_keywords = {
+        "where", "group", "order", "limit", "having", 
+        "join", "left", "right", "inner", "outer", "cross",
+        "on", "and", "or", "union", "except", "intersect", "select"
+    }
+    
+    for m in potential_aliases:
+        candidate = m.group(1).lower()
+        if candidate not in forbidden_alias_keywords and candidate not in keywords:
+             exclude.add(candidate)
+    # =======================================================================
+
+    # 5) Output aliases: SELECT ... AS alias
     m_sel = re.search(r"\bselect\b(.*?)\bfrom\b", code_only, flags=re.I | re.S)
     if m_sel:
         select_part = m_sel.group(1)
         for m in re.finditer(r"\bas\s+([A-Za-z_]\w*)\b", select_part, flags=re.I):
             exclude.add(m.group(1).lower())
-    # ---------------------------------------------------------------------------
+
     # 6) Collect qualified usages: alias.col / table.col
-    # ---------------------------------------------------------------------------
-    # Simpan dulu semua pattern qualifier.column
     for m in re.finditer(
         r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
         code_only,
@@ -161,16 +276,16 @@ def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
             continue
 
         out.setdefault(qual, set()).add(col)
-    # Remove qualified occurrences so they don't pollute unqualified scan
+
+    # Clean up qualified occurrences
     code_no_qual = re.sub(
         r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\b",
         " ",
         code_only,
         flags=re.I,
     )
-    # ---------------------------------------------------------------------------
-    # 7) Unqualified token scan (konservatif)
-    # ---------------------------------------------------------------------------
+
+    # 7) Unqualified token scan
     tok_pat = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
     for m in tok_pat.finditer(code_no_qual):
         tok = m.group(1)
@@ -182,7 +297,8 @@ def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
             continue
         if low in exclude:
             continue
-        # skip jika terlihat seperti function call: tok(...)
+        
+        # skip function call
         j = m.end()
         while j < len(code_no_qual) and code_no_qual[j].isspace():
             j += 1
@@ -341,6 +457,20 @@ def _get_requires_regex(state: "RAGState") -> bool:
     state["requires_regex"] = needs
     state["_requires_regex_q"] = q
     return needs
+
+def _regex_requirement_ok(sql: str, requires_regex: bool, requires_boundary: bool) -> bool:
+    if not (requires_regex or requires_boundary):
+        return True
+
+    low = (sql or "").lower()
+    has_regexp = ("regexp" in low) or ("rlike" in low)
+    if not has_regexp:
+        return False
+
+    if requires_boundary:
+        return "(^|[^[:alnum:]_])" in (sql or "")
+
+    return ("^" in (sql or "")) and ("$" in (sql or ""))
 # -----------------------------------------------------------
 # -------------------- HELPER CROSS MODULE ------------------
 # ------------------------- retrieval.py --------------------
@@ -772,64 +902,209 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
             out_parts.append(replace_in_code_segment(part))
     return "".join(out_parts)
 # ======================================================================
-# ====================== GENERATION PROMPT BUILDER =====================
+# ================= ROUTING & GENERATION PROMPT BUILDER ================
 # ======================================================================
-def make_generation_prompt(ctx: str, question: str) -> str:
+# ======================================================================
+# ================= ROUTING & GENERATION PROMPT BUILDER ================
+# ======================================================================
+
+def make_router_prompt(question: str, schema_summary: str) -> str:
+    """
+    Prompt Router yang dioptimalkan untuk Model SLM (1.5B/7B).
+    Output JSON: complexity & qtype.
+    """
+    return f"""You are a SQL router. Analyze the question and schema to decide complexity.
+
+Schema Tables: [{schema_summary}]
+
+DEFINITIONS:
+1. COMPLEXITY: "simple"
+   - Single table operations (Filter, Sort, Limit).
+   - Attribute Check (IS NULL/Empty).
+   - FK Filtering (Filtering by ID present in the main table).
+   - Global Rank (ORDER BY ... LIMIT).
+
+2. COMPLEXITY: "complex"
+   - Multi-table Joins.
+   - Relationship Check (e.g. "customers with no orders").
+   - Advanced Logic: "Top N per Group", HAVING, Subqueries.
+
+3. QTYPE:
+   - "lookup": Retrieve rows, Global Sorting.
+   - "aggregate": Math (SUM, AVG, COUNT) with GROUP BY.
+   - "rank": Group-wise ranking (e.g., "Top product PER category").
+
+CRITICAL RULES:
+1. "Missing" or "No" [X]:
+   - If [X] is a COLUMN -> SIMPLE.
+   - If [X] is a separate TABLE -> COMPLEX.
+2. Filtering:
+   - By ID/Code -> SIMPLE.
+   - By Name/Desc -> COMPLEX.
+3. Ranking:
+   - "Highest/Lowest" (Global) -> SIMPLE ("lookup").
+   - "Highest/Lowest PER [Group]" -> COMPLEX ("rank").
+
+Question: {question}
+
+Return JSON object with keys: complexity (simple/complex), qtype (lookup/aggregate/rank).
+"""
+
+def make_generation_prompt(ctx: str, question: str, router_decision: dict = None) -> str:
+    """
+    Dynamic Prompt Builder.
+    Versi Benchmark Standard (ANSI SQL Strict):
+    1. Memaksa pengulangan ekspresi di GROUP BY (ANSI Compliant).
+    2. Melarang UNION untuk binning.
+    3. Memaksa Single Line SQL untuk mencegah JSON Crash pada query panjang.
+    4. Menangani Error 1055 dengan strict column selection.
+    """
+    router_decision = router_decision or {}
+    complexity = router_decision.get("complexity", "simple")
+    qtype = router_decision.get("qtype", "lookup")
+    has_grouping = router_decision.get("has_grouping", False)
+    has_exclusion = router_decision.get("has_exclusion", False)
+    
+    # --- 1. BANGUN CONSTRAINT DINAMIS ---
+    constraints = []
+    
+    # [B] SIMPLE QUERY RULES
+    if complexity == "simple":
+        constraints.append("SCOPE: This query requires ONE TABLE ONLY. DO NOT JOIN.")
+        constraints.append("FILTERING: Filter by ID/Code directly in the main table.")
+        
+        if qtype == "lookup":
+            constraints.append(
+                "SIMPLE LOOKUP RULE: Do NOT use aggregation functions like MAX(), MIN(), or SUM(). "
+                "Just SELECT the column directly. Use 'ORDER BY column DESC' for 'latest/newest/highest'."
+            )
+
+    # [C] RANKING RULES
+    if qtype == "rank":
+        constraints.append(
+            "RANKING LOGIC: Use Window Functions `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` inside a CTE/Subquery."
+        )
+        constraints.append(
+            "ANTI-PATTERN: STRICTLY FORBIDDEN to use `WHERE (col1, col2) IN (SELECT ...)` pattern. This causes MySQL Error 1055."
+        )
+
+    # [D] REPORTING/AGGREGATION RULES
+    is_reporting = (qtype == "aggregate") or has_grouping or has_exclusion
+    if is_reporting and complexity == "complex":
+        constraints.append(
+            "REPORTING LOGIC: When aggregating a Master Table with a Transaction Table, use **LEFT JOIN**."
+        )
+        constraints.append(
+            "CRITICAL FILTER RULE: If using LEFT JOIN, filters for the RIGHT table MUST be in the **ON** clause."
+        )
+        constraints.append(
+            "GROUP BY RULE: Every column in the SELECT list that is not aggregated MUST be in the GROUP BY clause."
+        )
+
+    # [E] DATE RULES
+    constraints.append(
+        "DATE LABEL: If asking for Month Name, GROUP BY both MONTH(date) and DATE_FORMAT(date, '%M')."
+    )
+
+    # [F] COLUMN INTEGRITY RULES
+    constraints.append(
+        "COLUMN SELECTION: Select ALL columns requested by the user. Do not omit `ID` or `Number` columns if asked."
+    )
+    constraints.append(
+        "NO COLUMN RENAMING: Return column names EXACTLY as they appear in the Schema. "
+        "Do NOT use `AS` aliases for existing columns."
+    )
+
+    # [G] ANTI-HALLUCINATION & LOGIC EFFICIENCY
+    # 1. Casing Strictness
+    constraints.append(
+        "CASE SENSITIVITY RULE: The database uses specific casing (often camelCase like `orderDate`). "
+        "You MUST use the exact column names from the Schema. NEVER use snake_case."
+    )
+
+    # 2. Month Sorting
+    if "month" in question.lower() and ("order" in question.lower() or "sort" in question.lower()):
+        constraints.append(
+            "CHRONOLOGICAL SORTING RULE: If grouping by Month Name, you MUST also ORDER BY the month number `MONTH(dateColumn)`."
+        )
+        constraints.append(
+            "GROUP BY CONSISTENCY: To avoid SQL Error 1055, if you ORDER BY `MONTH(dateColumn)`, "
+            "you MUST also include `MONTH(dateColumn)` in the GROUP BY clause."
+        )
+
+    # 3. Categorization Strategy (ANSI SQL STANDARD FIX)
+    # Memaksa ANSI Standard (Repeat Expression) tapi melarang UNION.
+    if "case" in question.lower() or "band" in question.lower() or "range" in question.lower():
+        constraints.append(
+            "BINNING STRATEGY: Use a `CASE WHEN ... END` statement in a **SINGLE** SELECT query. "
+            "ANSI SQL RULE: You MUST repeat the exact `CASE WHEN` expression in the `GROUP BY` clause. "
+            "Do NOT group by the alias. Do NOT use UNION."
+        )
+
+    # 4. Aggregation Safety (Anti Error 1055)
+    if has_grouping or "group" in question.lower():
+        constraints.append(
+            "STRICT GROUP BY RULE (Error 1055): If you GROUP BY a derived column (e.g. `CASE WHEN`), "
+            "you MUST NOT select the original raw column (e.g. `MSRP`) unless it is wrapped in an aggregate function (COUNT, SUM). "
+            "ONLY select the derived expression and Aggregates."
+        )
+
+    # 5. Sorting Direction
+    desc_triggers = [
+    "latest", "newest", "most recent", "descending", 
+    "highest", "greatest", "largest", "biggest",
+    "terbaru", "terlama", "menurun", "tertinggi", "terbesar"
+    ]
+
+    asc_triggers = [
+        "ascending", "alphabetical", "alphabetically",
+        "smallest", "lowest", "oldest first", "earliest first",
+        "menaik", "terkecil", "terendah", "alfabetis"
+    ]
+
+    # Default untuk "sorted" tanpa qualifier
+    sort_requested = any(k in question.lower() for k in ["sort", "sorted", "order by", "urut", "urutkan"])
+
+    question_lower = question.lower()
+
+    if any(t in question_lower for t in desc_triggers):
+        constraints.append(
+            "SORT DIRECTION: The user implies a descending order. You MUST append `DESC` to the ORDER BY clause."
+        )
+    elif any(t in question_lower for t in asc_triggers):
+        constraints.append(
+            "SORT DIRECTION: The user requests ascending order. You MUST append `ASC` to the ORDER BY clause."
+        )
+    elif sort_requested:
+        # "sorted by X" without qualifier → default ascending (natural order)
+        constraints.append(
+            "SORT DIRECTION: The user requests sorting without specifying direction. "
+            "Use ascending order (ASC) as default, which means A-Z for text, 0-9 for numbers, oldest-to-newest for dates. "
+            "You can omit ASC keyword (ascending is SQL default)."
+        )
+
+    # 6. JSON FORMATTING (CRITICAL FOR 3B STABILITY)
+    # Ini tidak melanggar standar SQL (karena SQL whitespace insensitive), 
+    # tapi vital agar 3B tidak crash saat generate query panjang (CASE WHEN).
+    constraints.append(
+        "JSON FORMATTING: The 'sql' field must be a SINGLE LINE string. Remove all newlines (\\n) from the SQL."
+    )
+
+    # --- 2. RAKIT CONSTRAINT BLOCK ---
+    constraint_block = ""
+    if constraints:
+        constraint_block = "\n[STRICT CONSTRAINTS & HEURISTICS]:\n" + "\n".join([f"- {c}" for c in constraints])
+
+    # --- 3. RETURN PROMPT LENGKAP ---
     return fr"""
 You are a senior SQL assistant for MySQL 8.0.
 
 Use ONLY tables/columns listed under ALLOWED IDENTIFIERS in Context.
 If Context lists aliases, use the canonical column name.
 
-Customer naming preference (OUTPUT ONLY):
-When selecting customer attributes, prefer customerName over customerNumber unless the user explicitly asks for an id/number/code.
-This preference does NOT determine the anchor (driving) table.
-
-ANCHOR (driving table) rule:
-1) Row-preservation override:
-   If the user asks to include entities with zero related rows (e.g., "including customers with no payments", "never ordered"),
-   anchor the entity table (e.g., customers/products) and use LEFT JOIN or NOT EXISTS as appropriate.
-2) Otherwise choose anchor by primary measure/filter (use reranked Context evidence when possible):
-   - payments if the main filter/measure is payments.paymentDate or payments.amount
-   - orderdetails if computing sales/revenue or using orderdetails.quantityOrdered/priceEach
-   - orders if filtering by orders.orderDate/status/shippedDate/requiredDate
-3) "For each <entity>" implies GROUP BY that entity, not necessarily anchoring that entity.
-
-JOIN rule:
-- If all needed columns exist in ONE allowed table: do NOT JOIN.
-- JOIN only when needed to fetch columns from multiple tables.
-
-JOIN TYPE DEFAULT (IMPORTANT):
-- Use INNER JOIN by default.
-- Use LEFT JOIN ONLY when the question explicitly requires keeping entities with zero related rows
-  (e.g., "including customers with no payments", "all customers even if no payments", "never ordered/paid", "termasuk yang tidak punya").
-- Selecting customerName / grouping by customerName does NOT mean you should keep all customers.
-  Anchor is determined by the primary filter/measure (see ANCHOR rule).
-
-LIKE vs REGEXP:
-- Use LIKE only for simple wildcard intent: starts with -> 'X%', ends with -> '%X', contains -> '%X%'. Do NOT put ^ or $ inside LIKE.
-- Use REGEXP only if: (a) word-boundary intent (word starts with X), (b) strict structure/format (exact length/digits), or (c) user explicitly requests regex.
-  - Word-boundary REGEXP must use: (^|[^[:alnum:]_]) as left boundary and [[:alnum:]_]* after prefix. Do NOT use \\b or \\w.
-  - Strict-structure REGEXP must be anchored with ^ and $.
-
-DATE LABEL RULE:
-- If user asks month name: SELECT DATE_FORMAT(<date_col>, '%M') AS month_name.
-  GROUP BY MONTH(<date_col>), DATE_FORMAT(<date_col>, '%M').
-  ORDER BY MONTH(<date_col>) (or DESC if user asks latest->earliest).
-  Do NOT output helper month number unless asked.
-- If user asks day name (weekday): SELECT DATE_FORMAT(<date_col>, '%W') AS day_name.
-  GROUP BY DAYOFWEEK(<date_col>), DATE_FORMAT(<date_col>, '%W').
-  ORDER BY DAYOFWEEK(<date_col>) (or DESC if asked).
-- If user asks each day/per day: SELECT DATE(<date_col>) and GROUP/ORDER BY DATE(<date_col>).
-
-WINNER-ROW RULE (rank per entity):
-- If the question asks for largest/smallest per entity AND also asks another column from the same row
-  (e.g., paymentDate of the largest payment), DO NOT use MAX/MIN alone.
-- Use ROW_NUMBER() OVER (PARTITION BY <entity_id> ORDER BY <metric> DESC, <tie_breaker> ASC) and filter rn = 1.
-
 Output:
 Return EXACTLY one JSON object:
-{{"sql":"<final MySQL query>","notes":"<brief rationale; for EACH JOIN, name the column it contributes>"}}
+{{"sql":"<final MySQL query>","notes":"<brief rationale>"}}
 No Markdown. End SQL with a semicolon.
 If NO JOINs, notes MUST be exactly: "No joins used."
 
@@ -838,12 +1113,13 @@ Context:
 
 Question:
 {question}
+{constraint_block}
 """.strip()
 # ======================================================================
 # =========================== MAIN PIPELINE ============================
 # ================ Postprocess SQL & Normalize Pipeline ================
 # ======================================================================  
-def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
+def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     DEBUG_WR = True
     if not sql:
         return sql
@@ -905,14 +1181,14 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
     # Normalize tokens and table naming early
     # ---------------------------------------------------------------------------
     s = _fix_bad_backticks(s)
-    s = _canonicalize_table_names(s, context)
+    s = _canonicalize_table_names(s, ctx)
     s = ensure_join_aliases(s)
     # ---------------------------------------------------------------------------
     # Phase 1 — JOIN Semantics & Structural Rewrites (FINAL)
     # Decide JOIN necessity and semantics before touching aliases
     # ---------------------------------------------------------------------------
-    s = _rewrite_left_join_to_inner_if_not_needed(s, question)
-    s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question)
+    s = _rewrite_left_join_to_inner_if_not_needed(s, question, ctx)
+    s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question, ctx)
     s = _rewrite_inner_join_filter_to_exists(s)
     s = _rewrite_inner_join_existence_to_exists(s, question)
     s = _drop_redundant_inner_join_same_key(s)
@@ -932,6 +1208,38 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
     s = _expand_group_by_aliases_regex(s)
     if not _is_potential_winner_row(s, question, force=True):
         s = _enforce_explicit_group_by(s)
+    # ---------------------------------------------------------------------------
+    # Phase 3b — Reorder GROUP BY: Keys First, Descriptive Columns Later
+    # ---------------------------------------------------------------------------
+    group_match = re.search(
+        r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:HAVING|ORDER\s+BY|LIMIT|;|$))',
+        s,
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    if group_match:
+        group_clause = group_match.group(1).strip()
+        group_items = [item.strip() for item in group_clause.split(',')]
+        
+        if len(group_items) > 1:
+            key_patterns = [r'Number$', r'Code$', r'ID$', r'Id$', r'_id$']
+            
+            key_cols = []
+            desc_cols = []
+            
+            for item in group_items:
+                col_name = item.split('.')[-1].strip('`').strip()
+                is_key = any(re.search(pattern, col_name, re.IGNORECASE) for pattern in key_patterns)
+                
+                if is_key:
+                    key_cols.append(item)
+                else:
+                    desc_cols.append(item)
+            
+            if key_cols:
+                reordered = key_cols + desc_cols
+                new_group_clause = ', '.join(reordered)
+                s = s[:group_match.start(1)] + new_group_clause + s[group_match.end(1):]
     # ---------------------------------------------------------------------------
     # Phase 4 — Winner-Row & Aggregate Guardrails
     # Ensure semantic correctness for ranking-style queries
@@ -1001,9 +1309,12 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
     # ---------------------------------------------------------------------------
     # Phase 5 — Pattern, REGEXP, and Predicate Normalization
     # ---------------------------------------------------------------------------
-    s = _guardrail_fix_like_regex_anchors(s, question)
-    s = _rewrite_simple_regexp_to_like(s, question)
-    s = _guardrail_fix_mysql_regexp_literals(s)
+    # print("\n[PH5] start ----")  # ✅ ADD THIS
+    # s = _guardrail_fix_like_regex_anchors(s, question)
+    # print(f"[PH5] after fix_anchors: {s[:200]}")  # ✅ ADD THIS
+    # s = _rewrite_simple_regexp_to_like(s, question)
+    # s = _guardrail_fix_mysql_regexp_literals(s)
+    # print(f"[PH5] end ---- {s}\n")  # ✅ ADD THIS
     # ---------------------------------------------------------------------------
     # Phase 6 — NULL / DISTINCT / Result Cardinality Policies
     # ---------------------------------------------------------------------------
@@ -1016,6 +1327,151 @@ def _postprocess_sql(sql: str, question: str, context: str = "") -> str:
     # ---------------------------------------------------------------------------
     s = _remove_top_level_order_by_if_not_requested(s, question)
     s = _maybe_add_limit(question, s)    
+    # s = _collapse_spaces_outside_quotes(s)
+    # ---------------------------------------------------------------------------
+    # Phase 8 — Remove Cosmetic Aliases (FIX UTAMA)
+    # ---------------------------------------------------------------------------
+    # Masalah: LLM 7B sering menambahkan alias kosmetik: extension AS 'internal phone'.
+    # Solusi: Hapus alias JIKA kolomnya hanya terdiri dari huruf/angka/titik/underscore.
+    # Logic: 
+    # - Match: "extension AS 'phone'" atau "t1.col AS alias"
+    # - Ignore: "SUM(amount) AS total" (Karena regex [a-z0-9_.] tidak mencakup tanda kurung ')' )
+    
+    # Regex:
+    # 1. \b([a-zA-Z0-9_.]+)  -> Group 1: Nama kolom (tanpa kurung/aritmatika)
+    # 2. \s+AS\s+            -> Keyword AS
+    # 3. (['"][^'"]+['"]|...) -> Group 2: Alias (string quote atau identifier biasa)
+    
+    select_match = re.search(r'\bSELECT\b(.*?)\bFROM\b', s, re.IGNORECASE | re.DOTALL)
+    if select_match:
+        select_clause = select_match.group(1)
+        before_select = s[:select_match.start(1)]
+        after_select = s[select_match.end(1):]
+        
+        # Pattern: Hanya match string aliases yang quoted (bukan identifier aliases)
+        # Match: col AS 'alias' atau table.col AS "alias"
+        # Tidak match: customers AS c (identifier alias untuk table)
+        pattern_alias = re.compile(
+            r"\b([a-zA-Z0-9_`.]+)\s+AS\s+(['\"`][^'\"`]+['\"`])",
+            re.IGNORECASE
+        )
+        
+        # Apply replacement hanya di SELECT clause (max 3 iterations untuk safety)
+        for _ in range(3):
+            def replacer(match):
+                col_name = match.group(1)
+                # Keep CASE...END structure intact
+                if col_name.upper() in ('END', 'CASE', 'WHEN', 'THEN', 'ELSE'):
+                    return match.group(0)  # Pertahankan as-is
+                # Remove cosmetic string alias
+                return col_name
+            
+            new_select = pattern_alias.sub(replacer, select_clause)
+            if new_select == select_clause:
+                break
+            select_clause = new_select
+        
+        # Reconstruct query
+        s = before_select + select_clause + after_select
+    # ---------------------------------------------------------------------------
+    select_match = re.search(r'\bSELECT\b(.*?)\bFROM\b', s, re.IGNORECASE | re.DOTALL)
+    if select_match:
+        # ... existing Phase 8 code ...
+        pass
+    
+    # Phase 8b is DISABLED for thesis benchmark
+    
+    # ---------------------------------------------------------------------------
+    # Phase 8c — Standardize Table Aliases to Match _ALIAS_OVERRIDES
+    # ---------------------------------------------------------------------------
+    alias_standards = {tbl.lower(): alias for tbl, alias in _ALIAS_OVERRIDES.items()}
+    def find_subquery_table(sql_fragment):
+        """Extract first table name after FROM in a SQL fragment."""
+        match = re.search(r'\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', sql_fragment, re.IGNORECASE)
+        return match.group(1).lower() if match else None
+
+    replacements = {}
+
+    # Find all subquery patterns: FROM (...) AS alias
+    subquery_start_pattern = re.compile(r'\b(FROM|JOIN)\s+\(', re.IGNORECASE)
+
+    for match in subquery_start_pattern.finditer(s):
+        start_pos = match.end() - 1
+        
+        paren_count = 1
+        i = start_pos + 1
+        while i < len(s) and paren_count > 0:
+            if s[i] == '(':
+                paren_count += 1
+            elif s[i] == ')':
+                paren_count -= 1
+            i += 1
+        
+        if paren_count == 0:
+            subquery_content = s[start_pos+1:i-1]
+            alias_match = re.match(r'\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b', s[i:], re.IGNORECASE)
+            
+            if alias_match:
+                current_alias = alias_match.group(1)
+                
+                # Skip if alias is a SQL keyword
+                if current_alias.lower() in _SQL_KEYWORDS:
+                    continue
+                
+                inner_table = find_subquery_table(subquery_content)
+                
+                if inner_table and inner_table in alias_standards:
+                    standard_alias = alias_standards[inner_table]
+                    if current_alias.lower() != standard_alias.lower():
+                        replacements[current_alias] = standard_alias
+
+    # Handle regular table aliases (non-subquery)
+    table_alias_pattern = re.compile(
+        r'\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b',
+        re.IGNORECASE
+    )
+
+    for match in table_alias_pattern.finditer(s):
+        table = match.group(2).lower()
+        current_alias = match.group(3)
+        
+        # Skip if alias is a SQL keyword  ← TAMBAHKAN INI
+        if current_alias.lower() in _SQL_KEYWORDS:
+            continue
+        
+        if table in alias_standards:
+            standard_alias = alias_standards[table]
+            if current_alias.lower() != standard_alias.lower():
+                replacements[current_alias] = standard_alias
+
+    if replacements:
+        for old_alias, new_alias in replacements.items():
+            # Replace qualified references: old.col → new.col
+            s = re.sub(
+                rf'\b{re.escape(old_alias)}\.',
+                f'{new_alias}.',
+                s,
+                flags=re.IGNORECASE
+            )
+            
+            # Replace subquery alias: ) AS old → ) AS new
+            s = re.sub(
+                rf'\)\s+(?:AS\s+)?{re.escape(old_alias)}\b',
+                f') AS {new_alias}',
+                s,
+                flags=re.IGNORECASE
+            )
+            
+            # Replace regular table alias: FROM/JOIN table old → FROM/JOIN table new
+            s = re.sub(
+                rf'\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:AS\s+)?{re.escape(old_alias)}\b',
+                rf'\1 \2 {new_alias}',
+                s,
+                flags=re.IGNORECASE
+            )
+    # ---------------------------------------------------------------------------
+    # Final Polish
+    # ---------------------------------------------------------------------------
     s = _collapse_spaces_outside_quotes(s)
     return s
 
