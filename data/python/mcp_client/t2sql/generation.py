@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Dict, Any, Optional, Tuple
 from langchain_ollama import ChatOllama
-
+from .utils import try_llm_json
 
 def _strip_code_fences(s: str) -> str:
     s = (s or "").strip()
@@ -82,35 +82,6 @@ def _validate_sql_notes(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return None
 
     return {"sql": sql, "notes": notes}
-
-# ======================================================================
-# ===================== LLM RESPONSE PARSING (JSON) =====================
-# =====================================================================
-def try_llm_json(
-    llm: ChatOllama,
-    base_prompt: str,
-    max_attempts: int = 1,  # <-- dari 2 jadi 1
-) -> Optional[Dict[str, Any]]:
-    prompts = [
-        base_prompt
-        + "\n\nReturn ONLY a single JSON object with keys: sql, notes. "
-          "No markdown. No code fences. No explanation. "
-          "Example: {\"sql\":\"SELECT 1;\",\"notes\":\"...\"}"
-    ]
-
-    for attempt in range(min(max_attempts, len(prompts))):
-        resp = llm.invoke(prompts[attempt])
-        content = getattr(resp, "content", None) or str(resp)
-
-        obj = _extract_json_object(content)
-        if obj is None:
-            continue
-
-        cleaned = _validate_sql_notes(obj)
-        if cleaned is not None:
-            return cleaned
-
-    return None
 
 # ======================================================================
 # ===================== CONSTRAINTED REGENERATION (REPAIR) ==============
