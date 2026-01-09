@@ -1,7 +1,8 @@
 # ======================================================================
 # ========================== helpers_core.py ===========================
 # ======================================================================
-# Purpose: Heuristic Rules for SQL Generation Phase 0 - Phase 7
+# Purpose:
+# - Heuristic Rules for SQL Generation Phase 0 - Phase 7
 
 # ======================================================================
 # ====================== STANDARD LIBRARY IMPORT =======================
@@ -12,14 +13,14 @@ from typing import Dict, List, Optional, Set
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
 _ALIAS_OVERRIDES = {
-    "payments": "p",
-    "employees": "e",
-    "customers": "c",
+    "payments": "pmt",
+    "employees": "emp",
+    "customers": "cust",
     "orderdetails": "od",
-    "orders": "o",
-    "offices": "of",
-    "products": "pr",
-    "productlines": "pl",
+    "orders": "ord",
+    "offices": "ofc",
+    "products": "prod",
+    "productlines": "pline",
 }
 _RESERVED_ALIASES = {
     "or", "and", "on", "as", "in", "is", "by", "from", "join", "where",
@@ -300,10 +301,24 @@ def join_count(sql: str) -> int:
         return 0
     return len(re.findall(r"\bjoin\b", sql, flags=re.I))
 
-def _question_wants_include_zero(question: str) -> bool:
+def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
     q = (question or "").lower()
     
-    # Explicit zero-inclusion signals
+    # --- DINAMIS: Ambil daftar tabel dari context ---
+    allowed_tables = _parse_allowed_identifiers(ctx).keys()
+    if allowed_tables:
+        entities = []
+        for t in allowed_tables:
+            entities.append(re.escape(t.lower()))
+            # Handle singular (customers -> customer)
+            if t.lower().endswith('s'):
+                entities.append(re.escape(t.lower()[:-1]))
+        entity_kw = f"(?:{'|'.join(entities)})"
+    else:
+        # Fallback jika ctx tidak tersedia
+        entity_kw = r"(?:customer|product|employee|order|office|payment)"
+
+    # --- LOGIKA SIGNALS (Tetap sama) ---
     explicit_signals = [
         "including customers with no", "customers with no", "with no payments", 
         "never paid", "all customers", "even if no", "include those without",
@@ -314,32 +329,21 @@ def _question_wants_include_zero(question: str) -> bool:
     if any(s in q for s in explicit_signals):
         return True
     
-    # ✅ NEW: Implicit preserve-all patterns
-    entity_kw = r"(customer|product|employee|order|office|payment|pelanggan|produk|karyawan|pesanan|pembayaran)"
-    
-    # Pattern 1: "for each X" / "per X" / "by X"
+    # Pattern 1: "for each X"
     if re.search(rf"\b(for\s+each|per|setiap|tiap)\s+{entity_kw}", q, flags=re.I):
         return True
     
     # Pattern 2: "X with <aggregate condition>"
     if re.search(
         rf"\b{entity_kw}s?\s+with\s+(total|sum|count|average|avg|jumlah)\s+.*?\b(exceed|over|greater|more\s+than|above|>|melebihi|lebih\s+dari)",
-        q,
-        flags=re.I
+        q, flags=re.I
     ):
         return True
     
-    # Pattern 3: "group by X" dalam konteks non-filter
-    # (ini tricky, tapi "group by customer" biasanya preserve-all)
-    if re.search(rf"\bgroup\s+by\s+{entity_kw}", q, flags=re.I):
-        # HANYA jika tidak ada pre-filter intent ("who paid", "that ordered", dll)
-        if not re.search(r"\b(who|that|which|yang)\s+(paid|ordered|purchased|bought)", q, flags=re.I):
-            return True
-    
     return False
 
-def _rewrite_left_join_to_inner_if_not_needed(sql: str, question: str) -> str:
-    if not sql or _question_wants_include_zero(question):
+def _rewrite_left_join_to_inner_if_not_needed(sql: str, question: str, ctx: str = "") -> str:
+    if not sql or _question_wants_include_zero(question, ctx):
         return sql
     if join_count(sql) != 1:
         return sql
@@ -371,7 +375,7 @@ def _rewrite_left_join_to_inner_if_not_needed(sql: str, question: str) -> str:
 
     return sql
 
-def _rewrite_left_join_to_inner_if_rhs_filtered(sql: str, question: str) -> str:
+def _rewrite_left_join_to_inner_if_rhs_filtered(sql: str, question: str, ctx: str = "") -> str:
     """
     Generic Fix 2:
     If a LEFT JOIN's RHS is filtered in WHERE, it is semantically an INNER JOIN.
@@ -380,7 +384,7 @@ def _rewrite_left_join_to_inner_if_rhs_filtered(sql: str, question: str) -> str:
     """
     if not sql:
         return sql
-    if _question_wants_include_zero(question):
+    if _question_wants_include_zero(question, ctx):
         return sql
 
     # Only handle the simplest, safest case: exactly one JOIN, and it's a LEFT JOIN.
@@ -888,8 +892,75 @@ def _drop_redundant_inner_join_same_key(sql: str) -> str:
 
     return f"{new_prefix}{from_part}{new_tail}"
 
+# def _prune_ornamental_joins_safe(sql: str, question: str = "") -> str:
+#     if not sql:
+#         return sql
+
+#     out = sql
+
+#     join_pat = re.compile(
+#         r"""
+#         (?P<full>
+#             \s+
+#             (?P<jtype>(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN))
+#             \s+
+#             (?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)
+#             (?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?
+#             \s+\bON\b\s+(?P<on>.*?)
+#         )
+#         (?=
+#             \b(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN)\b
+#             |\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b
+#             |;|$
+#         )
+#         """,
+#         flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+#     )
+
+#     # ...lanjutkan logic kamu yang existing,
+#     # tapi pakai m.group("table") bila alias None
+#     matches = list(join_pat.finditer(out))
+#     for m in reversed(matches):
+#         alias = m.group("alias") or (m.group("table") or "").strip("`")
+#         jtype = (m.group("jtype") or "").upper()
+#         on_txt = m.group("on") or ""
+
+#         start_on = m.start("on")
+#         end_on = m.end("on")
+#         masked = out[:start_on] + (" " * (end_on - start_on)) + out[end_on:]
+
+#         if re.search(rf"\b{re.escape(alias)}\s*\.", masked, flags=re.I):
+#             continue
+
+#         is_inner = ("LEFT" not in jtype and "RIGHT" not in jtype and "FULL" not in jtype)
+#         if is_inner:
+#             if _on_clause_has_rhs_filter(on_txt, alias):
+#                 continue
+
+#         out = out[:m.start("full")] + " " + out[m.end("full"):]
+#     return out
 def _prune_ornamental_joins_safe(sql: str, question: str = "") -> str:
+    """
+    Drop JOIN yang tidak digunakan (ornamental).
+    
+    ULTRA SAFE MODE:
+    - Skip untuk query dengan GROUP BY (kemungkinan aggregation)
+    - Skip untuk query dengan aggregate functions (SUM, COUNT, dll)
+    - Hanya prune JOIN yang benar-benar tidak dipakai di mana pun
+    
+    Konservatif untuk menghindari false positive yang bisa merusak query valid.
+    """
     if not sql:
+        return sql
+
+    # ✅ GUARD 1: Skip untuk query dengan GROUP BY
+    # Aggregate queries sering pakai alias di dalam fungsi (SUM(p.amount))
+    if "GROUP BY" in sql.upper():
+        return sql
+    
+    # ✅ GUARD 2: Skip untuk query dengan aggregate functions
+    # Alias bisa tersembunyi di dalam SUM(p.amount), COUNT(o.orderNumber), dll
+    if re.search(r"\b(SUM|COUNT|AVG|MIN|MAX|GROUP_CONCAT)\s*\(", sql, flags=re.I):
         return sql
 
     out = sql
@@ -913,8 +984,6 @@ def _prune_ornamental_joins_safe(sql: str, question: str = "") -> str:
         flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
     )
 
-    # ...lanjutkan logic kamu yang existing,
-    # tapi pakai m.group("table") bila alias None
     matches = list(join_pat.finditer(out))
     for m in reversed(matches):
         alias = m.group("alias") or (m.group("table") or "").strip("`")
@@ -923,17 +992,24 @@ def _prune_ornamental_joins_safe(sql: str, question: str = "") -> str:
 
         start_on = m.start("on")
         end_on = m.end("on")
+        
+        # Mask ON clause: jangan hitung penggunaan alias di dalam ON
         masked = out[:start_on] + (" " * (end_on - start_on)) + out[end_on:]
 
+        # ✅ FIX: Case-insensitive search untuk alias usage
+        # Pattern: alias.column (qualified reference)
         if re.search(rf"\b{re.escape(alias)}\s*\.", masked, flags=re.I):
             continue
 
+        # Additional check: INNER JOIN with RHS filter di ON clause
         is_inner = ("LEFT" not in jtype and "RIGHT" not in jtype and "FULL" not in jtype)
         if is_inner:
             if _on_clause_has_rhs_filter(on_txt, alias):
                 continue
 
+        # Alias tidak dipakai → safe to remove JOIN
         out = out[:m.start("full")] + " " + out[m.end("full"):]
+    
     return out
 # =======================================================================
 # ================= Phase 2 — Syntax & Canonicalization =================
@@ -1024,11 +1100,21 @@ def _drop_unused_from_table_aliases(sql: str) -> str:
     - tidak menyentuh derived table: FROM (SELECT ...) t  (karena MySQL butuh alias derived table)
     - tidak menyentuh alias reserved
     """
+    
     if not sql:
         return sql
-
-    # Kalau ada JOIN di mana pun, jangan sentuh (biar aman).
+    print(f"[DROP_ALIAS] Input: {sql[:100]}")
+    print(f"[DROP_ALIAS] has_join: {has_join(sql)}")
+    # ✅ FIX 1: Kalau ada JOIN di mana pun, jangan sentuh (biar aman).
     if has_join(sql):
+        return sql
+
+    # ✅ FIX 2: Kalau ada GROUP BY, jangan sentuh (kemungkinan besar ada aggregasi multi-table)
+    if "GROUP BY" in sql.upper():
+        return sql
+
+    # ✅ FIX 3: Kalau ada aggregate functions, jangan sentuh
+    if re.search(r"\b(SUM|COUNT|AVG|MIN|MAX|GROUP_CONCAT)\s*\(", sql, flags=re.I):
         return sql
 
     # Build versi "scan" yang aman dari string literal + backticks untuk deteksi alias.col
@@ -1052,9 +1138,10 @@ def _drop_unused_from_table_aliases(sql: str) -> str:
         if not alias or alias.lower() in _RESERVED_ALIASES:
             return m.group(0)
 
-        # cek apakah alias dipakai sebagai qualifier setelah posisi FROM ini
-        # (kalau dipakai, jangan dihapus)
-        if re.search(rf"\b{re.escape(alias)}\s*\.", scan[m.end():], flags=re.I):
+        # ✅ FIX 4: Cek apakah alias dipakai di SELURUH query (bukan hanya setelah FROM)
+        # SEBELUMNYA: scan[m.end():] → hanya cek setelah FROM
+        # SEKARANG: scan → cek di seluruh query (termasuk SELECT clause)
+        if re.search(rf"\b{re.escape(alias)}\s*\.", scan, flags=re.I):
             return m.group(0)
 
         # alias tidak dipakai -> drop alias
@@ -1073,21 +1160,33 @@ def _strip_alias_if_single_table(sql: str) -> str:
 
     s = sql.lower()
 
-    # HARD GUARDS — jangan sentuh query kompleks
-    if " join " in s:
+    # ULTRA SAFE GUARDS
+    if re.search(r"\bjoin\b", s):
+        print(f"[STRIP_ALIAS] SKIP: has join")
         return sql
-    if " group by " in s:
+    
+    if re.search(r"\bgroup\s+by\b", s):
+        print(f"[STRIP_ALIAS] SKIP: has GROUP BY")
         return sql
-    if " from (" in s:          # subquery / derived table
+    
+    if re.search(r"\bfrom\s*\(", s):
+        print(f"[STRIP_ALIAS] SKIP: has subquery")
         return sql
-    if " row_number" in s:      # winner-row pipeline
+    
+    if re.search(r"\brow_number\b", s):
+        print(f"[STRIP_ALIAS] SKIP: has ROW_NUMBER")
         return sql
+    
+    if re.search(r"\b(sum|count|avg|min|max)\s*\(", s):
+        print(f"[STRIP_ALIAS] SKIP: has aggregate")
+        return sql
+
+    print(f"[STRIP_ALIAS] Processing simple single-table query...")
 
     m = re.search(r"\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", s)
     if not m:
         return sql
 
-    # split to avoid touching literals
     parts = re.split(r"('(?:''|[^'])*')", sql)
 
     for i in range(0, len(parts), 2):
@@ -1097,7 +1196,9 @@ def _strip_alias_if_single_table(sql: str) -> str:
             parts[i],
         )
 
-    return "".join(parts)
+    result = "".join(parts)
+    print(f"[STRIP_ALIAS] Output: {result[:100]}")
+    return result
 # =======================================================================
 # ============ Phase 3 — Column Naming & GROUP BY Consistency ===========
 # ================== Operate on final column identities =================
@@ -2638,29 +2739,21 @@ def _question_requires_word_boundary_regex(question: str) -> bool:
 def _question_requires_regex(question: str) -> bool:
     q = (question or "").strip().lower()
 
-    # explicit regex request
-    if any(k in q for k in ["regex", "regexp", "regular expression"]):
+    # 1. Deteksi eksplisit (sudah ada di code Anda)
+    if any(k in q for k in ["regex", "regexp", "regexp_like", "regular expression"]):
         return True
 
-    # word-boundary intent
-    if _question_requires_word_boundary_regex(question):
+    # 2. Deteksi jumlah digit yang spesifik (Start Small: Fokus di sini)
+    # Ini akan menangkap "3 digits", "three digits", "exactly 4 characters", dll.
+    if re.search(r"\b\d+\s+(digit|character|angka|huruf)\b", q):
+        return True
+    if re.search(r"\b(one|two|three|four|five)\s+(digit|character|angka|huruf)\b", q):
         return True
 
-    # strict structure / exact length / digits-only / mask/format
-    if re.search(r"\bexactly\s+\d+\b", q):
+    # 3. Deteksi pola "followed by" (kasus spesifik Anda)
+    if "followed by" in q or "diikuti oleh" in q:
         return True
-    if re.search(r"\b\d+\s+(digits|digit|characters|chars|huruf|karakter)\b", q):
-        return True
-    if re.search(r"\bexactly\s+(one|two|three|four|five|six|seven|eight|nine|ten)\b", q):
-        return True
-    if re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten)\s+(digits|digit|characters|chars|huruf|karakter)\b", q):
-        return True
-    if any(p in q for p in ["only digits", "hanya angka", "numeric only"]):
-        return True
-    # "format" dan "mask" harus whole-word, biar "information" tidak kena "format"
-    if re.search(r"\bformat\b", q) or re.search(r"\bmask\b", q):
-        return True
-    # default: prefix/suffix/contains biasa => LIKE cukup
+
     return False
 
 def _should_prefer_like_over_regexp(question: str) -> bool:
