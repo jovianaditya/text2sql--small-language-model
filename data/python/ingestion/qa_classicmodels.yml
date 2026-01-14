@@ -91,11 +91,11 @@ cases:
         WHERE reportsTo = 1143;
     - id: E14
       difficulty: easy
-      question: "Find customers whose names contain a word that starts with “Co”. Show their customer number and name."
+      question: "Find payments where the check number starts with two uppercase letters, followed by exactly 5 digits, and ends with any single digit. Display the check number and the payment amount."
       groundtruth_sql: |
-        SELECT customerNumber, customerName 
-        FROM customers 
-        WHERE customerName REGEXP '(^|[^[:alnum:]_])Co[[:alnum:]_]*';
+        SELECT checkNumber, amount
+        FROM payments
+        WHERE checkNumber REGEXP '^[A-Z]{2}[0-9]{5}[0-9]$';
     - id: E15
       difficulty: easy
       question: "Find payments that were made in the first quarter of 2004 (January to March). Show their customer numbers, payment dates, and amounts."
