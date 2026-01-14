@@ -1,17 +1,18 @@
--- permission.sql  (runs only on first init when /var/lib/mysql is empty)
+-- permission.sql
 
--- Ensure DB exists (harmless if classicmodels.sql also creates it)
+-- Ensure DB exists
 CREATE DATABASE IF NOT EXISTS classicmodels;
 
 -- Create the ingestion user
+-- Menggunakan 'IF NOT EXISTS' agar tidak error jika script dijalankan ulang
 CREATE USER IF NOT EXISTS 'datahub'@'%' IDENTIFIED BY 'datahub';
 
--- Minimal grants required for DataHub + profiling (GE uses TEMP TABLEs)
+-- Grant akses ke database target (classicmodels)
+-- Ini SUDAH CUKUP agar datahub bisa membaca metadata tabel ini di information_schema
 GRANT SELECT, SHOW VIEW, CREATE TEMPORARY TABLES
 ON classicmodels.* TO 'datahub'@'%';
 
--- (Optional) let the user read metadata schemas; harmless and useful
-GRANT SELECT ON information_schema.* TO 'datahub'@'%';
+-- performance_schema Boleh di-grant (opsional, bagus untuk profiling query)
 GRANT SELECT ON performance_schema.* TO 'datahub'@'%';
 
 FLUSH PRIVILEGES;
