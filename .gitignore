@@ -10,5 +10,6 @@ data/python/mcp_client/chroma_db/
 __pycache__/
 *.py[cod]
 *$py.class
-*.env
+.env
+**/.env
 *.ipynb_checkpoints
