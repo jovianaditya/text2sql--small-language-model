@@ -58,17 +58,6 @@ async def repl(paths):
         init_state = make_state(paths, first_q)
         state = app.invoke(init_state)
 
-        # ingestion report
-        col = build_vector_store()
-        total = col.count()
-        line = _print_banner("Collection Ingestion Report")
-        print(f"Added (first run): {state.get('added', 0)}")
-        print(f"Updated (upserted): {state.get('updated', 0)}")
-        print(f"Skipped (unchanged): {state.get('skipped', 0)}")
-        print(f"Total docs now in collection: {total}")
-        print(f"Chroma path: {Path(CHROMA_DIR).resolve()} | Collection: {COLLECTION_NAME}")
-        print(f"{line}\n")
-
         await _exec_via_mcp(mcp, state.get("answer", ""), state.get("final_sql"))
 
         _log_total("End-to-end total time (first run)", t0_total)

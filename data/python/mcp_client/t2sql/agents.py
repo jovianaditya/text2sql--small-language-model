@@ -18,34 +18,93 @@ from .utils import _dbg_print_two, try_llm_json, build_router_schema
 from .generation import regenerate_with_extra_constraint
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
     _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline)
-from .helpers_core import(has_join, _question_requires_word_boundary_regex, _parse_allowed_identifiers)
+from .helpers_core import(has_join, _question_requires_word_boundary_regex, _parse_allowed_identifiers, _remove_top_level_order_by_if_not_requested)
 
 # ======================================================================
-# ====================== AGENT 1 - MODEL ROUTING =======================
+# Update: agents.py -> router_agent (Final Robust Version)
 # ======================================================================
 def router_agent(state: RAGState) -> RAGState:
     print(f"\n[Router] Evidence-Based Analysis starting...")
     question = state.get("question", "").lower()
     ctx = state.get("context", "")
     
-    # 1. IDENTIFIKASI TABEL (Selective Logic)
+    # 1. IDENTIFIKASI TABEL (Pattern-Based Exclusion)
     allowed_identifiers = _parse_allowed_identifiers(ctx)
     whitelisted_tables = allowed_identifiers.keys()
     
+    # [FIX] Definisi Pattern yang HARUS DIBUANG sebelum deteksi tabel
+    # Format: 'root_word': [list_of_regex_patterns_to_remove]
+    ignore_patterns = {
+        'order': [
+            r"\border(ed|s)?\s+by\b",           # Remove: "order by", "ordered by"
+            r"\b(descending|ascending)\s+order\b", # Remove: "descending order", "ascending order"
+            r"\bin\s+order\b"                   # Remove: "in order" (e.g. "in order to")
+        ],
+        'group': [r"\bgroup\s+by\b"],           # Remove: "group by"
+        'sort':  [r"\bsort(ed)?\s+by\b"],       # Remove: "sort by", "sorted by"
+        'rank':  [r"\brank\s+over\b"]           # Remove: "rank over"
+    }
+    
     relevant_tables = []
     for tbl in whitelisted_tables:
-        if f"- {tbl}:" in ctx or f"- `{tbl}`:" in ctx:
-            table_word = tbl.lower().rstrip('s')
+        # Cek 1: Pastikan tabel ada di Context
+        if f"- {tbl}:" not in ctx and f"- `{tbl}`:" not in ctx:
+            continue
+        
+        table_word = tbl.lower().rstrip('s') # orders -> order
+        
+        # --- [ROBUST MASKING] ---
+        # Buat copy pertanyaan khusus untuk scanning tabel ini
+        search_scope = question
+        
+        if table_word in ignore_patterns:
+            patterns = ignore_patterns[table_word]
+            for pat in patterns:
+                # Hapus frasa pengganggu (ganti dengan spasi)
+                search_scope = re.sub(pat, " ", search_scope)
+        # ------------------------
+        
+        # Cek 2: Cari kata tabel di search_scope yang SUDAH BERSIH
+        if re.search(rf"\b{table_word}s?\b", search_scope):
             
-            if re.search(rf"\b{table_word}s?\b", question):
-                # Deteksi referensi ID saja (FK)
-                is_just_id_ref = re.search(rf"\b{table_word}s?\s+(number|id|code|kode|nomor)\b", question)
-                if is_just_id_ref:
-                    # Ambil tabel jika ada penyebutan entitas di luar ID
-                    if re.search(rf"\b{table_word}s?\b(?!\s+(number|id|code|kode|nomor))", question):
-                        relevant_tables.append(tbl)
-                else:
+            # Deteksi referensi ID saja (FK)
+            is_just_id_ref = re.search(rf"\b{table_word}s?\s+(number|id|code|kode|nomor)\b", search_scope)
+            
+            if is_just_id_ref:
+                # Ambil tabel jika ada penyebutan entitas di luar ID
+                if re.search(rf"\b{table_word}s?\b(?!\s+(number|id|code|kode|nomor))", search_scope):
                     relevant_tables.append(tbl)
+            else:
+                relevant_tables.append(tbl)
+    
+    # 🆕 [FK-ONLY FILTER] - Hapus tabel yang HANYA disebutkan sebagai filter nilai FK
+    # Pattern: "offices with codes 1, 2, or 3" -> offices cuma jadi constraint, bukan JOIN
+    filtered_tables = []
+    for tbl in relevant_tables:
+        table_word = tbl.lower().rstrip('s')
+        # Deteksi pattern: "<table> with <code/id> <angka/list>"
+        fk_only_pattern = rf"\b{table_word}s?\s+with\s+(code|number|id|kode|nomor)s?\s+[\d,\sor]+"
+        
+        # Jika match FK-only pattern DAN tidak ada penyebutan lain dari tabel tersebut
+        if re.search(fk_only_pattern, question):
+            # Cek apakah ada penyebutan tabel di luar pattern FK-only
+            temp_scope = re.sub(fk_only_pattern, "", question)
+            
+            # 🆕 PENTING: Cek tabel tanpa 's' juga (office vs offices)
+            # Karena "office codes" != "offices", harus cek strict word boundary
+            has_other_mention = (
+                re.search(rf"\b{table_word}s\b", temp_scope) or  # Cek plural (offices)
+                re.search(rf"\b{table_word}\s+(?!(code|number|id|kode|nomor))", temp_scope)  # Cek singular tapi bukan "<table> code"
+            )
+            
+            if not has_other_mention:
+                # Skip tabel ini, karena cuma disebutkan sebagai FK filter
+                continue
+        
+        filtered_tables.append(tbl)
+
+    relevant_tables = filtered_tables
+    # 🆕 [END FK-ONLY FILTER]
     
     # 2. DETEKSI SINYAL
     math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata']
@@ -64,28 +123,28 @@ def router_agent(state: RAGState) -> RAGState:
     has_group_word = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in group_indicators)
     is_by_logic = ("by " in question and not any(re.search(rf"\b{re.escape(s)}\b", question) for s in explicit_sort) and (has_math or is_ranking))
     has_grouping = has_group_word or is_by_logic
-
+    
     # 3. LOGIKA ESKALASI
     is_multi_table = len(relevant_tables) > 1
     is_winner_row = is_ranking_value and has_grouping
+    
     exclusion_keywords = ["no", "never", "without", "tidak pernah", "belum pernah", "tidak ada", "missing", "empty", "all customers", "all products"]
     has_exclusion = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in exclusion_keywords)
-
-    # Note: Exclusion tidak lagi memaksa eskalasi agar kasus "missing attribute" (simple) tidak masuk complex
+    
     should_escalate = is_multi_table or is_winner_row
     
     chosen_model = LARGE_MODEL if should_escalate else SMALL_MODEL
     complexity = "complex" if should_escalate else "simple"
-
-    # Tentukan QTYPE untuk Agent 2
+    
+    # Tentukan QTYPE
     if is_winner_row: qtype = "rank"
     elif has_math or has_grouping: qtype = "aggregate"
     else: qtype = "lookup"
-
+    
     print(f"[Router] Detected Tables: {relevant_tables}")
     print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, Exclusion:{has_exclusion}")
     print(f"[Router] Decision: {complexity.upper()} -> {chosen_model}")
-
+    
     return {
         **state,
         "router_tables": relevant_tables,
@@ -99,7 +158,6 @@ def router_agent(state: RAGState) -> RAGState:
             "has_exclusion": has_exclusion
         }
     }
-
 # ======================================================================
 # ======================= AGENT 2 - SQL DRAFTER ========================
 # ======================================================================
@@ -121,8 +179,14 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         return {**state, "draft_sql": "SELECT 'Error: LLM failed';"}
         
     draft_sql = (obj.get("sql") or "SELECT 1;").strip()
+    reasoning = (obj.get("notes") or "No reasoning provided.").strip()
     print(f"\n[DRAFT] Raw from LLM: {draft_sql}")
-    
+    print(f"[DRAFT] LLM Reasoning: {reasoning}")
+    draft_sql = _remove_top_level_order_by_if_not_requested(draft_sql, question)
+    # 2. [NEW] Hapus syntax error: SELECT col DESC FROM ...
+    # Regex ini mencari DESC/ASC sebelum FROM atau koma
+    draft_sql = re.sub(r"\s+(DESC|ASC)\s*(?=FROM)", " ", draft_sql, flags=re.IGNORECASE)
+    draft_sql = re.sub(r"\s+(DESC|ASC)\s*(?=,)", " ", draft_sql, flags=re.IGNORECASE)
     # Basic Cleanup (Limit Halusinasi)
     draft_sql = re.sub(r"LIMIT\s+(NULL|0)", "", draft_sql, flags=re.IGNORECASE).strip()
     match = re.search(r"LIMIT\s+(\d+)", draft_sql, re.IGNORECASE)
@@ -138,8 +202,9 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 # ======================= AGENT 3 - SQL REFINER ========================
 # ======================================================================
 def refine_sql_agent(state: RAGState) -> RAGState:
-    # GUNAKAN SELALU LARGE_MODEL (7B) untuk perbaikan logika yang kompleks
-    target_model = LARGE_MODEL
+    # DYNAMIC MODEL SELECTION berdasarkan draft quality
+    draft_model = state.get("target_model") or SMALL_MODEL  # 🆕 Track model asal
+    target_model = LARGE_MODEL  # Default untuk regeneration
     
     llm = build_llm_repair(model=target_model)
     question = state.get("question", "")
@@ -148,6 +213,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     
     decision = state.get("router_decision", {})
     detected_tables = state.get("router_tables") or []
+    complexity = decision.get("complexity", "complex")
+    qtype = decision.get("qtype", "lookup")
     
     # 1. HEURISTIC PIPELINE (Versi Bersih/Safe Mode)
     final_sql = normalize_sql_pipeline(draft_sql, question, ctx)
@@ -190,9 +257,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # 3. DECISION MATRIX
     needs_regeneration = False
+    regeneration_model = LARGE_MODEL  # 🆕 Default 7B untuk regeneration
     extra_instruction = ""
 
-    # --- KASUS A: Schema Validation & Hallucination Check (SMART) ---
+    # --- KASUS A: Schema Validation & Hallucination Check (HARD ERROR) ---
     if alien_cols and "JOIN" not in sql_up:
         can_be_solved_by_join = False
         potential_table = ""
@@ -205,16 +273,17 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 break
         
         if can_be_solved_by_join:
-            _dbg_print_two("[Agent3] 🚨 Missing JOIN", f"Columns {alien_cols} belong to {potential_table}")
+            _dbg_print_two("[Agent3] 🚨 HARD ERROR - Missing JOIN", f"Columns {alien_cols} belong to {potential_table}")
             extra_instruction = (
                 f"STRICT REQUIREMENT: Columns {alien_cols} do NOT exist in table '{primary_tbl}', but they belong to '{potential_table}'. "
                 f"Detected intent implies multiple tables: {detected_tables}. "
                 "You MUST use explicit JOIN (e.g., JOIN {potential_table} ON ...) to link the data."
             )
             needs_regeneration = True
+            regeneration_model = LARGE_MODEL  # Force 7B
             
         elif not can_be_solved_by_join:
-             _dbg_print_two("[Agent3] 🚨 Hallucination/Typo", f"Columns {alien_cols} do not exist in Schema.")
+             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Hallucination", f"Columns {alien_cols} do not exist in Schema.")
              extra_instruction = (
                 f"STRICT REQUIREMENT: The columns {alien_cols} do NOT exist in the database schema. "
                 "1. Check for typos (e.g. `order_date` vs `orderDate`). "
@@ -222,30 +291,33 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "3. Do NOT hallucinate snake_case names if the schema uses camelCase."
              )
              needs_regeneration = True
+             regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS B: Winner-Row Leak Check ---
+    # --- KASUS B: Winner-Row Leak Check (HARD ERROR) ---
     is_winner_row = decision.get("is_winner_row", False)
     if is_winner_row and not needs_regeneration:
         if re.search(r"SELECT\s+.*?\brn\b.*?FROM", sql_up):
-             _dbg_print_two("[Agent3] 🚨 Winner-Row Leak", "rn column found in outer select.")
+             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Winner-Row Leak", "rn column found in outer select.")
              extra_instruction = (
                 "STRICT REQUIREMENT: Use standard Winner-Row pattern. "
                 "Do NOT include the 'rn' (row number) column in the final output."
              )
              needs_regeneration = True
+             regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS C: ANTI-PATTERN (WHERE IN Subquery) ---
+    # --- KASUS C: ANTI-PATTERN (WHERE IN Subquery) (HARD ERROR) ---
     tuple_in_pattern = re.search(r"WHERE\s*\([^)]+,[^)]+\)\s*IN\s*\(SELECT", sql_up)
     if tuple_in_pattern and not needs_regeneration:
-        _dbg_print_two("[Agent3] 🚨 Anti-Pattern Detected", "Tuple comparison inside WHERE IN (...)")
+        _dbg_print_two("[Agent3] 🚨 HARD ERROR - Anti-Pattern", "Tuple comparison inside WHERE IN (...)")
         extra_instruction = (
             "STRICT REQUIREMENT: Do NOT use the `WHERE (col1, col2) IN (SELECT ...)` pattern. "
             "It causes Error 1055. INSTEAD, use the Window Function pattern:\n"
             "SELECT ... FROM (SELECT ..., ROW_NUMBER() OVER (...) as rn FROM table) t WHERE rn = 1;"
         )
         needs_regeneration = True
+        regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS D: MISSING PARTITION KEY IN OUTPUT ---
+    # --- KASUS D: MISSING PARTITION KEY IN OUTPUT (HARD ERROR) ---
     if is_winner_row and not needs_regeneration:
         part_match = re.search(r"PARTITION\s+BY\s+([A-Za-z0-9_]+)", sql_up)
         if part_match:
@@ -254,15 +326,16 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             if select_clause_match:
                 select_clause = select_clause_match.group(1)
                 if part_col not in select_clause.upper():
-                    _dbg_print_two("[Agent3] 🚨 Logic Check Failed", f"Partition key '{part_col}' missing from SELECT")
+                    _dbg_print_two("[Agent3] 🚨 HARD ERROR - Missing Partition Key", f"'{part_col}' missing from SELECT")
                     extra_instruction = (
                         f"STRICT REQUIREMENT: The query partitions by '{part_col}', but it is MISSING from the final SELECT list. "
                         f"You MUST include '{part_col}' in the output so we know who the record belongs to. "
                         f"Target format: SELECT {part_col}, [other columns] FROM ..."
                     )
                     needs_regeneration = True
+                    regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS E: INNER JOIN TRAP (DYNAMIC) ---
+    # --- KASUS E: INNER JOIN TRAP (HARD ERROR) ---
     has_groupby = "GROUP BY" in sql_up
     is_left_join = "LEFT JOIN" in sql_up
     if has_groupby and not is_left_join and not needs_regeneration:
@@ -275,7 +348,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             group_refs = set(re.findall(r"\b([a-z0-9_]+)\.", group_clause))
             risky_filters = where_refs - group_refs
             if risky_filters:
-                 _dbg_print_two("[Agent3] 🚨 Logic Check Failed", f"Filtering child table aliases {risky_filters} in WHERE clause without LEFT JOIN.")
+                 _dbg_print_two("[Agent3] 🚨 HARD ERROR - INNER JOIN Trap", f"Filtering child table {risky_filters}")
                  extra_instruction = (
                     "STRICT REQUIREMENT: You are aggregating data (GROUP BY), but you are filtering a related table in the WHERE clause. "
                     "This behaves like an INNER JOIN and removes master records with no matches. "
@@ -283,10 +356,19 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     "2. You MUST move the filters for the related table from WHERE to the ON clause."
                  )
                  needs_regeneration = True
+                 regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS F: CRITICAL COLUMN OMISSION (DYNAMIC) ---
+    # --- KASUS F: CRITICAL COLUMN OMISSION (SOFT/MEDIUM/HARD ERROR) ---
     if not needs_regeneration:
         missing_cols = []
+        
+        # 🆕 STEP 1: Ambil tokens HANYA dari klausa SELECT (Bukan seluruh SQL)
+        # Tujuannya agar kolom yang hanya ada di WHERE/ORDER BY tetap terdeteksi sebagai "missing" di output
+        select_match_chk = re.search(r"^SELECT\s+(.*?)\s+FROM", final_sql, re.IGNORECASE | re.DOTALL)
+        select_text_chk = select_match_chk.group(1).lower() if select_match_chk else ""
+        # Tokenize hanya bagian SELECT
+        select_tokens_chk = set(re.findall(r"\b([a-z][a-z0-9_]*)\b", select_text_chk))
+
         suffix_synonyms = {
             "number": r"(number|no|id|code|kode|nomor)",
             "code":   r"(code|id|no|number|kode|nomor)",
@@ -296,10 +378,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             "amount": r"(amount|total|jumlah|nilai|harga)",
             "extension": r"(extension|ext)"
         }
+        
         # all_valid_cols sudah disiapkan di atas
         for col_raw in all_valid_cols:
             col_lower = col_raw.lower()
-            if col_lower in sql_tokens: continue
+            
+            # 🆕 STEP 2: Logic Check yang Lebih Akurat
+            # Skip jika kolom sudah ada di SELECT tokens, atau jika ada wildcard (*)
+            if col_lower in select_tokens_chk or "*" in select_text_chk: 
+                continue
             
             clean_name = re.sub(r'([a-z])([A-Z])', r'\1 \2', col_raw)
             clean_name = clean_name.replace('_', ' ').lower()
@@ -318,24 +405,68 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 missing_cols.append(col_raw)
 
         if missing_cols:
-             _dbg_print_two("[Agent3] 🚨 Critical Omission", f"User asked for {missing_cols} but not selected.")
-             extra_instruction = (
-                f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
-                f"Please add {missing_cols} to the SELECT clause."
-             )
-             needs_regeneration = True
+            # 🆕 TIERING LOGIC - Smart escalation based on complexity
+            if complexity == "simple" and qtype == "lookup":
+                # SOFT ERROR: Auto-fix tanpa regenerate
+                _dbg_print_two("[Agent3] 🟡 SOFT FIX - Missing Columns", f"Auto-appending {missing_cols}")
+                
+                # 🆕 STEP 3: Safe Injection (Menangani DISTINCT)
+                is_distinct = re.search(r"^SELECT\s+DISTINCT\s+", final_sql, re.IGNORECASE)
+                
+                if is_distinct:
+                    # Pola: SELECT DISTINCT col1 -> SELECT DISTINCT missing, col1
+                    final_sql = re.sub(
+                        r"^(SELECT\s+DISTINCT\s+)(.*?)(\s+FROM)", 
+                        f"\\1{', '.join(missing_cols)}, \\2\\3", 
+                        final_sql, 
+                        count=1, 
+                        flags=re.IGNORECASE | re.DOTALL
+                    )
+                else:
+                    # Pola: SELECT col1 -> SELECT missing, col1
+                    final_sql = re.sub(
+                        r"^(SELECT\s+)(.*?)(\s+FROM)", 
+                        f"\\1{', '.join(missing_cols)}, \\2\\3", 
+                        final_sql, 
+                        count=1, 
+                        flags=re.IGNORECASE | re.DOTALL
+                    )
+                
+                corrections.append(f"Auto-added missing columns: {', '.join(missing_cols)}")
+            
+            elif draft_model == SMALL_MODEL and complexity == "simple":
+                # MEDIUM ERROR: Regenerate dengan 3B (simple query dari 3B yang salah)
+                _dbg_print_two("[Agent3] 🟠 MEDIUM ERROR - Missing Columns", f"Retry with 3B: {missing_cols}")
+                extra_instruction = (
+                    f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
+                    f"But they are MISSING from the SELECT clause. "
+                    f"You MUST include: {', '.join(missing_cols)} in the output."
+                )
+                needs_regeneration = True
+                regeneration_model = SMALL_MODEL  # Retry dengan 3B
+            
+            else:
+                # HARD ERROR: Complex query atau 7B draft → escalate ke 7B
+                _dbg_print_two("[Agent3] 🚨 HARD ERROR - Critical Omission", f"{missing_cols}")
+                extra_instruction = (
+                    f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
+                    f"Please add {missing_cols} to the SELECT clause."
+                )
+                needs_regeneration = True
+                regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS G: BROKEN ALIAS SYNTAX ---
+    # --- KASUS G: BROKEN ALIAS SYNTAX (HARD ERROR) ---
     if not needs_regeneration:
         if re.search(r"\b[a-z0-9_]+\.\(", sql_up.lower()):
-             _dbg_print_two("[Agent3] 🚨 Syntax Error", "Broken alias syntax `alias.(...)` detected.")
+             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Syntax Error", "Broken alias syntax `alias.(...)` detected.")
              extra_instruction = (
                 "SYNTAX ERROR: You generated invalid SQL syntax like `table_alias.(condition)`. "
                 "CORRECT: `(table_alias.column IS NULL ...)`."
              )
              needs_regeneration = True
+             regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS H: REGEX PATTERN MISMATCH ---
+    # --- KASUS H: REGEX PATTERN MISMATCH (HARD ERROR) ---
     if not needs_regeneration:
         regex_triggers = [
             r"exactly\s+\w+\s+digits",
@@ -348,32 +479,33 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         uses_simple_like = "LIKE" in sql_up and "REGEXP" not in sql_up and "RLIKE" not in sql_up
         
         if requires_strict_pattern and uses_simple_like:
-             _dbg_print_two("[Agent3] 🚨 Pattern Mismatch", "Question asks for strict pattern (digits), but SQL uses simple LIKE.")
+             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Pattern Mismatch", "Question asks for strict pattern (digits), but SQL uses simple LIKE.")
              extra_instruction = (
                 "STRICT REQUIREMENT: The user asks for a strict pattern (e.g. 'digits' vs 'characters', or exact length). "
                 "Simple 'LIKE' cannot distinguish digits from characters. "
                 "1. You MUST use `REGEXP` (or `REGEXP_LIKE`). "
                 "2. Use `[0-9]` for digits. "
                 "3. Use anchors `^` (start) and `$` (end) if exact length is needed. "
-                "4. Example for 'starts with x followed by 3 digits': `REGEXP '^x[0-9]{3}$'`"
              )
              needs_regeneration = True
+             regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS I: UNSAFE MONTH SORTING (NEW) ---
+    # --- KASUS I: UNSAFE MONTH SORTING (HARD ERROR) ---
     if "MONTH" in sql_up and "ORDER" in sql_up and not needs_regeneration:
         has_month_name_group = re.search(r"GROUP\s+BY\s+.*?DATE_FORMAT", sql_up, re.DOTALL)
         has_safe_sort = re.search(r"ORDER\s+BY\s+.*?(MONTH|YEAR|MIN|MAX|STR_TO_DATE)\(", sql_up, re.DOTALL)
         
         if has_month_name_group and not has_safe_sort:
-             _dbg_print_two("[Agent3] 🚨 Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
+             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
              extra_instruction = (
                 "STRICT REQUIREMENT: You are grouping by Month Name, which sorts Alphabetically (Apr, Aug...). "
                 "FIX: You MUST Group and Sort by the Month Number as well. "
                 "Example: `GROUP BY MONTH(orderDate), month_name ORDER BY MONTH(orderDate) DESC`."
              )
              needs_regeneration = True
+             regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS J: AGGREGATION VIOLATION (ERROR 1055) ---
+    # --- KASUS J: AGGREGATION VIOLATION (ERROR 1055) (HARD ERROR) ---
     # Menangkap kasus SELECT raw_col FROM... GROUP BY derived_col (Error 1055)
     if "GROUP BY" in sql_up and not needs_regeneration:
         group_clause = re.search(r"GROUP\s+BY\s+(.*?)($|ORDER|LIMIT|HAVING)", sql_up, re.DOTALL)
@@ -396,22 +528,34 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     is_alias = "AS " in prev_text or "AS" in prev_text
                     
                     if not is_func and not is_alias:
-                         _dbg_print_two("[Agent3] 🚨 Aggregation Violation", f"Raw column '{col}' selected but grouped by derived value.")
+                         _dbg_print_two("[Agent3] 🚨 HARD ERROR - Aggregation Violation", f"Raw column '{col}' selected but grouped by derived value.")
                          extra_instruction = (
                             f"STRICT REQUIREMENT: You are grouping by a derived value of '{col}' (e.g. CASE or DATE_FORMAT), "
                             f"but you are selecting the raw '{col}' column. This causes SQL Error 1055. "
                             f"FIX: Remove '{col}' from the SELECT clause. Only select the grouping key and aggregates (COUNT, SUM)."
                          )
                          needs_regeneration = True
+                         regeneration_model = LARGE_MODEL  # Force 7B
                          break
                 if needs_regeneration: break
 
-    # 4. EXECUTE REGENERATION
+    # 4. EXECUTE REGENERATION (dengan dynamic model selection)
     if needs_regeneration:
-        new_sql, _ = regenerate_with_extra_constraint(llm, make_generation_prompt, ctx, question, extra_instruction)
+        # 🆕 Use dynamic model selection
+        llm_regen = build_llm_repair(model=regeneration_model)
+        model_label = "7B" if regeneration_model == LARGE_MODEL else "3B"
+        _dbg_print_two("[Agent3] Regenerating with", model_label)
+        
+        new_sql, _ = regenerate_with_extra_constraint(
+            llm_regen, 
+            make_generation_prompt, 
+            ctx, 
+            question, 
+            extra_instruction
+        )
         if new_sql:
             final_sql = normalize_sql_pipeline(new_sql, question, ctx)
-            corrections.append("Regenerated & Re-Normalized")
+            corrections.append(f"Regenerated ({model_label}) & Re-Normalized")
 
     final_sql = final_sql.strip()
     if not final_sql.endswith(";"): final_sql += ";"

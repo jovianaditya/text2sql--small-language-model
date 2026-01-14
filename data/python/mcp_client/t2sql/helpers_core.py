@@ -3047,39 +3047,36 @@ def _question_requests_ordering(question: str) -> bool:
     return any(k in q for k in keywords)
 
 def _remove_top_level_order_by_if_not_requested(sql: str, question: str) -> str:
+    """
+    Versi Regex Barbar: Memangkas ORDER BY jika user tidak meminta.
+    Lebih kuat daripada SQLGlot karena tidak peduli validitas syntax SQL keseluruhan.
+    """
     if not sql:
         return sql
+        
+    # 1. Cek Intent: Kalau user minta sort, biarkan.
     if _question_requests_ordering(question):
         return sql
 
-    try:
-        import sqlglot
-        from sqlglot import exp
-    except Exception:
-        return sql  # jangan rusak pipeline kalau sqlglot tidak ada
-
-    try:
-        ast = sqlglot.parse_one(sql, read="mysql")
-    except Exception:
-        return sql
-
-    # ast biasanya Select untuk query normal
-    sel = ast if isinstance(ast, exp.Select) else None
-    if sel is None:
-        # fallback: cari Select terluar (bukan inner). Cari yang parent-nya bukan Select.
-        # (cukup aman untuk kasus kamu)
-        candidates = list(ast.find_all(exp.Select))
-        if candidates:
-            sel = candidates[0]
-
-    if sel is None:
-        return sql
-
-    # Hapus ORDER BY hanya di select terluar
-    if sel.args.get("order"):
-        sel.set("order", None)
-
-    return ast.sql(dialect="mysql")
+    # 2. Hapus ORDER BY
+    # Logic: Cari "ORDER BY <apa saja>" sampai ketemu "LIMIT", ";", atau habis string.
+    # Pattern penjelasan:
+    # \s+ORDER\s+BY\s+  -> Cari kata ORDER BY (case insensitive)
+    # .*?               -> Ambil semua karakter setelahnya (non-greedy)
+    # (?=...)           -> Berhenti (Lookahead) jika ketemu...
+    #   (?:\s+LIMIT\b|;|$) -> Kata LIMIT, titik koma, atau akhir string.
+    
+    cleaned = re.sub(
+        r"\s+ORDER\s+BY\s+.*?(?=(?:\s+LIMIT\b|;|$))", 
+        "", 
+        sql, 
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    
+    if cleaned != sql:
+        print("[Logic] ✂️ Removed unrequested ORDER BY (Regex Force).")
+        
+    return cleaned
 
 def _explicit_limit_from_question(question: str) -> Optional[int]:
     q = (question or "").lower()

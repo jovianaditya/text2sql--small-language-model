@@ -27,6 +27,7 @@ SPARSE_MAX_HITS  = int(os.getenv("SPARSE_MAX_HITS", "20"))
 # >>> Bisa dimatiin kalau mau lebih silent
 SPARSE_DEBUG   = bool(int(os.getenv("SPARSE_DEBUG", "0")))
 RETRIEVE_DEBUG = bool(int(os.getenv("RETRIEVE_DEBUG", "1")))
+EXPORT_JSONL_OUTPUT = os.getenv("EXPORT_JSONL_OUTPUT", "classicmodels_dense.jsonl").strip()
 # ======================================================================
 # =============================== MCP ==================================
 # ======================================================================

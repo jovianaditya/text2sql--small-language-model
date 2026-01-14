@@ -855,8 +855,8 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
             "customerid": "customerNumber",
             "customer_id": "customerNumber",
             "id_customer": "customerNumber",
-            "kodecustomer": "customerNumber",
-            "kode_pelanggan": "customerNumber",
+            "contactfirstname": "contactFirstName",
+            "contactlastname": "contactLastName", 
         },
         "employees": {
             "contactfirstname": "firstName",
@@ -904,10 +904,6 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
 # ======================================================================
 # ================= ROUTING & GENERATION PROMPT BUILDER ================
 # ======================================================================
-# ======================================================================
-# ================= ROUTING & GENERATION PROMPT BUILDER ================
-# ======================================================================
-
 def make_router_prompt(question: str, schema_summary: str) -> str:
     """
     Prompt Router yang dioptimalkan untuk Model SLM (1.5B/7B).
@@ -967,7 +963,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     
     # --- 1. BANGUN CONSTRAINT DINAMIS ---
     constraints = []
-    
+    # [A] STATS UTILIZATION (profiling statistics)
+    constraints.append(
+        "DATA INTELLIGENCE: Use the provided 'STATS' in the Context responsibly:\n"
+        "   - SAMPLES: Use exact string values found in 'Sample=...'. (e.g. if Sample='USA', do not query 'United States').\n"
+        "   - RANGE/DISTRIBUTION: `Min`/`Max` values are provided ONLY as a reference to describe data distribution. "
+        "     NEVER hardcode these values into the query. Use SQL logic (e.g. `ORDER BY`, `MAX()`, comparison operators) instead."
+    )
     # [B] SIMPLE QUERY RULES
     if complexity == "simple":
         constraints.append("SCOPE: This query requires ONE TABLE ONLY. DO NOT JOIN.")
@@ -978,14 +980,23 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 "SIMPLE LOOKUP RULE: Do NOT use aggregation functions like MAX(), MIN(), or SUM(). "
                 "Just SELECT the column directly. Use 'ORDER BY column DESC' for 'latest/newest/highest'."
             )
+            constraints.append(
+                "STRICT ALIAS PROHIBITION: Do NOT rename table columns with AS unless it's a computed expression.\n"
+                "Never rename plain table columns with AS."
+            )
 
     # [C] RANKING RULES
     if qtype == "rank":
         constraints.append(
-            "RANKING LOGIC: Use Window Functions `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` inside a CTE/Subquery."
+            "WINNER-ROW STRATEGY: You MUST use the standard 'Select-Filter-Rank' pattern."
         )
         constraints.append(
-            "ANTI-PATTERN: STRICTLY FORBIDDEN to use `WHERE (col1, col2) IN (SELECT ...)` pattern. This causes MySQL Error 1055."
+            "STRICT SYNTAX TEMPLATE: "
+            "`SELECT col1, col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ... DESC) AS rn FROM table) WHERE rn = 1`"
+        )
+        constraints.append(
+            "CRITICAL PROHIBITION: Do NOT put `ROW_NUMBER()` inside a `GROUP BY` clause. "
+            "Do NOT use `HAVING` for ranking. Use the subquery pattern above."
         )
 
     # [D] REPORTING/AGGREGATION RULES
@@ -1003,18 +1014,26 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
 
     # [E] DATE RULES
     constraints.append(
-        "DATE LABEL: If asking for Month Name, GROUP BY both MONTH(date) and DATE_FORMAT(date, '%M')."
+        "DATE LABEL STRICT RULE: If asking for Month Name, GROUP BY both MONTH(date) and DATE_FORMAT(date, '%M')."
     )
 
-    # [F] COLUMN INTEGRITY RULES
+    # [F] COLUMN INTEGRITY RULES (BENCHMARK MODE)
     constraints.append(
-        "COLUMN SELECTION: Select ALL columns requested by the user. Do not omit `ID` or `Number` columns if asked."
+        "STRICT COLUMN SELECTION: Select EXACTLY the columns requested by the user."
     )
     constraints.append(
-        "NO COLUMN RENAMING: Return column names EXACTLY as they appear in the Schema. "
-        "Do NOT use `AS` aliases for existing columns."
+        "IMPLICIT SELECTION RULE: If the user says 'For each [Entity]' or 'List [Entity]', "
+        "you MUST include that Entity's Identifier/Name in the SELECT list, even if not explicitly listed in 'Include ...'. "
+        "Example: 'For each Customer, show total amount' -> You MUST Select `customerName` AND `totalAmount`."
     )
-
+    constraints.append(
+        "NO EXTRA COLUMNS: Apart from the 'For each' entity, do NOT add other IDs/Codes unless asked."
+    )
+    constraints.append(
+        "ALIAS CONSISTENCY: If you use a table alias (e.g. `t`, `p`, `cust`), "
+        "you MUST prefix ALL columns in the SELECT clause with that alias. "
+        "Bad: `SELECT p.id, name FROM ...` | Good: `SELECT p.id, p.name FROM ...`"
+    )
     # [G] ANTI-HALLUCINATION & LOGIC EFFICIENCY
     # 1. Casing Strictness
     constraints.append(
@@ -1048,22 +1067,32 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "you MUST NOT select the original raw column (e.g. `MSRP`) unless it is wrapped in an aggregate function (COUNT, SUM). "
             "ONLY select the derived expression and Aggregates."
         )
+    # 5. Pattern Matching Rule (Balanced & Robust)
+    # Trigger dipersempit hanya untuk kata yang benar-benar butuh presisi
+    pattern_triggers = ["exactly", "digit", "alphanumeric", "alnum", "followed by"]
+    
+    if any(t in question.lower() for t in pattern_triggers):
+        constraints.append(
+            "PATTERN LOGIC: Use `LIKE` for simple prefix/suffix. "
+            "Use `REGEXP` ONLY for strict requirements: "
+            "1. Exact digit/character counts (Template: `REGEXP '^[0-9]{N}$'`). "
+            "2. Mixed types like Letters followed by Digits (Template: `REGEXP '^[a-z]+[0-9]+$'`). "
+            "Always use `^` and `$` anchors in REGEXP to ensure a full-string match."
+        )
 
-    # 5. Sorting Direction
+    # 6. Sorting Direction
     desc_triggers = [
     "latest", "newest", "most recent", "descending", 
-    "highest", "greatest", "largest", "biggest",
-    "terbaru", "terlama", "menurun", "tertinggi", "terbesar"
+    "highest", "greatest", "largest", "biggest"
     ]
 
     asc_triggers = [
         "ascending", "alphabetical", "alphabetically",
-        "smallest", "lowest", "oldest first", "earliest first",
-        "menaik", "terkecil", "terendah", "alfabetis"
+        "smallest", "lowest", "oldest first", "earliest first"
     ]
 
     # Default untuk "sorted" tanpa qualifier
-    sort_requested = any(k in question.lower() for k in ["sort", "sorted", "order by", "urut", "urutkan"])
+    sort_requested = any(k in question.lower() for k in ["sort", "sorted", "order by"])
 
     question_lower = question.lower()
 
@@ -1081,6 +1110,10 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "SORT DIRECTION: The user requests sorting without specifying direction. "
             "Use ascending order (ASC) as default, which means A-Z for text, 0-9 for numbers, oldest-to-newest for dates. "
             "You can omit ASC keyword (ascending is SQL default)."
+        )
+    else:
+        constraints.append(
+            "NO UNREQUESTED SORTING: Do NOT add 'ORDER BY' clause unless the user explicitly asks for ranking or sorting."
         )
 
     # 6. JSON FORMATTING (CRITICAL FOR 3B STABILITY)

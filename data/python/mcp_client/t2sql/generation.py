@@ -98,3 +98,59 @@ def regenerate_with_extra_constraint(
     if obj is None:
         return "", ""
     return (obj.get("sql") or "").strip(), (obj.get("notes") or "").strip()
+
+# ======================================================================
+# [BARU] MAIN GENERATION NODE (Update/Insert ini di paling bawah)
+# ======================================================================
+def generation_node(state: RAGState) -> RAGState:
+    """
+    Node utama untuk generate SQL.
+    Menggunakan Prompt Builder yang menggabungkan Context (Stats) + Router Constraints.
+    """
+    print("--- GENERATION NODE (Stats-Aware) ---")
+    
+    question = state["question"]
+    context = state["context"] 
+    router_decision = state.get("router_decision", {}) 
+    
+    # [FIX] Ambil model dinamis dari Router. Fallback ke LARGE_MODEL jika tidak ada.
+    target_model = state.get("target_model") or LARGE_MODEL
+    
+    # 1. Setup LLM
+    llm = ChatOllama(
+        model=target_model, # <-- Pakai model hasil keputusan Router
+        base_url=OLLAMA_BASE_URL,
+        temperature=0.1,
+        format="json",  
+    )
+
+    # 2. Build Prompt (Stats + Strict Constraints)
+    prompt_text = make_sql_prompt(
+        ctx=context, 
+        question=question, 
+        router_decision=router_decision
+    )
+    
+    # 3. Invoke LLM
+    print(f"[Generation] Invoking LLM ({target_model})...")
+    try:
+        response = llm.invoke(prompt_text)
+        raw_content = response.content
+    except Exception as e:
+        print(f"[ERROR] LLM Invoke failed: {e}")
+        state["answer"] = "Error generating SQL."
+        return state
+
+    # 4. Parse Output
+    parsed = _extract_json_object(raw_content)
+    validated = _validate_sql_notes(parsed)
+    
+    if validated:
+        print(f"[Generation] SQL generated: {validated['sql'][:50]}...")
+        state["final_sql"] = validated["sql"]
+        state["answer"] = validated["sql"] 
+    else:
+        print(f"[Generation] Failed to parse JSON. Raw: {raw_content}")
+        state["answer"] = "Failed to generate valid SQL JSON."
+
+    return state
