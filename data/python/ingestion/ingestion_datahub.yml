@@ -27,63 +27,6 @@ source:
       enabled: true
       remove_stale_metadata: true
 
-transformers:
-  - type: "pattern_add_dataset_domain"
-    config:
-      semantics: OVERWRITE
-      domain_pattern:
-        rules:
-          # Sales
-          ".*classicmodels.orders.*": ["Sales"]
-          ".*classicmodels.orderdetails.*": ["Sales"]
-
-          # CRM
-          ".*classicmodels.customers.*": ["CRM"]
-
-          # HR
-          ".*classicmodels.employees.*": ["HR"]
-
-          # Catalog
-          ".*classicmodels.products.*": ["Catalog"]
-          ".*classicmodels.productlines.*": ["Catalog"]
-
-          # Finance
-          ".*classicmodels.payments.*": ["Finance"]
-
-          # Geo
-          ".*classicmodels.offices.*": ["Geo"]
-
-  - type: "pattern_add_dataset_tags"
-    config:
-      semantics: PATCH
-      tag_pattern:
-        rules:
-          ".*classicmodels.orders.*":
-            - "urn:li:tag:dom.orders"
-            - "urn:li:tag:dom.sales"
-          ".*classicmodels.orderdetails.*":
-            - "urn:li:tag:dom.orderdetails"
-            - "urn:li:tag:dom.sales"
-          ".*classicmodels.customers.*":
-            - "urn:li:tag:dom.customers"
-            - "urn:li:tag:dom.crm"
-          ".*classicmodels.employees.*":
-            - "urn:li:tag:dom.employees"
-            - "urn:li:tag:dom.hr"
-          ".*classicmodels.products.*":
-            - "urn:li:tag:dom.products"
-            - "urn:li:tag:dom.catalog"
-          ".*classicmodels.productlines.*":
-            - "urn:li:tag:dom.productlines"
-            - "urn:li:tag:dom.catalog"
-          ".*classicmodels.payments.*":
-            - "urn:li:tag:dom.payments"
-            - "urn:li:tag:dom.finance"
-            - "urn:li:tag:dom.sales"
-          ".*classicmodels.offices.*":
-            - "urn:li:tag:dom.offices"
-            - "urn:li:tag:dom.geo"
-
 sink:
   type: datahub-rest
   config:
