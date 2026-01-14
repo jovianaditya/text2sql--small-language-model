@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+import os
+import json
+import requests
+import re
+from typing import Dict, List, Any, Optional, Tuple
+from dotenv import load_dotenv, find_dotenv
+from urllib.parse import quote
+
+# Load .env
+load_dotenv(find_dotenv(), override=True)
+
+# =========================
+# 1. CONFIGURATION
+# =========================
+GMS_BASE = os.getenv("DATAHUB_GMS_URL", "http://datahub-gms:8080")
+GRAPHQL_URL = os.getenv("DATAHUB_GRAPHQL_URL", f"{GMS_BASE}/api/graphql")
+TOKEN = os.getenv("DATAHUB_TOKEN")
+PAGE_SIZE = int(os.getenv("DATAHUB_PAGE_SIZE", "100"))
+TIMEOUT = 60
+ACTOR = os.getenv("DATAHUB_ACTOR")
+OUTPUT_DIR = os.getenv("EXPORT_JSONL_OUTPUT", "./exports_dense_final")
+
+if not TOKEN:
+    raise RuntimeError("DATAHUB_TOKEN is not set.")
+
+RELATIONAL_3LEVEL = {"postgres", "snowflake", "redshift", "bigquery", "mssql", "mysql"}
+
+# =========================
+# 2. GRAPHQL QUERIES
+# =========================
+SCROLL_QUERY = """
+query scrollPG($types: [EntityType!], $query: String!, $count: Int!, $scrollId: String) {
+  scrollAcrossEntities(input: { types: $types, query: $query, count: $count, scrollId: $scrollId }) {
+    nextScrollId
+    searchResults {
+      entity {
+        urn
+        type
+        ... on Dataset { urn }
+      }
+    }
+  }
+}
+""".strip()
+
+# ✨ ADDED: properties { description } untuk mengambil deskripsi tabel
+DATASET_META_QUERY = """
+query datasetMeta($urn: String!) {
+  dataset(urn: $urn) {
+    urn
+    properties { description } 
+    platform { name properties { datasetNameDelimiter } }
+    schemaMetadata(version: 0) {
+      fields {
+        fieldPath
+        description
+        nativeDataType
+        type
+        globalTags {
+          tags {
+            tag {
+              urn
+              properties { name }
+            }
+          }
+        }
+      }
+    }
+    editableSchemaMetadata {
+      editableSchemaFieldInfo {
+        fieldPath
+        globalTags {
+          tags {
+            tag {
+              urn
+              properties { name }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+DATASET_PROFILE_QUERY = """
+query datasetProfile($urn: String!) {
+  dataset(urn: $urn) {
+    datasetProfiles(limit: 1) {
+      rowCount
+      fieldProfiles {
+        fieldPath
+        uniqueCount
+        min
+        max
+        mean
+        stdev
+        sampleValues
+      }
+    }
+  }
+}
+""".strip()
+
+# =========================
+# 3. HELPER FUNCTIONS
+# =========================
+def _headers_json() -> Dict[str, str]:
+    h = {"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"}
+    if ACTOR: h["X-DataHub-Actor"] = ACTOR
+    return h
+
+def _graphql(query: str, variables: dict) -> dict:
+    try:
+        resp = requests.post(GRAPHQL_URL, json={"query": query, "variables": variables}, headers=_headers_json(), timeout=TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("errors"): return {}
+        return data.get("data", {})
+    except: return {}
+
+def iter_dataset_urns():
+    scroll_id = None
+    while True:
+        data = _graphql(SCROLL_QUERY, {"types": ["DATASET"], "query": "*", "count": PAGE_SIZE, "scrollId": scroll_id}).get("scrollAcrossEntities", {})
+        results = data.get("searchResults") or []
+        if not results: break
+        for item in results:
+            ent = item.get("entity") or {}
+            urn = ent.get("urn")
+            if urn: yield urn
+        scroll_id = data.get("nextScrollId")
+        if not scroll_id: break
+
+def _parse_urn_name(urn: str) -> Optional[str]:
+    try:
+        inner = urn[urn.index("(") + 1 : urn.rindex(")")]
+        parts = inner.split(",", 2)
+        return parts[1] if len(parts) > 1 else None
+    except: return None
+
+def _split_from_urn(urn: str, platform_name: Optional[str], delim: str = ".") -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    name_part = _parse_urn_name(urn)
+    if not name_part: return None, None, None, None
+    plat = (platform_name or "").lower()
+    if plat in RELATIONAL_3LEVEL:
+        parts = name_part.split(delim)
+        if len(parts) >= 3: return name_part, parts[0], parts[1], delim.join(parts[2:])
+        elif len(parts) == 2: return name_part, parts[0], None, parts[1]
+        else: return name_part, None, None, parts[0]
+    return name_part, None, None, name_part
+
+def _norm_field(s: Optional[str]) -> Optional[str]:
+    if s is None: return None
+    return s.strip().strip('`"[]').lower()
+
+def _as_float(x):
+    if x is None: return None
+    try: return float(x)
+    except: return None
+
+def _pick_sample_value(fp: dict) -> str:
+    sv = fp.get("sampleValues") or []
+    if isinstance(sv, list) and sv: return str(sv[0])
+    return ""
+
+def _profile_map_by_field(urn: str) -> dict:
+    d = _graphql(DATASET_PROFILE_QUERY, {"urn": urn})
+    if not d: return {}
+    ds = d.get("dataset") or {}
+    prof = (ds.get("datasetProfiles") or [None])[0]
+    if not prof: return {}
+    out = {}
+    for fp in (prof.get("fieldProfiles") or []):
+        key = _norm_field(fp.get("fieldPath"))
+        if not key: continue
+        out[key] = {
+            "min": _as_float(fp.get("min")),
+            "max": _as_float(fp.get("max")),
+            "mean": _as_float(fp.get("mean")),
+            "stddev": _as_float(fp.get("stdev")),
+            "distinct_count": fp.get("uniqueCount"),
+            "sample_value": _pick_sample_value(fp),
+        }
+    return out
+
+def fetch_schema_via_rest(urn: str) -> Optional[dict]:
+    url = f"{GMS_BASE}/entities/{quote(urn, safe='')}"
+    params = {"aspect": "schemaMetadata", "version": "0"}
+    try:
+        resp = requests.get(url, headers=_headers_json(), params=params, timeout=TIMEOUT)
+        if resp.status_code != 200: return None
+        sm = (resp.json().get("entityResponse") or resp.json()).get("aspects", {}).get("schemaMetadata")
+        return sm.get("value") if (sm and "value" in sm) else sm
+    except: return None
+
+def build_rest_tag_map(rest_schema: dict) -> Dict[str, List[str]]:
+    out = {}
+    if not rest_schema: return out
+    for f in rest_schema.get("fields") or []:
+        fp = f.get("fieldPath")
+        if not fp: continue
+        gtags = ((f.get("globalTags") or {}).get("tags") or [])
+        names = []
+        for gt in gtags:
+            val = gt.get("tag")
+            if isinstance(val, str): names.append(val)
+            elif isinstance(val, dict):
+                n = (val.get("properties") or {}).get("name") or val.get("urn")
+                if n: names.append(n)
+        out[fp] = names
+    return out
+
+def split_alias_and_role(raw_tags: List[str]) -> Tuple[List[str], List[str]]:
+    alias_out, role_out = [], []
+    
+    for t in raw_tags:
+        # FIX: Jangan split(':')[-1], karena itu membuang prefix 'alias' jika tag-nya 'alias:cost'
+        # Cukup buang header urn-nya saja.
+        clean_urn = t.replace("urn:li:tag:", "")
+        
+        lowered = clean_urn.lower()
+        
+        # Cek Role
+        if lowered.startswith("role:") or lowered.startswith("role."):
+            val = re.sub(r"^role[:.]", "", clean_urn, flags=re.IGNORECASE).strip()
+            if val: role_out.append(val)
+            
+        # Cek Alias
+        elif lowered.startswith("alias:") or lowered.startswith("alias."):
+            val = re.sub(r"^alias[:.]", "", clean_urn, flags=re.IGNORECASE).strip()
+            if val: alias_out.append(val)
+            
+        # FALLBACK PENTING:
+        # Jika tag tidak punya prefix (misal tag bernama "Cost" atau "KPI"), 
+        # jangan dibuang! Anggap sebagai Alias/Synonym.
+        else:
+            alias_out.append(clean_urn)
+            
+    return alias_out, role_out
+# ==============================================================================
+# 4. TRANSFORMATION LOGIC (GOLD STANDARD FOR DENSE RETRIEVAL)
+# ==============================================================================
+
+def translate_role_to_sentence(roles: List[str]) -> str:
+    if not roles: return ""
+    role_map = {
+        "pk": "Primary Key, identifies unique records.",
+        "fk": "Foreign Key, links to another table.",
+        "id": "Unique Identifier.",
+        "measure": "Metric, used for numerical calculations.",
+        "dimension": "Dimension, used for grouping or filtering.",
+        "date": "Temporal data.",
+        "geo": "Geographical location.",
+        "contact": "Contact info (Phone/Email).",
+        "binary": "Binary data (Image/File)."
+    }
+    sentences = []
+    for r in roles:
+        base = r.lower().split(':')[0]
+        sentences.append(role_map.get(base, f"Role: {r}."))
+    return " ".join(list(set(sentences)))
+
+def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> Dict[str, Any]:
+    """
+    Gold Standard: Context Injection + Metadata Separation
+    """
+    # 1. Type Detection
+    dt = str(raw_row.get("datatype", "")).lower()
+    is_numeric = any(k in dt for k in ('int', 'double', 'float', 'decimal', 'numeric', 'real', 'number', 'money'))
+    is_string = any(k in dt for k in ('char', 'text', 'string', 'clob'))
+
+    # 2. Prepare Text Components
+    tbl = raw_row.get("table")
+    col = raw_row.get("column")
+    desc = raw_row.get("description") or ""
+    aliases = raw_row.get("tags_alias", [])
+    roles = raw_row.get("tags_role", [])
+    
+    # 3. Sample Value Logic (For Text Embedding)
+    # Only inject sample into text if it's categorical (distinct < 20)
+    distinct_raw = raw_row.get("distinct_count")
+    sample_raw = str(raw_row.get("sample_value", ""))
+    sample_sentence = ""
+    if isinstance(distinct_raw, int) and distinct_raw < 20 and sample_raw.lower() not in ["", "unknown", "none", "null"]:
+        sample_sentence = f"Example value: {sample_raw}."
+
+    # 4. Context Injection (Table Description)
+    # Jika DataHub punya deskripsi tabel, masukkan ke embedding kolom
+    table_part = f"Table: {tbl}."
+    if table_desc:
+        clean_tbl_desc = table_desc.replace("\n", " ").strip()
+        if len(clean_tbl_desc) > 3: # Validasi panjang minimal
+            table_part = f"Table: {tbl} (Context: {clean_tbl_desc})."
+
+    # 5. Build Embedding Sentence
+    text_parts = [
+        table_part,
+        f"Column: {col}.",
+        f"Description: {desc}." if desc else "",
+        translate_role_to_sentence(roles),
+        f"Synonyms: {', '.join(aliases)}." if aliases else "",
+        sample_sentence
+    ]
+    full_text = " ".join([p for p in text_parts if p]).strip()
+
+    # 6. Build Metadata Payload (Stats separation)
+    stats = {}
+    stats["sample_value"] = sample_raw # Always keep raw sample in metadata
+    
+    if is_numeric:
+        stats["min"] = raw_row.get("min")
+        stats["max"] = raw_row.get("max")
+        stats["mean"] = raw_row.get("mean")
+        stats["stddev"] = raw_row.get("stddev")
+    
+    if is_string:
+        stats["distinct_count"] = raw_row.get("distinct_count")
+
+    metadata = {
+        "database": raw_row.get("database"),
+        "table": tbl,
+        "column": col,
+        "datatype": raw_row.get("datatype"),
+        "stats": stats
+    }
+
+    return {
+        "id": f"{tbl}.{col}",
+        "text": full_text,
+        "metadata": metadata
+    }
+
+# ==============================================================================
+# 5. FETCH & PROCESS
+# ==============================================================================
+def fetch_dataset_columns_dense(urn: str) -> List[Dict[str, Any]]:
+    # A. Fetch Metadata
+    d = _graphql(DATASET_META_QUERY, {"urn": urn}).get("dataset")
+    if not d: return []
+
+    # Get Table Description (Global Context)
+    table_desc = (d.get("properties") or {}).get("description") or ""
+
+    platform = d.get("platform") or {}
+    delim = (platform.get("properties") or {}).get("datasetNameDelimiter") or "."
+    _, db, _, table = _split_from_urn(urn, (platform.get("name") or "").lower(), delim)
+
+    # B. Profiles & Tags
+    profile_map = _profile_map_by_field(urn)
+    rest_schema = fetch_schema_via_rest(urn)
+    rest_tags = build_rest_tag_map(rest_schema)
+    
+    # C. Editable Tags
+    editable_tags = {}
+    for e in (d.get("editableSchemaMetadata") or {}).get("editableSchemaFieldInfo") or []:
+        fp = e.get("fieldPath")
+        if fp:
+            gtags = ((e.get("globalTags") or {}).get("tags") or [])
+            names = [((gt.get("tag") or {}).get("properties") or {}).get("name") or (gt.get("tag") or {}).get("urn") for gt in gtags]
+            editable_tags[fp] = [n for n in names if n]
+
+    # D. Loop Columns
+    dense_rows = []
+    sm = d.get("schemaMetadata") or {}
+    for f in (sm.get("fields") or []):
+        fp = f.get("fieldPath")
+        prof = profile_map.get(_norm_field(fp), {})
+        
+        schema_tags = [((gt.get("tag") or {}).get("properties") or {}).get("name") or (gt.get("tag") or {}).get("urn") for gt in ((f.get("globalTags") or {}).get("tags") or [])]
+        schema_tags = [t for t in schema_tags if t]
+        
+        all_tags = list(dict.fromkeys(schema_tags + editable_tags.get(fp, []) + rest_tags.get(fp, [])))
+        t_alias, t_role = split_alias_and_role(all_tags)
+        
+        raw_row = {
+            "database": db,
+            "table": table,
+            "column": fp,
+            "datatype": f.get("nativeDataType") or f.get("type"),
+            "description": f.get("description"),
+            "tags_alias": t_alias,
+            "tags_role": t_role,
+            "min": prof.get("min"),
+            "max": prof.get("max"),
+            "mean": prof.get("mean"),
+            "stddev": prof.get("stddev"),
+            "sample_value": prof.get("sample_value"),
+            "distinct_count": prof.get("distinct_count")
+        }
+        
+        # Pass table_desc down for context injection
+        dense_rows.append(transform_to_dense_schema(raw_row, table_desc))
+        
+    return dense_rows
+
+def _sanitize_filename(name: str) -> str:
+    if not name: return "unknown"
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    writers = {}
+    print(f"[INFO] Exporting Gold Standard Dense JSONL to: {os.path.abspath(OUTPUT_DIR)}")
+    
+    count = 0
+    for urn in iter_dataset_urns():
+        try:
+            rows = fetch_dataset_columns_dense(urn)
+            if not rows: continue
+            print(f"[proc] {urn} -> {len(rows)} cols")
+            
+            for row in rows:
+                db_name = row["metadata"].get("database") or "unknown"
+                fname = f"{_sanitize_filename(db_name)}_dense.jsonl"
+                
+                if fname not in writers:
+                    writers[fname] = open(os.path.join(OUTPUT_DIR, fname), "w", encoding="utf-8")
+                
+                writers[fname].write(json.dumps(row, ensure_ascii=False) + "\n")
+                count += 1
+        except Exception as e:
+            print(f"[ERROR] {urn}: {e}")
+
+    for f in writers.values(): f.close()
+    print(f"[DONE] Total {count} columns exported.")
+
+if __name__ == "__main__":
+    main()
