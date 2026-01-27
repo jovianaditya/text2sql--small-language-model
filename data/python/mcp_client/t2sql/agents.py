@@ -707,6 +707,19 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         select_text_chk = select_match_chk.group(1).lower() if select_match_chk else ""
         # Tokenize hanya bagian SELECT
         select_tokens_chk = set(re.findall(r"\b([a-z][a-z0-9_]*)\b", select_text_chk))
+        
+        # 🆕 STEP 1b: Ambil tokens dari WHERE/HAVING/subquery (kolom yang dipakai sebagai filter)
+        # Kolom yang sudah dipakai di WHERE tidak perlu ada di SELECT (bukan "missing")
+        sql_lower = final_sql.lower()
+        where_having_tokens = set()
+        # Extract WHERE clause
+        where_match = re.search(r"\bwhere\s+(.*?)(?:\bgroup\b|\border\b|\blimit\b|\bhaving\b|;|$)", sql_lower, re.DOTALL)
+        if where_match:
+            where_having_tokens.update(re.findall(r"\b([a-z][a-z0-9_]*)\b", where_match.group(1)))
+        # Extract HAVING clause
+        having_match = re.search(r"\bhaving\s+(.*?)(?:\border\b|\blimit\b|;|$)", sql_lower, re.DOTALL)
+        if having_match:
+            where_having_tokens.update(re.findall(r"\b([a-z][a-z0-9_]*)\b", having_match.group(1)))
 
         suffix_synonyms = {
             "number": r"(number|no|id|code|kode|nomor)",
@@ -725,6 +738,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             # 🆕 STEP 2: Logic Check yang Lebih Akurat
             # Skip jika kolom sudah ada di SELECT tokens, atau jika ada wildcard (*)
             if col_lower in select_tokens_chk or "*" in select_text_chk: 
+                continue
+            
+            # 🆕 Skip jika kolom sudah dipakai di WHERE/HAVING (artinya dipakai sebagai filter, bukan output)
+            if col_lower in where_having_tokens:
                 continue
             
             clean_name = re.sub(r'([a-z])([A-Z])', r'\1 \2', col_raw)

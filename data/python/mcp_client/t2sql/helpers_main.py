@@ -795,17 +795,22 @@ def sanitize_notes(sql: str, notes: str) -> str:
     return notes.strip()
 
 def _fix_missing_space_before_clauses(sql: str) -> str:
+    # Normalize whitespace before SQL clauses
     sql = re.sub(r"\s+(?=(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|WHERE)\b)", " ", sql, flags=re.I)
+    # Add space after punctuation before clauses
     sql = re.sub(
         r"([)\],;`])(?=(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|WHERE)\b)",
         r"\1 ",
         sql,
         flags=re.I,
     )
-    sql = re.sub(r"([A-Za-z0-9_\.])(?=(LIMIT|WHERE|HAVING)\b)", r"\1 ", sql)
-    sql = re.sub(r"([A-Za-z0-9_\.])(?=ORDER\s+BY\b)", r"\1 ", sql)
-    sql = re.sub(r"([A-Za-z0-9_\.])(?=GROUP\s+BY\b)", r"\1 ", sql)
-    sql = re.sub(r"\s+(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|WHERE)\b", r" \1", sql, flags=re.I)
+    # FIX: Add space between identifier and uppercase SQL keyword (NO re.I flag)
+    # This splits "customerNameHAVING" but NOT "creditLimit" (because 'imit' != 'LIMIT')
+    sql = re.sub(r"(\b[A-Za-z_][A-Za-z0-9_]*)(LIMIT|WHERE|HAVING)\b", r"\1 \2", sql)
+    sql = re.sub(r"(\b[A-Za-z_][A-Za-z0-9_]*)(ORDER\s+BY)\b", r"\1 \2", sql)
+    sql = re.sub(r"(\b[A-Za-z_][A-Za-z0-9_]*)(GROUP\s+BY)\b", r"\1 \2", sql)
+    # Collapse multiple spaces to single space
+    sql = re.sub(r"  +", " ", sql)
     return sql
 # -----------------------------------------------------------
 # ------------------ POSTPROCESS HEURISTIC ------------------
@@ -1172,11 +1177,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # CRITICAL FIX: Normalize ALL major clause boundaries FIRST
     # Pattern: ensure space before WHERE/GROUP BY/ORDER BY/HAVING/LIMIT
     # This must handle: "col1,col2HAVING" and "col1 HAVING" cases
+    # NO re.I flag: creditLimit won't match (lowercase 'imit'), but HAVING will match (uppercase)
     s = re.sub(
     r"(\b[A-Za-z_][A-Za-z0-9_]*)(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b",
     r"\1 \2",
-    s,
-    flags=re.I)   
+    s)   
     s = re.sub(r"(?<=\))(?=\b(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b)", " ", s, flags=re.I)
     
     # Extra safety: collapse multiple spaces (but preserve inside quotes)
@@ -1291,11 +1296,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     before_phase4 = s
 
     if DEBUG_WR: print("\n[PH4] start ----")
+    # FIX: NO re.I flag - creditLimit won't match (lowercase 'imit'), but HAVING will match (uppercase)
     s = re.sub(
     r"(\b[A-Za-z_][A-Za-z0-9_]*)(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b",
     r"\1 \2",
-    s,
-    flags=re.I)
+    s)
     if DEBUG_WR: print(f"[PH4] after re-spacing: {s[:200]}")
 
     # pre-sanity only (no rewrite)

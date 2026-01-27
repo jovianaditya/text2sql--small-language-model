@@ -58,7 +58,7 @@ cases:
       groundtruth_sql: |
         SELECT employeeNumber, firstName, lastName, extension 
         FROM employees 
-        WHERE REGEXP '^x[0-9]{3}$';
+        WHERE extension REGEXP '^x[0-9]{3}$';
     - id: E9
       difficulty: easy
       question: "Show orders that are either in status “Cancelled” or “On Hold”. Display the order number, order date, and status."
@@ -139,6 +139,15 @@ cases:
         FROM payments
         GROUP BY customerNumber
         HAVING AVG(amount) > 50000;
+    - id: M6
+      difficulty: medium
+      question: "Return the customer name and customer ID for customers with a credit limit greater than the average credit limit across all customers."
+      groundtruth_sql: |
+        SELECT
+          customerName,
+          customerNumber
+        FROM customers
+        WHERE creditLimit > (SELECT AVG(creditLimit) FROM customers);
     - id: H1
       difficulty: hard
       question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."
