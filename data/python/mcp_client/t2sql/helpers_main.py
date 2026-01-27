@@ -22,29 +22,31 @@ if TYPE_CHECKING:
     from .state import RAGState
 from .utils import _dbg_print_two
 from .helpers_core import (
-_parse_allowed_identifiers, _question_requires_regex, _question_requires_word_boundary_regex, has_join,
-# phase 0
-_fix_bad_backticks, _canonicalize_table_names, ensure_join_aliases,
-# phase 1
-_rewrite_left_join_to_inner_if_not_needed, _rewrite_left_join_to_inner_if_rhs_filtered,
-_rewrite_inner_join_filter_to_exists, _rewrite_inner_join_existence_to_exists,
-_drop_redundant_inner_join_same_key, _prune_ornamental_joins_safe, has_non_inner_join, join_count,
-# phase 2
-_drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table,
-# phase 3
-_wants_customer_name_only, _wants_product_name_only, _prefer_friendly_names, _wants_name_only,
-_expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
-# phase 4
-_winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _looks_like_max_date_tiebreaker,
-_question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
-_force_restore_groupby_if_aggregate_without_groupby, _rewrite_winner_row_guardrail,
-_rewrite_winner_row_aggregate_misuse, _rewrite_having_alias_to_expr, _winner_row_final_sanity,
-# phase 5 — Pattern, REGEXP, and Predicate Normalization
-_guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _guardrail_fix_mysql_regexp_literals,
-# phase 6 
-_expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _strip_unneeded_count_distinct, _parse_from_join_aliases,
-# phase 7
-_remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes, _ALIAS_OVERRIDES
+    _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
+    # phase 0
+    _fix_bad_backticks, _canonicalize_table_names, ensure_join_aliases,
+    # phase 1
+    _rewrite_left_join_to_inner_if_not_needed, _rewrite_left_join_to_inner_if_rhs_filtered,
+    _rewrite_inner_join_filter_to_exists, _rewrite_inner_join_existence_to_exists,
+    _drop_redundant_inner_join_same_key, _prune_ornamental_joins_safe, has_non_inner_join, join_count,
+    # phase 2
+    _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table,
+    # phase 3
+    _wants_customer_name_only, _wants_product_name_only, _prefer_friendly_names, _wants_name_only,
+    _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
+    # phase 4
+    _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _looks_like_max_date_tiebreaker,
+    _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
+    _force_restore_groupby_if_aggregate_without_groupby,
+    _rewrite_winner_row_aggregate_misuse, _winner_row_final_sanity,
+    # phase 4b - Aggregate in WHERE fix
+    _fix_aggregate_in_where,
+    # phase 5 — Pattern, REGEXP, and Predicate Normalization
+    _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _guardrail_fix_mysql_regexp_literals,
+    # phase 6 
+    _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _strip_unneeded_count_distinct, _parse_from_join_aliases,
+    # phase 7
+    _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes, _ALIAS_OVERRIDES
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -963,6 +965,11 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     
     # --- 1. BANGUN CONSTRAINT DINAMIS ---
     constraints = []
+    # === [NEW] GENERAL ANTI-HALLUCINATION RULE ===
+    constraints.append(
+        "CRITICAL RULE: Do NOT add SQL clauses (WHERE, HAVING, LIMIT, ORDER BY) "
+        "unless the user EXPLICITLY requests them. "
+    )
     # [A] STATS UTILIZATION (profiling statistics)
     constraints.append(
         "DATA INTELLIGENCE: Use the provided 'STATS' in the Context responsibly:\n"
@@ -1015,6 +1022,10 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     # [E] DATE RULES
     constraints.append(
         "DATE LABEL STRICT RULE: If asking for Month Name, GROUP BY both MONTH(date) and DATE_FORMAT(date, '%M')."
+        "DATE FILTERING RULES:\n"
+        "   - For year filtering: Use `YEAR(date_column) = YYYY` (NOT SUBSTR).\n"
+        "   - For month filtering: Use `MONTH(date_column) = M`.\n"
+        "   - For range filtering: Use `date_column BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`."
     )
 
     # [F] COLUMN INTEGRITY RULES (BENCHMARK MODE)
@@ -1331,7 +1342,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _rewrite_winner_row_aggregate_misuse(s, question)
         if DEBUG_WR: print("[PH4] after agg-misuse:", s)
-
+        
+        s = _fix_aggregate_in_where(s)
+        if DEBUG_WR: print(f"[PH4] after agg-in-where fix: {s}")
         s = _rewrite_having_alias_to_expr(s)
         s = _winner_row_final_sanity(s, question)
 
@@ -1339,6 +1352,10 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _force_restore_groupby_if_aggregate_without_groupby(before_phase4, s)
 
         if DEBUG_WR: print("[PH4] end ----", s, "\n")
+    else:
+            # Phase 4 was skipped due to goto_phase5, but still need aggregate fix
+            s = _fix_aggregate_in_where(s)
+            if DEBUG_WR: print(f"[PH4-FORCE] after agg-in-where fix: {s}")        
     # ---------------------------------------------------------------------------
     # Phase 5 — Pattern, REGEXP, and Predicate Normalization
     # ---------------------------------------------------------------------------

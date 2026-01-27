@@ -58,7 +58,7 @@ cases:
       groundtruth_sql: |
         SELECT employeeNumber, firstName, lastName, extension 
         FROM employees 
-        WHERE REGEXP_LIKE(extension, '^x[0-9]{3}$');
+        WHERE REGEXP '^x[0-9]{3}$';
     - id: E9
       difficulty: easy
       question: "Show orders that are either in status “Cancelled” or “On Hold”. Display the order number, order date, and status."
@@ -119,6 +119,26 @@ cases:
             ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC, paymentDate DESC) AS rn
           FROM payments) AS pmt
           WHERE pmt.rn = 1;
+    - id: M4
+      difficulty: medium
+      question: "For each order status, show the total number of orders and the earliest order date associated with that status." 
+      groundtruth_sql: |
+        SELECT
+          status,
+          COUNT(orderNumber) AS total_orders,
+          MIN(orderDate) AS earliest_order_date
+        FROM orders
+        GROUP BY status;
+    - id: M5
+      difficulty: medium
+      question: "Compute the average payment amount per customer and return the customer ID, and average payment for customers with an average payment above 50,000."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          AVG(amount) AS average_payment
+        FROM payments
+        GROUP BY customerNumber
+        HAVING AVG(amount) > 50000;
     - id: H1
       difficulty: hard
       question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."

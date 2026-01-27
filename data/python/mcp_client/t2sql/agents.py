@@ -23,46 +23,194 @@ from .helpers_core import(has_join, _question_requires_word_boundary_regex, _par
 # ======================================================================
 # Update: agents.py -> router_agent (Final Robust Version)
 # ======================================================================
+# def router_agent(state: RAGState) -> RAGState:
+#     print(f"\n[Router] Evidence-Based Analysis starting...")
+#     question = state.get("question", "").lower()
+#     ctx = state.get("context", "")
+    
+#     # 1. IDENTIFIKASI TABEL (Pattern-Based Exclusion)
+#     allowed_identifiers = _parse_allowed_identifiers(ctx)
+#     whitelisted_tables = allowed_identifiers.keys()
+    
+#     # [FIX] Definisi Pattern yang HARUS DIBUANG sebelum deteksi tabel
+#     ignore_patterns = {
+#         'order': [
+#             r"\border(ed|s)?\s+by\b",           # Remove: "order by", "ordered by"
+#             r"\b(descending|ascending)\s+order\b", # Remove: "descending order", "ascending order"
+#             r"\bin\s+order\b"                   # Remove: "in order" (e.g. "in order to")
+#         ],
+#         'group': [r"\bgroup\s+by\b"],           # Remove: "group by"
+#         'sort':  [r"\bsort(ed)?\s+by\b"],       # Remove: "sort by", "sorted by"
+#         'rank':  [r"\brank\s+over\b"]           # Remove: "rank over"
+#     }
+    
+#     relevant_tables = []
+#     for tbl in whitelisted_tables:
+#         # Cek 1: Pastikan tabel ada di Context
+#         if f"- {tbl}:" not in ctx and f"- `{tbl}`:" not in ctx:
+#             continue
+        
+#         table_word = tbl.lower().rstrip('s') # orders -> order
+        
+#         # --- [ROBUST MASKING] ---
+#         # Buat copy pertanyaan khusus untuk scanning tabel ini
+#         search_scope = question
+        
+#         if table_word in ignore_patterns:
+#             patterns = ignore_patterns[table_word]
+#             for pat in patterns:
+#                 # Hapus frasa pengganggu (ganti dengan spasi)
+#                 search_scope = re.sub(pat, " ", search_scope)
+#         # ------------------------
+        
+#         # Cek 2: Cari kata tabel di search_scope yang SUDAH BERSIH
+#         if re.search(rf"\b{table_word}s?\b", search_scope):
+            
+#             # Deteksi referensi ID saja (FK)
+#             is_just_id_ref = re.search(rf"\b{table_word}s?\s+(number|id|code|kode|nomor)\b", search_scope)
+            
+#             if is_just_id_ref:
+#                 # Ambil tabel jika ada penyebutan entitas di luar ID
+#                 if re.search(rf"\b{table_word}s?\b(?!\s+(number|id|code|kode|nomor))", search_scope):
+#                     relevant_tables.append(tbl)
+#             else:
+#                 relevant_tables.append(tbl)
+    
+#     # 🆕 [FK-ONLY FILTER] - Hapus tabel yang HANYA disebutkan sebagai filter nilai FK
+#     # Pattern: "offices with codes 1, 2, or 3" -> offices cuma jadi constraint, bukan JOIN
+#     filtered_tables = []
+#     for tbl in relevant_tables:
+#         table_word = tbl.lower().rstrip('s')
+#         # Deteksi pattern: "<table> with <code/id> <angka/list>"
+#         fk_only_pattern = rf"\b{table_word}s?\s+with\s+(code|number|id|kode|nomor)s?\s+[\d,\sor]+"
+        
+#         # Jika match FK-only pattern DAN tidak ada penyebutan lain dari tabel tersebut
+#         if re.search(fk_only_pattern, question):
+#             # Cek apakah ada penyebutan tabel di luar pattern FK-only
+#             temp_scope = re.sub(fk_only_pattern, "", question)
+            
+#             # 🆕 PENTING: Cek tabel tanpa 's' juga (office vs offices)
+#             # Karena "office codes" != "offices", harus cek strict word boundary
+#             has_other_mention = (
+#                 re.search(rf"\b{table_word}s\b", temp_scope) or  # Cek plural (offices)
+#                 re.search(rf"\b{table_word}\s+(?!(code|number|id|kode|nomor))", temp_scope)  # Cek singular tapi bukan "<table> code"
+#             )
+            
+#             if not has_other_mention:
+#                 # Skip tabel ini, karena cuma disebutkan sebagai FK filter
+#                 continue
+        
+#         filtered_tables.append(tbl)
+
+#     relevant_tables = filtered_tables
+#     # 🆕 [END FK-ONLY FILTER]
+    
+#     # 2. DETEKSI SINYAL
+#     math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata']
+#     has_math = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in math_keywords)
+    
+#     value_ranks = ["highest", "lowest", "top", "bottom", "most", "least", "largest", "smallest", "terbesar", "terkecil", "paling"]
+#     time_ranks = ["latest", "earliest", "newest", "oldest", "terbaru", "terlama"]
+#     is_ranking_value = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in value_ranks)
+#     is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in time_ranks)
+#     is_ranking = is_ranking_value or is_ranking_time
+    
+#     explicit_sort = ["sort by", "ordered by", "sorted by", "order by", "sorted from"]
+#     is_sorting = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in explicit_sort) or is_ranking
+    
+#     group_indicators = ["each", "per", "every", "masing-masing", "setiap", "for each", "classify"]
+#     has_group_word = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in group_indicators)
+#     is_by_logic = ("by " in question and not any(re.search(rf"\b{re.escape(s)}\b", question) for s in explicit_sort) and (has_math or is_ranking))
+#     has_grouping = has_group_word or is_by_logic
+    
+#     # 3. LOGIKA ESKALASI
+#     is_multi_table = len(relevant_tables) > 1
+#     is_winner_row = is_ranking_value and has_grouping
+    
+#     exclusion_keywords = ["no", "never", "without", "tidak pernah", "belum pernah", "tidak ada", "missing", "empty", "all customers", "all products"]
+#     has_exclusion = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in exclusion_keywords)
+    
+#     should_escalate = is_multi_table or is_winner_row
+    
+#     chosen_model = LARGE_MODEL if should_escalate else SMALL_MODEL
+#     complexity = "complex" if should_escalate else "simple"
+    
+#     # Tentukan QTYPE
+#     if is_winner_row: qtype = "rank"
+#     elif has_math or has_grouping: qtype = "aggregate"
+#     else: qtype = "lookup"
+    
+#     print(f"[Router] Detected Tables: {relevant_tables}")
+#     print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, Exclusion:{has_exclusion}")
+#     print(f"[Router] Decision: {complexity.upper()} -> {chosen_model}")
+    
+#     return {
+#         **state,
+#         "router_tables": relevant_tables,
+#         "target_model": chosen_model,
+#         "router_decision": {
+#             "complexity": complexity,
+#             "qtype": qtype,
+#             "has_grouping": has_grouping,
+#             "is_ranking": is_ranking,
+#             "is_winner_row": is_winner_row,
+#             "has_exclusion": has_exclusion
+#         }
+#     }
+# if is_aggregation and per_match:
+#     group_entity = per_match.group(1).rstrip('s')  # "customer"
+    
+#     # Build FK map
+#     for tbl in relevant_tables:
+#         tbl_cols = allowed_identifiers.get(tbl, set())
+#         for col in tbl_cols:
+#             fk_match = re.match(rf"^{group_entity}(Number|Code|Id)$", col, re.IGNORECASE)
+#             if fk_match:
+#                 fk_exists_in[col] = tbl
+    
+#     # Remove parent table if FK exists in child
+#     for fk_col, fk_table in fk_exists_in.items():
+#         parent_table = group_entity + 's'
+#         if parent_table in relevant_tables and parent_table != fk_table:
+#             print(f"[Router] 🎯 FK Inference: {fk_col} exists in {fk_table}, removing {parent_table}")
+#             relevant_tables.remove(parent_table)
 def router_agent(state: RAGState) -> RAGState:
     print(f"\n[Router] Evidence-Based Analysis starting...")
     question = state.get("question", "").lower()
     ctx = state.get("context", "")
     
-    # 1. IDENTIFIKASI TABEL (Pattern-Based Exclusion)
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 1: IDENTIFIKASI TABEL (Pattern-Based Exclusion)
+    # ═══════════════════════════════════════════════════════════════════
     allowed_identifiers = _parse_allowed_identifiers(ctx)
     whitelisted_tables = allowed_identifiers.keys()
     
     # [FIX] Definisi Pattern yang HARUS DIBUANG sebelum deteksi tabel
-    # Format: 'root_word': [list_of_regex_patterns_to_remove]
     ignore_patterns = {
         'order': [
-            r"\border(ed|s)?\s+by\b",           # Remove: "order by", "ordered by"
-            r"\b(descending|ascending)\s+order\b", # Remove: "descending order", "ascending order"
-            r"\bin\s+order\b"                   # Remove: "in order" (e.g. "in order to")
+            r"\border(ed|s)?\s+by\b",
+            r"\b(descending|ascending)\s+order\b",
+            r"\bin\s+order\b"
         ],
-        'group': [r"\bgroup\s+by\b"],           # Remove: "group by"
-        'sort':  [r"\bsort(ed)?\s+by\b"],       # Remove: "sort by", "sorted by"
-        'rank':  [r"\brank\s+over\b"]           # Remove: "rank over"
+        'group': [r"\bgroup\s+by\b"],
+        'sort':  [r"\bsort(ed)?\s+by\b"],
+        'rank':  [r"\brank\s+over\b"]
     }
     
     relevant_tables = []
     for tbl in whitelisted_tables:
-        # Cek 1: Pastikan tabel ada di Context
         if f"- {tbl}:" not in ctx and f"- `{tbl}`:" not in ctx:
             continue
         
-        table_word = tbl.lower().rstrip('s') # orders -> order
+        table_word = tbl.lower().rstrip('s')
         
-        # --- [ROBUST MASKING] ---
         # Buat copy pertanyaan khusus untuk scanning tabel ini
         search_scope = question
         
         if table_word in ignore_patterns:
             patterns = ignore_patterns[table_word]
             for pat in patterns:
-                # Hapus frasa pengganggu (ganti dengan spasi)
                 search_scope = re.sub(pat, " ", search_scope)
-        # ------------------------
         
         # Cek 2: Cari kata tabel di search_scope yang SUDAH BERSIH
         if re.search(rf"\b{table_word}s?\b", search_scope):
@@ -71,75 +219,179 @@ def router_agent(state: RAGState) -> RAGState:
             is_just_id_ref = re.search(rf"\b{table_word}s?\s+(number|id|code|kode|nomor)\b", search_scope)
             
             if is_just_id_ref:
-                # Ambil tabel jika ada penyebutan entitas di luar ID
                 if re.search(rf"\b{table_word}s?\b(?!\s+(number|id|code|kode|nomor))", search_scope):
                     relevant_tables.append(tbl)
             else:
                 relevant_tables.append(tbl)
     
-    # 🆕 [FK-ONLY FILTER] - Hapus tabel yang HANYA disebutkan sebagai filter nilai FK
-    # Pattern: "offices with codes 1, 2, or 3" -> offices cuma jadi constraint, bukan JOIN
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 2: FK-ONLY FILTER (Hapus tabel yang hanya disebutkan untuk FK)
+    # ═══════════════════════════════════════════════════════════════════
     filtered_tables = []
     for tbl in relevant_tables:
         table_word = tbl.lower().rstrip('s')
-        # Deteksi pattern: "<table> with <code/id> <angka/list>"
+        
+        # Pattern: "<table> with <code/id> <angka/list>"
         fk_only_pattern = rf"\b{table_word}s?\s+with\s+(code|number|id|kode|nomor)s?\s+[\d,\sor]+"
         
-        # Jika match FK-only pattern DAN tidak ada penyebutan lain dari tabel tersebut
         if re.search(fk_only_pattern, question):
-            # Cek apakah ada penyebutan tabel di luar pattern FK-only
             temp_scope = re.sub(fk_only_pattern, "", question)
             
-            # 🆕 PENTING: Cek tabel tanpa 's' juga (office vs offices)
-            # Karena "office codes" != "offices", harus cek strict word boundary
             has_other_mention = (
-                re.search(rf"\b{table_word}s\b", temp_scope) or  # Cek plural (offices)
-                re.search(rf"\b{table_word}\s+(?!(code|number|id|kode|nomor))", temp_scope)  # Cek singular tapi bukan "<table> code"
+                re.search(rf"\b{table_word}s\b", temp_scope) or
+                re.search(rf"\b{table_word}\s+(?!(code|number|id|kode|nomor))", temp_scope)
             )
             
             if not has_other_mention:
-                # Skip tabel ini, karena cuma disebutkan sebagai FK filter
                 continue
         
         filtered_tables.append(tbl)
 
     relevant_tables = filtered_tables
-    # 🆕 [END FK-ONLY FILTER]
     
-    # 2. DETEKSI SINYAL
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 2.5: 🆕 DETECT SIGNALS EARLY (needed for FK inference)
+    # ═══════════════════════════════════════════════════════════════════
+    question_lower = question.lower()
+    
+    # Detect aggregation context
     math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata']
-    has_math = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in math_keywords)
+    has_math = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in math_keywords)
     
+    group_indicators = ["each", "per", "every", "masing-masing", "setiap", "for each", "classify"]
+    has_group_word = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in group_indicators)
+    
+    is_aggregation = has_math or has_group_word
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 3: 🆕 FK INFERENCE (Smarter Version)
+    # ═══════════════════════════════════════════════════════════════════
+    # Rule: Remove table A if:
+    #   1. Table A's only mentioned column is a FK that exists in table B
+    #   2. AND the question does NOT ask for any OTHER column from table A
+    
+    question_lower = question.lower()
+    
+    # Build list of columns explicitly mentioned in question (non-FK)
+    # Common non-FK columns that require the actual table
+    non_fk_indicators = {
+        'customers': ['customername', 'customer name', 'contactfirstname', 'contactlastname', 
+                      'phone', 'addressline', 'city', 'state', 'country', 'creditlimit'],
+        'orders': ['orderdate', 'order date', 'requireddate', 'shippeddate', 'status', 'comments'],
+        'payments': ['amount', 'paymentdate', 'payment date', 'checknumber', 'check number'],
+        'products': ['productname', 'product name', 'productline', 'productscale', 'productvendor',
+                     'quantityinstock', 'buyprice', 'msrp'],
+        'employees': ['firstname', 'lastname', 'first name', 'last name', 'email', 'jobtitle', 'extension'],
+        'offices': ['city', 'phone', 'addressline', 'state', 'country', 'territory'],
+    }
+    
+    tables_to_remove = []
+    for tbl in list(relevant_tables):
+        tbl_lower = tbl.lower()
+        
+        # Check if question asks for any non-FK column from this table
+        needs_this_table = False
+        if tbl_lower in non_fk_indicators:
+            for col_indicator in non_fk_indicators[tbl_lower]:
+                if col_indicator in question_lower:
+                    needs_this_table = True
+                    print(f"[Router] ✋ Keeping {tbl}: question asks for '{col_indicator}'")
+                    break
+        
+        if needs_this_table:
+            continue  # Don't remove this table
+            
+        # Original FK inference logic: remove if FK exists in another table
+        tbl_cols = set(c.lower() for c in allowed_identifiers.get(tbl, []))
+        fk_cols = {c for c in tbl_cols if c.endswith('number') or c.endswith('code') or c.endswith('id')}
+        
+        for other_tbl in relevant_tables:
+            if other_tbl == tbl:
+                continue
+            other_cols = set(c.lower() for c in allowed_identifiers.get(other_tbl, []))
+            
+            # If FK exists in other table AND we don't need non-FK cols from this table
+            if fk_cols & other_cols and not needs_this_table:
+                # Only remove if the ONLY reason we included this table was the FK
+                non_fk_cols_mentioned = tbl_cols - fk_cols
+                question_mentions_non_fk = any(c in question_lower for c in non_fk_cols_mentioned)
+                
+                if not question_mentions_non_fk:
+                    print(f"[Router] 🎯 FK Inference: {tbl} only provides FK, removing")
+                    tables_to_remove.append(tbl)
+                    break
+    
+    for tbl in tables_to_remove:
+        if tbl in relevant_tables:
+            relevant_tables.remove(tbl)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 4: DETEKSI SINYAL (Complete Detection)
+    # ═══════════════════════════════════════════════════════════════════
     value_ranks = ["highest", "lowest", "top", "bottom", "most", "least", "largest", "smallest", "terbesar", "terkecil", "paling"]
     time_ranks = ["latest", "earliest", "newest", "oldest", "terbaru", "terlama"]
-    is_ranking_value = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in value_ranks)
-    is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in time_ranks)
+    is_ranking_value = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in value_ranks)
+    is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in time_ranks)
     is_ranking = is_ranking_value or is_ranking_time
     
     explicit_sort = ["sort by", "ordered by", "sorted by", "order by", "sorted from"]
-    is_sorting = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in explicit_sort) or is_ranking
+    is_sorting = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in explicit_sort) or is_ranking
     
-    group_indicators = ["each", "per", "every", "masing-masing", "setiap", "for each", "classify"]
-    has_group_word = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in group_indicators)
-    is_by_logic = ("by " in question and not any(re.search(rf"\b{re.escape(s)}\b", question) for s in explicit_sort) and (has_math or is_ranking))
+    is_by_logic = ("by " in question_lower and not any(re.search(rf"\b{re.escape(s)}\b", question_lower) for s in explicit_sort) and (has_math or is_ranking))
     has_grouping = has_group_word or is_by_logic
     
-    # 3. LOGIKA ESKALASI
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
+    # ═══════════════════════════════════════════════════════════════════
     is_multi_table = len(relevant_tables) > 1
     is_winner_row = is_ranking_value and has_grouping
     
-    exclusion_keywords = ["no", "never", "without", "tidak pernah", "belum pernah", "tidak ada", "missing", "empty", "all customers", "all products"]
-    has_exclusion = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in exclusion_keywords)
+    # 🆕 FIXED: Exclusion detection - only trigger for TRUE exclusion patterns
+    # These patterns imply NOT EXISTS / NOT IN / LEFT JOIN ... IS NULL (cross-table exclusion)
+    # NOT triggered by: "missing" in single-table context (just IS NULL check)
+    has_exclusion = False
     
-    should_escalate = is_multi_table or is_winner_row
+    # Pattern 1: Cross-table exclusion keywords (always need 7B)
+    cross_table_exclusion = ["never ordered", "never paid", "without any", "have no", "has no", 
+                             "tidak pernah", "belum pernah", "tidak ada", "yang tidak punya"]
+    if any(kw in question_lower for kw in cross_table_exclusion):
+        has_exclusion = True
+    
+    # Pattern 2: "no" + entity noun (no orders, no payments) → implies cross-table
+    if not has_exclusion and re.search(r"\bno\s+(orders?|payments?|customers?|products?|employees?)\b", question_lower):
+        has_exclusion = True
+    
+    # Pattern 3: "missing" or "empty" ONLY if multi-table context
+    # Single-table "missing" = just IS NULL (simple, 3B can handle)
+    if not has_exclusion and is_multi_table:
+        if re.search(r"\b(missing|empty)\b", question_lower):
+            has_exclusion = True
+    
+    # 🆕 ESCALATION LOGIC (Simplified)
+    # Always escalate to 7B when JOIN is needed, because 3B often fails to generate proper JOINs
+    # Escalate to 7B for:
+    # - ANY multi-table query (requires JOIN)
+    # - Winner-row patterns (complex window functions)
+    # - Exclusion patterns (NOT IN, NOT EXISTS)
+    should_escalate = (
+        is_multi_table or  # 🔥 Always use 7B for JOINs
+        is_winner_row or 
+        has_exclusion
+    )
+    
+    if is_multi_table:
+        print(f"[Router] ⚡ Multi-table detected: {relevant_tables} -> escalating to 7B")
     
     chosen_model = LARGE_MODEL if should_escalate else SMALL_MODEL
     complexity = "complex" if should_escalate else "simple"
     
     # Tentukan QTYPE
-    if is_winner_row: qtype = "rank"
-    elif has_math or has_grouping: qtype = "aggregate"
-    else: qtype = "lookup"
+    if is_winner_row: 
+        qtype = "rank"
+    elif has_math or has_grouping: 
+        qtype = "aggregate"
+    else: 
+        qtype = "lookup"
     
     print(f"[Router] Detected Tables: {relevant_tables}")
     print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, Exclusion:{has_exclusion}")
@@ -225,15 +477,35 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     sql_for_tokenizing = final_sql
     sql_for_tokenizing = re.sub(r"'(?:''|[^'])*'", " ", sql_for_tokenizing)
     sql_for_tokenizing = re.sub(r'"(?:""|[^"])*"', " ", sql_for_tokenizing)
-    sql_tokens = set(re.findall(r"\b([a-z][a-z0-9_]*)\b", sql_for_tokenizing.lower()))
-    
+    # 🆕 FIX 1: Remove function calls (word followed by parenthesis)
+    sql_for_tokenizing = re.sub(
+        r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(",
+        "(",
+        sql_for_tokenizing
+    )
+
+    # 🆕 FIX 2: Remove table names from tokenizing
+    # This prevents "payments" in "FROM payments" or subquery being treated as column
     allowed_ids = _parse_allowed_identifiers(ctx)
+    for tbl in allowed_ids.keys():
+        sql_for_tokenizing = re.sub(
+            rf"\b{re.escape(tbl)}\b",
+            "_TBL_",
+            sql_for_tokenizing,
+            flags=re.IGNORECASE
+        )
+
+    sql_tokens = set(re.findall(r"\b([a-z][a-z0-9_]*)\b", sql_for_tokenizing.lower()))
+
+    # Remove placeholder tokens
+    sql_tokens.discard("_tbl_")    
     reserved = _SQL_KEYWORDS.union({
         'year', 'month', 'day', 'date', 'date_format', 'now', 'curdate',
         'concat', 'group_concat', 'coalesce', 'ifnull', 'sum', 'count', 'avg',
         't', 'limit', 'offset', 'as', 'regexp_like', 'str_to_date',
         'case', 'when', 'then', 'else', 'end',
-        'union', 'all', 'distinct', 'values', 'exists', 'having'
+        'union', 'all', 'distinct', 'values', 'exists', 'having',
+        'substr',
     })
     
     defined_aliases = set()
@@ -262,36 +534,103 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS A: Schema Validation & Hallucination Check (HARD ERROR) ---
     if alien_cols and "JOIN" not in sql_up:
-        can_be_solved_by_join = False
-        potential_table = ""
-        for tbl in detected_tables:
-            if tbl == primary_tbl: continue
-            tbl_cols = {c.lower() for c in allowed_ids.get(tbl, [])}
-            if set(alien_cols).intersection(tbl_cols):
-                can_be_solved_by_join = True
-                potential_table = tbl
-                break
+        # 🆕 SMART SUBQUERY HANDLING
+        # Only skip validation if alien columns are INSIDE subquery (not in main SELECT)
+        has_subquery = re.search(r"\(\s*SELECT\b", sql_up, re.IGNORECASE)
         
-        if can_be_solved_by_join:
-            _dbg_print_two("[Agent3] 🚨 HARD ERROR - Missing JOIN", f"Columns {alien_cols} belong to {potential_table}")
-            extra_instruction = (
-                f"STRICT REQUIREMENT: Columns {alien_cols} do NOT exist in table '{primary_tbl}', but they belong to '{potential_table}'. "
-                f"Detected intent implies multiple tables: {detected_tables}. "
-                "You MUST use explicit JOIN (e.g., JOIN {potential_table} ON ...) to link the data."
-            )
-            needs_regeneration = True
-            regeneration_model = LARGE_MODEL  # Force 7B
+        if has_subquery:
+            # Extract main SELECT clause (before first subquery)
+            # Pattern: SELECT ... FROM ... WHERE ... (SELECT ...)
+            main_select_match = re.search(r"^SELECT\s+(.*?)\s+FROM", sql_up, re.IGNORECASE | re.DOTALL)
             
-        elif not can_be_solved_by_join:
-             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Hallucination", f"Columns {alien_cols} do not exist in Schema.")
-             extra_instruction = (
-                f"STRICT REQUIREMENT: The columns {alien_cols} do NOT exist in the database schema. "
-                "1. Check for typos (e.g. `order_date` vs `orderDate`). "
-                "2. Use ONLY columns listed in the schema context. "
-                "3. Do NOT hallucinate snake_case names if the schema uses camelCase."
-             )
-             needs_regeneration = True
-             regeneration_model = LARGE_MODEL  # Force 7B
+            if main_select_match:
+                main_select = main_select_match.group(1)
+                
+                # Check if alien columns appear in MAIN SELECT
+                aliens_in_main = [
+                    col for col in alien_cols 
+                    if re.search(rf"\b{re.escape(col)}\b", main_select, re.IGNORECASE)
+                ]
+                
+                if aliens_in_main:
+                    # Alien columns in main SELECT → NOT safe to skip
+                    _dbg_print_two(
+                        "[Agent3] 🚨 HARD ERROR - Hallucination in Main Query", 
+                        f"Columns {aliens_in_main} in SELECT but not in FROM table"
+                    )
+                    
+                    # Check if can be solved by JOIN
+                    can_be_solved_by_join = False
+                    potential_table = ""
+                    for tbl in detected_tables:
+                        if tbl == primary_tbl: continue
+                        tbl_cols = {c.lower() for c in allowed_ids.get(tbl, [])}
+                        if set(aliens_in_main).intersection(tbl_cols):
+                            can_be_solved_by_join = True
+                            potential_table = tbl
+                            break
+                    
+                    if can_be_solved_by_join:
+                        extra_instruction = (
+                            f"CRITICAL ERROR: You selected columns {aliens_in_main} from table '{primary_tbl}', "
+                            f"but these columns do NOT exist in '{primary_tbl}'. They exist in '{potential_table}'. "
+                            f"You MUST use JOIN to access columns from multiple tables.\n"
+                            f"CORRECT PATTERN:\n"
+                            f"SELECT {potential_table[0]}.{aliens_in_main[0]}, {primary_tbl[0]}.column, AGG()\n"
+                            f"FROM {potential_table} {potential_table[0]}\n"
+                            f"JOIN {primary_tbl} {primary_tbl[0]} ON ...\n"
+                            f"GROUP BY ..."
+                        )
+                        needs_regeneration = True
+                        regeneration_model = LARGE_MODEL
+                    else:
+                        extra_instruction = (
+                            f"STRICT REQUIREMENT: The columns {aliens_in_main} do NOT exist in table '{primary_tbl}'. "
+                            "Check the schema and use only valid column names."
+                        )
+                        needs_regeneration = True
+                        regeneration_model = LARGE_MODEL
+                else:
+                    # Alien columns only in subquery → safe to skip
+                    _dbg_print_two(
+                        "[Agent3] ⚠️ Skipping hallucination check", 
+                        "Alien columns only in subquery (different scope)"
+                    )
+            else:
+                # Can't parse SELECT clause → skip conservatively
+                _dbg_print_two("[Agent3] ⚠️ Skipping hallucination check", "Cannot parse SELECT clause")
+        else:
+            # No subquery → original logic
+            can_be_solved_by_join = False
+            potential_table = ""
+            for tbl in detected_tables:
+                if tbl == primary_tbl: continue
+                tbl_cols = {c.lower() for c in allowed_ids.get(tbl, [])}
+                if set(alien_cols).intersection(tbl_cols):
+                    can_be_solved_by_join = True
+                    potential_table = tbl
+                    break
+            
+            if can_be_solved_by_join:
+                _dbg_print_two("[Agent3] 🚨 HARD ERROR - Missing JOIN", f"Columns {alien_cols} belong to {potential_table}")
+                extra_instruction = (
+                    f"STRICT REQUIREMENT: Columns {alien_cols} do NOT exist in table '{primary_tbl}', but they belong to '{potential_table}'. "
+                    f"Detected intent implies multiple tables: {detected_tables}. "
+                    "You MUST use explicit JOIN (e.g., JOIN {potential_table} ON ...) to link the data."
+                )
+                needs_regeneration = True
+                regeneration_model = LARGE_MODEL
+                
+            elif not can_be_solved_by_join:
+                _dbg_print_two("[Agent3] 🚨 HARD ERROR - Hallucination", f"Columns {alien_cols} do not exist in Schema.")
+                extra_instruction = (
+                    f"STRICT REQUIREMENT: The columns {alien_cols} do NOT exist in the database schema. "
+                    "1. Check for typos (e.g. `order_date` vs `orderDate`). "
+                    "2. Use ONLY columns listed in the schema context. "
+                    "3. Do NOT hallucinate snake_case names if the schema uses camelCase."
+                )
+                needs_regeneration = True
+                regeneration_model = LARGE_MODEL
 
     # --- KASUS B: Winner-Row Leak Check (HARD ERROR) ---
     is_winner_row = decision.get("is_winner_row", False)

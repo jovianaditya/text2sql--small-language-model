@@ -203,7 +203,7 @@ def ensure_join_aliases(sql: str) -> str:
     #          JOIN table [AS] alias
     tj_pat = re.compile(
         r"(?P<kw>\bFROM\b|\bJOIN\b)\s+"
-        r"(?P<table>`?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?`?)"
+        r"(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)"
         r"(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?",
         flags=re.I,
     )
@@ -2787,7 +2787,7 @@ def _rewrite_simple_regexp_to_like(sql: str, question: str) -> str:
     # Jadi kita lakukan rewrite yang lebih eksplisit agar tidak ambigu:
     sql = re.sub(
         r"(\bWHERE\b.*?\b)((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)\s+REGEXP\s+'\^([A-Za-z0-9 _-]+)'",
-        r"\1\2 LIKE '\3%'",
+        r"\1\2 LIKE '\3%",
         sql,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -2932,7 +2932,7 @@ def _expand_missing_null_to_null_or_empty(sql: str, question: str) -> str:
         # Rewrite kolom string yang umum: state (qualified/unqualified)
         # state IS NULL  -> (state IS NULL OR state = '')
         seg = re.sub(
-            r"\b((?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?state)\s+IS\s+NULL\b",
+            r"\b((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)\s+IS\s+NULL\b",
             r"(\1 IS NULL OR \1 = '')",
             seg,
             flags=re.I,
@@ -3103,3 +3103,137 @@ def _collapse_spaces_outside_quotes(s: str) -> str:
         if i % 2 == 0:
             parts[i] = re.sub(r"[ \t]{2,}", " ", parts[i])
     return "".join(parts)
+# ======================================================================
+# ======= Phase 4b — Aggregate in WHERE Fix (MySQL Error 1111) =========
+# ======================================================================
+
+def _fix_aggregate_in_where(sql: str) -> str:
+    """
+    Fix invalid SQL where aggregate functions are used in WHERE clause.
+    MySQL Error 1111: Invalid use of group function
+    
+    WRONG:  SELECT ... FROM ... WHERE AVG(amount) > 50000 GROUP BY ...
+    RIGHT:  SELECT ... FROM ... GROUP BY ... HAVING AVG(amount) > 50000
+    
+    Handles:
+    - Simple: WHERE AVG(x) > 50000
+    - With other conditions: WHERE status = 'Active' AND AVG(x) > 50000
+    """
+    if not sql:
+        return sql
+    
+    sql_up = sql.upper()
+    
+    # Skip jika tidak ada GROUP BY
+    if "GROUP BY" not in sql_up:
+        return sql
+    
+    # Skip jika tidak ada WHERE
+    if "WHERE" not in sql_up:
+        return sql
+    
+    # Pattern untuk mendeteksi aggregate di WHERE
+    agg_funcs = r"(?:AVG|SUM|COUNT|MIN|MAX)"
+    
+    # Cari WHERE clause (sebelum GROUP BY)
+    where_match = re.search(
+        r"\bWHERE\s+(.*?)(?=\s+GROUP\s+BY\b)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    
+    if not where_match:
+        return sql
+    
+    where_body = where_match.group(1).strip()
+    
+    # Cari semua aggregate conditions di WHERE
+    agg_conditions = []
+    non_agg_conditions = []
+    
+    # Split by AND (simple approach)
+    conditions = re.split(r'\s+AND\s+', where_body, flags=re.IGNORECASE)
+    
+    for cond in conditions:
+        cond = cond.strip()
+        if not cond:
+            continue
+        
+        # Check if this condition contains an aggregate function
+        if re.search(rf"\b{agg_funcs}\s*\(", cond, flags=re.IGNORECASE):
+            agg_conditions.append(cond)
+        else:
+            non_agg_conditions.append(cond)
+    
+    # Jika tidak ada aggregate di WHERE, return as-is
+    if not agg_conditions:
+        return sql
+    
+    print(f"[FIX_AGG_WHERE] Found aggregate in WHERE: {agg_conditions}")
+    
+    # Build new WHERE clause (tanpa aggregate conditions)
+    if non_agg_conditions:
+        new_where = "WHERE " + " AND ".join(non_agg_conditions)
+    else:
+        new_where = ""
+    
+    # Find GROUP BY dan apa yang setelahnya
+    group_match = re.search(
+        r"(\bGROUP\s+BY\s+[\w\s,\.`]+?)(\s+HAVING\s+|\s+ORDER\s+BY\s+|\s+LIMIT\s+|\s*;|\s*$)",
+        sql,
+        flags=re.IGNORECASE
+    )
+    
+    if not group_match:
+        return sql
+    
+    group_clause = group_match.group(1).strip()
+    after_group = group_match.group(2)
+    
+    # Build HAVING clause
+    having_conditions = " AND ".join(agg_conditions)
+    
+    # Check if HAVING already exists
+    if re.search(r"\bHAVING\b", after_group, flags=re.IGNORECASE):
+        # Prepend to existing HAVING
+        new_having = re.sub(
+            r"(\bHAVING\s+)",
+            rf"\1{having_conditions} AND ",
+            after_group,
+            flags=re.IGNORECASE
+        )
+    else:
+        # Add new HAVING before ORDER BY/LIMIT/end
+        new_having = f" HAVING {having_conditions}{after_group}"
+    
+    # Get prefix (SELECT ... FROM ... ) - before WHERE
+    prefix_match = re.search(r"^(.*?)\bWHERE\b", sql, flags=re.IGNORECASE | re.DOTALL)
+    if not prefix_match:
+        return sql
+    prefix = prefix_match.group(1).strip()
+    
+    # Get suffix (after GROUP BY clause) 
+    suffix_start = group_match.end()
+    suffix = sql[suffix_start:].strip()
+    
+    # Build final SQL
+    if new_where:
+        result = f"{prefix} {new_where} {group_clause}{new_having}"
+    else:
+        result = f"{prefix} {group_clause}{new_having}"
+    
+    # Add remaining suffix if any
+    if suffix and not suffix.startswith(";") and suffix not in new_having:
+        result = f"{result} {suffix}"
+    
+    # Clean up multiple spaces
+    result = re.sub(r"\s{2,}", " ", result)
+    result = result.strip()
+    
+    # Ensure semicolon
+    if not result.endswith(";"):
+        result += ";"
+    
+    print(f"[FIX_AGG_WHERE] Fixed: {result}")
+    
+    return result
