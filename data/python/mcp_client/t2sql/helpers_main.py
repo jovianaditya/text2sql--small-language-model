@@ -975,6 +975,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "CRITICAL RULE: Do NOT add SQL clauses (WHERE, HAVING, LIMIT, ORDER BY) "
         "unless the user EXPLICITLY requests them. "
     )
+    # === [NEW] FOR EACH = ALL VALUES, NO WHERE FILTER ===
+    for_each_triggers = ["for each", "each ", "per ", "every "]
+    if any(t in question.lower() for t in for_each_triggers):
+        constraints.append(
+            "FOR EACH RULE: When the question says 'For each X' or 'Per X', you MUST return ALL values of X. "
+            "Do NOT add WHERE filters on the grouping column unless the user explicitly filters it. "
+        )
     # [A] STATS UTILIZATION (profiling statistics)
     constraints.append(
         "DATA INTELLIGENCE: Use the provided 'STATS' in the Context responsibly:\n"
@@ -1022,6 +1029,14 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         )
         constraints.append(
             "GROUP BY RULE: Every column in the SELECT list that is not aggregated MUST be in the GROUP BY clause."
+        )
+
+    # [D.1] PERCENTAGE/RATIO CALCULATION RULES
+    percentage_triggers = ["percentage", "percent", "ratio", "proportion"]
+    if any(t in question.lower() for t in percentage_triggers):
+        constraints.append(
+            "PERCENTAGE CALCULATION RULE: When asked for percentage, you MUST compute it as a formula. "
+            "Do NOT just return counts; return the actual percentage value."
         )
 
     # [E] DATE RULES
@@ -1376,6 +1391,32 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _expand_missing_null_to_null_or_empty(s, question)
     s = _ensure_reasonable_distinct(s, question)
     s = _strip_unneeded_count_distinct(s)
+    # ---------------------------------------------------------------------------
+    # Phase 6.5 — Strip Hallucinated WHERE on GROUP BY Column for "For Each" Queries
+    # ---------------------------------------------------------------------------
+    for_each_triggers = ["for each", "each ", "per ", "every "]
+    if any(t in question.lower() for t in for_each_triggers):
+        # Check if there's a GROUP BY clause
+        group_match = re.search(r'\bGROUP\s+BY\s+([a-zA-Z0-9_`.]+)', s, re.IGNORECASE)
+        if group_match:
+            group_col = group_match.group(1).strip().strip('`').lower()
+            # Pattern 1: WHERE col IN (...) - hardcoded list of values
+            where_in_match = re.search(
+                r'\bWHERE\s+' + re.escape(group_col) + r'\s+IN\s*\([^)]+\)',
+                s, re.IGNORECASE
+            )
+            # Pattern 2: WHERE col IS NOT NULL - unnecessary null check on grouping col
+            where_not_null_match = re.search(
+                r'\bWHERE\s+' + re.escape(group_col) + r'\s+IS\s+NOT\s+NULL\b',
+                s, re.IGNORECASE
+            )
+            where_match = where_in_match or where_not_null_match
+            if where_match:
+                # Remove the WHERE clause entirely - "for each" means ALL values
+                s = s[:where_match.start()] + s[where_match.end():]
+                s = re.sub(r'\s{2,}', ' ', s)  # collapse extra spaces
+                if DEBUG_WR: 
+                    print(f"[PH6.5] Removed hallucinated WHERE on GROUP BY column '{group_col}' for 'for each' query")
     # ---------------------------------------------------------------------------
     # Phase 7 — Ordering, Limits, and Output Formatting
     # Cosmetic and execution-safety adjustments only

@@ -255,7 +255,8 @@ def router_agent(state: RAGState) -> RAGState:
     question_lower = question.lower()
     
     # Detect aggregation context
-    math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata']
+    math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata', 
+                     'percentage', 'percent', 'ratio', 'proportion', 'persentase', 'rasio']
     has_math = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in math_keywords)
     
     group_indicators = ["each", "per", "every", "masing-masing", "setiap", "for each", "classify"]

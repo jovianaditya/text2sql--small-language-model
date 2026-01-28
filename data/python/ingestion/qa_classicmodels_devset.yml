@@ -148,6 +148,16 @@ cases:
           customerNumber
         FROM customers
         WHERE creditLimit > (SELECT AVG(creditLimit) FROM customers);
+    - id: M7
+      difficulty: medium
+      question: "For each order status, calculate the percentage of orders in that status with a non-null shipped date. Return the status and the calculated percentage, ordered by percentage in descending order."
+      groundtruth_sql: |  
+        SELECT
+          status,
+          (SUM(CASE WHEN shippedDate IS NOT NULL THEN 1 ELSE 0 END) * 100 / COUNT(*)) AS shipped_percentage
+        FROM orders
+        GROUP BY status
+        ORDER BY shipped_percentage DESC;
     - id: H1
       difficulty: hard
       question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."
