@@ -158,6 +158,38 @@ cases:
         FROM orders
         GROUP BY status
         ORDER BY shipped_percentage DESC;
+    - id: M8
+      difficulty: medium
+      question: "For each product line, count the total number of products and return only product lines with more than 5 products."
+      groundtruth_sql: |  
+        SELECT
+          productLine,
+          COUNT(productCode) AS total_products
+        FROM products
+        GROUP BY productLine
+        HAVING COUNT(productCode) > 5;
+    - id: M9
+      difficulty: medium
+      question: "For each office territory, show the number of offices located in that territory, ordered by the office count in descending order."
+      groundtruth_sql: |
+        SELECT
+          territory,
+          COUNT(officeCode) AS office_count
+        FROM offices
+        GROUP BY territory
+        ORDER BY office_count DESC;
+    - id: M10
+      difficulty: medium
+      question: "Return the employee number, job title, and a rank of employees within each job title based on employee number in descending order."
+      groundtruth_sql: |
+        SELECT
+          employeeNumber,
+          jobTitle,
+          RANK() OVER (
+            PARTITION BY jobTitle
+            ORDER BY employeeNumber DESC
+          ) AS employee_rank
+        FROM employees;
     - id: H1
       difficulty: hard
       question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."
@@ -167,6 +199,6 @@ cases:
           cust.customerName,
           SUM(pmt.amount) AS total_payment_amount
         FROM customers AS cust
-        LEFT JOIN payments AS pmt ON c.customerNumber = pmt.customerNumber AND YEAR(pmt.paymentDate) = 2004
+        LEFT JOIN payments AS pmt ON cust.customerNumber = pmt.customerNumber AND YEAR(pmt.paymentDate) = 2004
         GROUP BY cust.customerNumber, cust.customerName
         HAVING SUM(pmt.amount) > 50000;

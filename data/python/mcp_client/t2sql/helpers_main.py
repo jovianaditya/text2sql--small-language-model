@@ -24,8 +24,9 @@ from .utils import _dbg_print_two
 from .helpers_core import (
     _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
     # phase 0
-    _fix_bad_backticks, _canonicalize_table_names, ensure_join_aliases,
+    _fix_bad_backticks, _canonicalize_table_names, ensure_join_aliases, _escape_reserved_column_aliases,
     # phase 1
+    _move_rhs_filter_from_where_to_on,  # Only triggers for "ALL entities" questions
     _rewrite_left_join_to_inner_if_not_needed, _rewrite_left_join_to_inner_if_rhs_filtered,
     _rewrite_inner_join_filter_to_exists, _rewrite_inner_join_existence_to_exists,
     _drop_redundant_inner_join_same_key, _prune_ornamental_joins_safe, has_non_inner_join, join_count,
@@ -1247,10 +1248,14 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _fix_bad_backticks(s)
     s = _canonicalize_table_names(s, ctx)
     s = ensure_join_aliases(s)
+    s = _escape_reserved_column_aliases(s)  # Escape reserved words used as column aliases (e.g., AS rank -> AS `rank`)
     # ---------------------------------------------------------------------------
     # Phase 1 — JOIN Semantics & Structural Rewrites (FINAL)
     # Decide JOIN necessity and semantics before touching aliases
     # ---------------------------------------------------------------------------
+    # For "ALL entities" questions: preserve LEFT JOIN by moving RHS filter to ON
+    s = _move_rhs_filter_from_where_to_on(s, question, ctx)
+    # Otherwise: convert LEFT JOIN to INNER if RHS is filtered
     s = _rewrite_left_join_to_inner_if_not_needed(s, question, ctx)
     s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question, ctx)
     s = _rewrite_inner_join_filter_to_exists(s)

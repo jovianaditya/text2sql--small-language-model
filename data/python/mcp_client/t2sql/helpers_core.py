@@ -25,7 +25,10 @@ _ALIAS_OVERRIDES = {
 _RESERVED_ALIASES = {
     "or", "and", "on", "as", "in", "is", "by", "from", "join", "where",
     "group", "order", "limit", "select", "left", "right", "inner", "outer",
-    "having", "union", "cross", "natural"
+    "having", "union", "cross", "natural",
+    # MySQL 8.0+ window function keywords (reserved)
+    "rank", "dense_rank", "row_number", "ntile", "lead", "lag",
+    "first_value", "last_value", "nth_value", "cume_dist", "percent_rank"
 }
 _JOIN_KW = r"(?:inner\s+join|left\s+join|right\s+join|full\s+join|join)"
 # =======================================================================
@@ -78,6 +81,45 @@ def _fix_bad_backticks(sql: str) -> str:
                  lambda m: ".".join(_smart_backtick(p) for p in _split_qualified(m.group(1)))
                            + f".{_smart_backtick(m.group(2))}", sql)
     sql = re.sub(r'`([^`]+?)`(?!\s*\.)', lambda m: _smart_backtick(m.group(1)), sql, flags=re.I)
+    return sql
+
+def _escape_reserved_column_aliases(sql: str) -> str:
+    """
+    Escape column aliases that are MySQL reserved keywords.
+    E.g.: AS rank -> AS `rank`
+    
+    Pattern: ... AS <alias> (where alias is NOT already backticked)
+    Only applies to SELECT clause column aliases, not table aliases.
+    """
+    if not sql:
+        return sql
+    
+    # Pattern to find: ) AS alias or expr AS alias (column alias in SELECT)
+    # Must NOT match table aliases (FROM/JOIN table AS alias)
+    # Focus on common patterns: aggregate/window function result aliases
+    
+    def escape_alias(m: re.Match) -> str:
+        prefix = m.group(1)  # ") AS " or similar
+        alias = m.group(2)
+        
+        # Skip if already backticked
+        if alias.startswith('`'):
+            return m.group(0)
+        
+        # Check if alias is reserved
+        if alias.lower() in _RESERVED_ALIASES:
+            return f"{prefix}`{alias}`"
+        return m.group(0)
+    
+    # Match: ) AS alias or , expr AS alias (typical SELECT alias patterns)
+    # Negative lookbehind to skip FROM/JOIN table aliases
+    sql = re.sub(
+        r'(\)\s+AS\s+)([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\.)',
+        escape_alias,
+        sql,
+        flags=re.I
+    )
+    
     return sql
 
 def _parse_allowed_identifiers(ctx: str) -> Dict[str, Set[str]]:
@@ -444,6 +486,166 @@ def _rewrite_left_join_to_inner_if_rhs_filtered(sql: str, question: str, ctx: st
     join_part = f" JOIN {t2_raw}" + (f" {a2}" if a2 else "")
 
     return f"{prefix}{from_part}{join_part} ON {on_clause}{tail}"
+
+def _question_wants_all_entities(question: str, ctx: str = "") -> bool:
+    """
+    Detect if question explicitly wants ALL entities (including those with no matching RHS).
+    E.g., "show ALL customers", "list every customer", "for each customer"
+    
+    This is more strict than _question_wants_include_zero - only triggers on explicit "all/every/each".
+    """
+    q = (question or "").lower()
+    
+    # Build entity keywords from context
+    allowed_tables = _parse_allowed_identifiers(ctx).keys()
+    if allowed_tables:
+        entities = []
+        for t in allowed_tables:
+            entities.append(re.escape(t.lower()))
+            if t.lower().endswith('s'):
+                entities.append(re.escape(t.lower()[:-1]))
+        entity_kw = f"(?:{'|'.join(entities)})"
+    else:
+        entity_kw = r"(?:customer|product|employee|order|office|payment)"
+    
+    # Pattern: "all/every/each <entity>"
+    # E.g., "all customers", "every customer", "each customer"
+    all_patterns = [
+        rf"\ball\s+{entity_kw}s?\b",           # "all customers"
+        rf"\bevery\s+{entity_kw}\b",           # "every customer"
+        rf"\beach\s+{entity_kw}\b",            # "each customer"
+        rf"\bfor\s+each\s+{entity_kw}\b",      # "for each customer"
+        rf"\bsemua\s+{entity_kw}s?\b",         # "semua customers" (Indonesian)
+        rf"\bsetiap\s+{entity_kw}\b",          # "setiap customer" (Indonesian)
+    ]
+    
+    return any(re.search(pat, q, flags=re.I) for pat in all_patterns)
+
+def _move_rhs_filter_from_where_to_on(sql: str, question: str, ctx: str = "") -> str:
+    """
+    For LEFT JOIN queries: Move RHS-only filters from WHERE to ON clause.
+    This preserves LEFT JOIN semantics (include rows with no match).
+    
+    ONLY triggers when question explicitly asks for "ALL" entities.
+    
+    Example:
+    "Show ALL customers and their total payment in 2004"
+    FROM customers c LEFT JOIN payments p ON c.id = p.cid WHERE YEAR(p.date) = 2004
+    →
+    FROM customers c LEFT JOIN payments p ON c.id = p.cid AND YEAR(p.date) = 2004
+    """
+    if not sql:
+        return sql
+    
+    # SAFETY: Only trigger when question explicitly wants ALL entities
+    if not _question_wants_all_entities(question, ctx):
+        return sql
+    
+    # Only handle single LEFT JOIN
+    if join_count(sql) != 1:
+        return sql
+    if not re.search(r"\bleft\s+join\b", sql, flags=re.I):
+        return sql
+    
+    # Parse the query structure
+    pat = re.compile(
+        r"""
+        ^(?P<prefix>.*?)
+        \bFROM\s+(?P<t1>`?[A-Za-z_][A-Za-z0-9_]*`?)
+        (?:\s+(?:AS\s+)?(?P<a1>[A-Za-z_][A-Za-z0-9_]*))?
+        \s+LEFT\s+JOIN\s+(?P<t2>`?[A-Za-z_][A-Za-z0-9_]*`?)
+        (?:\s+(?:AS\s+)?(?P<a2>[A-Za-z_][A-Za-z0-9_]*))?
+        \s+\bON\s+(?P<on>.*?)
+        (?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*?|;?\s*)$
+        """,
+        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    )
+    m = pat.match(sql.strip())
+    if not m:
+        return sql
+    
+    t1 = (m.group("t1") or "").strip().strip("`")
+    a1 = (m.group("a1") or "").strip()
+    t2 = (m.group("t2") or "").strip().strip("`")
+    a2 = (m.group("a2") or "").strip()
+    on_clause = m.group("on").strip()
+    tail = m.group("tail") or ""
+    prefix = m.group("prefix")
+    
+    # Get qualifiers for LHS and RHS
+    lhs_qualifiers = [q for q in [a1, t1] if q]
+    rhs_qualifiers = [q for q in [a2, t2] if q]
+    
+    if not rhs_qualifiers:
+        return sql
+    
+    # Parse WHERE clause
+    where_body, rest_after_where = _split_where_and_rest(tail)
+    if not where_body:
+        return sql
+    
+    # Check for OR (too complex, skip)
+    if _has_top_level_or(where_body):
+        return sql
+    
+    # Split WHERE conditions by AND
+    conditions = _split_top_level_and(where_body)
+    if not conditions:
+        return sql
+    
+    # Categorize conditions: RHS-only vs others
+    rhs_only_conditions = []
+    other_conditions = []
+    
+    for cond in conditions:
+        cond_stripped = cond.strip()
+        if not cond_stripped:
+            continue
+        
+        # Check if condition references RHS
+        refs_rhs = any(
+            re.search(rf"\b{re.escape(q)}\s*\.", cond_stripped, flags=re.I) 
+            for q in rhs_qualifiers
+        )
+        # Check if condition references LHS
+        refs_lhs = any(
+            re.search(rf"\b{re.escape(q)}\s*\.", cond_stripped, flags=re.I) 
+            for q in lhs_qualifiers
+        )
+        
+        # Only move if it ONLY references RHS (not LHS)
+        if refs_rhs and not refs_lhs:
+            rhs_only_conditions.append(cond_stripped)
+        else:
+            other_conditions.append(cond_stripped)
+    
+    # If no RHS-only conditions found, nothing to move
+    if not rhs_only_conditions:
+        return sql
+    
+    # Build new ON clause with moved conditions
+    new_on_clause = on_clause
+    for cond in rhs_only_conditions:
+        new_on_clause += f" AND {cond}"
+    
+    # Build new WHERE clause (if any conditions remain)
+    if other_conditions:
+        new_where = " WHERE " + " AND ".join(other_conditions)
+    else:
+        new_where = ""
+    
+    # Reconstruct query
+    t1_raw = m.group("t1")
+    t2_raw = m.group("t2")
+    from_part = f"FROM {t1_raw}" + (f" {a1}" if a1 else "")
+    join_part = f" LEFT JOIN {t2_raw}" + (f" {a2}" if a2 else "")
+    
+    result = f"{prefix}{from_part}{join_part} ON {new_on_clause}{new_where}{rest_after_where}"
+    
+    if result != sql:
+        print(f"[Logic] 🔄 Moved RHS filter to ON clause (preserving LEFT JOIN for 'ALL' query)")
+    
+    return result
 
 def _split_where_and_rest(tail: str) -> tuple[Optional[str], str]:
     """
@@ -3035,16 +3237,72 @@ def _strip_unneeded_count_distinct(sql: str) -> str:
 # - collapse_spaces_outside_quotes
 
 def _question_requests_ordering(question: str) -> bool:
+    """
+    Detect if user explicitly wants final result ordering.
+    
+    IMPORTANT: "descending/ascending order" in context of RANK/ROW_NUMBER 
+    refers to window function ordering, NOT final result ORDER BY.
+    """
     q = (question or "").lower()
-    keywords = [
-        "order by", "sort", "sorted", "ascending", "descending", "asc", "desc",
-        "alphabetical", "alphabetically", "latest", "newest", "oldest",
-        "highest", "lowest", "top", "bottom", "most expensive", "cheapest",
-        "urut", "urutkan", "diurutkan", "menaik", "menurun",
-        "terbesar", "terkecil", "tertinggi", "terendah", "terbaru", "terlama",
-        "termahal", "termurah",
+    
+    # --- Pattern 1: Window function context (NOT final ORDER BY) ---
+    # If "ascending/descending order" appears with ranking context, skip it
+    # E.g., "rank employees ... based on employee number in descending order"
+    window_context_patterns = [
+        r"\brank\b.*\b(ascending|descending)\s+order\b",
+        r"\brow[_\s]?number\b.*\b(ascending|descending)\s+order\b",
+        r"\bdense[_\s]?rank\b.*\b(ascending|descending)\s+order\b",
+        r"\bpartition\s+by\b.*\b(ascending|descending)\b",
+        r"\bbased\s+on\b.*\b(ascending|descending)\s+order\b",  # "based on X in descending order" = window context
     ]
-    return any(k in q for k in keywords)
+    
+    has_window_context = any(re.search(pat, q) for pat in window_context_patterns)
+    
+    # --- Pattern 2: Explicit final ordering keywords ---
+    # These strongly indicate user wants final ORDER BY
+    explicit_sort_keywords = [
+        "order by", "sort by", "sorted by", "arrange by",
+        "urut berdasarkan", "urutkan berdasarkan", "diurutkan berdasarkan",
+    ]
+    
+    if any(k in q for k in explicit_sort_keywords):
+        return True
+    
+    # --- Pattern 3: Superlative / ranking output (implies ORDER BY + LIMIT) ---
+    # "top 10", "highest", "lowest", etc. → needs ORDER BY
+    superlative_keywords = [
+        "top ", "bottom ", "first ", "last ",
+        "highest", "lowest", "most expensive", "cheapest",
+        "terbesar", "terkecil", "tertinggi", "terendah", 
+        "termahal", "termurah", "terbaru", "terlama",
+    ]
+    
+    if any(k in q for k in superlative_keywords):
+        return True
+    
+    # --- Pattern 4: Explicit sort direction (only if NOT in window context) ---
+    # "ascending", "descending" without window function context
+    sort_direction_keywords = [
+        "ascending", "descending", "asc", "desc",
+        "alphabetical", "alphabetically",
+        "menaik", "menurun",
+    ]
+    
+    if not has_window_context and any(k in q for k in sort_direction_keywords):
+        return True
+    
+    # --- Pattern 5: Phrase-based ordering intent ---
+    # "from highest to lowest", "from latest", "from A to Z"
+    ordering_phrases = [
+        r"\bfrom\s+(highest|lowest|latest|earliest|newest|oldest)",
+        r"\bfrom\s+(a\s+to\s+z|z\s+to\s+a)",
+        r"\b(sorted|ordered)\s+from\b",
+    ]
+    
+    if any(re.search(pat, q) for pat in ordering_phrases):
+        return True
+    
+    return False
 
 def _remove_top_level_order_by_if_not_requested(sql: str, question: str) -> str:
     """
@@ -3066,12 +3324,42 @@ def _remove_top_level_order_by_if_not_requested(sql: str, question: str) -> str:
     # (?=...)           -> Berhenti (Lookahead) jika ketemu...
     #   (?:\s+LIMIT\b|;|$) -> Kata LIMIT, titik koma, atau akhir string.
     
-    cleaned = re.sub(
-        r"\s+ORDER\s+BY\s+.*?(?=(?:\s+LIMIT\b|;|$))", 
-        "", 
-        sql, 
-        flags=re.IGNORECASE | re.DOTALL
-    )
+    # IMPORTANT: Only remove TOP-LEVEL ORDER BY, not ORDER BY inside OVER(...)
+    # Strategy: Find the last ORDER BY that is NOT inside parentheses
+    
+    def find_top_level_order_by(s: str) -> Optional[int]:
+        """
+        Find position of top-level ORDER BY (not inside parentheses).
+        Returns start index or None if not found.
+        """
+        depth = 0
+        i = 0
+        s_upper = s.upper()
+        while i < len(s):
+            if s[i] == '(':
+                depth += 1
+            elif s[i] == ')':
+                depth -= 1
+            elif depth == 0 and s_upper[i:i+8] == 'ORDER BY':
+                # Check it's a word boundary
+                if (i == 0 or not s[i-1].isalnum()) and (i+8 >= len(s) or not s[i+8].isalnum()):
+                    return i
+            i += 1
+        return None
+    
+    order_pos = find_top_level_order_by(sql)
+    if order_pos is None:
+        return sql  # No top-level ORDER BY found
+    
+    # Find where ORDER BY clause ends (at LIMIT, ;, or end of string)
+    rest = sql[order_pos:]
+    # Match ORDER BY ... until LIMIT or ; or end
+    m = re.match(r"ORDER\s+BY\s+.*?(?=\s+LIMIT\b|;|$)", rest, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return sql
+    
+    # Remove the matched ORDER BY clause
+    cleaned = sql[:order_pos].rstrip() + sql[order_pos + m.end():]
     
     if cleaned != sql:
         print("[Logic] ✂️ Removed unrequested ORDER BY (Regex Force).")

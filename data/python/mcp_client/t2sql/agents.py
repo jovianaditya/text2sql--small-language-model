@@ -625,7 +625,10 @@ def router_agent(state: RAGState) -> RAGState:
     # ═══════════════════════════════════════════════════════════════════
     # STEP 4: DETEKSI SINYAL (Complete Detection)
     # ═══════════════════════════════════════════════════════════════════
-    value_ranks = ["highest", "lowest", "top", "bottom", "most", "least", "largest", "smallest", "terbesar", "terkecil", "paling"]
+    # Note: "rank/ranking" NOT included here - explicit ranking with RANK() OVER 
+    # is simpler than winner-row patterns (highest/lowest/top) which need subqueries
+    value_ranks = ["highest", "lowest", "top", "bottom", "most", "least", "largest", "smallest", 
+                   "terbesar", "terkecil", "paling", "tertinggi", "terendah"]
     time_ranks = ["latest", "earliest", "newest", "oldest", "terbaru", "terlama"]
     is_ranking_value = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in value_ranks)
     is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in time_ranks)
@@ -641,7 +644,36 @@ def router_agent(state: RAGState) -> RAGState:
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
     # ═══════════════════════════════════════════════════════════════════
     is_multi_table = len(relevant_tables) > 1
-    is_winner_row = is_ranking_value and has_grouping
+    
+    # Winner-row detection: needs ROW_NUMBER/RANK subquery pattern
+    # Case 1: Multi-table + ranking + grouping (e.g., "customer with highest total payment")
+    # Case 2: Single-table but explicit "X with largest/highest Y for each Z" pattern
+    # Case 3: Tiebreaker pattern ("if multiple, choose the one with...")
+    is_winner_row = False
+    
+    # Pattern A: ranking + grouping + multi-table (original logic)
+    if is_ranking_value and has_grouping and is_multi_table:
+        is_winner_row = True
+    
+    # Pattern B: "X with the largest/highest Y" (even single table)
+    # E.g., "payment record with the largest payment amount"
+    if not is_winner_row and is_ranking_value:
+        # "record/row with the largest/highest/lowest"
+        if re.search(r"\b(record|row|entry|item)\s+with\s+(the\s+)?(largest|highest|lowest|smallest|biggest)", question_lower):
+            is_winner_row = True
+        # "the largest X for each Y" / "largest X per Y"
+        if re.search(r"\b(largest|highest|lowest|smallest|biggest)\s+\w+\s+(for\s+each|per)\b", question_lower):
+            is_winner_row = True
+    
+    # Pattern C: Tiebreaker pattern (always complex, needs ROW_NUMBER with multiple ORDER BY)
+    # "if multiple X have the same Y, choose the one with..."
+    # "if there are ties, pick..."
+    has_tiebreaker = bool(re.search(
+        r"\bif\s+(multiple|several|there\s+are\s+ties?|same)\b.*\b(choose|pick|select|take)\s+(the\s+)?(one|latest|earliest|first|last)\b",
+        question_lower
+    ))
+    if has_tiebreaker:
+        is_winner_row = True
     
     # 🆕 FIXED: Exclusion detection - only trigger for TRUE exclusion patterns
     # These patterns imply NOT EXISTS / NOT IN / LEFT JOIN ... IS NULL (cross-table exclusion)
@@ -664,20 +696,21 @@ def router_agent(state: RAGState) -> RAGState:
         if re.search(r"\b(missing|empty)\b", question_lower):
             has_exclusion = True
     
-    # 🆕 ESCALATION LOGIC (Simplified)
-    # Always escalate to 7B when JOIN is needed, because 3B often fails to generate proper JOINs
-    # Escalate to 7B for:
-    # - ANY multi-table query (requires JOIN)
-    # - Winner-row patterns (complex window functions)
-    # - Exclusion patterns (NOT IN, NOT EXISTS)
+    # 🆕 ESCALATION LOGIC
+    # Escalate to 7B when complexity truly requires it:
+    # - Multi-table query (requires JOIN)
+    # - Winner-row patterns (requires ROW_NUMBER/RANK subquery)
+    # - Cross-table exclusion patterns (NOT IN, NOT EXISTS)
     should_escalate = (
-        is_multi_table or  # 🔥 Always use 7B for JOINs
-        is_winner_row or 
-        has_exclusion
+        is_multi_table or   # JOINs need 7B
+        is_winner_row or    # ROW_NUMBER subquery patterns need 7B
+        has_exclusion       # Cross-table exclusion needs 7B
     )
     
     if is_multi_table:
         print(f"[Router] ⚡ Multi-table detected: {relevant_tables} -> escalating to 7B")
+    if is_winner_row and not is_multi_table:
+        print(f"[Router] ⚡ Winner-row pattern detected (tiebreaker/subquery needed) -> escalating to 7B")
     
     chosen_model = LARGE_MODEL if should_escalate else SMALL_MODEL
     complexity = "complex" if should_escalate else "simple"
