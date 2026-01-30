@@ -2,7 +2,7 @@
 # ============================ agents.py ===============================
 # ======================================================================
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 _SQL_KEYWORDS: Set[str] = {
     "select","from","where","group","by","order","limit","join","left","right","inner",
@@ -11,7 +11,7 @@ _SQL_KEYWORDS: Set[str] = {
     "regexp","rlike","over","partition","row_number"
 }
 
-from .config import ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL
+from .config import ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_URL, OLLAMA_KEEP_ALIVE
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
 from .utils import _dbg_print_two, try_llm_json, build_router_schema
@@ -19,6 +19,294 @@ from .generation import regenerate_with_extra_constraint
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
     _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline)
 from .helpers_core import(has_join, _question_requires_word_boundary_regex, _parse_allowed_identifiers, _remove_top_level_order_by_if_not_requested)
+
+# ======================================================================
+# ====================== QUESTION GUARD (HYBRID) =======================
+# ======================================================================
+# Purpose: Reject non-SQL questions BEFORE hitting main LLM to prevent:
+#   1. Garbage output from irrelevant questions
+#   2. Resource spike from spam/abuse
+#
+# Strategy: Two-layer hybrid filter
+#   Layer 1: REGEX - Instant reject obvious garbage (zero cost)
+#   Layer 2: LLM 1.5B - Smart judge for borderline cases
+# ======================================================================
+
+# --- Layer 1: Patterns to INSTANT REJECT (obvious garbage) ---
+_INSTANT_REJECT_PATTERNS = [
+    r"^\s*(hi|hello|hey|halo|hai|hallo)\s*[!.,]?\s*$",
+    r"^\s*(good\s*)?(morning|afternoon|evening|night)\s*[!.,]?\s*$",
+    r"^\s*(selamat\s+)?(pagi|siang|sore|malam)\s*[!.,]?\s*$",
+    r"^\s*(apa\s+kabar|how\s+are\s+you|what'?s\s+up)\s*[?!.,]?\s*$",
+    r"^\s*(thanks?|thank\s+you|terima\s*kasih|makasih)\s*[!.,]?\s*$",
+    r"^\s*(bye|goodbye|see\s+you|sampai\s+jumpa)\s*[!.,]?\s*$",
+    r"^\s*(yes|no|ya|tidak|ok|okay|oke|sip)\s*[!.,]?\s*$",
+    r"^\s*(test|testing|tes|coba)\s*[!.,]?\s*$",
+    r"^\s*[!?.,:;\-_=+*#@&]+\s*$",  # Just punctuation/symbols
+    r"^\s*\d+\s*$",  # Just numbers
+    r"^\s*.{0,2}\s*$",  # Too short (0-2 chars)
+]
+
+# --- Patterns that BYPASS LLM check (definitely SQL-related) ---
+_DEFINITE_SQL_PATTERNS = [
+    # Explicit data entity mentions
+    r"\b(customer|order|product|employee|payment|office|orderdetail)\s*(s|es)?\b",
+    r"\b(pelanggan|pesanan|produk|karyawan|pembayaran|kantor)\b",
+    # Explicit query verbs
+    r"\b(show|list|display|get|find|retrieve|fetch|count|total|sum|average)\b",
+    r"\b(tampilkan|tunjukkan|lihat|ambil|cari|hitung|berapa)\b",
+    # SQL keywords
+    r"\b(select|from|where|join|group by|order by)\b",
+    # Superlatives (ranking intent)
+    r"\b(highest|lowest|top|most|least|largest|smallest|latest|earliest)\b",
+    r"\b(tertinggi|terendah|terbesar|terkecil|terbaru|terlama)\b",
+]
+
+def _check_instant_reject(question: str) -> Tuple[bool, str]:
+    """
+    Layer 1: Regex-based instant rejection for obvious garbage.
+    Returns: (should_reject, rejection_reason)
+    """
+    if not question or not question.strip():
+        return True, "Empty question. Please enter a data query."
+    
+    q = question.strip()
+    q_lower = q.lower()
+    
+    # --- Check 1: Pattern-based rejection (greetings, etc) ---
+    for pattern in _INSTANT_REJECT_PATTERNS:
+        if re.match(pattern, q_lower, re.IGNORECASE):
+            return True, "This doesn't look like a data query. Please ask about your data (e.g., 'Show all customers', 'How many orders in 2023?')."
+    
+    # --- Check 2: Gibberish detection ---
+    is_gibberish, gibberish_reason = _detect_gibberish(q)
+    if is_gibberish:
+        return True, gibberish_reason
+    
+    return False, ""
+
+def _detect_gibberish(text: str) -> Tuple[bool, str]:
+    """
+    Detect gibberish/random text using heuristics.
+    Returns: (is_gibberish, reason)
+    
+    Heuristics:
+    1. Vowel ratio too low (normal text ~35-45% vowels)
+    2. Too many consecutive consonants (>6 in a row) - raised threshold
+    3. No spaces in long text (>15 chars without space)
+    4. Repeated character patterns
+    """
+    if not text or len(text) < 3:
+        return False, ""  # Too short to judge, let other checks handle
+    
+    t = text.lower().strip()
+    
+    # IMPORTANT: If text has spaces (likely a sentence), be more lenient
+    # Real sentences like "Find products whose names start with..." are valid
+    has_spaces = ' ' in t
+    word_count = len(t.split())
+    
+    # If it looks like a real sentence (3+ words), skip gibberish check
+    if has_spaces and word_count >= 3:
+        return False, ""
+    
+    alpha_only = re.sub(r'[^a-z]', '', t)
+    
+    if len(alpha_only) < 3:
+        return False, ""  # Not enough letters to analyze
+    
+    # --- Heuristic 1: Vowel ratio ---
+    vowels = set('aiueo')
+    vowel_count = sum(1 for c in alpha_only if c in vowels)
+    vowel_ratio = vowel_count / len(alpha_only)
+    
+    # Normal English/Indonesian text has ~35-50% vowels
+    # "asdgasdgasd" has ratio ~0.18 (too low)
+    # Only apply to single-word inputs (no spaces)
+    if vowel_ratio < 0.12 and len(alpha_only) > 5 and not has_spaces:
+        return True, "Input appears to be random text. Please enter a valid data query."
+    
+    # --- Heuristic 2: Consecutive consonants ---
+    # Raised threshold to 7 to avoid false positives like "strengths", "start with"
+    # "qwrtypsdfgh" still caught (10 consonants)
+    # Only apply to single-word inputs
+    if not has_spaces:
+        consonant_run = re.search(r'[bcdfghjklmnpqrstvwxyz]{7,}', alpha_only)
+        if consonant_run and len(alpha_only) > 6:
+            return True, "Input appears to be random text. Please enter a valid data query."
+    
+    # --- Heuristic 3: No spaces in long text ---
+    # Normal questions have spaces: "show all customers"
+    # Gibberish often doesn't: "asdgasdgasdgasd"
+    if len(t) > 15 and ' ' not in t:
+        # Exception: could be a single long word like "customerNumber"
+        # Check if it looks like camelCase or has some structure
+        if not re.search(r'[A-Z]', text) and not re.search(r'[_\-]', text):
+            return True, "Input appears to be random text. Please enter a valid data query."
+    
+    # --- Heuristic 4: Repeated patterns ---
+    # "abcabcabc" or "xyxyxyxy"
+    # Only for short inputs without spaces
+    if len(t) >= 6 and not has_spaces:
+        # Check for 2-3 char patterns repeated 3+ times
+        for pattern_len in [2, 3]:
+            pattern = t[:pattern_len]
+            if pattern * 3 in t and len(set(pattern)) < pattern_len:
+                return True, "Input appears to be random text. Please enter a valid data query."
+    
+    # --- Heuristic 5: Keyboard mash detection ---
+    # Common keyboard patterns: qwerty, asdf, zxcv
+    # Only for inputs without spaces (single gibberish words)
+    if not has_spaces:
+        keyboard_patterns = ['qwert', 'asdfg', 'zxcvb', 'qazwsx', 'yxcvbn', 'hjkl', 'yuiop']
+        for kp in keyboard_patterns:
+            if kp in alpha_only:
+                return True, "Input appears to be random text. Please enter a valid data query."
+    
+    return False, ""
+
+def _check_definite_sql(question: str) -> bool:
+    """
+    Check if question definitely has SQL intent (bypass LLM check).
+    """
+    q_lower = question.lower()
+    for pattern in _DEFINITE_SQL_PATTERNS:
+        if re.search(pattern, q_lower, re.IGNORECASE):
+            return True
+    return False
+
+def _llm_judge_sql_intent(question: str) -> Tuple[bool, str]:
+    """
+    Layer 2: Use LLM 1.5B to judge if question has SQL/data query intent.
+    Returns: (is_valid, rejection_reason)
+    """
+    from langchain_ollama import ChatOllama
+    
+    llm = ChatOllama(
+        model=ROUTING_MODEL,  # qwen2.5:1.5b-instruct
+        base_url=OLLAMA_URL,
+        temperature=0.0,
+        format="json",
+        keep_alive=OLLAMA_KEEP_ALIVE,
+        num_ctx=512,  # Small context for fast inference
+        num_predict=64,  # Short response
+    )
+    
+    prompt = f"""You are a query intent classifier for a SQL database system.
+Determine if the user's question is asking about DATA or DATABASE QUERIES.
+
+VALID questions (answer "yes"):
+- Questions about customers, orders, products, employees, payments, offices
+- Questions asking for lists, counts, totals, averages
+- Questions with filters (by date, by country, by status)
+- Questions asking for rankings (highest, lowest, top, most)
+
+INVALID questions (answer "no"):
+- Greetings, small talk, chitchat
+- Questions about weather, news, general knowledge
+- Personal questions, opinions, advice
+- Random text, gibberish, spam
+
+User question: "{question}"
+
+Return JSON: {{"is_data_query": true/false, "reason": "brief explanation"}}"""
+
+    try:
+        response = llm.invoke(prompt)
+        import json
+        result = json.loads(response.content)
+        is_valid = result.get("is_data_query", False)
+        reason = result.get("reason", "")
+        
+        if not is_valid:
+            return False, f"This doesn't appear to be a data query. {reason}\n\nPlease ask about your data, for example:\n  - 'Show all customers from USA'\n  - 'How many orders in 2023?'\n  - 'List products with price above 100'"
+        
+        return True, ""
+        
+    except Exception as e:
+        # If LLM fails, be permissive (let it through)
+        print(f"[Guard] LLM judge failed: {e}, allowing question through")
+        return True, ""
+
+def validate_question_intent(question: str) -> Tuple[bool, str]:
+    """
+    Hybrid question validation: Regex + LLM 1.5B
+    
+    Returns:
+        Tuple[bool, str]: (is_valid, rejection_reason)
+        - (True, "") if question is valid
+        - (False, reason) if question should be rejected
+    
+    Flow:
+        1. Regex instant reject (obvious garbage) → No LLM cost
+        2. Regex definite SQL (obvious valid) → No LLM cost
+        3. LLM 1.5B judge (borderline cases) → Smart decision
+    """
+    print(f"[Guard] Validating question: '{question[:50]}...'")
+    
+    # Layer 1: Instant reject obvious garbage
+    should_reject, reason = _check_instant_reject(question)
+    if should_reject:
+        print(f"[Guard] ❌ Layer 1 REJECT (regex): {reason[:50]}")
+        return False, reason
+    
+    # Layer 1b: Instant accept definite SQL
+    if _check_definite_sql(question):
+        print(f"[Guard] ✓ Layer 1 ACCEPT (definite SQL pattern)")
+        return True, ""
+    
+    # Layer 2: LLM judge for borderline cases
+    print(f"[Guard] → Layer 2: LLM 1.5B judging...")
+    is_valid, reason = _llm_judge_sql_intent(question)
+    
+    if is_valid:
+        print(f"[Guard] ✓ Layer 2 ACCEPT (LLM approved)")
+    else:
+        print(f"[Guard] ❌ Layer 2 REJECT (LLM): {reason[:50]}")
+    
+    return is_valid, reason
+
+# ======================================================================
+# =================== QUESTION GUARD NODE (GRAPH) ======================
+# ======================================================================
+def question_guard_node(state: RAGState) -> RAGState:
+    """
+    Standalone guard node - runs BEFORE retrieve to save resources.
+    If rejected, pipeline ends early without calling retrieve/router/draft/refine.
+    """
+    print(f"\n{'='*70}")
+    print(f"                         QUESTION GUARD")
+    print(f"{'='*70}")
+    
+    question = state.get("question", "")
+    
+    is_valid, rejection_reason = validate_question_intent(question)
+    
+    if not is_valid:
+        print(f"\n❌ REJECTED: Question is not a valid data query")
+        print(f"   Reason: {rejection_reason[:100]}...")
+        print(f"{'='*70}\n")
+        return {
+            **state,
+            "router_decision": {
+                "complexity": "rejected",
+                "qtype": "invalid", 
+                "rejection_reason": rejection_reason,
+                "is_valid_question": False,
+            },
+            "final_sql": "",
+            "answer": rejection_reason,
+        }
+    
+    print(f"\n✓ PASSED: Question appears to be a valid data query")
+    print(f"{'='*70}\n")
+    
+    return {
+        **state,
+        "router_decision": {
+            "is_valid_question": True,
+        }
+    }
 
 # ======================================================================
 # Update: agents.py -> router_agent (Final Robust Version)
@@ -175,9 +463,17 @@ from .helpers_core import(has_join, _question_requires_word_boundary_regex, _par
 #             print(f"[Router] 🎯 FK Inference: {fk_col} exists in {fk_table}, removing {parent_table}")
 #             relevant_tables.remove(parent_table)
 def router_agent(state: RAGState) -> RAGState:
+    """
+    Router agent - determines query complexity and target model.
+    Note: Question guard is now handled by separate question_guard_node (runs before retrieve).
+    """
     print(f"\n[Router] Evidence-Based Analysis starting...")
-    question = state.get("question", "").lower()
+    question_raw = state.get("question", "")
+    question = question_raw.lower()
     ctx = state.get("context", "")
+    
+    # Get existing router_decision from guard node (preserve is_valid_question)
+    existing_decision = state.get("router_decision", {})
     
     # ═══════════════════════════════════════════════════════════════════
     # STEP 1: IDENTIFIKASI TABEL (Pattern-Based Exclusion)
@@ -415,12 +711,17 @@ def router_agent(state: RAGState) -> RAGState:
 # ======================= AGENT 2 - SQL DRAFTER ========================
 # ======================================================================
 def draft_sql_agent(state: RAGState) -> RAGState:
+    # --- Guard: Skip if question was rejected by router ---
+    decision = state.get("router_decision", {})
+    if decision.get("complexity") == "rejected" or decision.get("is_valid_question") == False:
+        print("[DRAFT] Skipped: Question was rejected by router guard")
+        return state  # Pass through unchanged
+    
     target_model = state.get("target_model") or LARGE_MODEL
     llm = build_llm_json(model=target_model)
 
     question = state.get("question", "")
     ctx = state.get("context", "")
-    decision = state.get("router_decision", {})
     
     # Panggil Dynamic Prompt Builder (helpers_main.py)
     # Segala aturan heuristik (Anti-MAX, Anti-1055, Anti-Inner Join) sudah diurus di sana.
@@ -455,6 +756,12 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 # ======================= AGENT 3 - SQL REFINER ========================
 # ======================================================================
 def refine_sql_agent(state: RAGState) -> RAGState:
+    # --- Guard: Skip if question was rejected by router ---
+    decision = state.get("router_decision", {})
+    if decision.get("complexity") == "rejected" or decision.get("is_valid_question") == False:
+        print("[REFINE] Skipped: Question was rejected by router guard")
+        return state  # Pass through unchanged
+    
     # DYNAMIC MODEL SELECTION berdasarkan draft quality
     draft_model = state.get("target_model") or SMALL_MODEL  # 🆕 Track model asal
     target_model = LARGE_MODEL  # Default untuk regeneration
