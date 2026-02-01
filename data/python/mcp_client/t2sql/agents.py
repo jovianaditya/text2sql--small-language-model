@@ -274,9 +274,10 @@ def question_guard_node(state: RAGState) -> RAGState:
     Standalone guard node - runs BEFORE retrieve to save resources.
     If rejected, pipeline ends early without calling retrieve/router/draft/refine.
     """
-    print(f"\n{'='*70}")
-    print(f"                         QUESTION GUARD")
-    print(f"{'='*70}")
+    line_sep = "─" * 150
+    print(f"\n{line_sep}")
+    print(f"{'QUESTION GUARD':^150}")
+    print(f"{line_sep}")
     
     question = state.get("question", "")
     
@@ -285,7 +286,7 @@ def question_guard_node(state: RAGState) -> RAGState:
     if not is_valid:
         print(f"\n❌ REJECTED: Question is not a valid data query")
         print(f"   Reason: {rejection_reason[:100]}...")
-        print(f"{'='*70}\n")
+        print(f"{line_sep}\n")
         return {
             **state,
             "router_decision": {
@@ -299,7 +300,7 @@ def question_guard_node(state: RAGState) -> RAGState:
         }
     
     print(f"\n✓ PASSED: Question appears to be a valid data query")
-    print(f"{'='*70}\n")
+    print(f"{line_sep}\n")
     
     return {
         **state,
@@ -634,6 +635,13 @@ def router_agent(state: RAGState) -> RAGState:
     is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in time_ranks)
     is_ranking = is_ranking_value or is_ranking_time
     
+    # 🆕 ORDINAL RANKING DETECTION: "second highest", "third largest", "2nd lowest", etc.
+    # These patterns ALWAYS need ROW_NUMBER() with rn = N, much more complex than simple MAX/MIN
+    ordinal_words = ["second", "third", "fourth", "fifth", "2nd", "3rd", "4th", "5th",
+                     "kedua", "ketiga", "keempat", "kelima"]
+    ordinal_pattern = rf"\b({'|'.join(ordinal_words)})\s+(highest|lowest|largest|smallest|biggest|top|bottom|best|worst|most|least|terbesar|terkecil|tertinggi|terendah)\b"
+    is_ordinal_ranking = bool(re.search(ordinal_pattern, question_lower))
+    
     explicit_sort = ["sort by", "ordered by", "sorted by", "order by", "sorted from"]
     is_sorting = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in explicit_sort) or is_ranking
     
@@ -649,10 +657,17 @@ def router_agent(state: RAGState) -> RAGState:
     # Case 1: Multi-table + ranking + grouping (e.g., "customer with highest total payment")
     # Case 2: Single-table but explicit "X with largest/highest Y for each Z" pattern
     # Case 3: Tiebreaker pattern ("if multiple, choose the one with...")
+    # Case 4: 🆕 Ordinal ranking ("second highest", "third largest") - ALWAYS needs ROW_NUMBER
     is_winner_row = False
     
+    # 🆕 Pattern D: ORDINAL RANKING (highest priority - always complex)
+    # "second highest", "third largest", "2nd lowest" - requires ROW_NUMBER() WHERE rn = N
+    if is_ordinal_ranking:
+        is_winner_row = True
+        print(f"[Router] ⚡ Ordinal ranking detected ('second highest' etc) -> requires ROW_NUMBER subquery")
+    
     # Pattern A: ranking + grouping + multi-table (original logic)
-    if is_ranking_value and has_grouping and is_multi_table:
+    if not is_winner_row and is_ranking_value and has_grouping and is_multi_table:
         is_winner_row = True
     
     # Pattern B: "X with the largest/highest Y" (even single table)
@@ -724,7 +739,7 @@ def router_agent(state: RAGState) -> RAGState:
         qtype = "lookup"
     
     print(f"[Router] Detected Tables: {relevant_tables}")
-    print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, Exclusion:{has_exclusion}")
+    print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, OrdinalRank:{is_ordinal_ranking}, Exclusion:{has_exclusion}")
     print(f"[Router] Decision: {complexity.upper()} -> {chosen_model}")
     
     return {
@@ -737,6 +752,7 @@ def router_agent(state: RAGState) -> RAGState:
             "has_grouping": has_grouping,
             "is_ranking": is_ranking,
             "is_winner_row": is_winner_row,
+            "is_ordinal_ranking": is_ordinal_ranking,
             "has_exclusion": has_exclusion
         }
     }
@@ -771,9 +787,26 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     print(f"[DRAFT] LLM Reasoning: {reasoning}")
     draft_sql = _remove_top_level_order_by_if_not_requested(draft_sql, question)
     # 2. [NEW] Hapus syntax error: SELECT col DESC FROM ...
-    # Regex ini mencari DESC/ASC sebelum FROM atau koma
+    # Regex ini mencari DESC/ASC sebelum FROM (hanya di SELECT clause, bukan di ORDER BY)
+    # Hanya strip DESC/ASC yang langsung sebelum FROM (dalam SELECT list)
     draft_sql = re.sub(r"\s+(DESC|ASC)\s*(?=FROM)", " ", draft_sql, flags=re.IGNORECASE)
-    draft_sql = re.sub(r"\s+(DESC|ASC)\s*(?=,)", " ", draft_sql, flags=re.IGNORECASE)
+    # 🆕 FIX: Jangan strip DESC/ASC sebelum koma jika ada di dalam ORDER BY atau OVER clause
+    # Pattern lama: r"\s+(DESC|ASC)\s*(?=,)" - ini salah strip "ORDER BY amount DESC, date"
+    # Pattern baru: hanya strip jika di SELECT clause (sebelum FROM)
+    # Gunakan negative lookbehind untuk memastikan bukan dalam ORDER BY context
+    def _strip_desc_in_select_only(sql: str) -> str:
+        """Strip DESC/ASC before comma only in SELECT clause, not in ORDER BY."""
+        # Find SELECT ... FROM boundary
+        match = re.search(r"\bSELECT\b(.*?)\bFROM\b", sql, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return sql
+        select_part = match.group(1)
+        # Strip DESC/ASC before comma only in SELECT part
+        fixed_select = re.sub(r"\s+(DESC|ASC)\s*(?=,)", " ", select_part, flags=re.IGNORECASE)
+        if fixed_select != select_part:
+            sql = sql[:match.start(1)] + fixed_select + sql[match.end(1):]
+        return sql
+    draft_sql = _strip_desc_in_select_only(draft_sql)
     # Basic Cleanup (Limit Halusinasi)
     draft_sql = re.sub(r"LIMIT\s+(NULL|0)", "", draft_sql, flags=re.IGNORECASE).strip()
     match = re.search(r"LIMIT\s+(\d+)", draft_sql, re.IGNORECASE)

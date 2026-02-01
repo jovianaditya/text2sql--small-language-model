@@ -190,6 +190,20 @@ cases:
             ORDER BY employeeNumber DESC
           ) AS employee_rank
         FROM employees;
+    - id: M11
+      difficulty: medium
+      question: "For each customer, return the customer ID, and the second highest payment amount they have made. Exclude customers who have fewer than two payment records."
+      groundtruth_sql: |
+        SELECT
+          pmt.customerNumber,
+          pmt.amount
+        FROM (
+          SELECT 
+            customerNumber
+            ,amount
+            ,ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC) AS rn 
+          FROM payments) pmt
+        WHERE rn = 2;
     - id: H1
       difficulty: hard
       question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."

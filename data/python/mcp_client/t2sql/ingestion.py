@@ -8,8 +8,6 @@ def ingest_node(state: RAGState) -> RAGState:
     Node Ingestion (Simplified).
     Delegates to Auto-Ingest logic and reports existing stats IMMEDIATELY.
     """
-    print("--- INGEST NODE (Delegating to Auto-Ingest logic) ---")
-
     # 1. Trigger Auto-Ingest (logs dari chroma_embedding akan muncul disini)
     col = build_vector_store()
     

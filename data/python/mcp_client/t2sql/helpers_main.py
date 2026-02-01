@@ -411,6 +411,13 @@ def validate_identifiers(sql: str, ctx: str) -> List[str]:
 def classify_query(question: str) -> str:
     q = " " + (question or "").strip().lower() + " "
     # ---------------------------------------------------------------------------
+    # --- 0. DETEKSI ORDINAL RANKING (always "rank") ---
+    # "second highest", "third largest", etc. ALWAYS need ROW_NUMBER subquery
+    # ---------------------------------------------------------------------------
+    ordinal_pattern = r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th|kedua|ketiga|keempat|kelima)\s+(highest|lowest|largest|smallest|biggest|top|bottom|best|worst|most|least|terbesar|terkecil|tertinggi|terendah)\b"
+    if re.search(ordinal_pattern, q):
+        return "rank"
+    # ---------------------------------------------------------------------------
     # --- 1. DETEKSI RANK (The "Winner-Row" Pattern) ---
     # Syarat: Mencari 'baris data' tunggal dalam sebuah kelompok.
     # Pattern: [Group Context] + [Superlative] + [Object, not count]
@@ -968,6 +975,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     qtype = router_decision.get("qtype", "lookup")
     has_grouping = router_decision.get("has_grouping", False)
     has_exclusion = router_decision.get("has_exclusion", False)
+    is_ordinal_ranking = router_decision.get("is_ordinal_ranking", False)
     
     # --- 1. BANGUN CONSTRAINT DINAMIS ---
     constraints = []
@@ -1010,10 +1018,38 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         constraints.append(
             "WINNER-ROW STRATEGY: You MUST use the standard 'Select-Filter-Rank' pattern."
         )
-        constraints.append(
-            "STRICT SYNTAX TEMPLATE: "
-            "`SELECT col1, col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ... DESC) AS rn FROM table) WHERE rn = 1`"
-        )
+        
+        # 🆕 ORDINAL RANKING: Detect the specific rank number from question
+        if is_ordinal_ranking:
+            # Extract the ordinal number from question
+            q_lower = question.lower()
+            ordinal_map = {
+                "second": 2, "2nd": 2, "kedua": 2,
+                "third": 3, "3rd": 3, "ketiga": 3,
+                "fourth": 4, "4th": 4, "keempat": 4,
+                "fifth": 5, "5th": 5, "kelima": 5,
+            }
+            rank_n = 1  # default
+            for word, num in ordinal_map.items():
+                if word in q_lower:
+                    rank_n = num
+                    break
+            
+            constraints.append(
+                f"ORDINAL RANKING RULE: The question asks for the **{rank_n}th** highest/lowest item. "
+                f"You MUST use `WHERE rn = {rank_n}` in the outer query. "
+                f"This automatically excludes entities with fewer than {rank_n} records."
+            )
+            constraints.append(
+                f"STRICT SYNTAX TEMPLATE: "
+                f"`SELECT col1, col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY valueCol DESC) AS rn FROM table) t WHERE rn = {rank_n}`"
+            )
+        else:
+            constraints.append(
+                "STRICT SYNTAX TEMPLATE: "
+                "`SELECT col1, col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ... DESC) AS rn FROM table) WHERE rn = 1`"
+            )
+        
         constraints.append(
             "CRITICAL PROHIBITION: Do NOT put `ROW_NUMBER()` inside a `GROUP BY` clause. "
             "Do NOT use `HAVING` for ranking. Use the subquery pattern above."
