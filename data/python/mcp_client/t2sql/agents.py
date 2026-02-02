@@ -562,26 +562,64 @@ def router_agent(state: RAGState) -> RAGState:
     is_aggregation = has_math or has_group_word
     
     # ═══════════════════════════════════════════════════════════════════
-    # STEP 3: 🆕 FK INFERENCE (Smarter Version)
+    # STEP 3: 🆕 FK INFERENCE (Dynamic from Context)
     # ═══════════════════════════════════════════════════════════════════
     # Rule: Remove table A if:
     #   1. Table A's only mentioned column is a FK that exists in table B
     #   2. AND the question does NOT ask for any OTHER column from table A
+    #
+    # Dynamic detection: Parse "FK to X.Y" patterns from context (JSONL metadata)
     
     question_lower = question.lower()
     
-    # Build list of columns explicitly mentioned in question (non-FK)
-    # Common non-FK columns that require the actual table
-    non_fk_indicators = {
-        'customers': ['customername', 'customer name', 'contactfirstname', 'contactlastname', 
-                      'phone', 'addressline', 'city', 'state', 'country', 'creditlimit'],
-        'orders': ['orderdate', 'order date', 'requireddate', 'shippeddate', 'status', 'comments'],
-        'payments': ['amount', 'paymentdate', 'payment date', 'checknumber', 'check number'],
-        'products': ['productname', 'product name', 'productline', 'productscale', 'productvendor',
-                     'quantityinstock', 'buyprice', 'msrp'],
-        'employees': ['firstname', 'lastname', 'first name', 'last name', 'email', 'jobtitle', 'extension'],
-        'offices': ['city', 'phone', 'addressline', 'state', 'country', 'territory'],
-    }
+    # --- DYNAMIC: Extract FK columns from context ---
+    # Multiple patterns to handle different context formats:
+    # 1. Card format: "table: employees | column: officeCode | desc: ... FK to offices.officeCode"
+    # 2. JSONL format: "employees.officeCode ... FK to offices.officeCode"
+    
+    fk_columns_by_table = {}  # {source_table: set of FK column names}
+    fk_targets = {}  # {target_table: set of source_tables that reference it}
+    
+    # Pattern 1: Card format "table: X | column: Y | ... FK to Z.W"
+    fk_pattern_card = re.compile(r'table:\s*(\w+)\s*\|\s*column:\s*(\w+).*?FK to (\w+)\.(\w+)', re.IGNORECASE)
+    for match in fk_pattern_card.finditer(ctx):
+        source_table = match.group(1).lower()
+        source_col = match.group(2).lower()
+        target_table = match.group(3).lower()
+        
+        if source_table not in fk_columns_by_table:
+            fk_columns_by_table[source_table] = set()
+        fk_columns_by_table[source_table].add(source_col)
+        
+        # Track which tables are FK targets (referenced by other tables)
+        if target_table not in fk_targets:
+            fk_targets[target_table] = set()
+        fk_targets[target_table].add(source_table)
+    
+    # Pattern 2: Dot notation "X.Y ... FK to Z.W"
+    fk_pattern_dot = re.compile(r'(\w+)\.(\w+).*?FK to (\w+)\.(\w+)', re.IGNORECASE)
+    for match in fk_pattern_dot.finditer(ctx):
+        source_table = match.group(1).lower()
+        source_col = match.group(2).lower()
+        target_table = match.group(3).lower()
+        
+        if source_table not in fk_columns_by_table:
+            fk_columns_by_table[source_table] = set()
+        fk_columns_by_table[source_table].add(source_col)
+        
+        if target_table not in fk_targets:
+            fk_targets[target_table] = set()
+        fk_targets[target_table].add(source_table)
+    
+    # --- DYNAMIC: Build non-FK columns per table ---
+    # Store BOTH original (for camelCase regex) and lowercase (for FK comparison)
+    non_fk_columns_by_table = {}  # {table: list of (original_col, lowercase_col)}
+    for tbl, cols in allowed_identifiers.items():
+        tbl_lower = tbl.lower()
+        fk_cols = fk_columns_by_table.get(tbl_lower, set())
+        non_fk_list = [(c, c.lower()) for c in cols if c.lower() not in fk_cols]
+        if non_fk_list:
+            non_fk_columns_by_table[tbl_lower] = non_fk_list
     
     tables_to_remove = []
     for tbl in list(relevant_tables):
@@ -589,19 +627,30 @@ def router_agent(state: RAGState) -> RAGState:
         
         # Check if question asks for any non-FK column from this table
         needs_this_table = False
-        if tbl_lower in non_fk_indicators:
-            for col_indicator in non_fk_indicators[tbl_lower]:
-                if col_indicator in question_lower:
+        non_fk_list = non_fk_columns_by_table.get(tbl_lower, [])
+        
+        for original_col, col_lower in non_fk_list:
+            # Generate human-readable variants: "customerName" -> "customer name"
+            col_variants = [col_lower]
+            # Add space-separated variant for camelCase (use ORIGINAL for regex)
+            spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', original_col).lower()
+            if spaced != col_lower:
+                col_variants.append(spaced)
+            
+            for variant in col_variants:
+                if variant in question_lower:
                     needs_this_table = True
-                    print(f"[Router] ✋ Keeping {tbl}: question asks for '{col_indicator}'")
+                    print(f"[Router] ✋ Keeping {tbl}: question asks for '{variant}'")
                     break
+            if needs_this_table:
+                break
         
         if needs_this_table:
             continue  # Don't remove this table
-            
-        # Original FK inference logic: remove if FK exists in another table
-        tbl_cols = set(c.lower() for c in allowed_identifiers.get(tbl, []))
-        fk_cols = {c for c in tbl_cols if c.endswith('number') or c.endswith('code') or c.endswith('id')}
+        
+        # --- CASE 1: Table has FK that exists in another table (original logic) ---
+        fk_cols = fk_columns_by_table.get(tbl_lower, set())
+        tbl_all_cols = set(c.lower() for c in allowed_identifiers.get(tbl, []))
         
         for other_tbl in relevant_tables:
             if other_tbl == tbl:
@@ -610,18 +659,59 @@ def router_agent(state: RAGState) -> RAGState:
             
             # If FK exists in other table AND we don't need non-FK cols from this table
             if fk_cols & other_cols and not needs_this_table:
-                # Only remove if the ONLY reason we included this table was the FK
-                non_fk_cols_mentioned = tbl_cols - fk_cols
-                question_mentions_non_fk = any(c in question_lower for c in non_fk_cols_mentioned)
+                # Build spaced variants for non-FK cols check
+                non_fk_variants = set()
+                for orig_col, col_lower in non_fk_list:
+                    non_fk_variants.add(col_lower)
+                    spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', orig_col).lower()
+                    if spaced != col_lower:
+                        non_fk_variants.add(spaced)
+                
+                question_mentions_non_fk = any(v in question_lower for v in non_fk_variants)
                 
                 if not question_mentions_non_fk:
                     print(f"[Router] 🎯 FK Inference: {tbl} only provides FK, removing")
                     tables_to_remove.append(tbl)
                     break
+        
+        # --- CASE 2: Table is FK TARGET (referenced by another table already in relevant_tables) ---
+        # Example: offices is referenced by employees.officeCode
+        # If employees is in relevant_tables and we don't need offices.city/country/etc, remove offices
+        if tbl_lower in fk_targets and tbl not in tables_to_remove:
+            source_tables = fk_targets[tbl_lower]
+            # Check if any source table is already in relevant_tables
+            source_in_relevant = any(src in [t.lower() for t in relevant_tables] for src in source_tables)
+            
+            if source_in_relevant and not needs_this_table:
+                # Check if question mentions any non-PK column from this table
+                # PK columns typically end with 'code', 'number', 'id' - same pattern as FK
+                pk_like_cols = {c for c in tbl_all_cols if c.endswith('code') or c.endswith('number') or c.endswith('id')}
+                non_pk_cols = tbl_all_cols - pk_like_cols
+                
+                # Build spaced variants for non-PK cols
+                non_pk_variants = set()
+                for c in allowed_identifiers.get(tbl, []):
+                    if c.lower() in non_pk_cols:
+                        non_pk_variants.add(c.lower())
+                        spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', c).lower()
+                        if spaced != c.lower():
+                            non_pk_variants.add(spaced)
+                
+                question_mentions_data = any(v in question_lower for v in non_pk_variants)
+                
+                if not question_mentions_data:
+                    print(f"[Router] 🎯 FK Target Inference: {tbl} is only FK target, source table already present, removing")
+                    tables_to_remove.append(tbl)
     
     for tbl in tables_to_remove:
         if tbl in relevant_tables:
             relevant_tables.remove(tbl)
+
+    # 🆕 SAFETY: Never leave relevant_tables empty - fallback to first whitelisted table
+    if not relevant_tables and whitelisted_tables:
+        fallback_table = list(whitelisted_tables)[0]
+        relevant_tables.append(fallback_table)
+        print(f"[Router] ⚠️ All tables removed by FK inference, falling back to: {fallback_table}")
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 4: DETEKSI SINYAL (Complete Detection)
@@ -635,12 +725,32 @@ def router_agent(state: RAGState) -> RAGState:
     is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in time_ranks)
     is_ranking = is_ranking_value or is_ranking_time
     
+    # 🆕 EXPLICIT RANK FUNCTION DETECTION: "a rank of X" / "rank employees" / "ranking"
+    # This means user explicitly wants RANK() OVER window function
+    # E.g., "return a rank of employees within each job title"
+    explicit_rank_patterns = [
+        r"\ba\s+rank\s+of\b",           # "a rank of employees"
+        r"\brand\s+employees\b",         # "rank employees"
+        r"\branking\s+of\b",             # "ranking of X"
+        r"\breturn.*\brank\b.*\bwithin\b",  # "return X and rank within"
+        r"\brank\s+.*\bbased\s+on\b",    # "rank X based on Y"
+    ]
+    is_explicit_rank_function = any(re.search(pat, question_lower) for pat in explicit_rank_patterns)
+    
     # 🆕 ORDINAL RANKING DETECTION: "second highest", "third largest", "2nd lowest", etc.
     # These patterns ALWAYS need ROW_NUMBER() with rn = N, much more complex than simple MAX/MIN
     ordinal_words = ["second", "third", "fourth", "fifth", "2nd", "3rd", "4th", "5th",
                      "kedua", "ketiga", "keempat", "kelima"]
     ordinal_pattern = rf"\b({'|'.join(ordinal_words)})\s+(highest|lowest|largest|smallest|biggest|top|bottom|best|worst|most|least|terbesar|terkecil|tertinggi|terendah)\b"
     is_ordinal_ranking = bool(re.search(ordinal_pattern, question_lower))
+    
+    # 🆕 WINDOW AGGREGATE DETECTION: "within the same X" / "in the same X" pattern
+    # This pattern requires COUNT(*) OVER (PARTITION BY X), NOT GROUP BY
+    # E.g., "total employees within the same office" → PARTITION BY officeCode
+    within_same_pattern = r"\b(within|in)\s+the\s+same\s+(\w+)"
+    within_same_match = re.search(within_same_pattern, question_lower)
+    is_window_aggregate = bool(within_same_match)
+    partition_hint = within_same_match.group(2) if within_same_match else None
     
     explicit_sort = ["sort by", "ordered by", "sorted by", "order by", "sorted from"]
     is_sorting = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in explicit_sort) or is_ranking
@@ -739,7 +849,7 @@ def router_agent(state: RAGState) -> RAGState:
         qtype = "lookup"
     
     print(f"[Router] Detected Tables: {relevant_tables}")
-    print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, OrdinalRank:{is_ordinal_ranking}, Exclusion:{has_exclusion}")
+    print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, OrdinalRank:{is_ordinal_ranking}, Exclusion:{has_exclusion}, WindowAgg:{is_window_aggregate}, ExplicitRank:{is_explicit_rank_function}")
     print(f"[Router] Decision: {complexity.upper()} -> {chosen_model}")
     
     return {
@@ -753,7 +863,10 @@ def router_agent(state: RAGState) -> RAGState:
             "is_ranking": is_ranking,
             "is_winner_row": is_winner_row,
             "is_ordinal_ranking": is_ordinal_ranking,
-            "has_exclusion": has_exclusion
+            "has_exclusion": has_exclusion,
+            "is_window_aggregate": is_window_aggregate,
+            "partition_hint": partition_hint,
+            "is_explicit_rank_function": is_explicit_rank_function
         }
     }
 # ======================================================================
@@ -887,10 +1000,24 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     quoted_aliases = re.findall(r"\bAS\s+['\"`]?([a-zA-Z0-9_]+)['\"`]?", sql_up, re.IGNORECASE)
     defined_aliases.update(quoted_aliases)
     
+    # 🆕 Also capture subquery aliases: FROM (...) alias or FROM (...) AS alias
+    subquery_aliases = re.findall(r'\)\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b', sql_up, re.IGNORECASE)
+    for sa in subquery_aliases:
+        if sa.lower() not in ('where', 'group', 'order', 'having', 'limit', 'on', 'and', 'or'):
+            defined_aliases.add(sa)
+    
     reserved.update(a.lower() for a in defined_aliases)
 
+    # 🆕 Fix: For subqueries, FROM (SELECT...) matches "SELECT" - skip that
+    # Look for real table name or subquery alias
     primary_match = re.search(r"FROM\s+([A-Za-z0-9_]+)", sql_up)
-    primary_tbl = primary_match.group(1).lower() if primary_match else ""
+    primary_tbl = ""
+    if primary_match:
+        candidate = primary_match.group(1).lower()
+        # Skip if it's a keyword (subquery case: FROM (SELECT...))
+        if candidate not in ('select', 'with'):
+            primary_tbl = candidate
+    
     if primary_tbl: reserved.add(primary_tbl)
 
     primary_cols = {c.lower() for c in allowed_ids.get(primary_tbl, [])}

@@ -802,6 +802,146 @@ def sanitize_notes(sql: str, notes: str) -> str:
         return "No joins used."
     return notes.strip()
 
+def _fix_undefined_alias_typos(sql: str) -> str:
+    """
+    Fix undefined alias typos where LLM hallucinates similar aliases.
+    Example: p2.amount when only 'p' is defined -> p.amount
+    
+    Strategy:
+    1. Find all defined table/subquery aliases
+    2. Find all alias.column references
+    3. If alias is undefined but similar to a defined alias, replace it
+    """
+    sql_up = sql.upper()
+    
+    # Collect defined aliases from:
+    # 1. "... FROM table AS alias" or "... FROM table alias"
+    # 2. "... JOIN table AS alias" or "... JOIN table alias"  
+    # 3. "... FROM (...) AS alias" or "... FROM (...) alias"
+    
+    defined_aliases = set()
+    
+    # Pattern 1: FROM/JOIN table AS alias
+    for m in re.finditer(r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b', sql, re.IGNORECASE):
+        tbl_name = m.group(1).lower()
+        alias = m.group(2).lower()
+        # Skip if "alias" is a SQL keyword
+        if alias not in ('where', 'group', 'order', 'having', 'limit', 'on', 'and', 'or', 'as', 'join', 'inner', 'left', 'right', 'select'):
+            defined_aliases.add(alias)
+    
+    # Pattern 2: FROM (...) AS alias or FROM (...) alias  
+    for m in re.finditer(r'\)\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b', sql, re.IGNORECASE):
+        alias = m.group(1).lower()
+        if alias not in ('where', 'group', 'order', 'having', 'limit', 'on', 'and', 'or', 'as'):
+            defined_aliases.add(alias)
+    
+    if not defined_aliases:
+        return sql
+    
+    # Find all alias.column patterns used
+    used_aliases = set()
+    for m in re.finditer(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b', sql, re.IGNORECASE):
+        used_alias = m.group(1).lower()
+        # Skip table names that look like real tables
+        if used_alias not in ('payments', 'customers', 'orders', 'orderdetails', 'products', 'employees', 'offices', 'productlines'):
+            used_aliases.add(used_alias)
+    
+    # Find undefined aliases and try to match to defined ones
+    result = sql
+    for used in used_aliases:
+        if used not in defined_aliases:
+            # Try to find a similar defined alias
+            # Strategy: If used is like "p2" and defined has "p", map p2 -> p
+            for defined in defined_aliases:
+                # Check if used is defined + digits (e.g., p2 when p exists)
+                if used.startswith(defined) and used[len(defined):].isdigit():
+                    print(f"[FIX_ALIAS] Correcting typo: {used} -> {defined}")
+                    # Replace all occurrences of the undefined alias
+                    result = re.sub(
+                        rf'\b{re.escape(used)}\.',
+                        f'{defined}.',
+                        result,
+                        flags=re.IGNORECASE
+                    )
+                    break
+                # Check if used differs by just one char at end (e.g., pmt2 vs pmt)
+                elif len(used) == len(defined) + 1 and used[:-1] == defined and used[-1].isdigit():
+                    print(f"[FIX_ALIAS] Correcting typo: {used} -> {defined}")
+                    result = re.sub(
+                        rf'\b{re.escape(used)}\.',
+                        f'{defined}.',
+                        result,
+                        flags=re.IGNORECASE
+                    )
+                    break
+    
+    return result
+
+def _normalize_subquery_alias_to_standard(sql: str) -> str:
+    """
+    Normalize subquery aliases to use standard table aliases from _ALIAS_OVERRIDES.
+    
+    Example: 
+    - FROM (SELECT ... FROM payments) p WHERE p.rn = 2
+    - -> FROM (SELECT ... FROM payments) pmt WHERE pmt.rn = 2
+    
+    This ensures consistency with table alias conventions.
+    """
+    # Standard aliases (from helpers_core._ALIAS_OVERRIDES)
+    TABLE_ALIAS_MAP = {
+        "payments": "pmt",
+        "employees": "emp",
+        "customers": "cust",
+        "orderdetails": "od",
+        "orders": "ord",
+        "offices": "ofc",
+        "products": "prod",
+        "productlines": "pline",
+    }
+    
+    # Find subquery patterns: FROM (SELECT ... FROM table) alias
+    # We need to identify which table is inside the subquery
+    subquery_pattern = re.compile(
+        r'\(\s*SELECT\s+.*?\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b',
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    result = sql
+    for m in subquery_pattern.finditer(sql):
+        inner_table = m.group(1).lower()
+        current_alias = m.group(2)
+        
+        # Check if this table has a standard alias
+        if inner_table in TABLE_ALIAS_MAP:
+            standard_alias = TABLE_ALIAS_MAP[inner_table]
+            
+            # Only fix if current alias is non-standard (e.g., 'p' instead of 'pmt')
+            if current_alias.lower() != standard_alias:
+                print(f"[SUBQUERY_ALIAS] Normalizing: {current_alias} -> {standard_alias} (for {inner_table})")
+                
+                # Replace the subquery alias definition
+                # Pattern: ) p WHERE -> ) pmt WHERE or ) AS p WHERE -> ) AS pmt WHERE
+                result = re.sub(
+                    rf'\)\s*(?:AS\s+)?{re.escape(current_alias)}\b',
+                    f') {standard_alias}',
+                    result,
+                    count=1,
+                    flags=re.IGNORECASE
+                )
+                
+                # Replace all references to this alias
+                result = re.sub(
+                    rf'\b{re.escape(current_alias)}\.',
+                    f'{standard_alias}.',
+                    result,
+                    flags=re.IGNORECASE
+                )
+                
+                # Also replace standalone alias references (e.g., WHERE p.rn -> WHERE pmt.rn)
+                # Already handled by the above pattern
+    
+    return result
+
 def _fix_missing_space_before_clauses(sql: str) -> str:
     # Normalize whitespace before SQL clauses
     sql = re.sub(r"\s+(?=(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|WHERE)\b)", " ", sql, flags=re.I)
@@ -976,6 +1116,16 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     has_grouping = router_decision.get("has_grouping", False)
     has_exclusion = router_decision.get("has_exclusion", False)
     is_ordinal_ranking = router_decision.get("is_ordinal_ranking", False)
+    is_window_aggregate = router_decision.get("is_window_aggregate", False)
+    partition_hint = router_decision.get("partition_hint", None)
+    is_explicit_rank_function = router_decision.get("is_explicit_rank_function", False)
+    is_winner_row = router_decision.get("is_winner_row", False)
+    
+    # Detect tiebreaker pattern: "if multiple...choose the one with latest/earliest"
+    has_tiebreaker = bool(re.search(
+        r"\bif\s+(multiple|several|there\s+are\s+ties?|same)\b.*\b(choose|pick|select|take)\s+(the\s+)?(one|latest|earliest|first|last)\b",
+        question.lower()
+    ))
     
     # --- 1. BANGUN CONSTRAINT DINAMIS ---
     constraints = []
@@ -991,6 +1141,33 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "FOR EACH RULE: When the question says 'For each X' or 'Per X', you MUST return ALL values of X. "
             "Do NOT add WHERE filters on the grouping column unless the user explicitly filters it. "
         )
+    
+    # === [NEW] EXPLICIT RANK() FUNCTION RULE ===
+    # Detect "a rank of X" / "rank employees" -> use RANK() OVER window function
+    if is_explicit_rank_function:
+        constraints.append(
+            "RANK FUNCTION RULE (CRITICAL): The question asks for a 'rank' of items. "
+            "You MUST use the RANK() or DENSE_RANK() window function. "
+            "CORRECT PATTERN: `SELECT col1, col2, RANK() OVER (PARTITION BY groupCol ORDER BY orderCol DESC) AS employee_rank FROM table` "
+            "WRONG: Using COUNT(*) - that gives a total count, NOT a rank. "
+            "WRONG: Using ROW_NUMBER() - use RANK() for tied values. "
+            "IMPORTANT: RANK() assigns the same rank to equal values and skips ranks for ties."
+        )
+    
+    # === [NEW] WINDOW AGGREGATE RULE: "within the same X" pattern ===
+    if is_window_aggregate:
+        partition_col_hint = ""
+        if partition_hint:
+            # Try to infer column name from hint (e.g., "office" -> "officeCode")
+            partition_col_hint = f" Look for a column like `{partition_hint}Code` or `{partition_hint}Number` or `{partition_hint}Id` to use as the PARTITION BY column."
+        constraints.append(
+            f"WINDOW AGGREGATE RULE (CRITICAL): The phrase 'within the same' or 'in the same' means you MUST use a WINDOW FUNCTION with PARTITION BY. "
+            f"CORRECT: `SELECT col1, col2, COUNT(*) OVER (PARTITION BY groupColumn) AS total FROM table` "
+            f"WRONG: `COUNT(*) OVER ()` without PARTITION BY. "
+            f"WRONG: Using GROUP BY with window functions.{partition_col_hint} "
+            f"IMPORTANT: Do NOT add GROUP BY clause when using window functions for this pattern."
+        )
+    
     # [A] STATS UTILIZATION (profiling statistics)
     constraints.append(
         "DATA INTELLIGENCE: Use the provided 'STATS' in the Context responsibly:\n"
@@ -1008,10 +1185,14 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 "SIMPLE LOOKUP RULE: Do NOT use aggregation functions like MAX(), MIN(), or SUM(). "
                 "Just SELECT the column directly. Use 'ORDER BY column DESC' for 'latest/newest/highest'."
             )
-            constraints.append(
-                "STRICT ALIAS PROHIBITION: Do NOT rename table columns with AS unless it's a computed expression.\n"
-                "Never rename plain table columns with AS."
-            )
+
+    # [B.1] GLOBAL ALIAS RULE (applies to all query types)
+    constraints.append(
+        "COLUMN ALIAS RULE: Do NOT rename plain table columns using AS. "
+        "Only use AS for computed expressions (aggregations, CASE WHEN, window functions). "
+        "CORRECT: `SELECT employeeNumber, COUNT(*) AS total, CASE WHEN x>0 THEN 'Y' END AS flag`. "
+        "WRONG: `SELECT employeeNumber AS empNum` - never alias plain columns."
+    )
 
     # [C] RANKING RULES
     if qtype == "rank":
@@ -1036,19 +1217,31 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     break
             
             constraints.append(
-                f"ORDINAL RANKING RULE: The question asks for the **{rank_n}th** highest/lowest item. "
-                f"You MUST use `WHERE rn = {rank_n}` in the outer query. "
-                f"This automatically excludes entities with fewer than {rank_n} records."
+                f"ORDINAL RANKING RULE (CRITICAL): The question asks for the {rank_n}th highest/lowest item. "
+                f"Use SIMPLE pattern: `WHERE rn = {rank_n}` in the outer query. "
+                f"This AUTOMATICALLY excludes entities with fewer than {rank_n} records - NO NEED for HAVING or extra COUNT checks."
             )
             constraints.append(
-                f"STRICT SYNTAX TEMPLATE: "
-                f"`SELECT col1, col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY valueCol DESC) AS rn FROM table) t WHERE rn = {rank_n}`"
+                f"STRICT SYNTAX (FOLLOW EXACTLY): "
+                f"`SELECT t.col1, t.col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY valueCol DESC) AS rn FROM table) t WHERE t.rn = {rank_n}` "
+                f"Do NOT use GROUP BY, HAVING, or MAX(CASE WHEN...) - just WHERE rn = {rank_n} is enough!"
             )
         else:
             constraints.append(
-                "STRICT SYNTAX TEMPLATE: "
-                "`SELECT col1, col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ... DESC) AS rn FROM table) WHERE rn = 1`"
+                "WINNER-ROW RULE (CRITICAL): You MUST use ROW_NUMBER() subquery pattern. "
+                "CORRECT: `SELECT t.col1, t.col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY valueCol DESC) AS rn FROM table) t WHERE t.rn = 1` "
+                "WRONG: Using MAX() with GROUP BY - this does NOT give you the correct row with all its columns! "
             )
+            
+            # Add tiebreaker constraint if detected
+            if has_tiebreaker:
+                constraints.append(
+                    "TIEBREAKER RULE (CRITICAL): The question says 'if multiple, choose the one with latest/earliest'. "
+                    "You MUST add a SECOND column to ORDER BY for tiebreaking: "
+                    "`ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY primaryCol [direction], tiebreakCol [direction]) AS rn` "
+                    "Use DESC for 'latest/highest/largest', ASC for 'earliest/lowest/smallest'. "
+                    "DO NOT use MAX(), GROUP BY, LEFT JOIN, or correlated subquery - just the simple subquery pattern!"
+                )
         
         constraints.append(
             "CRITICAL PROHIBITION: Do NOT put `ROW_NUMBER()` inside a `GROUP BY` clause. "
@@ -1086,9 +1279,30 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     )
 
     # [F] COLUMN INTEGRITY RULES (BENCHMARK MODE)
-    constraints.append(
-        "STRICT COLUMN SELECTION: Select EXACTLY the columns requested by the user."
-    )
+    # Extract explicitly mentioned columns from question for stricter enforcement
+    import re as _re
+    q_lower = question.lower()
+    
+    # Parse "return X, Y, and Z" or "show X, Y, and Z" patterns
+    requested_cols = []
+    col_pattern = r'\b(return|show|display|include|get)\s+(?:the\s+)?(.+?)(?:\.|$)'
+    col_match = _re.search(col_pattern, q_lower)
+    if col_match:
+        col_text = col_match.group(2)
+        # Split by comma and "and"
+        parts = _re.split(r',\s*|\s+and\s+', col_text)
+        requested_cols = [p.strip() for p in parts if p.strip() and len(p.strip()) > 2]
+    
+    if requested_cols:
+        cols_list = ", ".join([f"'{c}'" for c in requested_cols[:5]])  # Limit to 5
+        constraints.append(
+            f"EXPLICIT COLUMN REQUIREMENT: The user explicitly requested these items: {cols_list}. "
+            f"You MUST include ALL of them in your SELECT clause. Do not skip any."
+        )
+    else:
+        constraints.append(
+            "STRICT COLUMN SELECTION: Select EXACTLY the columns requested by the user."
+        )
     constraints.append(
         "IMPLICIT SELECTION RULE: If the user says 'For each [Entity]' or 'List [Entity]', "
         "you MUST include that Entity's Identifier/Name in the SELECT list, even if not explicitly listed in 'Include ...'. "
@@ -1226,6 +1440,17 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         return sql
     s = sql.strip()
     
+    # -------------------------------------------------------------------------
+    # Phase -1: Fix undefined alias typos (e.g., p2.amount -> p.amount)
+    # LLM sometimes hallucinates aliases like p2 when only p is defined
+    # -------------------------------------------------------------------------
+    s = _fix_undefined_alias_typos(s)
+    
+    # -------------------------------------------------------------------------
+    # Phase -0.5: Normalize subquery aliases to standard (e.g., p -> pmt)
+    # -------------------------------------------------------------------------
+    s = _normalize_subquery_alias_to_standard(s)
+    
     # CRITICAL FIX: Normalize ALL major clause boundaries FIRST
     # Pattern: ensure space before WHERE/GROUP BY/ORDER BY/HAVING/LIMIT
     # This must handle: "col1,col2HAVING" and "col1 HAVING" cases
@@ -1314,7 +1539,14 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     if not _is_potential_winner_row(s, question, force=True):
         s = _enforce_explicit_group_by(s)
     # ---------------------------------------------------------------------------
-    # Phase 3b — Reorder GROUP BY: Keys First, Descriptive Columns Later
+    # Phase 3b — Fix invalid GROUP BY syntax (strip DESC/ASC)
+    # DESC/ASC is only valid in ORDER BY, not GROUP BY
+    # ---------------------------------------------------------------------------
+    s = re.sub(r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:HAVING|ORDER\s+BY|LIMIT|;|$))', 
+               lambda m: 'GROUP BY ' + re.sub(r'\s+(DESC|ASC)\b', '', m.group(1), flags=re.IGNORECASE),
+               s, flags=re.IGNORECASE | re.DOTALL)
+    # ---------------------------------------------------------------------------
+    # Phase 3c — Reorder GROUP BY: Keys First, Descriptive Columns Later
     # ---------------------------------------------------------------------------
     group_match = re.search(
         r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:HAVING|ORDER\s+BY|LIMIT|;|$))',
@@ -1510,6 +1742,35 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         
         # Reconstruct query
         s = before_select + select_clause + after_select
+    # ---------------------------------------------------------------------------
+    # Phase 8a — Strip plain identifier aliases for simple columns in ROW_NUMBER queries
+    # Example: pmt.amount AS secondHighestPayment -> pmt.amount
+    # Only for queries with ROW_NUMBER subquery pattern (ordinal ranking)
+    # ---------------------------------------------------------------------------
+    if 'ROW_NUMBER' in s.upper() and re.search(r'\)\s*\w+\s+WHERE\s+\w+\.rn\s*=', s, re.IGNORECASE):
+        select_match = re.search(r'\bSELECT\b(.*?)\bFROM\s*\(', s, re.IGNORECASE | re.DOTALL)
+        if select_match:
+            select_clause = select_match.group(1)
+            before_select = s[:select_match.start(1)]
+            after_select = s[select_match.end(1):]
+            
+            # Pattern: alias.column AS identifier (plain column with alias)
+            # Match: pmt.amount AS secondHighestPayment
+            # Skip: COUNT(*) AS total (has parentheses)
+            pattern_plain_alias = re.compile(
+                r'\b([a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)\b',
+                re.IGNORECASE
+            )
+            
+            def strip_plain_alias(match):
+                col_ref = match.group(1)  # e.g., pmt.amount
+                return col_ref  # Remove the AS alias part
+            
+            new_select = pattern_plain_alias.sub(strip_plain_alias, select_clause)
+            if new_select != select_clause:
+                if DEBUG_WR:
+                    print(f"[PH8a] Stripped plain alias in ROW_NUMBER query")
+                s = before_select + new_select + after_select
     # ---------------------------------------------------------------------------
     select_match = re.search(r'\bSELECT\b(.*?)\bFROM\b', s, re.IGNORECASE | re.DOTALL)
     if select_match:

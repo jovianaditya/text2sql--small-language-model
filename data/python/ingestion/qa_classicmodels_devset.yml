@@ -164,17 +164,17 @@ cases:
       groundtruth_sql: |  
         SELECT
           productLine,
-          COUNT(productCode) AS total_products
+          COUNT(*) AS total_products
         FROM products
         GROUP BY productLine
-        HAVING COUNT(productCode) > 5;
+        HAVING COUNT(*) > 5;
     - id: M9
       difficulty: medium
       question: "For each office territory, show the number of offices located in that territory, ordered by the office count in descending order."
       groundtruth_sql: |
         SELECT
           territory,
-          COUNT(officeCode) AS office_count
+          COUNT(*) AS office_count
         FROM offices
         GROUP BY territory
         ORDER BY office_count DESC;
@@ -204,6 +204,30 @@ cases:
             ,ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC) AS rn 
           FROM payments) pmt
         WHERE rn = 2;
+    - id: M12
+      difficulty: medium
+      question: "For each payment record, return the customer number, payment date, amount, and the cumulative payment amount per customer ordered by payment date."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          paymentDate,
+          amount,
+          SUM(amount) OVER (
+            PARTITION BY customerNumber
+            ORDER BY paymentDate
+          ) AS cumulative_payment
+        FROM payments;
+    - id: M13
+      difficulty: medium
+      question: "For each employee, return the employee number, job title, and the total number of employees within the same office."
+      groundtruth_sql: |
+        SELECT
+          employeeNumber,
+          jobTitle,
+          COUNT(*) OVER (
+            PARTITION BY officeCode
+          ) AS employees_in_same_office
+        FROM employees;  
     - id: H1
       difficulty: hard
       question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."

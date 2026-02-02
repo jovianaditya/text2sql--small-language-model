@@ -3248,24 +3248,31 @@ def _question_requests_ordering(question: str) -> bool:
     # --- Pattern 1: Window function context (NOT final ORDER BY) ---
     # If "ascending/descending order" appears with ranking context, skip it
     # E.g., "rank employees ... based on employee number in descending order"
+    # E.g., "cumulative payment amount ... ordered by payment date"
     window_context_patterns = [
         r"\brank\b.*\b(ascending|descending)\s+order\b",
         r"\brow[_\s]?number\b.*\b(ascending|descending)\s+order\b",
         r"\bdense[_\s]?rank\b.*\b(ascending|descending)\s+order\b",
         r"\bpartition\s+by\b.*\b(ascending|descending)\b",
         r"\bbased\s+on\b.*\b(ascending|descending)\s+order\b",  # "based on X in descending order" = window context
+        r"\b(cumulative|running)\b.*\bordered\s+by\b",  # "cumulative X ordered by Y" = window context
     ]
     
     has_window_context = any(re.search(pat, q) for pat in window_context_patterns)
     
     # --- Pattern 2: Explicit final ordering keywords ---
     # These strongly indicate user wants final ORDER BY
+    # NOTE: "ordered by" only counts if NOT in window context
     explicit_sort_keywords = [
         "order by", "sort by", "sorted by", "arrange by",
         "urut berdasarkan", "urutkan berdasarkan", "diurutkan berdasarkan",
     ]
     
     if any(k in q for k in explicit_sort_keywords):
+        return True
+    
+    # "ordered by" is ambiguous - only treat as final sort if NOT in window context
+    if "ordered by" in q and not has_window_context:
         return True
     
     # --- Pattern 3: Superlative / ranking output (implies ORDER BY + LIMIT) ---
@@ -3294,7 +3301,7 @@ def _question_requests_ordering(question: str) -> bool:
     # --- Pattern 5: Phrase-based ordering intent ---
     # "from highest to lowest", "from latest", "from A to Z"
     ordering_phrases = [
-        r"\bfrom\s+(highest|lowest|latest|earliest|newest|oldest)",
+        r"\bfrom\s+(the\s+)?(highest|lowest|latest|earliest|newest|oldest)",
         r"\bfrom\s+(a\s+to\s+z|z\s+to\s+a)",
         r"\b(sorted|ordered)\s+from\b",
     ]
