@@ -35,7 +35,7 @@ os.environ.setdefault("OLLAMA_URL", "http://ollama:11434")
 from .config import MCP_BASE, CHROMA_DIR, COLLECTION_NAME, JSON_INPUT, OLLAMA_URL, ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_KEEP_ALIVE
 from .state import make_state
 from .graph import build_app
-from .mcp_execution import query_db_full  # Pakai FULL query tanpa LIMIT
+from .mcp_execution import query_db_full, _mcp_call  # Pakai FULL query tanpa LIMIT dan _mcp_call helper
 from .utils import resolve_jsonl_paths
 
 # For direct Ollama warmup
@@ -234,7 +234,7 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     summary_data = [
         ("Metric", "Value", "Percentage"),
         ("Total Cases", total, ""),
-        ("Execution Success", exec_success, f"{100*exec_success/total:.1f}%"),
+        ("Result Match (VA)", sum(r.get("va_success", 0) for r in results), f"{100*sum(r.get('va_success', 0) for r in results)/total:.1f}%"),
         ("Result Match (EX)", result_match, f"{100*result_match/total:.1f}%"),
         ("Average Latency (s)", f"{avg_latency_sec:.2f}" if latencies else "N/A", ""),
     ]
@@ -251,21 +251,31 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     ws_summary["A10"] = "BY DIFFICULTY"
     ws_summary["A10"].font = Font(bold=True, size=12)
     
-    diff_header = ["Difficulty", "Total", "Exec Success", "Result Match", "Match %", "Avg Latency (s)"]
+    diff_header = [
+        "Difficulty",
+        "Total",
+        "EX Success",
+        "Percentage VA Success (%)",
+        "VA Success",
+        "Percentage EX Success (%)",
+        "Avg Latency (s)"
+    ]
     for col_idx, h in enumerate(diff_header, start=1):
         cell = ws_summary.cell(row=11, column=col_idx, value=h)
         cell.font = header_font
         cell.fill = header_fill
         cell.border = border
-    
+
     for row_idx, (d, stats) in enumerate(sorted(by_difficulty.items()), start=12):
         t = stats["total"]
         es = stats["exec_success"]
-        rm = stats["result_match"]
+        va = stats.get("va_success", 0)
         # Calculate avg latency for this difficulty
         diff_latencies = latency_by_diff.get(d, [])
         avg_lat = f"{sum(diff_latencies)/len(diff_latencies):.2f}" if diff_latencies else "N/A"
-        row_data = [d, t, es, rm, f"{100*rm/t:.1f}%", avg_lat]
+        pct_va = f"{100*va/t:.1f}%" if t else "N/A"
+        pct_ex = f"{100*es/t:.1f}%" if t else "N/A"
+        row_data = [d, t, es, pct_va, va, pct_ex, avg_lat]
         for col_idx, value in enumerate(row_data, start=1):
             cell = ws_summary.cell(row=row_idx, column=col_idx, value=value)
             cell.border = border
@@ -325,6 +335,7 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     print(f"\nResults saved to Excel: {output_path}")
 
 
+
 async def execute_sql(mcp: Client, sql: str) -> tuple[bool, list | None, str | None]:
     """
     Execute SQL via MCP (FULL mode - tanpa LIMIT) and return (success, rows, error).
@@ -342,6 +353,27 @@ async def execute_sql(mcp: Client, sql: str) -> tuple[bool, list | None, str | N
         return False, None, err
     except Exception as e:
         return False, None, str(e)
+
+# --- VA: Valid SQL check using EXPLAIN ---
+async def check_valid_sql(mcp: Client, sql: str) -> tuple[bool, str | None]:
+    """
+    Run EXPLAIN <sql> via MCP tool to check validity. Return (is_valid, error_message_if_any)
+    """
+    sql_clean = sql.rstrip(";").strip()
+    try:
+        payload = await _mcp_call(mcp, "query_explain", {"sql": sql_clean})
+        # Ambil dict dari CallToolResult jika perlu
+        if not isinstance(payload, dict):
+            if hasattr(payload, "structured_content") and isinstance(payload.structured_content, dict):
+                payload = payload.structured_content
+            elif hasattr(payload, "data") and isinstance(payload.data, dict):
+                payload = payload.data
+        if isinstance(payload, dict) and payload.get("success"):
+            return True, None
+        err = payload.get("error") if isinstance(payload, dict) else str(payload)
+        return False, err
+    except Exception as e:
+        return False, str(e)
 
 
 async def run_single_case(
@@ -370,6 +402,8 @@ async def run_single_case(
         "groundtruth_sql": groundtruth_sql,
         "predicted_sql": "",
         "model_used": "",       # Model yang digunakan (3b/7b)
+        "va_success": False,     # Valid SQL (EXPLAIN)
+        "va_error": None,        # Error message if not valid
         "exec_success": False,
         "result_match": False,  # Execution Accuracy (hasil sama)
         "match_reason": "",     # Alasan match/mismatch
@@ -419,17 +453,27 @@ async def run_single_case(
         print(f"[ERROR] Pipeline failed: {e}")
         return result
     
-    # 2. Execute predicted SQL
+
+    # 2a. Valid SQL (VA) check using EXPLAIN
+    va_success, va_error = await check_valid_sql(mcp, predicted_sql)
+    result["va_success"] = va_success
+    result["va_error"] = va_error
+    if va_success:
+        print("[VA] Valid SQL (EXPLAIN) ✓")
+    else:
+        print(f"[VA] Invalid SQL (EXPLAIN): {va_error}")
+
+    # 2b. Execute predicted SQL
     pred_success, pred_rows, pred_error = await execute_sql(mcp, predicted_sql)
     result["exec_success"] = pred_success
     
     if not pred_success:
         result["error"] = f"Predicted SQL execution failed: {pred_error}"
-        print(f"[EXEC] Predicted SQL failed: {pred_error}")
+        print(f"[EX] Predicted SQL failed: {pred_error}")
         return result
     
     result["pred_row_count"] = len(pred_rows or [])
-    print(f"[EXEC] Predicted SQL returned {result['pred_row_count']} rows")
+    print(f"[EX] Predicted SQL returned {result['pred_row_count']} rows")
     
     # 3. Execute groundtruth SQL for comparison (Execution Accuracy)
     if execute_groundtruth and groundtruth_sql:
@@ -444,7 +488,7 @@ async def run_single_case(
             result["match_reason"] = reason
             
             status = "✅ MATCH" if is_match else "❌ MISMATCH"
-            print(f"[EVAL] {status} - {reason}")
+            print(f"[EVALUATION] {status} - {reason}")
             print(f"       (pred: {result['pred_row_count']} rows, gt: {result['gt_row_count']} rows)")
         else:
             result["match_reason"] = f"Groundtruth SQL failed: {gt_error}"
@@ -552,49 +596,58 @@ async def run_batch_eval(
             )
             results.append(result)
     
+
     # Calculate metrics
     total = len(results)
+    va_success = sum(1 for r in results if r["va_success"])
     exec_success = sum(1 for r in results if r["exec_success"])
     result_match = sum(1 for r in results if r["result_match"])
-    
+
     # Metrics by difficulty
     by_difficulty = {}
     for r in results:
         d = r["difficulty"]
         if d not in by_difficulty:
-            by_difficulty[d] = {"total": 0, "exec_success": 0, "result_match": 0}
+            by_difficulty[d] = {"total": 0, "va_success": 0, "exec_success": 0, "result_match": 0}
         by_difficulty[d]["total"] += 1
+        if r["va_success"]:
+            by_difficulty[d]["va_success"] += 1
         if r["exec_success"]:
             by_difficulty[d]["exec_success"] += 1
         if r["result_match"]:
             by_difficulty[d]["result_match"] += 1
-    
-    # Print summary
-    print("\n" + "="*60)
+
+
+    # Print summary (custom format)
+    print("\n" + "="*120)
     print("EVALUATION SUMMARY")
-    print("="*60)
+    print("="*120)
     print(f"Total cases: {total}")
-    print(f"Execution Success Rate: {exec_success}/{total} ({100*exec_success/total:.1f}%)")
-    print(f"Result Match (EX): {result_match}/{total} ({100*result_match/total:.1f}%)")
-    
+    print(f"Valid SQL (VA): {va_success}/{total} ({100*va_success/total:.1f}%)")
+    print(f"Execution Summary (EX): {result_match}/{total} ({100*result_match/total:.1f}%)")
+
     print("\nBy Difficulty:")
     for d, stats in sorted(by_difficulty.items()):
         t = stats["total"]
-        es = stats["exec_success"]
+        va = stats["va_success"]
         rm = stats["result_match"]
-        print(f"  {d}: Result Match={rm}/{t} ({100*rm/t:.1f}%), Exec Success={es}/{t}")
-    
+        print(f"  {d}: VA={va}/{t} ({100*va/t:.1f}%), Execution Summary ={rm}/{t} ({100*rm/t:.1f}%)")
+
+    print("\n\n")
+
     # Average latency (in seconds)
     latencies = [r["latency_s"] for r in results if r["latency_s"] > 0]
     if latencies:
-        print(f"\nAverage Latency: {sum(latencies)/len(latencies):.2f}s")
+        print(f"Average Latency: {sum(latencies)/len(latencies):.2f}s\n")
     
     # Save to Excel or CSV
+
     if output_path:
         fieldnames = [
             "id", "difficulty", "question", 
             "groundtruth_sql", "predicted_sql",
             "model_used",  # Model yang digunakan (3b/7b)
+            "va_success", "va_error",
             "exec_success", "result_match", "match_reason",
             "pred_row_count", "gt_row_count",
             "latency_s", "error"

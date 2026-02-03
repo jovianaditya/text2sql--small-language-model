@@ -269,6 +269,34 @@ def _warn_identifier_keyword_split(tag: str, sql: str):
 # Tools
 # -----------------------------
 @mcp.tool()
+def query_explain(sql: str) -> dict:
+    """Run EXPLAIN <sql> and return the result (for Valid SQL/VA metric)."""
+    req = _req_id()
+    t0 = time.perf_counter()
+    logger.info(f"[{req}] query_explain CALLED")
+    conn = None
+    try:
+        conn = _conn()
+        set_statement_timeout(conn, STATEMENT_TIMEOUT_MS)
+        with conn.cursor() as cur:
+            cur.execute("EXPLAIN " + sql)
+            columns = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()
+        logger.info(f"[{req}] query_explain DONE rows={len(rows)} elapsed_ms={_elapsed_ms(t0):.1f}")
+        return {
+            "success": True,
+            "columns": columns,
+            "rows": [list(r) for r in rows],
+            "duration_seconds": _elapsed_ms(t0) / 1000.0
+        }
+    except Exception as e:
+        logger.exception(f"[{req}] ❌ query_explain ERROR elapsed_ms={_elapsed_ms(t0):.1f}")
+        return {"success": False, "error": str(e)}
+    finally:
+        if conn:
+            conn.close()
+
+@mcp.tool()
 def list_tables() -> dict:
     """List all table names in the connected MySQL database."""
     req = _req_id()
