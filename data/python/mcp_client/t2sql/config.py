@@ -6,11 +6,11 @@ import os
 # ======================================================================
 # ============================ APP/GENERAL =============================
 # ======================================================================
-JSON_INPUT        = os.getenv("EXPORT_JSONL_OUTPUT", "./datahub_metadata/*.jsonl").strip()
+JSON_INPUT        = os.getenv("EXPORT_JSONL_OUTPUT", "./metadata_jsonl/*.jsonl").strip()
 CHROMA_DIR        = os.getenv("CHROMA_DIR", "./chroma_db").strip()
 COLLECTION_NAME   = os.getenv("COLLECTION_NAME", "classicmodels").strip()
 OLLAMA_URL        = os.getenv("OLLAMA_URL", "http://localhost:11434").strip()
-OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "180s")  # keep_alive 90s, model stays loaded for batch eval
 ROUTING_MODEL     = os.getenv("ROUTING_MODEL", "qwen2.5:1.5b-instruct").strip()
 SMALL_MODEL       = os.getenv("SMALL_MODEL", "qwen2.5:3b-instruct").strip()
 LARGE_MODEL       = os.getenv("LARGE_MODEL", "qwen2.5:7b-instruct").strip()

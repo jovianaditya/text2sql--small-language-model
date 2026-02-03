@@ -872,6 +872,67 @@ def router_agent(state: RAGState) -> RAGState:
 # ======================================================================
 # ======================= AGENT 2 - SQL DRAFTER ========================
 # ======================================================================
+import time as _time  # For inference timing
+# Track last warmup time per model
+_last_model_warmup = {}
+
+
+# OOM retry settings
+OOM_WAIT_TIME = 35  # Wait 35 seconds for model to unload (keep_alive=30s + buffer)
+OOM_MAX_RETRIES = 3  # Max retry attempts on OOM
+
+def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM_MAX_RETRIES) -> bool:
+        global _last_model_warmup
+        # Get keep_alive in seconds
+        import re
+        from .config import OLLAMA_KEEP_ALIVE
+        m = re.match(r"(\d+)([smh])", str(OLLAMA_KEEP_ALIVE).lower())
+        if m:
+            val, unit = int(m.group(1)), m.group(2)
+            if unit == "s":
+                keep_alive_sec = val
+            elif unit == "m":
+                keep_alive_sec = val * 60
+            elif unit == "h":
+                keep_alive_sec = val * 3600
+            else:
+                keep_alive_sec = 60
+        else:
+            keep_alive_sec = 60
+
+        now = _time.time()
+        last_warmup = _last_model_warmup.get(target_model, 0)
+        idle_time = now - last_warmup
+        # Only warmup if idle_time > keep_alive
+        if idle_time < keep_alive_sec:
+            print(f"[DRAFT] Model {target_model} still warm (idle {idle_time:.1f}s < keep_alive {keep_alive_sec}s), skip warmup.")
+            return True
+
+        """
+        Pre-warm model with OOM retry logic.
+        Returns True if model is ready, False if failed after all retries.
+        """
+        for attempt in range(max_retries):
+            try:
+                print(f"[DRAFT] Pre-warming model: {target_model}..." + (f" (attempt {attempt+1})" if attempt > 0 else ""))
+                llm.invoke("Say OK")  # Quick call to load model into memory
+                print(f"[DRAFT] Model ready!")
+                _last_model_warmup[target_model] = _time.time()
+                return True
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "memory" in error_msg:
+                    print(f"[DRAFT OOM] Memory issue detected. Waiting {OOM_WAIT_TIME}s for previous model to unload...")
+                    _time.sleep(OOM_WAIT_TIME)
+                    print(f"[DRAFT OOM] Retrying model load...")
+                else:
+                    print(f"[DRAFT] Pre-warm failed: {e}")
+                    return False
+        
+        print(f"[DRAFT] Failed to load model after {max_retries} OOM retries")
+        return False
+
+
 def draft_sql_agent(state: RAGState) -> RAGState:
     # --- Guard: Skip if question was rejected by router ---
     decision = state.get("router_decision", {})
@@ -882,6 +943,14 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     target_model = state.get("target_model") or LARGE_MODEL
     llm = build_llm_json(model=target_model)
 
+    # ===== PRE-WARM WITH OOM RETRY =====
+    # This separates cold-start time from actual inference time
+    # Also handles OOM by waiting for previous model to unload
+    model_ready = _prewarm_model_with_oom_retry(llm, target_model)
+    
+    if not model_ready:
+        return {**state, "draft_sql": "SELECT 'Error: Model OOM after retries';"}
+    
     question = state.get("question", "")
     ctx = state.get("context", "")
     
@@ -889,7 +958,14 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # Segala aturan heuristik (Anti-MAX, Anti-1055, Anti-Inner Join) sudah diurus di sana.
     prompt = make_generation_prompt(ctx, question, decision)
     
-    obj = try_llm_json(llm, prompt, max_attempts=2)
+    # ===== TIMED INFERENCE (model already loaded) =====
+    _t0 = _time.perf_counter()
+    obj = try_llm_json(llm, prompt, max_attempts=2, oom_retry_wait=OOM_WAIT_TIME)
+    _inference_time = _time.perf_counter() - _t0
+    
+    # Store inference time in state for accurate latency measurement
+    state["draft_inference_time"] = _inference_time
+    print(f"[DRAFT] Inference time: {_inference_time:.2f}s")
     
     if obj is None:
         return {**state, "draft_sql": "SELECT 'Error: LLM failed';"}

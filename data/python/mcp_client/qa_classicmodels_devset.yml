@@ -78,7 +78,7 @@ cases:
       question: "For each month in 2004, show the month name and the number of orders placed in that month, ordered from the latest month to the earliest."
       groundtruth_sql: |
         SELECT 
-          DATE_FORMAT(orderDate, %M) AS month_name,
+          DATE_FORMAT(orderDate, '%M') AS month_name,
           COUNT(orderNumber) AS order_count
         FROM orders
         WHERE YEAR(orderDate) = 2004
@@ -227,7 +227,27 @@ cases:
           COUNT(*) OVER (
             PARTITION BY officeCode
           ) AS employees_in_same_office
-        FROM employees;  
+        FROM employees;
+    - id: M14
+      difficulty: medium
+      question: "For each product, return the product code, buy price, and the average buy price within the same product line."
+      groundtruth_sql: |
+        SELECT
+          productCode,
+          buyPrice,
+          AVG(buyPrice) OVER (
+            PARTITION BY productLine
+          ) AS average_buy_price_per_line
+        FROM products; 
+    - id: M15
+      difficulty: medium
+      question: "For each product, return the product code, quantity in stock, and the percentage contribution of its quantity in stock to the total quantity in stock across all products."
+      groundtruth_sql: |
+        SELECT
+          productCode,
+          quantityInStock,
+          (quantityInStock * 100.0 / SUM(quantityInStock) OVER ()) AS stock_percentage
+        FROM products;
     - id: H1
       difficulty: hard
       question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."

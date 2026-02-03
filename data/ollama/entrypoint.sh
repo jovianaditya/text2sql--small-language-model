@@ -2,7 +2,7 @@
 set -e
 
 # Ambil env; fallback bila kosong
-RAW="${OLLAMA_MODELS:-snowflake-arctic-embed2:568m,qwen2.5:7b-instruct,qwen2.5:3b-instruct}"
+RAW="${OLLAMA_MODELS:-snowflake-arctic-embed2:568m,qwen2.5:7b-instruct,qwen2.5:3b-instruct,qwen2.5:1.5b-instruct}"
 
 # Normalisasi: hapus kutip jika ada, ganti pemisah koma/spasi ganda jadi newline
 # (juga aman untuk CRLF karena tr -d '\r')

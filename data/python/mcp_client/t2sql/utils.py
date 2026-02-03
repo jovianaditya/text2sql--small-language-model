@@ -318,12 +318,16 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 def try_llm_json(
     llm: Any,  # ChatOllama atau tipe LLM lain
     prompt: str,
-    max_attempts: int = 1
+    max_attempts: int = 1,
+    oom_retry_wait: int = 0  # Seconds to wait if OOM detected (0 = no retry)
 ) -> Optional[Dict[str, Any]]:
     """
     Generic function untuk memanggil LLM dan mengharapkan return JSON.
     Tidak ada validasi key spesifik di sini (supaya bisa dipakai Router & SQL Generator).
+    
+    If oom_retry_wait > 0: Will wait and retry when OOM error is detected.
     """
+    import time
     
     # Debug: Cek apakah model LLM valid
     if not llm:
@@ -348,8 +352,17 @@ def try_llm_json(
                 print(f"[LLM Warning] Gagal extract JSON dari response:\n{content[:100]}...")
                 
         except Exception as e:
+            error_msg = str(e).lower()
             # INI PENTING: Print error asli supaya tidak 'silent fail'
             print(f"[LLM CRITICAL ERROR] Attempt {attempt+1} failed: {e}")
+            
+            # Check for OOM error
+            if "memory" in error_msg and oom_retry_wait > 0:
+                print(f"[LLM OOM] Detected memory issue. Waiting {oom_retry_wait}s for model to unload...")
+                time.sleep(oom_retry_wait)
+                print(f"[LLM OOM] Retrying...")
+                # Don't count this as an attempt - let outer loop handle retry
+                continue
 
     return None
 

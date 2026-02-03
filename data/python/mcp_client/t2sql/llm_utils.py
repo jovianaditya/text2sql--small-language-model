@@ -10,6 +10,7 @@ def build_llm_json(model: str | None = None) -> ChatOllama:
     Fitur Utama:
     1. format="json": Memaksa model output JSON murni (tanpa teks pembuka/penutup).
     2. keep_alive: Mencegah model unload dari VRAM saat ganti agent.
+    3. timeout: Extended timeout untuk model switching (3b→7b).
     """
     return ChatOllama(
         # Gunakan model yang di passing, atau fallback ke LARGE_MODEL
@@ -21,6 +22,7 @@ def build_llm_json(model: str | None = None) -> ChatOllama:
         num_ctx=4096,
         num_predict=512,
         stop=None,
+        timeout=120,  # 2 menit untuk model switching
     )
 
 def build_llm_repair(model: str | None = None) -> ChatOllama:
@@ -37,4 +39,5 @@ def build_llm_repair(model: str | None = None) -> ChatOllama:
         num_ctx=4096,
         num_predict=512,
         stop=None,
+        timeout=120,  # 2 menit untuk model switching
     )
