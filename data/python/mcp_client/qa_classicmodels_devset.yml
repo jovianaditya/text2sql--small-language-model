@@ -271,4 +271,17 @@ cases:
         FROM customers AS cust
         JOIN orders AS ord ON cust.customerNumber = ord.customerNumber
         GROUP BY cust.customerNumber, cust.customerName;
-    
+    - id: H3
+      difficulty: hard
+      question: "Show only customers who have placed orders, and for each such customer display the customer number, customer name, and total order amount calculated as the sum of quantity ordered multiplied by price each."
+      groundtruth_sql: |
+        SELECT
+          cust.customerNumber,
+          cust.customerName,
+          SUM(od.quantityOrdered * od.priceEach) AS total_order_amount
+        FROM customers AS cust
+        JOIN orders AS ord
+          ON cust.customerNumber = ord.customerNumber
+        JOIN orderdetails AS od
+          ON ord.orderNumber = od.orderNumber
+        GROUP BY cust.customerNumber, cust.customerName;
