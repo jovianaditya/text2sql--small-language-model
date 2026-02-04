@@ -983,190 +983,22 @@ def _strip_string_literals(s: str) -> str:
     s = re.sub(r'"(?:""|[^"])*"', '""', s)
     return s
 
-def _drop_redundant_inner_join_same_key(sql: str) -> str:
+def _remove_redundant_and_ornamental_joins(sql: str) -> str:
     """
-    Drop INNER JOIN jika:
-    - hanya 1 JOIN
-    - ON adalah equality join-key sederhana: a1.k = a2.k (nama kolom sama)
-    - RHS alias/table tidak dipakai untuk kolom lain di SELECT/WHERE/GROUP/ORDER/HAVING (kecuali join key)
-    Lalu rewrite: rhs.k -> lhs.k di luar ON, dan buang JOIN.
-
-    Diperkuat:
-    - tahan backtick di ON / qualifiers
-    - guard: jika ON mengandung RHS filter (mis. a2.status='X'), jangan drop (biarkan EXISTS logic)
-    """
-    if not sql or join_count(sql) != 1:
-        return sql
-    if has_non_inner_join(sql):
-        return sql
-
-    pat = re.compile(
-        r"""
-        ^(?P<prefix>.*?)
-        \bFROM\s+(?P<t1>`?[A-Za-z_][A-Za-z0-9_]*`?)
-        (?:\s+(?:AS\s+)?(?P<a1>[A-Za-z_][A-Za-z0-9_]*))?
-        \s+\b(?:INNER\s+)?JOIN\s+(?P<t2>`?[A-Za-z_][A-Za-z0-9_]*`?)
-        (?:\s+(?:AS\s+)?(?P<a2>[A-Za-z_][A-Za-z0-9_]*))?
-        \s+\bON\s+(?P<on>.*?)
-        (?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*?|;?\s*)$
-        """,
-        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
-    )
-    m = pat.match(sql.strip())
-    if not m:
-        return sql
-
-    a1 = (m.group("a1") or "").strip()
-    a2 = (m.group("a2") or "").strip()
-    t1 = (m.group("t1") or "").strip().strip("`")
-    t2 = (m.group("t2") or "").strip().strip("`")
-    on_txt = (m.group("on") or "").strip()
-    tail = m.group("tail") or ""
-
-    lhs = a1 or t1
-    rhs = a2 or t2
-
-    # Guard: kalau ON mengandung filter RHS (bukan pure equi-join key), jangan drop.
-    # Ini mencegah bentrok dengan logic join->exists (ON-filter-only).
-    if _on_clause_has_rhs_filter(on_txt, rhs):
-        return sql
-
-    # Normalisasi untuk parsing ON:
-    # - strip string literals supaya tidak false positive
-    # - remove backtick supaya regex join-key match stabil
-    on_clean = _strip_string_literals(on_txt).replace("`", "")
-    lhs_clean = lhs.replace("`", "")
-    rhs_clean = rhs.replace("`", "")
-
-    # ON harus bentuk sederhana: lhs.k = rhs.k (atau kebalik), dengan k sama
-    on_m = re.search(
-        rf"\b{re.escape(lhs_clean)}\s*\.\s*(?P<k1>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*{re.escape(rhs_clean)}\s*\.\s*(?P<k2>[A-Za-z_][A-Za-z0-9_]*)\b"
-        rf"|\b{re.escape(rhs_clean)}\s*\.\s*(?P<k3>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*{re.escape(lhs_clean)}\s*\.\s*(?P<k4>[A-Za-z_][A-Za-z0-9_]*)\b",
-        on_clean,
-        flags=re.I,
-    )
-    if not on_m:
-        return sql
-
-    k_left = (on_m.group("k1") or on_m.group("k4") or "")
-    k_right = (on_m.group("k2") or on_m.group("k3") or "")
-    if not k_left or not k_right:
-        return sql
-
-    # konservatif: hanya kalau nama kolom sama (case-insensitive)
-    if k_left.lower() != k_right.lower():
-        return sql
-
-    join_key = k_left  # canonical from lhs side
-
-    # Ambil bagian di luar ON untuk cek pemakaian RHS
-    outside_on = (m.group("prefix") or "") + (m.group("tail") or "")
-    outside_on = _strip_string_literals(outside_on).replace("`", "")
-
-    # Jika RHS dipakai untuk kolom lain selain join_key → tidak aman drop
-    bad_rhs_use = re.search(
-        rf"\b{re.escape(rhs_clean)}\s*\.\s*(?!{re.escape(join_key)}\b)[A-Za-z_][A-Za-z0-9_]*\b",
-        outside_on,
-        flags=re.I,
-    )
-    if bad_rhs_use:
-        return sql
-
-    # Rewrite rhs.join_key -> lhs.join_key di luar ON (jangan sentuh string/backtick segments)
-    def _rewrite_outside_on(text: str) -> str:
-        parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`[^`]*`)", text)
-        for i in range(0, len(parts), 2):
-            parts[i] = re.sub(
-                rf"\b{re.escape(rhs)}\s*\.\s*{re.escape(join_key)}\b",
-                f"{lhs}.{join_key}",
-                parts[i],
-                flags=re.I,
-            )
-        return "".join(parts)
-
-    prefix_raw = (m.group("prefix") or "")
-    t1_raw = m.group("t1")
-    from_part = f"FROM {t1_raw}" + (f" {a1}" if a1 else "")
-
-    # FIX: rewrite rhs.join_key -> lhs.join_key juga di SELECT/prefix
-    new_prefix = _rewrite_outside_on(prefix_raw)
-    new_tail   = _rewrite_outside_on(tail)
-
-    return f"{new_prefix}{from_part}{new_tail}"
-
-# def _prune_ornamental_joins_safe(sql: str, question: str = "") -> str:
-#     if not sql:
-#         return sql
-
-#     out = sql
-
-#     join_pat = re.compile(
-#         r"""
-#         (?P<full>
-#             \s+
-#             (?P<jtype>(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN))
-#             \s+
-#             (?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)
-#             (?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?
-#             \s+\bON\b\s+(?P<on>.*?)
-#         )
-#         (?=
-#             \b(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN)\b
-#             |\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b
-#             |;|$
-#         )
-#         """,
-#         flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
-#     )
-
-#     # ...lanjutkan logic kamu yang existing,
-#     # tapi pakai m.group("table") bila alias None
-#     matches = list(join_pat.finditer(out))
-#     for m in reversed(matches):
-#         alias = m.group("alias") or (m.group("table") or "").strip("`")
-#         jtype = (m.group("jtype") or "").upper()
-#         on_txt = m.group("on") or ""
-
-#         start_on = m.start("on")
-#         end_on = m.end("on")
-#         masked = out[:start_on] + (" " * (end_on - start_on)) + out[end_on:]
-
-#         if re.search(rf"\b{re.escape(alias)}\s*\.", masked, flags=re.I):
-#             continue
-
-#         is_inner = ("LEFT" not in jtype and "RIGHT" not in jtype and "FULL" not in jtype)
-#         if is_inner:
-#             if _on_clause_has_rhs_filter(on_txt, alias):
-#                 continue
-
-#         out = out[:m.start("full")] + " " + out[m.end("full"):]
-#     return out
-def _prune_ornamental_joins_safe(sql: str, question: str = "") -> str:
-    """
-    Drop JOIN yang tidak digunakan (ornamental).
-    
-    ULTRA SAFE MODE:
-    - Skip untuk query dengan GROUP BY (kemungkinan aggregation)
-    - Skip untuk query dengan aggregate functions (SUM, COUNT, dll)
-    - Hanya prune JOIN yang benar-benar tidak dipakai di mana pun
-    
-    Konservatif untuk menghindari false positive yang bisa merusak query valid.
+    Gabungan logic:
+    - Hapus JOIN yang tidak dipakai di hasil query (ornamental)
+    - Jika JOIN adalah equi-join dan referensi kolom RHS hanya join key, hapus JOIN dan rewrite referensi kolom ke LHS
+    - Tetap konservatif untuk query agregasi/GROUP BY
     """
     if not sql:
         return sql
-
-    # ✅ GUARD 1: Skip untuk query dengan GROUP BY
-    # Aggregate queries sering pakai alias di dalam fungsi (SUM(p.amount))
+    # Skip jika ada GROUP BY atau fungsi agregat
     if "GROUP BY" in sql.upper():
         return sql
-    
-    # ✅ GUARD 2: Skip untuk query dengan aggregate functions
-    # Alias bisa tersembunyi di dalam SUM(p.amount), COUNT(o.orderNumber), dll
     if re.search(r"\b(SUM|COUNT|AVG|MIN|MAX|GROUP_CONCAT)\s*\(", sql, flags=re.I):
         return sql
 
     out = sql
-
     join_pat = re.compile(
         r"""
         (?P<full>
@@ -1185,33 +1017,64 @@ def _prune_ornamental_joins_safe(sql: str, question: str = "") -> str:
         """,
         flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
     )
-
     matches = list(join_pat.finditer(out))
     for m in reversed(matches):
         alias = m.group("alias") or (m.group("table") or "").strip("`")
         jtype = (m.group("jtype") or "").upper()
         on_txt = m.group("on") or ""
-
         start_on = m.start("on")
         end_on = m.end("on")
-        
-        # Mask ON clause: jangan hitung penggunaan alias di dalam ON
         masked = out[:start_on] + (" " * (end_on - start_on)) + out[end_on:]
 
-        # ✅ FIX: Case-insensitive search untuk alias usage
-        # Pattern: alias.column (qualified reference)
-        if re.search(rf"\b{re.escape(alias)}\s*\.", masked, flags=re.I):
-            continue
-
-        # Additional check: INNER JOIN with RHS filter di ON clause
-        is_inner = ("LEFT" not in jtype and "RIGHT" not in jtype and "FULL" not in jtype)
-        if is_inner:
-            if _on_clause_has_rhs_filter(on_txt, alias):
-                continue
-
-        # Alias tidak dipakai → safe to remove JOIN
-        out = out[:m.start("full")] + " " + out[m.end("full"):]
-    
+        # Jika alias tidak dipakai di luar ON, JOIN bisa dihapus
+        if not re.search(rf"\b{re.escape(alias)}\s*\.", masked, flags=re.I):
+            # Tambahan: Untuk INNER JOIN, cek apakah equi-join dan referensi kolom RHS hanya join key
+            is_inner = ("LEFT" not in jtype and "RIGHT" not in jtype and "FULL" not in jtype)
+            if is_inner:
+                # Cek apakah ON clause adalah equi-join
+                on_clean = _strip_string_literals(on_txt).replace("`", "")
+                lhs = None
+                rhs = alias
+                # Cari bentuk lhs.k = rhs.k
+                on_m = re.search(
+                    rf"([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*{re.escape(rhs)}\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)",
+                    on_clean,
+                    flags=re.I,
+                )
+                if on_m:
+                    lhs = on_m.group(1)
+                    k_left = on_m.group(2)
+                    k_right = on_m.group(3)
+                    if k_left.lower() == k_right.lower():
+                        join_key = k_left
+                        # Cek di luar ON, referensi rhs.<col> selain join_key
+                        outside_on = out[:m.start("full")] + out[m.end("full"):]
+                        outside_on = _strip_string_literals(outside_on).replace("`", "")
+                        bad_rhs_use = re.search(
+                            rf"\b{re.escape(rhs)}\s*\.\s*(?!{re.escape(join_key)}\b)[A-Za-z_][A-Za-z0-9_]*\b",
+                            outside_on,
+                            flags=re.I,
+                        )
+                        if not bad_rhs_use:
+                            # Rewrite rhs.join_key -> lhs.join_key di luar ON
+                            def _rewrite_outside_on(text: str) -> str:
+                                parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`[^`]*`)", text)
+                                for i in range(0, len(parts), 2):
+                                    parts[i] = re.sub(
+                                        rf"\b{re.escape(rhs)}\s*\.\s*{re.escape(join_key)}\b",
+                                        f"{lhs}.{join_key}",
+                                        parts[i],
+                                        flags=re.I,
+                                    )
+                                return "".join(parts)
+                            prefix_raw = out[:m.start("full")]
+                            tail_raw = out[m.end("full"):]
+                            new_prefix = _rewrite_outside_on(prefix_raw)
+                            new_tail = _rewrite_outside_on(tail_raw)
+                            out = new_prefix + " " + new_tail
+                            continue
+            # Jika bukan equi-join, hapus JOIN saja
+            out = out[:m.start("full")] + " " + out[m.end("full"):] 
     return out
 # =======================================================================
 # ================= Phase 2 — Syntax & Canonicalization =================

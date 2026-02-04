@@ -260,3 +260,15 @@ cases:
         LEFT JOIN payments AS pmt ON cust.customerNumber = pmt.customerNumber AND YEAR(pmt.paymentDate) = 2004
         GROUP BY cust.customerNumber, cust.customerName
         HAVING SUM(pmt.amount) > 50000;
+    - id: H2
+      difficulty: hard
+      question: "Show only customers who have placed orders, and for each such customer display the customer number, customer name, and total number of orders they have placed."
+      groundtruth_sql: |
+        SELECT
+          cust.customerNumber,
+          cust.customerName,
+          COUNT(ord.orderNumber) AS total_orders
+        FROM customers AS cust
+        JOIN orders AS ord ON cust.customerNumber = ord.customerNumber
+        GROUP BY cust.customerNumber, cust.customerName;
+    

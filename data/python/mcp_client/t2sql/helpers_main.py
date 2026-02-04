@@ -29,7 +29,7 @@ from .helpers_core import (
     _move_rhs_filter_from_where_to_on,  # Only triggers for "ALL entities" questions
     _rewrite_left_join_to_inner_if_not_needed, _rewrite_left_join_to_inner_if_rhs_filtered,
     _rewrite_inner_join_filter_to_exists, _rewrite_inner_join_existence_to_exists,
-    _drop_redundant_inner_join_same_key, _prune_ornamental_joins_safe, has_non_inner_join, join_count,
+    _remove_redundant_and_ornamental_joins, has_non_inner_join, join_count,
     # phase 2
     _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table,
     # phase 3
@@ -1521,8 +1521,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question, ctx)
     s = _rewrite_inner_join_filter_to_exists(s)
     s = _rewrite_inner_join_existence_to_exists(s, question)
-    s = _drop_redundant_inner_join_same_key(s)
-    s = _prune_ornamental_joins_safe(s, question)
+    s = _remove_redundant_and_ornamental_joins(s)
     # ---------------------------------------------------------------------------
     # Phase 2 — Alias Hygiene & FROM Cleanup
     # Safe only after JOIN structure is frozen

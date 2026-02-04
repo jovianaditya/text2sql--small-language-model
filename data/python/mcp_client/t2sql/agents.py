@@ -648,7 +648,7 @@ def router_agent(state: RAGState) -> RAGState:
         if needs_this_table:
             continue  # Don't remove this table
         
-        # --- CASE 1: Table has FK that exists in another table (original logic) ---
+        # --- CASE 1: Table has FK that exists in another table (enhanced with aggregate detection) ---
         fk_cols = fk_columns_by_table.get(tbl_lower, set())
         tbl_all_cols = set(c.lower() for c in allowed_identifiers.get(tbl, []))
         
@@ -667,11 +667,39 @@ def router_agent(state: RAGState) -> RAGState:
                     if spaced != col_lower:
                         non_fk_variants.add(spaced)
                 
+                # CHECK 1: Direct column mention
                 question_mentions_non_fk = any(v in question_lower for v in non_fk_variants)
                 
-                if not question_mentions_non_fk:
+                # 🆕 CHECK 2: Aggregate context detection (REFINED VERSION)
+                # Only keep table if aggregate has relational/possessive context
+                # This prevents false removal of tables needed for COUNT/SUM operations
+                table_singular = tbl_lower.rstrip('s')
+                aggregate_patterns = [
+                    # Pattern 1: "count/number of <table> they/that/which <verb>"
+                    # Matches: "orders they placed", "payments they made"
+                    rf"\b(count|total|sum|number)\s+of\s+{tbl_lower}\s+(they|that|which|who)\s+(placed|made|have|has|created|completed)\b",
+                    
+                    # Pattern 2: "<table> <possessive> placed/made"
+                    # Matches: "orders each customer placed", "payments customers made"
+                    rf"\b{tbl_lower}\s+(each|every|that)\s+\w+\s+(placed|made|have|has|created)\b",
+                    
+                    # Pattern 3: "for each X ... <table>" (cross-reference)
+                    # Matches: "total orders for each customer"
+                    rf"\b(for\s+each|per|every)\s+(?!{tbl_lower})\w+.*?\b{tbl_lower}\b",
+                ]
+                needs_for_aggregate = any(
+                    re.search(pat, question_lower) for pat in aggregate_patterns
+                )
+                
+                # Only remove table if:
+                # 1. No direct column mention AND
+                # 2. Not needed for aggregate operations
+                if not question_mentions_non_fk and not needs_for_aggregate:
                     print(f"[Router] 🎯 FK Inference: {tbl} only provides FK, removing")
                     tables_to_remove.append(tbl)
+                    break
+                elif needs_for_aggregate:
+                    print(f"[Router] ✋ Keeping {tbl}: needed for aggregation (COUNT/SUM)")
                     break
         
         # --- CASE 2: Table is FK TARGET (referenced by another table already in relevant_tables) ---
