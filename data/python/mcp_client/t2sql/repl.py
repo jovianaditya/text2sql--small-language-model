@@ -62,6 +62,11 @@ async def repl(paths):
 
         _log_total("End-to-end total time (first run)", t0_total)
 
+        # 🆕 Log processing time (Model ready → Final SQL) for thesis benchmark
+        processing_time = state.get("processing_time")
+        if processing_time:
+            print(f"[BENCHMARK] Processing latency (Model ready → Final SQL): {processing_time:.3f}s")
+
         print("\nAsk me more questions! (type 'exit' to quit')")
 
         # ---------- LOOP (end-to-end only) ----------
@@ -79,3 +84,8 @@ async def repl(paths):
             await _exec_via_mcp(mcp, out.get("answer", ""), out.get("final_sql"))
 
             _log_total("End-to-end total time (this question)", t0_total)
+
+            # 🆕 Log processing time (Model ready → Final SQL) for thesis benchmark
+            processing_time = out.get("processing_time")
+            if processing_time:
+                print(f"[BENCHMARK] Processing latency (Model ready → Final SQL): {processing_time:.3f}s")

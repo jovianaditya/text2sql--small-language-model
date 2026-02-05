@@ -571,8 +571,19 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
     mentions_productline = any(k in q_l for k in ["product line", "product lines", "kategori", "category", "lini produk", "line produk"])
     mentions_orderdetails = any(k in q_l for k in ["order detail", "order details", "line item", "line items", "item pesanan", "detail pesanan"])
     mentions_employee = any(k in q_l for k in ["employee", "employees", "karyawan", "sales rep", "salesrep"])
-    penalize_orderdetails_default = mentions_order and not mentions_orderdetails
-    
+
+    # 🆕 Detect aggregate context - indicates we need detail tables
+    math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata',
+                     'percentage', 'percent', 'ratio', 'proportion', 'persentase', 'rasio']
+    has_aggregation = any(kw in q_l for kw in math_keywords)
+
+    # 🆕 Check if we need numeric columns - based on RETRIEVED columns metadata (not hardcoded keywords)
+    # Check if any retrieved column has numeric/aggregate characteristics
+    needs_numeric_data = _check_needs_numeric_data_from_retrieved(reranked)
+
+    # Only penalize orderdetails if NOT in aggregate context AND NOT needing numeric data
+    penalize_orderdetails_default = mentions_order and not mentions_orderdetails and not has_aggregation and not needs_numeric_data
+
     for it in reranked:
         md = it.get("meta") or {}
         tbl = _meta_table(md)
@@ -593,11 +604,239 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
         if mentions_office and tl == "offices": base += 0.8
         if mentions_productline and tl == "productlines": base += 0.8
         if mentions_orderdetails and tl == "orderdetails": base += 0.8
+
+        # 🆕 Don't penalize orderdetails in aggregate/numeric contexts
         if penalize_orderdetails_default and tl == "orderdetails": base -= 0.4
+
+        # 🆕 Boost orderdetails when numeric data is needed (even if not explicitly mentioned)
+        if needs_numeric_data and tl == "orderdetails": base += 0.6
+
         if mentions_employee and tl == "employees": base += 0.8
 
         scores[tbl] += base
     return scores
+
+# ==============================================================================
+# NUMERIC DATA DETECTION (METADATA-DRIVEN)
+# ==============================================================================
+def _check_needs_numeric_data_from_retrieved(reranked: List[Dict[str, Any]]) -> bool:
+    """
+    Check if the query needs numeric data based on retrieved columns' metadata.
+
+    Uses a metadata-driven approach:
+    1. Checks datatype field for numeric types (INTEGER, DECIMAL, NUMERIC, FLOAT, DOUBLE, etc.)
+    2. Falls back to column name patterns for backward compatibility
+
+    Args:
+        reranked: List of reranked column results with metadata
+
+    Returns:
+        True if any retrieved column indicates numeric data is needed
+    """
+    # Numeric SQL datatypes
+    numeric_datatypes = {
+        'int', 'integer', 'tinyint', 'smallint', 'mediumint', 'bigint',
+        'decimal', 'numeric', 'float', 'double', 'double precision',
+        'real', 'money', 'smallmoney', 'bit'
+    }
+
+    for item in reranked[:MAX_CTX_DOCS]:
+        md = item.get("meta") or {}
+
+        # Primary: Check datatype field from metadata
+        datatype = (md.get("datatype") or md.get("data_type") or "").strip().lower()
+        if datatype:
+            # Remove any size specification (e.g., "decimal(10,2)" -> "decimal")
+            base_type = datatype.split('(')[0].strip()
+            if base_type in numeric_datatypes:
+                # Check if this numeric column is used for calculations
+                # (not just IDs or counts)
+                col = _meta_column(md).lower()
+                # Exclude primary keys and foreign keys (IDs) as they're not used for calculations
+                desc = str(md.get("description") or "").lower()
+                if not any(kw in col for kw in ['id', 'code', 'key']):
+                    return True
+                # Check description for calculation-related terms
+                if any(kw in desc for kw in ['quantity', 'price', 'amount', 'total', 'cost', 'value', 'each', 'rate']):
+                    return True
+
+        # Fallback: Check column name pattern for numeric-sounding columns
+        # (only if datatype check above didn't trigger)
+        col = _meta_column(md).lower()
+        if any(kw in col for kw in ['quantity', 'price', 'amount', 'total', 'value', 'cost', 'each', 'rate']):
+            return True
+
+    return False
+
+
+# ==============================================================================
+# BRIDGE TABLE INFERENCE
+# ==============================================================================
+def _infer_bridge_tables(
+    selected_tables: set,
+    allowed: Dict[str, List[str]],
+    reranked: List[Dict[str, Any]],
+) -> set:
+    """
+    Infer bridge tables needed to connect selected tables.
+
+    Uses FK information from column metadata to detect bridge tables.
+    For example:
+    - customers + orderdetails → need orders (bridge table)
+    - orders + products → need orderdetails (bridge table)
+
+    Args:
+        selected_tables: Set of lowercase table names already selected
+        allowed: Dict mapping table names to their allowed columns
+        reranked: List of reranked column results with metadata
+
+    Returns:
+        Set of lowercase bridge table names to add
+    """
+    if len(selected_tables) < 2:
+        return set()
+
+    # Build FK graph from metadata
+    # Format: {source_table: {fk_column: target_table}}
+    fk_graph: Dict[str, Dict[str, str]] = {}
+
+    for item in reranked:
+        md = item.get("meta") or {}
+        desc = str(md.get("description") or "")
+
+        # Parse FK references from description
+        # Pattern: "FK to targetTable.targetColumn"
+        fk_match = re.search(r'FK to (\w+)\.(\w+)', desc, re.IGNORECASE)
+        if fk_match:
+            source_table = _meta_table(md)
+            fk_column = _meta_column(md)
+            target_table = fk_match.group(1)
+
+            if source_table and fk_column:
+                st_lower = source_table.lower()
+                fc_lower = fk_column.lower()
+                tt_lower = target_table.lower()
+
+                if st_lower not in fk_graph:
+                    fk_graph[st_lower] = {}
+                fk_graph[st_lower][fc_lower] = tt_lower
+
+    # Find bridge tables using BFS
+    bridge_tables = set()
+
+    # Convert selected_tables to lowercase for comparison
+    selected_lower = {t.lower() for t in selected_tables}
+
+    # 🆕 NEW: Also consider tables with numeric columns in reranked results
+    # Uses metadata-driven approach: check datatype field + column patterns as fallback
+    numeric_datatypes = {
+        'int', 'integer', 'tinyint', 'smallint', 'mediumint', 'bigint',
+        'decimal', 'numeric', 'float', 'double', 'double precision', 'real'
+    }
+
+    tables_with_numeric_cols = set()
+    for item in reranked[:MAX_CTX_DOCS]:
+        md = item.get("meta") or {}
+        tbl = _meta_table(md)
+        col = _meta_column(md)
+        if tbl and col:
+            # Primary: Check datatype field for numeric types
+            datatype = (md.get("datatype") or md.get("data_type") or "").strip().lower()
+            col_lower = col.lower()
+            is_numeric = False
+
+            if datatype:
+                base_type = datatype.split('(')[0].strip()
+                is_numeric = base_type in numeric_datatypes
+            else:
+                # Fallback: Check column name pattern
+                is_numeric = any(kw in col_lower for kw in ['quantity', 'price', 'amount', 'value', 'total', 'cost', 'each', 'rate'])
+
+            # Exclude ID columns from numeric consideration
+            if is_numeric and not any(kw in col_lower for kw in ['id', 'code', 'key']):
+                tables_with_numeric_cols.add(tbl.lower())
+
+    # Expand selection to include tables with numeric columns
+    expanded_tables = set(selected_lower) | tables_with_numeric_cols
+
+    # For each pair of expanded tables, check if we need a bridge
+    table_list = list(expanded_tables)
+    for i, tbl_a in enumerate(table_list):
+        for tbl_b in table_list[i+1:]:
+            # Check if tbl_a can reach tbl_b via FK path
+            path = _find_fk_path(tbl_a, tbl_b, fk_graph, allowed)
+            if path:
+                # Add intermediate tables (excluding endpoints)
+                for bridge in path[1:-1]:
+                    if bridge not in selected_lower:
+                        bridge_tables.add(bridge)
+
+    # Also check for common FK relationships
+    # If table A has FK to table B, and both have columns in results, no bridge needed
+    # But if we need columns from A and C where A→B→C, we need B as bridge
+
+    return bridge_tables
+
+
+def _find_fk_path(
+    start: str,
+    end: str,
+    fk_graph: Dict[str, Dict[str, str]],
+    allowed: Dict[str, List[str]],
+    max_depth: int = 3,
+) -> Optional[List[str]]:
+    """
+    Find FK path between two tables using BFS.
+
+    Args:
+        start: Starting table name (lowercase)
+        end: Target table name (lowercase)
+        fk_graph: FK relationship graph
+        allowed: Allowed tables and columns
+        max_depth: Maximum path length to search
+
+    Returns:
+        List of table names forming the path, or None if no path found
+    """
+    from collections import deque
+
+    if start == end:
+        return [start]
+
+    # Build reverse graph (target -> sources) for easier traversal
+    reverse_graph: Dict[str, set] = {}
+    for source, fk_targets in fk_graph.items():
+        for fk_col, target in fk_targets.items():
+            if target not in reverse_graph:
+                reverse_graph[target] = set()
+            reverse_graph[target].add(source)
+
+    # BFS from start to end
+    queue = deque([(start, [start])])
+    visited = {start}
+
+    while queue and len(queue[0][1]) <= max_depth:
+        current, path = queue.popleft()
+
+        # Check forward FKs (current -> target)
+        if current in fk_graph:
+            for target in fk_graph[current].values():
+                if target == end:
+                    return path + [target]
+                if target not in visited and target in [t.lower() for t in allowed.keys()]:
+                    visited.add(target)
+                    queue.append((target, path + [target]))
+
+        # Check reverse FKs (target -> current)
+        if current in reverse_graph:
+            for source in reverse_graph[current]:
+                if source == end:
+                    return path + [source]
+                if source not in visited and source in [t.lower() for t in allowed.keys()]:
+                    visited.add(source)
+                    queue.append((source, path + [source]))
+
+    return None
 
 # ======================================================================
 # =========================== RETRIEVE NODE ============================
@@ -902,12 +1141,62 @@ def retrieve_node(state: RAGState) -> RAGState:
                     filtered_allowed = {t: cols for t, cols in allowed.items() if t == top1}
                 else: filtered_allowed = dict(allowed)
         else:
+            # -----------------------------
+            # 🆕 ENHANCED: Column-driven table selection
+            # -----------------------------
+            # Instead of just top 2 tables, include tables that:
+            # 1. Have high scores (mentioned in question)
+            # 2. Have columns that appeared in reranked results
+            # 3. Are bridge tables needed to connect selected tables
+
             if table_scores:
                 sorted_tbls = sorted(table_scores.items(), key=lambda x: x[1], reverse=True)
-                top_tables = {name for name, score in sorted_tbls[:2] if score > 0.0}
-                if top_tables: filtered_allowed = {t: cols for t, cols in allowed.items() if t in top_tables}
-                else: filtered_allowed = dict(allowed)
-            else: filtered_allowed = dict(allowed)
+
+                # 🆕 DEBUG: Print table scores
+                if RETRIEVE_DEBUG:
+                    print(f"\n[TABLE SCORES]")
+                    for tbl, score in sorted_tbls:
+                        print(f"  {tbl}: {score:.2f}")
+
+                # Base: Top 3 tables by score (increased from 2)
+                max_top_tables = 3
+                top_tables = {name for name, score in sorted_tbls[:max_top_tables] if score > 0.0}
+
+                # 🆕 Addition: Include tables with any column in reranked results
+                # This captures tables that may not be mentioned but have needed columns
+                tables_with_reranked_cols = set()
+                for item in reranked[:MAX_CTX_DOCS]:
+                    md = item.get("meta") or {}
+                    tbl = _meta_table(md)
+                    if tbl:
+                        tables_with_reranked_cols.add(tbl.lower())
+
+                # Merge: top scoring + tables with reranked columns
+                # Use all available table keys (from original allowed, not filtered)
+                all_table_keys_lower = {tbl.lower(): tbl for tbl in allowed.keys()}
+
+                # 🆕 DEBUG: Print what we're adding
+                if RETRIEVE_DEBUG:
+                    print(f"\n[COLUMN-DRIVEN SELECTION]")
+                    print(f"  tables_with_reranked_cols: {tables_with_reranked_cols}")
+                    print(f"  all_table_keys_lower: {list(all_table_keys_lower.keys())}")
+                    to_add = [t for t in tables_with_reranked_cols if t in all_table_keys_lower]
+                    print(f"  adding to top_tables: {to_add}")
+
+                top_tables.update(t for t in tables_with_reranked_cols if t in all_table_keys_lower)
+
+                # 🆕 Addition: Bridge table inference
+                # If we have multiple tables, check if we need bridge tables
+                if len(top_tables) >= 2:
+                    bridge_tables = _infer_bridge_tables(top_tables, allowed, reranked)
+                    top_tables.update(bridge_tables)
+
+                if top_tables:
+                    filtered_allowed = {t: cols for t, cols in allowed.items() if t.lower() in top_tables}
+                else:
+                    filtered_allowed = dict(allowed)
+            else:
+                filtered_allowed = dict(allowed)
 
     if wants_customer_no_id:
         for t_key in list(filtered_allowed.keys()):

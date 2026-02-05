@@ -345,7 +345,7 @@ def join_count(sql: str) -> int:
 
 def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
     q = (question or "").lower()
-    
+
     # --- DINAMIS: Ambil daftar tabel dari context ---
     allowed_tables = _parse_allowed_identifiers(ctx).keys()
     if allowed_tables:
@@ -362,19 +362,24 @@ def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
 
     # --- LOGIKA SIGNALS (Tetap sama) ---
     explicit_signals = [
-        "including customers with no", "customers with no", "with no payments", 
+        "including customers with no", "customers with no", "with no payments",
         "never paid", "all customers", "even if no", "include those without",
-        "termasuk", "meskipun tidak", "walaupun tidak", "yang tidak punya", 
+        "termasuk", "meskipun tidak", "walaupun tidak", "yang tidak punya",
         "tanpa pembayaran", "pelanggan yang belum", "customer yang belum",
     ]
-    
+
     if any(s in q for s in explicit_signals):
         return True
-    
+
+    # 🆕 Pattern 0: "only X who have Y" - filtering pattern (NOT include-zero)
+    # This explicitly wants to filter out rows that don't match, so use INNER JOIN
+    if re.search(rf"\bonly\s+{entity_kw}s?\s+(who|that)\s+(have|has|had|placed|made|ordered)\b", q, flags=re.I):
+        return False  # Explicitly NOT include-zero, trigger INNER JOIN preference
+
     # Pattern 1: "for each X"
     if re.search(rf"\b(for\s+each|per|setiap|tiap)\s+{entity_kw}", q, flags=re.I):
         return True
-    
+
     # Pattern 2: "X with <aggregate condition>"
     if re.search(
         rf"\b{entity_kw}s?\s+with\s+(total|sum|count|average|avg|jumlah)\s+.*?\b(exceed|over|greater|more\s+than|above|>|melebihi|lebih\s+dari)",
@@ -1711,6 +1716,121 @@ def _question_wants_winner_row(question: str) -> bool:
 
     # Winner-row jika ada rank + (same_row ATAU context ATAU multi_attr)
     return rank_sig and (same_row_sig or context_sig or multi_attr_sig)
+
+def _fix_mixed_max_groupby_rownumber(sql: str) -> Optional[str]:
+    """
+    Detect and fix malformed SQL where LLM mixed MAX()/GROUP BY with ROW_NUMBER().
+
+    Example malformed:
+    SELECT ... FROM (SELECT customerNumber, MAX(amount), paymentDate
+                     FROM payments GROUP BY customerNumber
+                     ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC) = 1) p;
+
+    Correct:
+    SELECT t.customerNumber, t.amount, t.paymentDate
+    FROM (SELECT customerNumber, amount, paymentDate,
+          ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC) AS rn
+          FROM payments) t
+    WHERE t.rn = 1;
+
+    Returns fixed SQL or None if pattern not detected.
+    """
+    if not sql:
+        return None
+
+    s = sql.lower()
+
+    # Detect the malformed pattern: has MAX()/MIN() + GROUP BY + ROW_NUMBER()
+    has_agg = bool(re.search(r"\b(max|min|sum|count|avg)\s*\(", s))
+    has_group_by = "group by" in s
+    has_row_number = "row_number() over" in s
+
+    if not (has_agg and has_group_by and has_row_number):
+        return None  # Not the malformed pattern we're looking for
+
+    # Also check if ROW_NUMBER is in wrong position (not in SELECT with AS)
+    # Malformed: ROW_NUMBER() OVER ... = 1 (at end, without AS)
+    # Correct: ROW_NUMBER() OVER ... AS rn (in SELECT)
+    malformed_pattern = re.search(
+        r"row_number\s*\(\s*\)\s+over\s*\([^)]+\)\s*[=<>\s]*1\s*\)",
+        sql,
+        re.IGNORECASE
+    )
+
+    if not malformed_pattern:
+        return None
+
+    # ===== DETECTED: Malformed MAX/GROUP BY + ROW_NUMBER mixed =====
+    # Need to extract components and rebuild correctly
+
+    # 1. Extract outer query columns
+    outer_select_match = re.search(
+        r"select\s+(.*?)\s+from\s*\(",
+        sql,
+        re.IGNORECASE | re.DOTALL
+    )
+    if not outer_select_match:
+        return None
+
+    outer_cols = outer_select_match.group(1).strip()
+
+    # 2. Extract inner table name (for aliases)
+    from_table_match = re.search(
+        r"from\s+.*?\)\s*(?:as\s+)?(\w+)",
+        sql,
+        re.IGNORECASE
+    )
+    outer_alias = from_table_match.group(1) if from_table_match else "t"
+
+    # 3. Extract the base table (FROM xxx before GROUP BY)
+    base_table_match = re.search(
+        r"from\s+(\w+)\s+(?:(?!group\s+by|row_number).)*?(?=group\s+by|row_number|\))",
+        sql,
+        re.IGNORECASE
+    )
+    if not base_table_match:
+        return None
+    base_table = base_table_match.group(1)
+
+    # 4. Extract PARTITION BY and ORDER BY from ROW_NUMBER
+    partition_match = re.search(
+        r"partition\s+by\s+([^)]+)",
+        sql,
+        re.IGNORECASE
+    )
+    partition_by = partition_match.group(1).strip() if partition_match else ""
+
+    order_match = re.search(
+        r"order\s+by\s+([^)]+?)(?:\)|desc|asc)",
+        sql,
+        re.IGNORECASE
+    )
+    order_by = order_match.group(1).strip() if order_match else ""
+
+    # 5. Extract actual column names (remove MAX/MIN wrappers)
+    # Parse outer_cols to get real column names
+    select_cols = []
+    for col in re.split(r",\s*", outer_cols):
+        col = col.strip()
+        # Remove alias prefix (e.g., "p.customerNumber" -> "customerNumber")
+        col = re.sub(r"^\w+\.", "", col)
+        # Remove MAX/MIN wrapper
+        col = re.sub(r"^(max|min|sum|count|avg)\s*\(([^)]+)\)\s*(?:as\s+\w+)?$", r"\2", col, flags=re.IGNORECASE)
+        select_cols.append(col)
+
+    # 6. Build correct ROW_NUMBER query
+    inner_select = ", ".join(select_cols)
+    outer_select = ", ".join([f"{outer_alias}.{col.strip()}" for col in select_cols])
+
+    fixed_sql = (
+        f"SELECT {outer_select} "
+        f"FROM (SELECT {inner_select}, "
+        f"ROW_NUMBER() OVER (PARTITION BY {partition_by} ORDER BY {order_by}) AS rn "
+        f"FROM {base_table}) {outer_alias} "
+        f"WHERE {outer_alias}.rn = 1"
+    )
+
+    return fixed_sql
 
 def _split_top_level_commas(expr: str) -> List[str]:
     """
@@ -3393,5 +3513,280 @@ def _fix_aggregate_in_where(sql: str) -> str:
         result += ";"
     
     print(f"[FIX_AGG_WHERE] Fixed: {result}")
-    
+
+    return result
+
+
+# ===== Phase 4c — Fix Raw Column WHERE → HAVING for Aggregate Questions =====
+# ======================================================================
+def _fix_raw_column_where_to_having(sql: str, question: str = "") -> str:
+    """
+    Fix semantic error: raw column in WHERE should be aggregate in HAVING.
+
+    Pattern:
+    - Question asks: "average/sum/total above/below/equal X"
+    - SQL has: WHERE <column> > <value> GROUP BY ...
+    - Should be: WHERE (maybe other filters) GROUP BY ... HAVING AVG(<column>) > <value>
+
+    Example:
+    WRONG: SELECT customer, AVG(amount) FROM payments WHERE amount > 50000 GROUP BY customer
+    RIGHT: SELECT customer, AVG(amount) FROM payments GROUP BY customer HAVING AVG(amount) > 50000
+    """
+    if not sql or not question:
+        return sql
+
+    sql_up = sql.upper()
+
+    # Skip jika tidak ada GROUP BY
+    if "GROUP BY" not in sql_up:
+        return sql
+
+    # Skip jika tidak ada WHERE
+    if "WHERE" not in sql_up:
+        return sql
+
+    # Detect aggregate intent in question
+    question_lower = question.lower()
+    agg_intent_patterns = [
+        # Pattern: "average/sum/total ... above/below X" (allows words in between)
+        r"(?:average|avg|sum|total|count|maximum|minimum|max|min).{0,20}(?:above|below|greater|less|over|under|more|than?|exceeds?|>\s*\d+)",
+        # Reverse pattern: "above/below X ... average/sum/total"
+        r"(?:above|below|greater|less|over|under|more|than?|exceeds?|>\s*\d+).{0,20}(?:average|avg|sum|total)",
+        # Direct pattern with operator: "avg > 50000"
+        r"(?:avg|average|sum|total|count|max|min)\s+[><=]",
+    ]
+
+    has_agg_intent = any(re.search(p, question_lower) for p in agg_intent_patterns)
+    if not has_agg_intent:
+        return sql
+
+    # Extract WHERE clause
+    where_match = re.search(
+        r"\bWHERE\s+(.*?)(?=\s+GROUP\s+BY\b)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    if not where_match:
+        return sql
+
+    where_body = where_match.group(1).strip()
+
+    # Get columns used in aggregate functions in SELECT
+    select_match = re.search(r"\bSELECT\b(.*?)\bFROM\b", sql, flags=re.IGNORECASE | re.DOTALL)
+    if not select_match:
+        return sql
+
+    select_clause = select_match.group(1)
+
+    # Find aggregate functions and their columns in SELECT
+    agg_in_select = {}
+    for m in re.finditer(r"(AVG|SUM|COUNT|MIN|MAX)\s*\(\s*([^)]+)\s*\)", select_clause, flags=re.IGNORECASE):
+        func = m.group(1).upper()
+        col = m.group(2).strip()
+        agg_in_select[col.lower()] = func
+
+    if not agg_in_select:
+        return sql
+
+    # Find WHERE conditions that use these columns WITHOUT aggregate wrapper
+    conditions_to_move = []
+    conditions_to_keep = []
+
+    # Split by AND/OR (simple approach)
+    separators = r'\s+(AND|OR)\s+'
+    parts = re.split(f'({separators})', where_body, flags=re.IGNORECASE)
+
+    i = 0
+    while i < len(parts):
+        part = parts[i].strip()
+        if not part:
+            i += 1
+            continue
+
+        if part.upper() in ("AND", "OR"):
+            conditions_to_keep.append(part)
+            i += 1
+            continue
+
+        # Check if this condition uses a column that's aggregated in SELECT
+        # Pattern: column operator value
+        cond_match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_.]*)\s*(=|!=|<>|>=?|<=?|>)\s*(.+)$", part, flags=re.IGNORECASE)
+        if cond_match:
+            col = cond_match.group(1).lower()
+            operator = cond_match.group(2)
+            value = cond_match.group(3).strip()
+
+            if col in agg_in_select:
+                # This condition should be in HAVING with aggregate wrapper
+                agg_func = agg_in_select[col]
+                conditions_to_move.append(f"{agg_func}({col}) {operator} {value}")
+            else:
+                conditions_to_keep.append(part)
+        else:
+            # Complex condition, keep in WHERE
+            conditions_to_keep.append(part)
+
+        i += 1
+
+    if not conditions_to_move:
+        return sql
+
+    print(f"[FIX_RAW_WHERE] Moving conditions to HAVING: {conditions_to_move}")
+
+    # Build new SQL
+    # Get prefix (before WHERE)
+    prefix_match = re.search(r"^(.*?)\bWHERE\b", sql, flags=re.IGNORECASE | re.DOTALL)
+    if not prefix_match:
+        return sql
+    prefix = prefix_match.group(1).strip()
+
+    # Build new WHERE (if anything left)
+    new_where = ""
+    if conditions_to_keep:
+        new_where = "WHERE " + " ".join(conditions_to_keep)
+
+    # Build GROUP BY + HAVING
+    group_match = re.search(
+        r"\bGROUP\s+BY\s+.*?(?=\s*(?:HAVING|ORDER\s+BY|LIMIT|;|$))",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    if not group_match:
+        return sql
+
+    group_clause = group_match.group(0)
+
+    # Build HAVING
+    having_clause = " HAVING " + " AND ".join(conditions_to_move)
+
+    # Find what comes after GROUP BY (before HAVING if exists, or ORDER BY/LIMIT)
+    after_group_match = re.search(
+        r"\bGROUP\s+BY\s+.*?(\s+(?:HAVING|ORDER\s+BY|LIMIT|;|$))",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    if after_group_match:
+        after_group = after_group_match.group(1).strip()
+        if after_group.upper().startswith("HAVING"):
+            # Merge with existing HAVING
+            existing_having = re.search(r"\bHAVING\s+(.*?)(?:\s+(?:ORDER\s+BY|LIMIT|;|$))", sql, flags=re.IGNORECASE | re.DOTALL)
+            if existing_having:
+                existing_cond = existing_having.group(1).strip()
+                having_clause = f" HAVING ({' AND '.join(conditions_to_move)}) AND ({existing_cond})"
+                # Remove old HAVING position
+                after_group = re.sub(r"\bHAVING\s+.*?(?=\s+(?:ORDER\s+BY|LIMIT|;|$))", "", after_group, flags=re.IGNORECASE | re.DOTALL).strip()
+
+        result = f"{prefix} {new_where} {group_clause}{having_clause} {after_group}".strip()
+    else:
+        result = f"{prefix} {new_where} {group_clause}{having_clause};".strip()
+
+    # Clean up multiple spaces
+    result = re.sub(r"\s{2,}", " ", result)
+    result = result.strip()
+    if not result.endswith(";"):
+        result += ";"
+
+    print(f"[FIX_RAW_WHERE] Fixed: {result}")
+    return result
+
+
+# ===== Phase 4d — Add Missing COUNT(*) for GROUP BY Aggregates =====
+# ======================================================================
+def _add_missing_count_for_group_by(sql: str, question: str = "") -> str:
+    """
+    Safely add COUNT(*) to SELECT when question asks for count/total in GROUP BY query.
+
+    Guardrails:
+    1. Must have GROUP BY (simple aggregate, not window function)
+    2. NOT a ranking/comparison query (e.g., "top 3", "more than 5")
+    3. Has GROUP BY intent indicators
+    4. Question asks for count/total number
+    5. COUNT not already in SELECT
+
+    Examples:
+    - "For each status, show total number of orders" → Add COUNT(*)
+    - "Count orders per status" → Add COUNT(*)
+    - "Customers with more than 5 orders" → Skip (needs HAVING/window)
+    - "Top 3 customers by count" → Skip (needs ROW_NUMBER)
+    """
+    if not sql or not question:
+        return sql
+
+    sql_up = sql.upper()
+    question_lower = question.lower()
+
+    # GUARDRAIL 1: Must have GROUP BY
+    if "GROUP BY" not in sql_up:
+        return sql
+
+    # GUARDRAIL 2: NOT a ranking/comparison query (needs window function or HAVING)
+    comparison_patterns = [
+        r"more than\s+\d+",
+        r"above\s+\d+",
+        r"below\s+\d+",
+        r"exceeds?\s+\d+",
+        r"greater than\s+\d+",
+        r"less than\s+\d+",
+        r"top\s+\d+",
+        r"bottom\s+\d+",
+        r"highest\s+\d+",
+        r"lowest\s+\d+",
+        r"\d+\s+or more",
+        r"\d+\s+or less",
+        r"at least\s+\d+",
+        r"at most\s+\d+",
+    ]
+    if any(re.search(p, question, re.IGNORECASE) for p in comparison_patterns):
+        # Likely needs window function, HAVING, or subquery - skip
+        return sql
+
+    # GUARDRAIL 3: Has GROUP BY intent indicators (looser patterns)
+    group_by_indicators = [
+        r"for each",
+        r"per ",
+        r"every ",
+        r"by\s+\w+",           # "by status", "by city"
+        r"in each",            # "in each city"
+        r"for\s+\w+",          # "for customers"
+        r"each\s+\w+",         # "each status"
+    ]
+    has_group_intent = any(re.search(p, question, re.IGNORECASE) for p in group_by_indicators)
+    if not has_group_intent:
+        return sql
+
+    # GUARDRAIL 4: Question asks for count/total number (specific phrases only)
+    # NOTE: "total" alone removed - too generic, can mean SUM(amount) not COUNT(*)
+    count_keywords = ["total number", "number of", "count of", "how many", "count"]
+    has_count_intent = any(kw in question_lower for kw in count_keywords)
+    if not has_count_intent:
+        return sql
+
+    # GUARDRAIL 5: COUNT not already in SELECT
+    select_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql, flags=re.IGNORECASE | re.DOTALL)
+    if not select_match:
+        return sql
+
+    select_clause = select_match.group(1).upper()
+    if "COUNT" in select_clause:
+        return sql  # COUNT already present
+
+    # All guardrails passed - safe to add COUNT(*)
+    print(f"[ADD_COUNT] Adding COUNT(*) for GROUP BY aggregate")
+    result = re.sub(
+        r"(SELECT\s+)",
+        r"\1COUNT(*) AS total_count, ",
+        sql,
+        count=1,
+        flags=re.IGNORECASE
+    )
+
+    # Clean up multiple spaces
+    result = re.sub(r"\s{2,}", " ", result)
+    result = result.strip()
+    if not result.endswith(";"):
+        result += ";"
+
+    print(f"[ADD_COUNT] Fixed: {result}")
     return result

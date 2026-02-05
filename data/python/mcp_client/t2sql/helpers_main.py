@@ -36,12 +36,14 @@ from .helpers_core import (
     _wants_customer_name_only, _wants_product_name_only, _prefer_friendly_names, _wants_name_only,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     # phase 4
-    _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _looks_like_max_date_tiebreaker,
+    _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _looks_like_max_date_tiebreaker,
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _rewrite_winner_row_aggregate_misuse, _winner_row_final_sanity,
     # phase 4b - Aggregate in WHERE fix
     _fix_aggregate_in_where,
+    _fix_raw_column_where_to_having,
+    _add_missing_count_for_group_by,
     # phase 5 — Pattern, REGEXP, and Predicate Normalization
     _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _guardrail_fix_mysql_regexp_literals,
     # phase 6 
@@ -1195,11 +1197,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     )
 
     # [C] RANKING RULES
-    if qtype == "rank":
+    # 🆕 Check winner-row pattern FIRST (before qtype check)
+    # This ensures winner-row constraints are applied even when qtype="aggregate" due to grouping
+    if is_winner_row or qtype == "rank":
         constraints.append(
             "WINNER-ROW STRATEGY: You MUST use the standard 'Select-Filter-Rank' pattern."
         )
-        
+
         # 🆕 ORDINAL RANKING: Detect the specific rank number from question
         if is_ordinal_ranking:
             # Extract the ordinal number from question
@@ -1228,11 +1232,11 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             )
         else:
             constraints.append(
-                "WINNER-ROW RULE (CRITICAL): You MUST use ROW_NUMBER() subquery pattern. "
+                "WINNER-ROW RULE (CRITICAL): You MUST use ROW_NUMBER() subquery pattern ONLY. "
                 "CORRECT: `SELECT t.col1, t.col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY valueCol DESC) AS rn FROM table) t WHERE t.rn = 1` "
                 "WRONG: Using MAX() with GROUP BY - this does NOT give you the correct row with all its columns! "
             )
-            
+
             # Add tiebreaker constraint if detected
             if has_tiebreaker:
                 constraints.append(
@@ -1242,6 +1246,15 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     "Use DESC for 'latest/highest/largest', ASC for 'earliest/lowest/smallest'. "
                     "DO NOT use MAX(), GROUP BY, LEFT JOIN, or correlated subquery - just the simple subquery pattern!"
                 )
+
+            # 🆕 ANTI-PATTERN PROHIBITION: Prevent mixing MAX() GROUP BY with ROW_NUMBER()
+            constraints.append(
+                "STRICT PROHIBITION (SYNTAX ERROR): DO NOT mix MAX()/MIN()/GROUP BY with ROW_NUMBER(). "
+                "These are MUTUALLY EXCLUSIVE patterns. Choose ONE:\n"
+                "• If you need ROW_NUMBER(): Do NOT use MAX(), MIN(), SUM(), COUNT(), GROUP BY, or HAVING\n"
+                "• If you need GROUP BY aggregation: Do NOT use ROW_NUMBER(), RANK(), or window functions\n"
+                "For this query, use ONLY the ROW_NUMBER() pattern - no GROUP BY, no MAX(), no aggregate functions."
+            )
         
         constraints.append(
             "CRITICAL PROHIBITION: Do NOT put `ROW_NUMBER()` inside a `GROUP BY` clause. "
@@ -1249,14 +1262,27 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         )
 
     # [D] REPORTING/AGGREGATION RULES
+    # 🆕 Skip aggregation rules for winner-row queries (they use ROW_NUMBER, not GROUP BY)
     is_reporting = (qtype == "aggregate") or has_grouping or has_exclusion
-    if is_reporting and complexity == "complex":
-        constraints.append(
-            "REPORTING LOGIC: When aggregating a Master Table with a Transaction Table, use **LEFT JOIN**."
-        )
-        constraints.append(
-            "CRITICAL FILTER RULE: If using LEFT JOIN, filters for the RIGHT table MUST be in the **ON** clause."
-        )
+    if is_reporting and complexity == "complex" and not is_winner_row:
+        # 🆕 Check for "only X who have Y" filtering pattern
+        # This pattern requires INNER JOIN (filter out non-matching rows), not LEFT JOIN
+        q_lower = question.lower()
+        only_who_has_pattern = re.search(rf"\bonly\s+\w+.*?\s+(who|that)\s+(have|has|had|placed|made|ordered)\b", q_lower, flags=re.I)
+
+        if only_who_has_pattern:
+            # Filtering pattern: use INNER JOIN to exclude non-matching rows
+            constraints.append(
+                "FILTERING LOGIC: This query uses 'only X who have Y' pattern. Use **INNER JOIN** to exclude entities without matching data."
+            )
+        else:
+            # Default reporting: use LEFT JOIN to preserve all entities
+            constraints.append(
+                "REPORTING LOGIC: When aggregating a Master Table with a Transaction Table, use **LEFT JOIN**."
+            )
+            constraints.append(
+                "CRITICAL FILTER RULE: If using LEFT JOIN, filters for the RIGHT table MUST be in the **ON** clause."
+            )
         constraints.append(
             "GROUP BY RULE: Every column in the SELECT list that is not aggregated MUST be in the GROUP BY clause."
         )
@@ -1282,26 +1308,59 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     # Extract explicitly mentioned columns from question for stricter enforcement
     import re as _re
     q_lower = question.lower()
-    
-    # Parse "return X, Y, and Z" or "show X, Y, and Z" patterns
+
+    # 🆕 PRIORITY: Check for "Include X, Y, and Z" pattern (highest priority)
+    include_pattern = r'\binclude\s+(?:the\s+)?(.+?)(?:\.|$)'
+    include_match = _re.search(include_pattern, q_lower)
+
     requested_cols = []
-    col_pattern = r'\b(return|show|display|include|get)\s+(?:the\s+)?(.+?)(?:\.|$)'
-    col_match = _re.search(col_pattern, q_lower)
-    if col_match:
-        col_text = col_match.group(2)
+    explicit_include = False
+
+    if include_match:
+        explicit_include = True
+        include_text = include_match.group(1)
         # Split by comma and "and"
-        parts = _re.split(r',\s*|\s+and\s+', col_text)
-        requested_cols = [p.strip() for p in parts if p.strip() and len(p.strip()) > 2]
-    
+        parts = _re.split(r',\s*|\s+and\s+', include_text)
+        for p in parts:
+            p = p.strip()
+            # Remove articles and stop words at the end
+            p = _re.sub(r'\s+(in\s+(?:the\s+)?result|respectively)?$', '', p)
+            if p and len(p) > 2:
+                requested_cols.append(p)
+
+    # If not "Include" pattern, try other patterns
+    if not explicit_include:
+        col_pattern = r'\b(return|show|display|get)\s+(?:the\s+)?(.+?)(?:\.|$)'
+        col_match = _re.search(col_pattern, q_lower)
+        if col_match:
+            col_text = col_match.group(2)
+            # Split by comma and "and"
+            parts = _re.split(r',\s*|\s+and\s+', col_text)
+            requested_cols = [p.strip() for p in parts if p.strip() and len(p.strip()) > 2]
+
     if requested_cols:
         cols_list = ", ".join([f"'{c}'" for c in requested_cols[:5]])  # Limit to 5
-        constraints.append(
-            f"EXPLICIT COLUMN REQUIREMENT: The user explicitly requested these items: {cols_list}. "
-            f"You MUST include ALL of them in your SELECT clause. Do not skip any."
-        )
+        if explicit_include:
+            # Strongest constraint for "Include X, Y, Z" pattern
+            constraints.append(
+                f"CRITICAL COLUMN REQUIREMENT: The question explicitly says 'Include {cols_list}'. "
+                f"Select ONLY these columns (plus the 'For each' entity identifier). "
+                f"Do NOT add any other columns like checkNumber, orderNumber, etc."
+            )
+        else:
+            constraints.append(
+                f"EXPLICIT COLUMN REQUIREMENT: The user explicitly requested these items: {cols_list}. "
+                f"You MUST include ALL of them in your SELECT clause. Do not skip any."
+            )
+            # 🆕 Stronger constraint: prohibit extra columns
+            constraints.append(
+                f"STRICT COLUMN LIMIT: Select ONLY these columns: {cols_list}. "
+                f"Do NOT add any other columns (IDs, codes, names) that were not explicitly requested."
+            )
     else:
         constraints.append(
-            "STRICT COLUMN SELECTION: Select EXACTLY the columns requested by the user."
+            "STRICT COLUMN SELECTION: Select EXACTLY the columns requested by the user. "
+            "Do NOT add extra columns like IDs, codes, or check numbers unless explicitly mentioned."
         )
     constraints.append(
         "IMPLICIT SELECTION RULE: If the user says 'For each [Entity]' or 'List [Entity]', "
@@ -1597,6 +1656,14 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # remove MAX(..) HAVING self-subquery hacks
     s = _strip_having_max_self_subquery(s)
     if DEBUG_WR: print("[PH4] after strip having max self subquery:", s)
+
+    # 🆕 NEW: Detect and fix malformed MAX/GROUP BY + ROW_NUMBER mixed pattern
+    # This catches cases where 7B model incorrectly combines aggregate and window function patterns
+    fixed_mixed = _fix_mixed_max_groupby_rownumber(s)
+    if fixed_mixed:
+        if DEBUG_WR: print("[PH4] 🔧 Fixed malformed MAX/GROUP BY + ROW_NUMBER pattern")
+        s = fixed_mixed
+
     # -------------------------------------------------------------
     # CASE 1 — pattern clearly indicates MAX + date tie-breaker
     # → enforce ROW_NUMBER rewrite (FORCE MODE)
@@ -1637,6 +1704,15 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         
         s = _fix_aggregate_in_where(s)
         if DEBUG_WR: print(f"[PH4] after agg-in-where fix: {s}")
+
+        # Fix raw column WHERE -> HAVING for aggregate questions
+        s = _fix_raw_column_where_to_having(s, question)
+        if DEBUG_WR: print(f"[PH4] after raw-where-to-having fix: {s}")
+
+        # Add missing COUNT(*) for GROUP BY aggregates
+        s = _add_missing_count_for_group_by(s, question)
+        if DEBUG_WR: print(f"[PH4] after add-count fix: {s}")
+
         s = _rewrite_having_alias_to_expr(s)
         s = _winner_row_final_sanity(s, question)
 
@@ -1647,7 +1723,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     else:
             # Phase 4 was skipped due to goto_phase5, but still need aggregate fix
             s = _fix_aggregate_in_where(s)
-            if DEBUG_WR: print(f"[PH4-FORCE] after agg-in-where fix: {s}")        
+            if DEBUG_WR: print(f"[PH4-FORCE] after agg-in-where fix: {s}")
+            s = _fix_raw_column_where_to_having(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after raw-where-to-having fix: {s}")
+            s = _add_missing_count_for_group_by(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after add-count fix: {s}")        
     # ---------------------------------------------------------------------------
     # Phase 5 — Pattern, REGEXP, and Predicate Normalization
     # ---------------------------------------------------------------------------

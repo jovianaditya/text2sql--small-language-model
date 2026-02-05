@@ -11,7 +11,7 @@ _SQL_KEYWORDS: Set[str] = {
     "regexp","rlike","over","partition","row_number"
 }
 
-from .config import ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_URL, OLLAMA_KEEP_ALIVE
+from .config import ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_URL, OLLAMA_KEEP_ALIVE, RETRIEVE_DEBUG
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
 from .utils import _dbg_print_two, try_llm_json, build_router_schema
@@ -545,6 +545,84 @@ def router_agent(state: RAGState) -> RAGState:
         filtered_tables.append(tbl)
 
     relevant_tables = filtered_tables
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 2.2: 🆕 INCLUDE TABLES WITH NUMERIC COLUMNS (for calculations)
+    # ═══════════════════════════════════════════════════════════════════
+    # If question asks for numeric calculations (sum, total, quantity * price, etc.),
+    # include tables that have numeric columns even if not explicitly mentioned
+    #
+    # IMPORTANT: Only trigger on cross-table calculation patterns, not generic aggregation
+
+    question_lower = question.lower()
+
+    # Detect numeric calculation needs - look for SPECIFIC calculation patterns
+    # that indicate cross-table arithmetic (not just count/avg on single table)
+    calc_operation_keywords = ['sum', 'total', 'calculate', 'multiplied', 'times', 'each',
+                               'jumlah', 'harga', 'qty', 'value', 'cost']
+    # Detect if question mentions numeric column terms that would require detail tables
+    numeric_column_keywords = ['quantity', 'price', 'amount', 'ordered', 'instock']
+
+    needs_numeric_calc = (
+        any(kw in question_lower for kw in calc_operation_keywords) and
+        any(kw in question_lower for kw in numeric_column_keywords)
+    )
+
+    # Special case: if question explicitly mentions calculation operations
+    if not needs_numeric_calc:
+        # Check for arithmetic patterns like "quantity * price", "sum of amount", etc.
+        calc_patterns = [
+            r'\b(?:quantity|amount|price)\s*\*\s*(?:price|each|amount)',
+            r'(?:sum|total|calculate)\s+(?:of\s+)?(?:quantity|amount|price)',
+            r'(?:quantity|price|amount)\s+(?:multiplied|times)\s+(?:by|each)',
+        ]
+        needs_numeric_calc = any(re.search(pattern, question_lower) for pattern in calc_patterns)
+
+    if needs_numeric_calc:
+        # Look for tables with numeric columns in context
+        # Check for column patterns like: quantityOrdered, priceEach, amount, etc.
+        numeric_column_patterns = [
+            r'\btable:\s*\w+\s*\|\s*column:\s*(\w+quantity\w*|\w*price\w*|\w*amount\w*|\w*value\w*|\w*cost\w*|\w*total\w*)',
+            r'\bcolumn:\s*(\w+quantity\w*|\w*price\w*|\w*amount\w*|\w*value\w*|\w*cost\w*|\w*total\w*)\s*\|',
+        ]
+
+        # Only include tables that are FK-related to already-selected tables
+        # This prevents adding unrelated numeric tables
+        relevant_lower = {t.lower() for t in relevant_tables}
+        tables_with_numeric = set()
+
+        for pattern in numeric_column_patterns:
+            for match in re.finditer(pattern, ctx, re.IGNORECASE):
+                # Extract table name from the context around this match
+                table_match = None
+                search_start = max(0, match.start() - 200)  # Look back 200 chars
+                context_before = ctx[search_start:match.start()]
+                table_match = re.search(r'table:\s*(\w+)', context_before, re.IGNORECASE)
+
+                if table_match:
+                    tbl_name = table_match.group(1)
+                    if tbl_name:
+                        tbl_lower = tbl_name.lower()
+                        # Only add if this table is NOT already selected AND
+                        # has FK relationship with selected tables
+                        if tbl_lower not in relevant_lower:
+                            # Check for FK relationship in context
+                            # Look for patterns like "table: orderdetails | column: orderNumber FK to orders.orderNumber"
+                            context_section = ctx[max(0, match.start() - 300):match.start() + 300]
+                            # If this table has FK to/from any selected table, include it
+                            has_fk_to_selected = any(
+                                re.search(rf'FK to\s+{re.escape(t)}\.', context_section, re.IGNORECASE) or
+                                re.search(rf'{re.escape(tbl_lower)}\.', context_section, re.IGNORECASE) and
+                                re.search(r'FK to', context_section, re.IGNORECASE)
+                                for t in relevant_lower
+                            )
+                            if has_fk_to_selected:
+                                tables_with_numeric.add(tbl_name)
+
+        if tables_with_numeric and RETRIEVE_DEBUG:
+            print(f"[Router] ✋ Including tables based on column relevance")
+
+        relevant_tables.extend(t for t in tables_with_numeric if t.lower() not in relevant_lower)
     
     # ═══════════════════════════════════════════════════════════════════
     # STEP 2.5: 🆕 DETECT SIGNALS EARLY (needed for FK inference)
@@ -640,7 +718,7 @@ def router_agent(state: RAGState) -> RAGState:
             for variant in col_variants:
                 if variant in question_lower:
                     needs_this_table = True
-                    print(f"[Router] ✋ Keeping {tbl}: question asks for '{variant}'")
+                    print(f"[Router] ✋ Keeping {tbl}: column reference found in question")
                     break
             if needs_this_table:
                 break
@@ -669,28 +747,85 @@ def router_agent(state: RAGState) -> RAGState:
                 
                 # CHECK 1: Direct column mention
                 question_mentions_non_fk = any(v in question_lower for v in non_fk_variants)
-                
-                # 🆕 CHECK 2: Aggregate context detection (REFINED VERSION)
+
+                # 🆕 CHECK 2: Aggregate context detection (ENHANCED VERSION)
                 # Only keep table if aggregate has relational/possessive context
                 # This prevents false removal of tables needed for COUNT/SUM operations
                 table_singular = tbl_lower.rstrip('s')
+
+                # Build more comprehensive aggregate patterns
                 aggregate_patterns = [
                     # Pattern 1: "count/number of <table> they/that/which <verb>"
                     # Matches: "orders they placed", "payments they made"
                     rf"\b(count|total|sum|number)\s+of\s+{tbl_lower}\s+(they|that|which|who)\s+(placed|made|have|has|created|completed)\b",
-                    
+
                     # Pattern 2: "<table> <possessive> placed/made"
                     # Matches: "orders each customer placed", "payments customers made"
                     rf"\b{tbl_lower}\s+(each|every|that)\s+\w+\s+(placed|made|have|has|created)\b",
-                    
+
                     # Pattern 3: "for each X ... <table>" (cross-reference)
                     # Matches: "total orders for each customer"
                     rf"\b(for\s+each|per|every)\s+(?!{tbl_lower})\w+.*?\b{tbl_lower}\b",
+
+                    # 🆕 Pattern 4: "<table> amount/total" with aggregate keywords
+                    # Matches: "order amount", "total order", "payment total", "order value"
+                    rf"\b(total|sum|average|avg)\s+(of\s+)?{table_singular}?\b",
+                    rf"\b{table_singular}?\s+(amount|total|value|cost)\b",
+
+                    # 🆕 Pattern 5: Aggregate with calculation keywords
+                    # Matches: "sum of quantity", "total price", "calculate total"
+                    rf"\b(calculate|show|display|find|get)\s+(total|sum|average|count)\b",
+                    rf"\b(total|sum|average|count|avg)\s+(of\s+)?(quantity|price|amount|value)\b",
+
+                    # 🆕 Pattern 6: "have/has placed <table>"
+                    # Matches: "customers who have placed orders"
+                    rf"\b(who|that|which)\s+(have|has)\s+placed\s+{tbl_lower}\b",
+
+                    # 🆕 Pattern 7: Numeric data indicators
+                    # If question asks for quantity/price/amount calculation, might need this table
+                    rf"\b(quantity|price|amount|total|sum)\s+(of|from|for|in)\s+{tbl_lower}\b",
                 ]
+
                 needs_for_aggregate = any(
                     re.search(pat, question_lower) for pat in aggregate_patterns
                 )
-                
+
+                # 🆕 Additional check: If numeric calculation keywords present, be more conservative
+                # This catches cases like "sum of quantity ordered multiplied by price each"
+                numeric_calc_keywords = ['quantity', 'price', 'amount', 'multiplied', 'times', 'each', 'per unit']
+                has_numeric_calc = any(kw in question_lower for kw in numeric_calc_keywords)
+
+                # 🆕 For orders table specifically: if it's mentioned with customers in aggregate context
+                needs_orders_for_aggregate = False
+                if tbl_lower == 'orders':
+                    # Check patterns: "customers who placed orders", "orders placed by customers"
+                    if re.search(rf"\b(people|customers|clients|employees)\s+(who|that)\s+(have|has|placed)\s+{tbl_lower}\b", question_lower):
+                        needs_orders_for_aggregate = True
+                    # Check: "total amount", "order amount" patterns
+                    if re.search(rf"\b(total|sum|calculate).*?\b(order|orders)\b", question_lower):
+                        needs_orders_for_aggregate = True
+
+                # 🆕 For orderdetails table specifically: if numeric calculation needed
+                needs_orderdetails_for_numeric = False
+                if tbl_lower == 'orderdetails' or tbl_lower == 'order_details':
+                    if has_numeric_calc:
+                        # Check if calculation involves orderdetail columns
+                        calc_patterns = [
+                            r'quantity\s+(ordered|instock)',
+                            r'price\s+each',
+                            r'order\s+detail',
+                            r'line\s+item',
+                        ]
+                        if any(re.search(pat, question_lower) for pat in calc_patterns):
+                            needs_orderdetails_for_numeric = True
+
+                # Combine all aggregate-related needs
+                needs_for_aggregate = (
+                    needs_for_aggregate or
+                    needs_orders_for_aggregate or
+                    needs_orderdetails_for_numeric
+                )
+
                 # Only remove table if:
                 # 1. No direct column mention AND
                 # 2. Not needed for aggregate operations
@@ -699,7 +834,8 @@ def router_agent(state: RAGState) -> RAGState:
                     tables_to_remove.append(tbl)
                     break
                 elif needs_for_aggregate:
-                    print(f"[Router] ✋ Keeping {tbl}: needed for aggregation (COUNT/SUM)")
+                    print(f"[Router] ✋ Keeping {tbl}: needed for query context")
+                    needs_this_table = True  # Mark as needed so CASE 2 won't remove it
                     break
         
         # --- CASE 2: Table is FK TARGET (referenced by another table already in relevant_tables) ---
@@ -715,7 +851,7 @@ def router_agent(state: RAGState) -> RAGState:
                 # PK columns typically end with 'code', 'number', 'id' - same pattern as FK
                 pk_like_cols = {c for c in tbl_all_cols if c.endswith('code') or c.endswith('number') or c.endswith('id')}
                 non_pk_cols = tbl_all_cols - pk_like_cols
-                
+
                 # Build spaced variants for non-PK cols
                 non_pk_variants = set()
                 for c in allowed_identifiers.get(tbl, []):
@@ -724,9 +860,9 @@ def router_agent(state: RAGState) -> RAGState:
                         spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', c).lower()
                         if spaced != c.lower():
                             non_pk_variants.add(spaced)
-                
+
                 question_mentions_data = any(v in question_lower for v in non_pk_variants)
-                
+
                 if not question_mentions_data:
                     print(f"[Router] 🎯 FK Target Inference: {tbl} is only FK target, source table already present, removing")
                     tables_to_remove.append(tbl)
@@ -942,9 +1078,9 @@ def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM
         """
         for attempt in range(max_retries):
             try:
-                print(f"[DRAFT] Pre-warming model: {target_model}..." + (f" (attempt {attempt+1})" if attempt > 0 else ""))
+                print(f"[Model] Loading: {target_model}..." + (f" (attempt {attempt+1})" if attempt > 0 else ""))
                 llm.invoke("Say OK")  # Quick call to load model into memory
-                print(f"[DRAFT] Model ready!")
+                print(f"[Model] Ready: {target_model}")
                 _last_model_warmup[target_model] = _time.time()
                 return True
             except Exception as e:
@@ -975,10 +1111,18 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # This separates cold-start time from actual inference time
     # Also handles OOM by waiting for previous model to unload
     model_ready = _prewarm_model_with_oom_retry(llm, target_model)
-    
+
     if not model_ready:
         return {**state, "draft_sql": "SELECT 'Error: Model OOM after retries';"}
-    
+
+    # 🆕 START TIMER: Model ready → Final SQL complete (for thesis latency benchmark)
+    # This measures the core text-to-SQL processing time, excluding:
+    # - Model loading/warmup (one-time cost)
+    # - Retrieval (vector store, depends on index size)
+    # - SQL execution (depends on database performance)
+    state["processing_start_time"] = _time.perf_counter()
+    print(f"[DEBUG] processing_start_time set")
+
     question = state.get("question", "")
     ctx = state.get("context", "")
     
@@ -990,11 +1134,10 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     _t0 = _time.perf_counter()
     obj = try_llm_json(llm, prompt, max_attempts=2, oom_retry_wait=OOM_WAIT_TIME)
     _inference_time = _time.perf_counter() - _t0
-    
-    # Store inference time in state for accurate latency measurement
+
+    # Store inference time in state for debugging (not logged to reduce noise)
     state["draft_inference_time"] = _inference_time
-    print(f"[DRAFT] Inference time: {_inference_time:.2f}s")
-    
+
     if obj is None:
         return {**state, "draft_sql": "SELECT 'Error: LLM failed';"}
         
@@ -1520,6 +1663,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     final_sql = final_sql.strip()
     if not final_sql.endswith(";"): final_sql += ";"
+
+    # 🆕 END TIMER: Calculate processing time (Model ready → Final SQL complete)
+    # This is the core text-to-SQL processing latency for thesis benchmark
+    processing_start = state.get("processing_start_time")
+    if processing_start:
+        processing_time = _time.perf_counter() - processing_start
+        state["processing_time"] = processing_time
+        print(f"[DEBUG] Processing time: {processing_time:.2f}s")
 
     return {
         **state,

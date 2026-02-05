@@ -30,6 +30,9 @@ class RAGState(TypedDict, total=False):
     # Benchmark policy / audit trail
     group_by_policy: str
     group_by_added_exprs: List[str]
+    # Benchmark timing
+    processing_start_time: float
+    processing_time: float
 
 def make_state(paths, question: str) -> RAGState:
     return {
