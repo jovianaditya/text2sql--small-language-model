@@ -1606,6 +1606,25 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     # 🆕 Skip aggregation rules for winner-row queries (they use ROW_NUMBER, not GROUP BY)
     is_reporting = (qtype == "aggregate") or has_grouping or has_exclusion
     if is_reporting and complexity == "complex" and not is_winner_row:
+        # 🆕 PRIMARY TABLE GUIDANCE (Soft Hint)
+        # Get primary_table from router decision for multi-table queries
+        primary_table = state.get("primary_table") if state else None
+        primary_reason = state.get("primary_table_reason") if state else None
+
+        if primary_table:
+            other_tables = state.get("router_tables", []) if state else []
+            other_tables = [t for t in other_tables if t != primary_table]
+            other_tables_str = ", ".join(other_tables) if other_tables else "none"
+
+            # Add soft hint (not hard requirement)
+            hint_msg = f"TABLE SELECTION GUIDANCE: Based on query analysis, '{primary_table}' appears to be the primary table"
+            if primary_reason:
+                hint_msg += f" (reason: {primary_reason})"
+            hint_msg += f". This suggests using FROM {primary_table} and JOINing {other_tables_str} if needed."
+            hint_msg += " Use your judgment to confirm this is the optimal structure."
+
+            constraints.append(hint_msg)
+
         # 🆕 Check for "only X who have Y" filtering pattern
         # This pattern requires INNER JOIN (filter out non-matching rows), not LEFT JOIN
         q_lower = question.lower()

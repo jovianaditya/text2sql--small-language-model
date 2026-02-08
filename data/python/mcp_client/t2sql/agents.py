@@ -499,28 +499,37 @@ def router_agent(state: RAGState) -> RAGState:
     for tbl in whitelisted_tables:
         if f"- {tbl}:" not in ctx and f"- `{tbl}`:" not in ctx:
             continue
-        
+
         table_word = tbl.lower().rstrip('s')
-        
+
         # Buat copy pertanyaan khusus untuk scanning tabel ini
         search_scope = question
-        
+
         if table_word in ignore_patterns:
             patterns = ignore_patterns[table_word]
             for pat in patterns:
                 search_scope = re.sub(pat, " ", search_scope)
-        
+
         # Cek 2: Cari kata tabel di search_scope yang SUDAH BERSIH
         if re.search(rf"\b{table_word}s?\b", search_scope):
-            
+
             # Deteksi referensi ID saja (FK)
             is_just_id_ref = re.search(rf"\b{table_word}s?\s+(number|id|code|kode|nomor)\b", search_scope)
-            
+
             if is_just_id_ref:
                 if re.search(rf"\b{table_word}s?\b(?!\s+(number|id|code|kode|nomor))", search_scope):
                     relevant_tables.append(tbl)
+                    if RETRIEVE_DEBUG:
+                        print(f"[Router] ✓ Added {tbl} (with ID ref check)")
             else:
                 relevant_tables.append(tbl)
+                if RETRIEVE_DEBUG:
+                    print(f"[Router] ✓ Added {tbl} (direct match)")
+        elif RETRIEVE_DEBUG:
+            pattern_str = rf"\b{table_word}s?\b"
+            print(f"[Router] ✗ Skipped {tbl} (no match in question)")
+            print(f"[Router]   Pattern: {pattern_str}")
+            print(f"[Router]   In question? {bool(re.search(pattern_str, search_scope))}")
     
     # ═══════════════════════════════════════════════════════════════════
     # STEP 2: FK-ONLY FILTER (Hapus tabel yang hanya disebutkan untuk FK)
@@ -600,233 +609,231 @@ def router_agent(state: RAGState) -> RAGState:
     is_aggregation = has_math or has_group_word
     
     # ═══════════════════════════════════════════════════════════════════
-    # STEP 3: 🆕 FK INFERENCE (Dynamic from Context)
+    # STEP 3: 🆕 GRAPH-BASED TABLE SELECTION (Robust, Schema-Agnostic)
     # ═══════════════════════════════════════════════════════════════════
-    # Rule: Remove table A if:
-    #   1. Table A's only mentioned column is a FK that exists in table B
-    #   2. AND the question does NOT ask for any OTHER column from table A
+    # This approach uses graph theory to find the minimal set of tables needed:
+    # 1. Build FK relationship graph
+    # 2. Identify "seed" tables (tables directly referenced in question)
+    # 3. Find minimal connecting subgraph (shortest paths between seeds)
+    # 4. Remove tables not in the connecting subgraph
     #
-    # Dynamic detection: Parse "FK to X.Y" patterns from context (JSONL metadata)
-    
+    # Advantages:
+    # - Works for any schema (no hardcoded patterns)
+    # - Based on actual FK relationships
+    # - Finds minimal table set for valid joins
+    # - Handles multi-hop joins correctly
+
     question_lower = question.lower()
-    
-    # --- DYNAMIC: Extract FK columns from context ---
-    # Multiple patterns to handle different context formats:
-    # 1. Card format: "table: employees | column: officeCode | desc: ... FK to offices.officeCode"
-    # 2. JSONL format: "employees.officeCode ... FK to offices.officeCode"
-    
-    fk_columns_by_table = {}  # {source_table: set of FK column names}
-    fk_targets = {}  # {target_table: set of source_tables that reference it}
-    
+
+    # --- STEP 3.1: Build FK Relationship Graph ---
+    # Graph structure: adjacency list with bidirectional edges
+    # fk_graph: {table: {neighbor: (fk_column, reverse_fk_column)}}
+    fk_graph = {}
+    fk_columns_by_table = {}  # {source_table: {fk_column: target_table}}
+
     # Pattern 1: Card format "table: X | column: Y | ... FK to Z.W"
     fk_pattern_card = re.compile(r'table:\s*(\w+)\s*\|\s*column:\s*(\w+).*?FK to (\w+)\.(\w+)', re.IGNORECASE)
     for match in fk_pattern_card.finditer(ctx):
         source_table = match.group(1).lower()
         source_col = match.group(2).lower()
         target_table = match.group(3).lower()
-        
+
+        # Add to fk_columns_by_table for reference
         if source_table not in fk_columns_by_table:
-            fk_columns_by_table[source_table] = set()
-        fk_columns_by_table[source_table].add(source_col)
-        
-        # Track which tables are FK targets (referenced by other tables)
-        if target_table not in fk_targets:
-            fk_targets[target_table] = set()
-        fk_targets[target_table].add(source_table)
-    
+            fk_columns_by_table[source_table] = {}
+        fk_columns_by_table[source_table][source_col] = target_table
+
+        # Build bidirectional graph
+        if source_table not in fk_graph:
+            fk_graph[source_table] = {}
+        if target_table not in fk_graph:
+            fk_graph[target_table] = {}
+
+        # Forward edge: source -> target with FK column
+        fk_graph[source_table][target_table] = (source_col, None)
+        # Reverse edge: target -> source (for path finding)
+        fk_graph[target_table][source_table] = (None, source_col)
+
     # Pattern 2: Dot notation "X.Y ... FK to Z.W"
     fk_pattern_dot = re.compile(r'(\w+)\.(\w+).*?FK to (\w+)\.(\w+)', re.IGNORECASE)
     for match in fk_pattern_dot.finditer(ctx):
         source_table = match.group(1).lower()
         source_col = match.group(2).lower()
         target_table = match.group(3).lower()
-        
+
         if source_table not in fk_columns_by_table:
-            fk_columns_by_table[source_table] = set()
-        fk_columns_by_table[source_table].add(source_col)
-        
-        if target_table not in fk_targets:
-            fk_targets[target_table] = set()
-        fk_targets[target_table].add(source_table)
-    
-    # --- DYNAMIC: Build non-FK columns per table ---
-    # Store BOTH original (for camelCase regex) and lowercase (for FK comparison)
-    non_fk_columns_by_table = {}  # {table: list of (original_col, lowercase_col)}
-    for tbl, cols in allowed_identifiers.items():
+            fk_columns_by_table[source_table] = {}
+        fk_columns_by_table[source_table][source_col] = target_table
+
+        if source_table not in fk_graph:
+            fk_graph[source_table] = {}
+        if target_table not in fk_graph:
+            fk_graph[target_table] = {}
+
+        fk_graph[source_table][target_table] = (source_col, None)
+        fk_graph[target_table][source_table] = (None, source_col)
+
+    # --- STEP 3.2: Identify Seed Tables ---
+    # Seed tables are tables that have direct evidence from the question:
+    # 1. Columns mentioned (including camelCase variants)
+    # 2. "For each X" patterns
+    # 3. Table name + attribute patterns ("employee name", "customer number")
+    # 4. Aggregate keywords with table context
+
+    seed_tables = set()
+    seed_evidence = {}  # {table: [evidence_strings]}
+
+    for tbl in relevant_tables:
         tbl_lower = tbl.lower()
-        fk_cols = fk_columns_by_table.get(tbl_lower, set())
-        non_fk_list = [(c, c.lower()) for c in cols if c.lower() not in fk_cols]
-        if non_fk_list:
-            non_fk_columns_by_table[tbl_lower] = non_fk_list
-    
-    tables_to_remove = []
-    for tbl in list(relevant_tables):
-        tbl_lower = tbl.lower()
-        
-        # Check if question asks for any non-FK column from this table
-        needs_this_table = False
-        non_fk_list = non_fk_columns_by_table.get(tbl_lower, [])
-        
-        for original_col, col_lower in non_fk_list:
-            # Generate human-readable variants: "customerName" -> "customer name"
+        tbl_cols = allowed_identifiers.get(tbl, [])
+        evidence = []
+
+        # Check 1: Direct column mentions (all columns, including FKs)
+        for col in tbl_cols:
+            col_lower = col.lower()
             col_variants = [col_lower]
-            # Add space-separated variant for camelCase (use ORIGINAL for regex)
-            spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', original_col).lower()
+            # Add space-separated variant for camelCase
+            spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
             if spaced != col_lower:
                 col_variants.append(spaced)
-            
+
             for variant in col_variants:
                 if variant in question_lower:
-                    needs_this_table = True
-                    print(f"[Router] ✋ Keeping {tbl}: column reference found in question")
+                    evidence.append(f"column '{col}'")
                     break
-            if needs_this_table:
+
+        # Check 2: "For each X" patterns
+        # Handle both plural and singular, with optional words in between (e.g., "for each such customer")
+        table_singular = tbl_lower.rstrip('s')
+        for_each_patterns = [
+            rf"\bfor\s+each\s+(?:\w+\s+)?{tbl_lower}\b",      # "for each customers", "for each such customers"
+            rf"\bfor\s+each\s+(?:\w+\s+)?{table_singular}\b",  # "for each customer", "for each such customer"
+            rf"\bper\s+(?:\w+\s+)?{tbl_lower}\b",             # "per customers", "per such customers"
+            rf"\bper\s+(?:\w+\s+)?{table_singular}\b",         # "per customer", "per such customer"
+            rf"\beach\s+(?:\w+\s+)?{tbl_lower}\b",            # "each customers", "each such customers"
+            rf"\beach\s+(?:\w+\s+)?{table_singular}\b",        # "each customer", "each such customer"
+        ]
+        if any(re.search(p, question_lower) for p in for_each_patterns):
+            evidence.append("'for each' pattern")
+
+        # Check 3: Table name + attribute patterns
+        table_singular = tbl_lower.rstrip('s')
+        table_patterns = [
+            rf"\b{table_singular}\s+(name|number|id|code)\b",
+            rf"\b{tbl_lower}\s+(name|number|id|code)\b",
+        ]
+        if any(re.search(p, question_lower) for p in table_patterns):
+            evidence.append("table+attribute pattern")
+
+        # Check 4: Aggregate keywords with table mention
+        if has_math or has_group_word:
+            # Patterns like "total orders", "count of customers", etc.
+            aggregate_patterns = [
+                rf"\b(total|sum|count|average|avg)\s+(of\s+)?{tbl_lower}\b",
+                rf"\b{tbl_lower}\s+(total|sum|count|average)\b",
+            ]
+            if any(re.search(p, question_lower) for p in aggregate_patterns):
+                evidence.append("aggregate context")
+
+        if evidence:
+            seed_tables.add(tbl_lower)
+            seed_evidence[tbl_lower] = evidence
+            if RETRIEVE_DEBUG:
+                print(f"[Router] 🌱 Seed table: {tbl} (evidence: {', '.join(evidence)})")
+
+    # --- STEP 3.3: Find Minimal Connecting Subgraph ---
+    # Use BFS to find shortest paths between all pairs of seed tables
+    # The union of all paths = minimal table set needed
+
+    def bfs_shortest_path(start, end, graph):
+        """Find shortest path between start and end using BFS."""
+        if start == end:
+            return [start]
+
+        queue = [(start, [start])]
+        visited = {start}
+
+        while queue:
+            node, path = queue.pop(0)
+
+            for neighbor in graph.get(node, {}):
+                if neighbor == end:
+                    return path + [neighbor]
+
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, path + [neighbor]))
+
+        return None  # No path found
+
+    # Collect all tables in the minimal connecting subgraph
+    tables_in_subgraph = set(seed_tables)
+
+    if len(seed_tables) >= 2:
+        # Find paths between all pairs of seed tables
+        seed_list = list(seed_tables)
+        for i, start in enumerate(seed_list):
+            for end in seed_list[i+1:]:
+                path = bfs_shortest_path(start, end, fk_graph)
+                if path:
+                    tables_in_subgraph.update(path)
+                # Path removed: not passed to LLM, only internal use
+
+    # --- STEP 3.4: Remove Tables Not in Connecting Subgraph ---
+    # Keep tables that are:
+    # 1. Seed tables (direct evidence)
+    # 2. In the minimal connecting subgraph (needed for joins)
+    # 3. NOT in the subgraph but might be needed for aggregation (edge case)
+
+    tables_to_remove = []
+    for tbl in relevant_tables:
+        tbl_lower = tbl.lower()
+
+        # Keep if it's a seed table
+        if tbl_lower in seed_tables:
+            if RETRIEVE_DEBUG:
+                print(f"[Router] ✅ Keeping {tbl}: seed table")
+            continue
+
+        # Keep if it's in the connecting subgraph
+        if tbl_lower in tables_in_subgraph:
+            if RETRIEVE_DEBUG:
+                print(f"[Router] ✅ Keeping {tbl}: in connecting subgraph")
+            continue
+
+        # Keep if it has outgoing FKs to a seed table (might be needed for query)
+        has_fk_to_seed = False
+        for target in fk_graph.get(tbl_lower, {}):
+            if target in seed_tables:
+                has_fk_to_seed = True
                 break
-        
-        if needs_this_table:
-            continue  # Don't remove this table
-        
-        # --- CASE 1: Table has FK that exists in another table (enhanced with aggregate detection) ---
-        fk_cols = fk_columns_by_table.get(tbl_lower, set())
-        tbl_all_cols = set(c.lower() for c in allowed_identifiers.get(tbl, []))
-        
-        for other_tbl in relevant_tables:
-            if other_tbl == tbl:
+
+        if has_fk_to_seed:
+            # This table references a seed table via FK
+            # Check if we need any non-FK columns from it
+            non_fk_cols = [c for c in allowed_identifiers.get(tbl, [])
+                          if c.lower() not in fk_columns_by_table.get(tbl_lower, {})]
+            needs_non_fk = False
+            for col in non_fk_cols:
+                col_variants = [col.lower()]
+                spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
+                if spaced != col.lower():
+                    col_variants.append(spaced)
+                if any(v in question_lower for v in col_variants):
+                    needs_non_fk = True
+                    break
+
+            if needs_non_fk:
+                if RETRIEVE_DEBUG:
+                    print(f"[Router] ✅ Keeping {tbl}: has FK to seed + needs non-FK columns")
                 continue
-            other_cols = set(c.lower() for c in allowed_identifiers.get(other_tbl, []))
-            
-            # If FK exists in other table AND we don't need non-FK cols from this table
-            if fk_cols & other_cols and not needs_this_table:
-                # Build spaced variants for non-FK cols check
-                non_fk_variants = set()
-                for orig_col, col_lower in non_fk_list:
-                    non_fk_variants.add(col_lower)
-                    spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', orig_col).lower()
-                    if spaced != col_lower:
-                        non_fk_variants.add(spaced)
-                
-                # CHECK 1: Direct column mention
-                question_mentions_non_fk = any(v in question_lower for v in non_fk_variants)
 
-                # 🆕 CHECK 2: Aggregate context detection (ENHANCED VERSION)
-                # Only keep table if aggregate has relational/possessive context
-                # This prevents false removal of tables needed for COUNT/SUM operations
-                table_singular = tbl_lower.rstrip('s')
+        # Mark for removal
+        tables_to_remove.append(tbl)
+        if RETRIEVE_DEBUG:
+            print(f"[Router] ❌ Removing {tbl}: not in minimal subgraph")
 
-                # Build more comprehensive aggregate patterns
-                aggregate_patterns = [
-                    # Pattern 1: "count/number of <table> they/that/which <verb>"
-                    # Matches: "orders they placed", "payments they made"
-                    rf"\b(count|total|sum|number)\s+of\s+{tbl_lower}\s+(they|that|which|who)\s+(placed|made|have|has|created|completed)\b",
-
-                    # Pattern 2: "<table> <possessive> placed/made"
-                    # Matches: "orders each customer placed", "payments customers made"
-                    rf"\b{tbl_lower}\s+(each|every|that)\s+\w+\s+(placed|made|have|has|created)\b",
-
-                    # Pattern 3: "for each X ... <table>" (cross-reference)
-                    # Matches: "total orders for each customer"
-                    rf"\b(for\s+each|per|every)\s+(?!{tbl_lower})\w+.*?\b{tbl_lower}\b",
-
-                    # 🆕 Pattern 4: "<table> amount/total" with aggregate keywords
-                    # Matches: "order amount", "total order", "payment total", "order value"
-                    rf"\b(total|sum|average|avg)\s+(of\s+)?{table_singular}?\b",
-                    rf"\b{table_singular}?\s+(amount|total|value|cost)\b",
-
-                    # 🆕 Pattern 5: Aggregate with calculation keywords
-                    # Matches: "sum of quantity", "total price", "calculate total"
-                    rf"\b(calculate|show|display|find|get)\s+(total|sum|average|count)\b",
-                    rf"\b(total|sum|average|count|avg)\s+(of\s+)?(quantity|price|amount|value)\b",
-
-                    # 🆕 Pattern 6: "have/has placed <table>"
-                    # Matches: "customers who have placed orders"
-                    rf"\b(who|that|which)\s+(have|has)\s+placed\s+{tbl_lower}\b",
-
-                    # 🆕 Pattern 7: Numeric data indicators
-                    # If question asks for quantity/price/amount calculation, might need this table
-                    rf"\b(quantity|price|amount|total|sum)\s+(of|from|for|in)\s+{tbl_lower}\b",
-                ]
-
-                needs_for_aggregate = any(
-                    re.search(pat, question_lower) for pat in aggregate_patterns
-                )
-
-                # 🆕 Additional check: If numeric calculation keywords present, be more conservative
-                # This catches cases like "sum of quantity ordered multiplied by price each"
-                numeric_calc_keywords = ['quantity', 'price', 'amount', 'multiplied', 'times', 'each', 'per unit']
-                has_numeric_calc = any(kw in question_lower for kw in numeric_calc_keywords)
-
-                # 🆕 For orders table specifically: if it's mentioned with customers in aggregate context
-                needs_orders_for_aggregate = False
-                if tbl_lower == 'orders':
-                    # Check patterns: "customers who placed orders", "orders placed by customers"
-                    if re.search(rf"\b(people|customers|clients|employees)\s+(who|that)\s+(have|has|placed)\s+{tbl_lower}\b", question_lower):
-                        needs_orders_for_aggregate = True
-                    # Check: "total amount", "order amount" patterns
-                    if re.search(rf"\b(total|sum|calculate).*?\b(order|orders)\b", question_lower):
-                        needs_orders_for_aggregate = True
-
-                # 🆕 For orderdetails table specifically: if numeric calculation needed
-                needs_orderdetails_for_numeric = False
-                if tbl_lower == 'orderdetails' or tbl_lower == 'order_details':
-                    if has_numeric_calc:
-                        # Check if calculation involves orderdetail columns
-                        calc_patterns = [
-                            r'quantity\s+(ordered|instock)',
-                            r'price\s+each',
-                            r'order\s+detail',
-                            r'line\s+item',
-                        ]
-                        if any(re.search(pat, question_lower) for pat in calc_patterns):
-                            needs_orderdetails_for_numeric = True
-
-                # Combine all aggregate-related needs
-                needs_for_aggregate = (
-                    needs_for_aggregate or
-                    needs_orders_for_aggregate or
-                    needs_orderdetails_for_numeric
-                )
-
-                # Only remove table if:
-                # 1. No direct column mention AND
-                # 2. Not needed for aggregate operations
-                if not question_mentions_non_fk and not needs_for_aggregate:
-                    print(f"[Router] 🎯 FK Inference: {tbl} only provides FK, removing")
-                    tables_to_remove.append(tbl)
-                    break
-                elif needs_for_aggregate:
-                    print(f"[Router] ✋ Keeping {tbl}: needed for query context")
-                    needs_this_table = True  # Mark as needed so CASE 2 won't remove it
-                    break
-        
-        # --- CASE 2: Table is FK TARGET (referenced by another table already in relevant_tables) ---
-        # Example: offices is referenced by employees.officeCode
-        # If employees is in relevant_tables and we don't need offices.city/country/etc, remove offices
-        if tbl_lower in fk_targets and tbl not in tables_to_remove:
-            source_tables = fk_targets[tbl_lower]
-            # Check if any source table is already in relevant_tables
-            source_in_relevant = any(src in [t.lower() for t in relevant_tables] for src in source_tables)
-            
-            if source_in_relevant and not needs_this_table:
-                # Check if question mentions any non-PK column from this table
-                # PK columns typically end with 'code', 'number', 'id' - same pattern as FK
-                pk_like_cols = {c for c in tbl_all_cols if c.endswith('code') or c.endswith('number') or c.endswith('id')}
-                non_pk_cols = tbl_all_cols - pk_like_cols
-
-                # Build spaced variants for non-PK cols
-                non_pk_variants = set()
-                for c in allowed_identifiers.get(tbl, []):
-                    if c.lower() in non_pk_cols:
-                        non_pk_variants.add(c.lower())
-                        spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', c).lower()
-                        if spaced != c.lower():
-                            non_pk_variants.add(spaced)
-
-                question_mentions_data = any(v in question_lower for v in non_pk_variants)
-
-                if not question_mentions_data:
-                    print(f"[Router] 🎯 FK Target Inference: {tbl} is only FK target, source table already present, removing")
-                    tables_to_remove.append(tbl)
-    
+    # Apply removals
     for tbl in tables_to_remove:
         if tbl in relevant_tables:
             relevant_tables.remove(tbl)
@@ -835,7 +842,8 @@ def router_agent(state: RAGState) -> RAGState:
     if not relevant_tables and whitelisted_tables:
         fallback_table = list(whitelisted_tables)[0]
         relevant_tables.append(fallback_table)
-        print(f"[Router] ⚠️ All tables removed by FK inference, falling back to: {fallback_table}")
+        if RETRIEVE_DEBUG:
+            print(f"[Router] ⚠️ All tables removed, falling back to: {fallback_table}")
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 4: DETEKSI SINYAL (Complete Detection)
@@ -881,7 +889,93 @@ def router_agent(state: RAGState) -> RAGState:
     
     is_by_logic = ("by " in question_lower and not any(re.search(rf"\b{re.escape(s)}\b", question_lower) for s in explicit_sort) and (has_math or is_ranking))
     has_grouping = has_group_word or is_by_logic
-    
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 4.5: PRIMARY TABLE DETERMINATION
+    # ═══════════════════════════════════════════════════════════════════
+    # Determine which table should be the FROM table (primary table)
+    # This provides guidance to LLM for SQL generation
+    #
+    # Priority rules:
+    # 1. "For each X" → X is primary table (GROUP BY context)
+    # 2. "Show X from Y" / "X in Y" → Y is primary table
+    # 3. "All X that Y" → X is primary table (filtering on X)
+    # 4. Table with most direct evidence (column mentions)
+    # 5. First table in list (fallback)
+
+    primary_table = None
+    primary_reason = None
+
+    if len(relevant_tables) == 1:
+        # Single table - easy decision
+        primary_table = relevant_tables[0]
+        primary_reason = "single table"
+    else:
+        # Multiple tables - apply priority rules
+
+        # Rule 1: "For each X" pattern (highest priority)
+        # Handle both plural and singular, with optional words in between
+        for tbl in relevant_tables:
+            tbl_lower = tbl.lower()
+            table_singular = tbl_lower.rstrip('s')
+            for_each_patterns = [
+                rf"\bfor\s+each\s+(?:\w+\s+)?{tbl_lower}\b",
+                rf"\bfor\s+each\s+(?:\w+\s+)?{table_singular}\b",
+                rf"\bper\s+(?:\w+\s+)?{tbl_lower}\b",
+                rf"\bper\s+(?:\w+\s+)?{table_singular}\b",
+                rf"\beach\s+(?:\w+\s+)?{tbl_lower}\b",
+                rf"\beach\s+(?:\w+\s+)?{table_singular}\b",
+            ]
+            if any(re.search(p, question_lower) for p in for_each_patterns):
+                primary_table = tbl
+                primary_reason = "'for each' pattern"
+                break
+
+        # Rule 2: Not yet found, check "show X from Y" / "X in Y" patterns
+        if not primary_table:
+            for tbl in relevant_tables:
+                tbl_lower = tbl.lower()
+                # Patterns: "customers who placed", "offices in", "products from"
+                from_in_patterns = [
+                    rf"\b\w+\s+(from|in)\s+{tbl_lower}\b",
+                    rf"\b{tbl_lower}\s+who\s+",
+                    rf"\b{tbl_lower}\s+that\s+",
+                ]
+                if any(re.search(p, question_lower) for p in from_in_patterns):
+                    primary_table = tbl
+                    primary_reason = "from/in pattern"
+                    break
+
+        # Rule 3: Not yet found, check "all X that Y" pattern
+        if not primary_table:
+            for tbl in relevant_tables:
+                tbl_lower = tbl.lower()
+                if re.search(rf"\ball\s+{tbl_lower}\s+", question_lower):
+                    primary_table = tbl
+                    primary_reason = "'all X' pattern"
+                    break
+
+        # Rule 4: Not yet found, use table with most seed evidence
+        if not primary_table:
+            # Use the seed_tables set from earlier (tables with direct evidence)
+            best_score = -1
+            for tbl in relevant_tables:
+                tbl_lower = tbl.lower()
+                if tbl_lower in seed_evidence:
+                    score = len(seed_evidence[tbl_lower])
+                    if score > best_score:
+                        best_score = score
+                        primary_table = tbl
+                        primary_reason = f"most evidence ({score} factors)"
+
+        # Rule 5: Fallback - first table
+        if not primary_table:
+            primary_table = relevant_tables[0]
+            primary_reason = "first table (fallback)"
+
+    if RETRIEVE_DEBUG:
+        print(f"[Router] 🎯 Primary Table: {primary_table} (reason: {primary_reason})")
+
     # ═══════════════════════════════════════════════════════════════════
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
     # ═══════════════════════════════════════════════════════════════════
@@ -975,10 +1069,12 @@ def router_agent(state: RAGState) -> RAGState:
     print(f"[Router] Detected Tables: {relevant_tables}")
     print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, OrdinalRank:{is_ordinal_ranking}, Exclusion:{has_exclusion}, WindowAgg:{is_window_aggregate}, ExplicitRank:{is_explicit_rank_function}")
     print(f"[Router] Decision: {complexity.upper()} -> {chosen_model}")
-    
+
     return {
         **state,
         "router_tables": relevant_tables,
+        "primary_table": primary_table,
+        "primary_table_reason": primary_reason,
         "target_model": chosen_model,
         "router_decision": {
             "complexity": complexity,

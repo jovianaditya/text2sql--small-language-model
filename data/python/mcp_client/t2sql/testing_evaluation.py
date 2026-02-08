@@ -559,13 +559,31 @@ async def run_batch_eval(
     paths: list[str] | None = None,
     execute_groundtruth: bool = True,
     skip_warmup: bool = False,
+    difficulties: list[str] | None = None,
 ):
     """
     Main batch evaluation function.
+
+    Args:
+        testset_path: Path to test set YAML file
+        output_path: Path to output file (.xlsx for Excel, .csv for CSV)
+        paths: JSONL paths for context
+        execute_groundtruth: Whether to execute groundtruth SQL for comparison
+        skip_warmup: Skip warmup phase (not recommended)
+        difficulties: List of difficulties to filter (e.g., ['easy', 'hard']). None = all
     """
     # Load test cases
-    cases = load_testset(testset_path)
-    print(f"Loaded {len(cases)} test cases from {testset_path}")
+    all_cases = load_testset(testset_path)
+    print(f"Loaded {len(all_cases)} test cases from {testset_path}")
+
+    # Filter by difficulty if specified
+    if difficulties:
+        difficulties_lower = [d.lower() for d in difficulties]
+        cases = [c for c in all_cases if c.get("difficulty", "").lower() in difficulties_lower]
+        print(f"Filtered to {len(cases)} test cases with difficulty: {', '.join(difficulties)}")
+    else:
+        cases = all_cases
+        print(f"No difficulty filter - running all {len(cases)} test cases")
     
     # Default paths for JSONL - resolve from config like CLI does
     if paths is None or len(paths) == 0:
@@ -672,7 +690,24 @@ async def run_batch_eval(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch evaluation for Text-to-SQL pipeline")
+    parser = argparse.ArgumentParser(
+        description="Batch evaluation for Text-to-SQL pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Test all questions
+  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx
+
+  # Test only hard questions
+  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --hard
+
+  # Test easy and medium questions
+  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy --medium
+
+  # Test only medium questions (single difficulty)
+  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --medium
+        """
+    )
     parser.add_argument(
         "--testset", "-t",
         required=True,
@@ -693,21 +728,49 @@ def main():
         action="store_true",
         help="Skip warmup phase (not recommended - will cause cold start bias)"
     )
-    
+    # Difficulty filter arguments
+    parser.add_argument(
+        "--easy",
+        action="store_true",
+        help="Only test easy questions"
+    )
+    parser.add_argument(
+        "--medium",
+        action="store_true",
+        help="Only test medium questions"
+    )
+    parser.add_argument(
+        "--hard",
+        action="store_true",
+        help="Only test hard questions"
+    )
+
     args = parser.parse_args()
-    
+
+    # Build difficulty filter list
+    difficulties = []
+    if args.easy:
+        difficulties.append("easy")
+    if args.medium:
+        difficulties.append("medium")
+    if args.hard:
+        difficulties.append("hard")
+
     # Generate default output filename if not specified
     if args.output is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         # Default to Excel if available
         ext = ".xlsx" if HAS_EXCEL else ".csv"
-        args.output = f"eval_results_{timestamp}{ext}"
-    
+        # Add difficulty suffix if filtering
+        suffix = f"_{'-'.join(difficulties)}" if difficulties else ""
+        args.output = f"eval_results{suffix}_{timestamp}{ext}"
+
     asyncio.run(run_batch_eval(
         testset_path=args.testset,
         output_path=args.output,
         execute_groundtruth=not args.no_groundtruth_exec,
         skip_warmup=args.skip_warmup,
+        difficulties=difficulties if difficulties else None,
     ))
 
 

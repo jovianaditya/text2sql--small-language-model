@@ -45,3 +45,9 @@ done
 
 # running EVALUATION
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx"
+# hard
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --hard"
+# medium
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy --medium"
+# easy
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy --easy"
