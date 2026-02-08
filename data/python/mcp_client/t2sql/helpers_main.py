@@ -46,10 +46,10 @@ from .helpers_core import (
     _add_missing_count_for_group_by,
     # phase 5 — Pattern, REGEXP, and Predicate Normalization
     _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _guardrail_fix_mysql_regexp_literals,
-    # phase 6 
+    # phase 6
     _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _strip_unneeded_count_distinct, _parse_from_join_aliases,
     # phase 7
-    _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes, _ALIAS_OVERRIDES
+    _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -1058,6 +1058,346 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
         else:
             out_parts.append(replace_in_code_segment(part))
     return "".join(out_parts)
+
+# ======================================================================
+# ==================== DYNAMIC JOIN CONTEXT FROM RETRIEVAL ==============
+# ======================================================================
+
+def _extract_fk_from_context(ctx: str) -> Dict[str, Dict[str, str]]:
+    """
+    🆕 Dynamically extract FK relationships from retrieval context.
+
+    Parses context for "FK to X.Y" patterns (from JSONL metadata).
+
+    Returns:
+        {
+            "source_table": {"fk_column": "target_table"}
+        }
+    """
+    fk_map = defaultdict(dict)
+
+    # Pattern: "FK to targetTable.targetColumn"
+    fk_pattern = re.compile(r'FK to (\w+)\.(\w+)', re.IGNORECASE)
+
+    # Also extract source table and column from context lines
+    # Format: "table: X | column: Y | ... FK to Z.W"
+    for line in ctx.split('\n'):
+        match = fk_pattern.search(line)
+        if match:
+            target_table = match.group(1).lower()
+            target_col = match.group(2).lower()
+
+            # Try to find source table and column in the same line
+            table_match = re.search(r'table:\s*(\w+)', line, re.IGNORECASE)
+            col_match = re.search(r'column:\s*(\w+)', line, re.IGNORECASE)
+
+            if table_match and col_match:
+                source_table = table_match.group(1).lower()
+                source_col = col_match.group(1).lower()
+                fk_map[source_table][source_col] = target_table
+
+    return dict(fk_map)
+
+
+def _infer_tables_from_question_columns(
+    question: str,
+    ranked_cols: list,
+    router_tables: list
+) -> Dict[str, List[str]]:
+    """
+    🆕 Infer which tables are needed based on question mentions of columns.
+
+    When question doesn't explicitly mention table names (e.g., "total amount", "quantity ordered"),
+    use retrieval results to find which tables have matching columns.
+
+    Returns:
+        {
+            "table_name": ["matched_column1", "matched_column2", ...]
+        }
+    """
+    q_lower = question.lower()
+
+    # Build spaced variants for camelCase columns (e.g., "quantityOrdered" -> "quantity ordered")
+    table_matches = defaultdict(list)
+
+    for tbl, col in ranked_cols:
+        col_lower = col.lower()
+        # Direct match
+        if col_lower in q_lower:
+            table_matches[tbl.lower()].append(col)
+            continue
+
+        # Spaced variant for camelCase
+        spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
+        if spaced in q_lower and spaced != col_lower:
+            table_matches[tbl.lower()].append(col)
+            continue
+
+        # Check for word boundary matches (e.g., "amount" matches "paymentAmount")
+        col_words = set(col_lower.split('_'))
+        for word in col_words:
+            if len(word) >= 3 and f'\\b{word}\\b' in q_lower:
+                table_matches[tbl.lower()].append(col)
+                break
+
+    # Always include tables explicitly mentioned in router_tables
+    for tbl in router_tables:
+        tbl_lower = tbl.lower()
+        if tbl_lower not in table_matches:
+            table_matches[tbl_lower] = []
+
+    return dict(table_matches)
+
+
+def _build_fk_join_chain(
+    question: str,
+    ranked_cols: list,
+    router_tables: list,
+    fk_map: Dict[str, Dict[str, str]]
+) -> List[Dict[str, str]]:
+    """
+    🆕 Build FK join chain for multi-table queries.
+
+    For questions that mention columns from multiple tables but don't explicitly
+    specify the join path, use FK relationships to construct the join chain.
+
+    Returns:
+        [
+            {"from": "table1", "join": "table2", "on": "table1.fk_col = table2.pk_col"},
+            ...
+        ]
+    """
+    if len(router_tables) < 2:
+        return []
+
+    # Infer which tables are needed based on question
+    table_matches = _infer_tables_from_question_columns(question, ranked_cols, router_tables)
+
+    if len(table_matches) < 2:
+        return []
+
+    # Build FK join chain
+    join_chain = []
+
+    # For each pair of tables, check if there's a FK relationship
+    router_tables_lower = [t.lower() for t in router_tables]
+
+    for i, source_tbl in enumerate(router_tables_lower):
+        if source_tbl not in fk_map:
+            continue
+
+        for fk_col, target_tbl in fk_map[source_tbl].items():
+            if target_tbl in router_tables_lower:
+                join_chain.append({
+                    "from": source_tbl,
+                    "join": target_tbl,
+                    "on": f"{source_tbl}.{fk_col} = {target_tbl}.{_infer_target_column(fk_col, target_tbl, ranked_cols)}"
+                })
+
+    return join_chain
+
+
+def _infer_target_column(
+    fk_col: str,
+    target_table: str,
+    ranked_cols: list
+) -> str:
+    """
+    🆕 Infer the target column name for a FK relationship.
+
+    Example: If fk_col is "customerNumber" and target_table is "customers",
+    the target column is likely "customerNumber".
+    """
+    # Check if we have this column in ranked_cols
+    for tbl, col in ranked_cols:
+        if tbl.lower() == target_table.lower():
+            col_lower = col.lower()
+            # Common pattern: fk_col = target_col (e.g., customerNumber -> customerNumber)
+            if fk_col.lower() == col_lower:
+                return col
+
+    # Fallback: use fk_col as target_col (common pattern)
+    return fk_col
+
+
+def _build_dynamic_join_context(
+    state: "RAGState",
+    router_decision: dict = None
+) -> str:
+    """
+    🆕 Build dynamic join context from retrieval results and FK relationships.
+
+    Uses:
+    1. ranked_cols from state (what retrieval found)
+    2. FK relationships from context
+    3. router_tables from state
+    4. Question column mentions (implicit table detection)
+
+    Returns:
+        Context block with FK relationships and detected tables
+    """
+    ranked_cols = state.get("ranked_cols", [])
+    router_tables = state.get("router_tables", [])
+    question = state.get("question", "")
+    ctx = state.get("context", "")
+
+    if not ranked_cols or not router_tables:
+        return ""
+
+    fk_map = _extract_fk_from_context(ctx)
+
+    lines = []
+    lines.append("\n### JOIN RELATIONSHIPS")
+
+    # Build FK join chain
+    join_chain = _build_fk_join_chain(question, ranked_cols, router_tables, fk_map)
+
+    if join_chain:
+        lines.append("# Detected FK join chain:")
+        for join in join_chain:
+            lines.append(f"#   FROM {join['from']} JOIN {join['join']} ON {join['on']}")
+    else:
+        lines.append("# FK relationships detected from schema:")
+        # Build FK relationships between detected tables
+        router_tables_lower = {t.lower(): t for t in router_tables}
+
+        for source, fks in fk_map.items():
+            if source in router_tables_lower:
+                for fk_col, target in fks.items():
+                    if target in router_tables_lower:
+                        lines.append(f"#   {source}.{fk_col} REFERENCES {target}")
+
+    # Show which columns matched from question
+    table_matches = _infer_tables_from_question_columns(question, ranked_cols, router_tables)
+
+    if table_matches:
+        lines.append("\n# Columns matched from question:")
+        for tbl, cols in table_matches.items():
+            if cols:
+                cols_str = ", ".join(cols)
+                lines.append(f"#   {tbl}: {cols_str}")
+
+    # Show what columns are available for each detected table
+    lines.append("\n# Available columns per table:")
+    table_cols = defaultdict(list)
+    for tbl, col in ranked_cols:
+        table_cols[tbl.lower()].append(col)
+
+    for tbl in router_tables:
+        tbl_lower = tbl.lower()
+        if tbl_lower in table_cols:
+            cols_str = ", ".join(table_cols[tbl_lower][:8])  # Show first 8 columns
+            if len(table_cols[tbl_lower]) > 8:
+                cols_str += f" ... ({len(table_cols[tbl_lower])} total)"
+            lines.append(f"#   {tbl}: {cols_str}")
+
+    return "\n".join(lines)
+
+
+def _find_tables_with_implicit_columns(
+    question: str,
+    ranked_cols: list,
+    relevant_tables: list,
+    ctx: str
+) -> Set[str]:
+    """
+    🆕 Find tables whose columns are implicitly mentioned in the question.
+
+    AGNOSTIC approach - works for ANY column type (numeric, string, date, etc.).
+    Uses retrieval results (ranked_cols) to find columns mentioned in the question,
+    then filters to only include tables that have FK relationships with relevant tables.
+
+    Example:
+        Question: "show customer names and order dates"
+        -> Finds: customers (customerName), orders (orderDate)
+        -> Only adds tables that have FK relationships with already-selected tables
+
+    Args:
+        question: User's question
+        ranked_cols: List of (table, column) tuples from retrieval
+        relevant_tables: Tables already selected by router
+        ctx: Retrieval context (for FK extraction)
+
+    Returns:
+        Set of table names to add (lowercase)
+    """
+    if not ranked_cols or not relevant_tables:
+        return set()
+
+    q_lower = question.lower()
+    relevant_lower = {t.lower() for t in relevant_tables}
+
+    # Find tables whose columns are mentioned in question
+    mentioned_tables = defaultdict(set)  # {table: {matched_columns}}
+
+    for tbl, col in ranked_cols:
+        tbl_lower = tbl.lower()
+        col_lower = col.lower()
+
+        # Skip if already in relevant tables
+        if tbl_lower in relevant_lower:
+            continue
+
+        # Check if column is mentioned in question
+        matched = False
+
+        # 1. Direct match
+        if col_lower in q_lower:
+            matched = True
+
+        # 2. CamelCase split (e.g., "customerName" -> "customer name")
+        if not matched:
+            spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
+            if spaced in q_lower and spaced != col_lower:
+                matched = True
+
+        # 3. Word boundary match (e.g., "name" matches "customerName")
+        if not matched:
+            col_words = set(col_lower.split('_'))
+            for word in col_words:
+                if len(word) >= 3:
+                    # Use regex for word boundary
+                    pattern = rf'\b{re.escape(word)}\b'
+                    if re.search(pattern, q_lower):
+                        matched = True
+                        break
+
+        if matched:
+            mentioned_tables[tbl_lower].add(col)
+
+    if not mentioned_tables:
+        return set()
+
+    # Extract FK relationships from context
+    fk_map = _extract_fk_from_context(ctx)
+
+    # Only include tables that have FK relationship with relevant tables
+    tables_to_add = set()
+
+    for tbl in mentioned_tables:
+        # Check if this table has FK to/from any relevant table
+        has_fk_connection = False
+
+        # Check forward FK: tbl -> relevant_table
+        if tbl in fk_map:
+            for target_tbl in fk_map[tbl].values():
+                if target_tbl in relevant_lower:
+                    has_fk_connection = True
+                    break
+
+        # Check reverse FK: relevant_table -> tbl
+        if not has_fk_connection:
+            for rel_tbl in relevant_lower:
+                if rel_tbl in fk_map and tbl in fk_map[rel_tbl].values():
+                    has_fk_connection = True
+                    break
+
+        if has_fk_connection:
+            tables_to_add.add(tbl)
+
+    return tables_to_add
+
+
 # ======================================================================
 # ================= ROUTING & GENERATION PROMPT BUILDER ================
 # ======================================================================
@@ -1103,7 +1443,7 @@ Question: {question}
 Return JSON object with keys: complexity (simple/complex), qtype (lookup/aggregate/rank).
 """
 
-def make_generation_prompt(ctx: str, question: str, router_decision: dict = None) -> str:
+def make_generation_prompt(ctx: str, question: str, router_decision: dict = None, state: "RAGState" = None) -> str:
     """
     Dynamic Prompt Builder.
     Versi Benchmark Standard (ANSI SQL Strict):
@@ -1111,6 +1451,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     2. Melarang UNION untuk binning.
     3. Memaksa Single Line SQL untuk mencegah JSON Crash pada query panjang.
     4. Menangani Error 1055 dengan strict column selection.
+    5. 🆕 Dynamic join context from retrieval results.
     """
     router_decision = router_decision or {}
     complexity = router_decision.get("complexity", "simple")
@@ -1464,12 +1805,17 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "JSON FORMATTING: The 'sql' field must be a SINGLE LINE string. Remove all newlines (\\n) from the SQL."
     )
 
-    # --- 2. RAKIT CONSTRAINT BLOCK ---
+    # --- 2. BUILD DYNAMIC JOIN CONTEXT (from retrieval) ---
+    join_context = ""
+    if state:
+        join_context = _build_dynamic_join_context(state, router_decision)
+
+    # --- 3. RAKIT CONSTRAINT BLOCK ---
     constraint_block = ""
     if constraints:
         constraint_block = "\n[STRICT CONSTRAINTS & HEURISTICS]:\n" + "\n".join([f"- {c}" for c in constraints])
 
-    # --- 3. RETURN PROMPT LENGKAP ---
+    # --- 4. RETURN PROMPT LENGKAP ---
     return fr"""
 You are a senior SQL assistant for MySQL 8.0.
 
@@ -1484,6 +1830,7 @@ If NO JOINs, notes MUST be exactly: "No joins used."
 
 Context:
 {ctx}
+{join_context}
 
 Question:
 {question}
@@ -1857,95 +2204,13 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         pass
     
     # Phase 8b is DISABLED for thesis benchmark
-    
+
     # ---------------------------------------------------------------------------
-    # Phase 8c — Standardize Table Aliases to Match _ALIAS_OVERRIDES
+    # Phase 8c — REMOVED (let LLM decide aliases)
     # ---------------------------------------------------------------------------
-    alias_standards = {tbl.lower(): alias for tbl, alias in _ALIAS_OVERRIDES.items()}
-    def find_subquery_table(sql_fragment):
-        """Extract first table name after FROM in a SQL fragment."""
-        match = re.search(r'\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', sql_fragment, re.IGNORECASE)
-        return match.group(1).lower() if match else None
+    # Previously standardized table aliases to match _ALIAS_OVERRIDES.
+    # Now we let the LLM decide its own aliases without hardcoded overrides.
 
-    replacements = {}
-
-    # Find all subquery patterns: FROM (...) AS alias
-    subquery_start_pattern = re.compile(r'\b(FROM|JOIN)\s+\(', re.IGNORECASE)
-
-    for match in subquery_start_pattern.finditer(s):
-        start_pos = match.end() - 1
-        
-        paren_count = 1
-        i = start_pos + 1
-        while i < len(s) and paren_count > 0:
-            if s[i] == '(':
-                paren_count += 1
-            elif s[i] == ')':
-                paren_count -= 1
-            i += 1
-        
-        if paren_count == 0:
-            subquery_content = s[start_pos+1:i-1]
-            alias_match = re.match(r'\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b', s[i:], re.IGNORECASE)
-            
-            if alias_match:
-                current_alias = alias_match.group(1)
-                
-                # Skip if alias is a SQL keyword
-                if current_alias.lower() in _SQL_KEYWORDS:
-                    continue
-                
-                inner_table = find_subquery_table(subquery_content)
-                
-                if inner_table and inner_table in alias_standards:
-                    standard_alias = alias_standards[inner_table]
-                    if current_alias.lower() != standard_alias.lower():
-                        replacements[current_alias] = standard_alias
-
-    # Handle regular table aliases (non-subquery)
-    table_alias_pattern = re.compile(
-        r'\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b',
-        re.IGNORECASE
-    )
-
-    for match in table_alias_pattern.finditer(s):
-        table = match.group(2).lower()
-        current_alias = match.group(3)
-        
-        # Skip if alias is a SQL keyword  ← TAMBAHKAN INI
-        if current_alias.lower() in _SQL_KEYWORDS:
-            continue
-        
-        if table in alias_standards:
-            standard_alias = alias_standards[table]
-            if current_alias.lower() != standard_alias.lower():
-                replacements[current_alias] = standard_alias
-
-    if replacements:
-        for old_alias, new_alias in replacements.items():
-            # Replace qualified references: old.col → new.col
-            s = re.sub(
-                rf'\b{re.escape(old_alias)}\.',
-                f'{new_alias}.',
-                s,
-                flags=re.IGNORECASE
-            )
-            
-            # Replace subquery alias: ) AS old → ) AS new
-            s = re.sub(
-                rf'\)\s+(?:AS\s+)?{re.escape(old_alias)}\b',
-                f') AS {new_alias}',
-                s,
-                flags=re.IGNORECASE
-            )
-            
-            # Replace regular table alias: FROM/JOIN table old → FROM/JOIN table new
-            s = re.sub(
-                rf'\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:AS\s+)?{re.escape(old_alias)}\b',
-                rf'\1 \2 {new_alias}',
-                s,
-                flags=re.IGNORECASE
-            )
     # ---------------------------------------------------------------------------
     # Final Polish
     # ---------------------------------------------------------------------------

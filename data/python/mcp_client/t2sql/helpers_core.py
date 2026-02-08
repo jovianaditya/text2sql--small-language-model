@@ -12,16 +12,9 @@ from typing import Dict, List, Optional, Set
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
-_ALIAS_OVERRIDES = {
-    "payments": "pmt",
-    "employees": "emp",
-    "customers": "cust",
-    "orderdetails": "od",
-    "orders": "ord",
-    "offices": "ofc",
-    "products": "prod",
-    "productlines": "pline",
-}
+# 🆕 ALIAS_OVERRIDES removed - let LLM decide the alias
+# Previously hardcoded aliases like "pmt" for payments, "emp" for employees
+# Now LLM generates aliases naturally
 _RESERVED_ALIASES = {
     "or", "and", "on", "as", "in", "is", "by", "from", "join", "where",
     "group", "order", "limit", "select", "left", "right", "inner", "outer",
@@ -185,17 +178,14 @@ def _canonicalize_table_names(sql: str, ctx: str) -> str:
 
 def _alias_for_table(table: str, used: set[str]) -> str:
     """
-    Deterministic alias:
-    - use overrides first
-    - fallback: 1-2 letters from table name, increasing until unique
+    🆕 Deterministic alias WITHOUT hardcoded overrides.
+    LLM is free to generate its own aliases - this function is only
+    used when aliases need to be auto-generated (e.g., in heuristic fixes).
+
+    Strategy: 1-2 letters from table name, increasing until unique
     """
     t = (table or "").strip("`").split(".")[-1]  # drop schema if any
     tl = t.lower()
-
-    base = _ALIAS_OVERRIDES.get(tl)
-    if base and base not in used:
-        used.add(base)
-        return base
 
     # generic fallback
     # e.g. products -> pr, productlines -> pl, etc.

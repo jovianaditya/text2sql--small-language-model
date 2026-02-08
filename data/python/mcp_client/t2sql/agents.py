@@ -17,7 +17,8 @@ from .state import RAGState
 from .utils import _dbg_print_two, try_llm_json, build_router_schema
 from .generation import regenerate_with_extra_constraint
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
-    _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline)
+    _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline,
+    _find_tables_with_implicit_columns, _extract_fk_from_context)
 from .helpers_core import(has_join, _question_requires_word_boundary_regex, _parse_allowed_identifiers, _remove_top_level_order_by_if_not_requested)
 
 # ======================================================================
@@ -547,83 +548,42 @@ def router_agent(state: RAGState) -> RAGState:
     relevant_tables = filtered_tables
 
     # ═══════════════════════════════════════════════════════════════════
-    # STEP 2.2: 🆕 INCLUDE TABLES WITH NUMERIC COLUMNS (for calculations)
+    # STEP 2.2: 🆕 INCLUDE TABLES WITH IMPLICITLY MENTIONED COLUMNS (AGNOSTIC)
     # ═══════════════════════════════════════════════════════════════════
-    # If question asks for numeric calculations (sum, total, quantity * price, etc.),
-    # include tables that have numeric columns even if not explicitly mentioned
+    # AGNOSTIC approach - works for ANY column type (numeric, string, date, etc.)
+    # Uses retrieval results (ranked_cols) to find tables whose columns are
+    # mentioned in the question, even when table names aren't explicitly stated.
     #
-    # IMPORTANT: Only trigger on cross-table calculation patterns, not generic aggregation
+    # Examples:
+    #   - "total amount" → finds tables with "amount" column
+    #   - "customer names" → finds tables with "customerName" column
+    #   - "order dates" → finds tables with "orderDate" column
+    #
+    # Only includes tables that have FK relationships with already-selected tables.
 
-    question_lower = question.lower()
+    ranked_cols = state.get("ranked_cols", [])
+    if ranked_cols:
+        # Find tables whose columns are mentioned in the question
+        tables_with_implicit_cols = _find_tables_with_implicit_columns(
+            question=question,
+            ranked_cols=ranked_cols,
+            relevant_tables=relevant_tables,
+            ctx=ctx
+        )
 
-    # Detect numeric calculation needs - look for SPECIFIC calculation patterns
-    # that indicate cross-table arithmetic (not just count/avg on single table)
-    calc_operation_keywords = ['sum', 'total', 'calculate', 'multiplied', 'times', 'each',
-                               'jumlah', 'harga', 'qty', 'value', 'cost']
-    # Detect if question mentions numeric column terms that would require detail tables
-    numeric_column_keywords = ['quantity', 'price', 'amount', 'ordered', 'instock']
-
-    needs_numeric_calc = (
-        any(kw in question_lower for kw in calc_operation_keywords) and
-        any(kw in question_lower for kw in numeric_column_keywords)
-    )
-
-    # Special case: if question explicitly mentions calculation operations
-    if not needs_numeric_calc:
-        # Check for arithmetic patterns like "quantity * price", "sum of amount", etc.
-        calc_patterns = [
-            r'\b(?:quantity|amount|price)\s*\*\s*(?:price|each|amount)',
-            r'(?:sum|total|calculate)\s+(?:of\s+)?(?:quantity|amount|price)',
-            r'(?:quantity|price|amount)\s+(?:multiplied|times)\s+(?:by|each)',
-        ]
-        needs_numeric_calc = any(re.search(pattern, question_lower) for pattern in calc_patterns)
-
-    if needs_numeric_calc:
-        # Look for tables with numeric columns in context
-        # Check for column patterns like: quantityOrdered, priceEach, amount, etc.
-        numeric_column_patterns = [
-            r'\btable:\s*\w+\s*\|\s*column:\s*(\w+quantity\w*|\w*price\w*|\w*amount\w*|\w*value\w*|\w*cost\w*|\w*total\w*)',
-            r'\bcolumn:\s*(\w+quantity\w*|\w*price\w*|\w*amount\w*|\w*value\w*|\w*cost\w*|\w*total\w*)\s*\|',
-        ]
-
-        # Only include tables that are FK-related to already-selected tables
-        # This prevents adding unrelated numeric tables
-        relevant_lower = {t.lower() for t in relevant_tables}
-        tables_with_numeric = set()
-
-        for pattern in numeric_column_patterns:
-            for match in re.finditer(pattern, ctx, re.IGNORECASE):
-                # Extract table name from the context around this match
-                table_match = None
-                search_start = max(0, match.start() - 200)  # Look back 200 chars
-                context_before = ctx[search_start:match.start()]
-                table_match = re.search(r'table:\s*(\w+)', context_before, re.IGNORECASE)
-
-                if table_match:
-                    tbl_name = table_match.group(1)
-                    if tbl_name:
-                        tbl_lower = tbl_name.lower()
-                        # Only add if this table is NOT already selected AND
-                        # has FK relationship with selected tables
+        if tables_with_implicit_cols:
+            # Get the original table names (case-preserving) from context
+            all_table_names = set(allowed_identifiers.keys())
+            for tbl_lower in tables_with_implicit_cols:
+                # Find the original table name with correct casing
+                for original_tbl in all_table_names:
+                    if original_tbl.lower() == tbl_lower:
+                        relevant_lower = {t.lower() for t in relevant_tables}
                         if tbl_lower not in relevant_lower:
-                            # Check for FK relationship in context
-                            # Look for patterns like "table: orderdetails | column: orderNumber FK to orders.orderNumber"
-                            context_section = ctx[max(0, match.start() - 300):match.start() + 300]
-                            # If this table has FK to/from any selected table, include it
-                            has_fk_to_selected = any(
-                                re.search(rf'FK to\s+{re.escape(t)}\.', context_section, re.IGNORECASE) or
-                                re.search(rf'{re.escape(tbl_lower)}\.', context_section, re.IGNORECASE) and
-                                re.search(r'FK to', context_section, re.IGNORECASE)
-                                for t in relevant_lower
-                            )
-                            if has_fk_to_selected:
-                                tables_with_numeric.add(tbl_name)
+                            relevant_tables.append(original_tbl)
+                            if RETRIEVE_DEBUG:
+                                print(f"[Router] ✋ Including {original_tbl} (implicit column mention)")
 
-        if tables_with_numeric and RETRIEVE_DEBUG:
-            print(f"[Router] ✋ Including tables based on column relevance")
-
-        relevant_tables.extend(t for t in tables_with_numeric if t.lower() not in relevant_lower)
-    
     # ═══════════════════════════════════════════════════════════════════
     # STEP 2.5: 🆕 DETECT SIGNALS EARLY (needed for FK inference)
     # ═══════════════════════════════════════════════════════════════════
@@ -1128,7 +1088,8 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     
     # Panggil Dynamic Prompt Builder (helpers_main.py)
     # Segala aturan heuristik (Anti-MAX, Anti-1055, Anti-Inner Join) sudah diurus di sana.
-    prompt = make_generation_prompt(ctx, question, decision)
+    # 🆕 Pass state for dynamic join context from retrieval results
+    prompt = make_generation_prompt(ctx, question, decision, state)
     
     # ===== TIMED INFERENCE (model already loaded) =====
     _t0 = _time.perf_counter()

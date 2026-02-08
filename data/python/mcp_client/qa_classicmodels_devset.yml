@@ -273,6 +273,18 @@ cases:
         GROUP BY cust.customerNumber, cust.customerName;
     - id: H3
       difficulty: hard
+      question: "Show only products that have been ordered at least once, and for each such product display the product code, product name, and total quantity ordered."
+      groundtruth_sql: |
+        SELECT
+          p.productCode,
+          p.productName,
+          SUM(od.quantityOrdered) AS total_quantity_ordered
+        FROM products AS p
+        JOIN orderdetails AS od
+          ON p.productCode = od.productCode
+        GROUP BY p.productCode, p.productName;
+    - id: H4
+      difficulty: hard
       question: "Show only customers who have placed orders, and for each such customer display the customer number, customer name, and total order amount calculated as the sum of quantity ordered multiplied by price each."
       groundtruth_sql: |
         SELECT
@@ -285,3 +297,20 @@ cases:
         JOIN orderdetails AS od
           ON ord.orderNumber = od.orderNumber
         GROUP BY cust.customerNumber, cust.customerName;
+    - id: H5
+      difficulty: hard
+      question: "For each employee, including employees who do not manage any customers and customers who have never made any payments, show the employee number, employee name, and the total payment amount collected by their customers."
+      groundtruth_sql: |
+        SELECT
+          emp.employeeNumber,
+          CONCAT(emp.firstName, ' ', emp.lastName) AS employee_name,
+          SUM(pmt.amount) AS total_payment_amount
+        FROM employees AS emp
+        LEFT JOIN customers AS cust
+          ON emp.employeeNumber = cust.salesRepEmployeeNumber
+        LEFT JOIN payments AS pmt
+          ON cust.customerNumber = pmt.customerNumber
+        GROUP BY
+          emp.employeeNumber,
+          emp.firstName,
+          emp.lastName;
