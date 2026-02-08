@@ -1666,7 +1666,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
              needs_regeneration = True
              regeneration_model = LARGE_MODEL  # Force 7B
 
-    # --- KASUS J: AGGREGATION VIOLATION (ERROR 1055) (HARD ERROR) ---
+    # --- KASUS K: AGGREGATION VIOLATION (ERROR 1055) (HARD ERROR) ---
     # Menangkap kasus SELECT raw_col FROM... GROUP BY derived_col (Error 1055)
     if "GROUP BY" in sql_up and not needs_regeneration:
         group_clause = re.search(r"GROUP\s+BY\s+(.*?)($|ORDER|LIMIT|HAVING)", sql_up, re.DOTALL)

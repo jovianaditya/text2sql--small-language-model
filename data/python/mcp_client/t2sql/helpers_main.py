@@ -1368,6 +1368,50 @@ def _find_tables_with_implicit_columns(
     if not mentioned_tables:
         return set()
 
+    # 🆕 [FIX] Filter out tables whose columns are already available in existing relevant tables
+    # Example: If payments.customerNumber exists, don't add customers just for customerNumber
+    # This prevents single-table queries from being detected as multi-table
+    available_cols_in_existing = set()
+    for tbl_lower in relevant_lower:
+        for rel_tbl, col in ranked_cols:
+            if rel_tbl.lower() == tbl_lower:
+                available_cols_in_existing.add(col.lower())
+
+    # Filter out tables whose columns are already covered
+    filtered_mentioned_tables = {}
+    for tbl, cols in mentioned_tables.items():
+        cols_not_available = set()
+        for col in cols:
+            col_lower = col.lower()
+            # Check if this column or its word components are already available
+            already_covered = False
+
+            # Direct match
+            if col_lower in available_cols_in_existing:
+                already_covered = True
+            else:
+                # Check word component overlap (e.g., "customerNumber" covers "customer")
+                for avail_col in available_cols_in_existing:
+                    if col_lower in avail_col or avail_col in col_lower:
+                        already_covered = True
+                        break
+                    # Check word component overlap
+                    col_words = set(col_lower.split('_'))
+                    avail_words = set(avail_col.split('_'))
+                    if col_words & avail_words:  # intersection non-empty
+                        already_covered = True
+                        break
+
+            if not already_covered:
+                cols_not_available.add(col)
+
+        if cols_not_available:
+            filtered_mentioned_tables[tbl] = cols_not_available
+
+    mentioned_tables = filtered_mentioned_tables
+    if not mentioned_tables:
+        return set()
+
     # Extract FK relationships from context
     fk_map = _extract_fk_from_context(ctx)
 
@@ -1472,7 +1516,29 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     
     # --- 1. BANGUN CONSTRAINT DINAMIS ---
     constraints = []
-    # === [NEW] GENERAL ANTI-HALLUCINATION RULE ===
+
+    # === [PRIORITY 1] TOP N GLOBAL RANKING RULE (FIRST - before all other rules) ===
+    # Detect "Top N" or "N highest/lowest" pattern that should use ORDER BY + LIMIT
+    # This is DIFFERENT from ordinal ranking ("second highest per group")
+    q_lower = question.lower()
+    # Pattern: "10 highest", "top 10", "10 largest", "10 products with the highest"
+    top_n_pattern = re.search(r'\b(top\s+\d+|\d+\s+(highest|lowest|largest|smallest|most|least|tertinggi|terendah|terbesar|terkecil))\b', q_lower)
+    # Also check for "N products/highest/largest" followed by "stock/amount/etc"
+    top_n_context = re.search(r'\b\d+\s+(products|customers|items?|entities?).+?(highest|largest|most)\b', q_lower, re.IGNORECASE)
+
+    is_top_n_global_ranking = bool(top_n_pattern or top_n_context) and not is_ordinal_ranking
+
+    if is_top_n_global_ranking:
+        constraints.append(
+            "⚠️ TOP N QUERY (HIGHEST PRIORITY): This question asks for 'Top N' or 'N highest/lowest'. "
+            "YOU MUST USE: ORDER BY column DESC LIMIT N. "
+            "EXAMPLE: 'Show 10 products with highest stock' → SELECT productCode, productName, quantityInStock FROM products ORDER BY quantityInStock DESC LIMIT 10. "
+            "FORBIDDEN: Do NOT use MAX() in WHERE clause. Do NOT use subquery with LIMIT. "
+            "FORBIDDEN: WHERE col = (SELECT MAX(col) ...). "
+            "CORRECT: Just ORDER BY and LIMIT directly on the main table."
+        )
+
+    # === [PRIORITY 2] GENERAL ANTI-HALLUCINATION RULE ===
     constraints.append(
         "CRITICAL RULE: Do NOT add SQL clauses (WHERE, HAVING, LIMIT, ORDER BY) "
         "unless the user EXPLICITLY requests them. "
@@ -1484,7 +1550,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "FOR EACH RULE: When the question says 'For each X' or 'Per X', you MUST return ALL values of X. "
             "Do NOT add WHERE filters on the grouping column unless the user explicitly filters it. "
         )
-    
+
     # === [NEW] EXPLICIT RANK() FUNCTION RULE ===
     # Detect "a rank of X" / "rank employees" -> use RANK() OVER window function
     if is_explicit_rank_function:
@@ -1496,7 +1562,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "WRONG: Using ROW_NUMBER() - use RANK() for tied values. "
             "IMPORTANT: RANK() assigns the same rank to equal values and skips ranks for ties."
         )
-    
+
     # === [NEW] WINDOW AGGREGATE RULE: "within the same X" pattern ===
     if is_window_aggregate:
         partition_col_hint = ""
@@ -1510,7 +1576,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             f"WRONG: Using GROUP BY with window functions.{partition_col_hint} "
             f"IMPORTANT: Do NOT add GROUP BY clause when using window functions for this pattern."
         )
-    
+
     # [A] STATS UTILIZATION (profiling statistics)
     constraints.append(
         "DATA INTELLIGENCE: Use the provided 'STATS' in the Context responsibly:\n"
@@ -1522,8 +1588,8 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     if complexity == "simple":
         constraints.append("SCOPE: This query requires ONE TABLE ONLY. DO NOT JOIN.")
         constraints.append("FILTERING: Filter by ID/Code directly in the main table.")
-        
-        if qtype == "lookup":
+
+        if qtype == "lookup" and not is_top_n_global_ranking:
             constraints.append(
                 "SIMPLE LOOKUP RULE: Do NOT use aggregation functions like MAX(), MIN(), or SUM(). "
                 "Just SELECT the column directly. Use 'ORDER BY column DESC' for 'latest/newest/highest'."
