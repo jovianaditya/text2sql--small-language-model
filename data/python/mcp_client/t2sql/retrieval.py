@@ -1,16 +1,25 @@
 # ======================================================================
 # ============================ retrieval.py ============================
 # ======================================================================
+# Purpose:
+# - Implementation of retrieval logic for T2SQL RAG system.
+# - Includes BM25 sparse retrieval and dense retrieval, scoring, and context building.
+# - Functions to build allowed blocks and cards for LLM context.
+
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 import os
 import re
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from collections import defaultdict
-
 from rank_bm25 import BM25Okapi
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
-
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .config import (
     TOP_K,
     SPARSE_BONUS,
@@ -21,12 +30,10 @@ from .config import (
     SPARSE_DEBUG,
     RETRIEVE_DEBUG,
 )
-
 from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
 from .helpers_main import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _get_qtype, build_dynamic_probe
-
 # ======================================================================
 # ========================== CONTEXT BUILDER ===========================
 # ======================================================================
@@ -40,7 +47,6 @@ def _build_allowed_block(filtered_allowed: Dict[str, List[str]]) -> str:
         lines.append(f"- {t}: {', '.join(uniq)}")
     body = "\n".join(lines) if lines else "- (none)"
     return "### ALLOWED IDENTIFIERS\n" + body
-
 # ==============================================================================
 # 1. HELPER: FORMAT STATISTICS
 # ==============================================================================
@@ -100,8 +106,6 @@ def _format_stats_for_llm(stats_raw: Any) -> str:
         return ""
     
     return " | STATS: " + ", ".join(parts)
-
-
 # ==============================================================================
 # 2. CORE LOGIC: CARD BUILDER (Update fungsi ini)
 # ==============================================================================
@@ -214,26 +218,12 @@ def _build_cards(
             injected += 1
 
     return "\n".join(cards)
-
 # ======================================================================
 # =========================== SPARSE (BM25) ============================
 # ======================================================================
 _BM25_CACHE: dict[str, Any] = {}
-# _BASE_STOPWORDS = set(ENGLISH_STOP_WORDS)
 
-# for w in ["name", "names"]:
-#     _BASE_STOPWORDS.discard(w)
-
-# _EXTRA_STOPWORDS = {
-#     "show", "all", "list", "their", "that", "have", "no",
-#     "include", "includes", "including", "sort", "sorted", "sorting",
-#     "result", "results", "record", "records", "row", "rows",
-#     "display", "return", "get", "give", "find", "fetch", "please", "kindly",
-#     "alphabetical", "alphabetically", "ascending", "descending", "distinct",
-#     "yang", "dan", "atau", "ke", "dari", "di", "itu", "ini",
-#     "tampilkan", "daftar",
-# }
-# _STOPWORDS = _BASE_STOPWORDS | _EXTRA_STOPWORDS
+# Stopwords for BM25 tokenization
 _STOPWORDS = (set(ENGLISH_STOP_WORDS) - {"name", "names"}) | {"show", "all", "list", "their", "that", "have", "no",
     "include", "includes", "including", "sort", "sorted", "sorting",
     "result", "results", "record", "records", "row", "rows",
@@ -464,49 +454,6 @@ def _doc_matches_sparse(md: Dict[str, Any], sparse_ids: List[str]) -> bool:
 # =========================
 # ======= SCORING =========
 # =========================
-# def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List[str], aliases: List[str]) -> float:
-#     bonus = 0.0
-#     if any(k in q_l for k in ["name", "nama"]):
-#         if any(r == "name" or "name" in r for r in roles) or "name" in col_name:
-#             bonus += NAME_QUERY_BONUS
-#     if table.lower() == "customers":
-#         mentions_customer = any(k in q_l for k in ["customer", "customers", "pelanggan"])
-#         asks_id_like = any(k in q_l for k in [" id", "id ", " id,", "identifier", "kode", "code", "customer number"])
-#         if mentions_customer and not asks_id_like:
-#             if "customername" in col_name or "customer_name" in col_name:
-#                 bonus += 0.6
-#             if "customernumber" in col_name or col_name.endswith("number"):
-#                 bonus -= 0.35
-#     if table.lower() == "products":
-#         mentions_product = any(k in q_l for k in ["product", "products", "produk"])
-#         asks_id_like = any(k in q_l for k in [" id", "id ", " id,", "identifier", "kode", "code", "product code"])
-#         if mentions_product and not asks_id_like:
-#             if "productname" in col_name or "product_name" in col_name:
-#                 bonus += 0.5 
-#             if "productcode" in col_name or col_name.endswith("code"):
-#                 bonus -= 0.3 
-#     if any(k in q_l for k in [" id ", "id ", " id,", "identifier", "kode", "code"]):
-#         if (any(r == "id" or "id" in r for r in roles) or "number" in col_name or col_name.lower().endswith("id")):
-#             bonus += ID_QUERY_BONUS
-
-#     # col_lower = col_name.lower()
-#     # role_set = set(roles)
-#     # alias_set = set(aliases)
-#     # for rule in COLUMN_PRIORITY_CONFIG:
-#     #     tables = [t.lower() for t in rule.get("tables", []) or []]
-#     #     if tables and table.lower() not in tables: continue
-#     #     role_any = rule.get("role_any") or []
-#     #     if role_any and not any(r in role_set for r in role_any): continue
-#     #     alias_any = rule.get("alias_any") or []
-#     #     if alias_any and not any(a in alias_set for a in alias_any): continue
-#     #     column_contains = rule.get("column_contains") or []
-#     #     if column_contains and not any(sub in col_lower for sub in column_contains): continue
-#     #     qt_any = rule.get("query_terms_any") or []
-#     #     if qt_any and not any(t in q_l for t in qt_any): continue
-#     #     qt_also = rule.get("query_terms_also_any") or []
-#     #     if qt_also and not any(t in q_l for t in qt_also): continue
-#     #     bonus += float(rule.get("boost", 0.0))
-#     return bonus
 def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List[str], aliases: List[str]) -> float:
     bonus = 0.0
     
@@ -521,13 +468,13 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
         asks_id_like = any(k in q_l for k in [" id", "id ", " id,", "identifier", "code", "customer number"])
         asks_for_names = any(k in q_l for k in ["name", "names", "nama"])  # ← NEW
         
-        # ✅ NEW: Detect explicit contact person request
+        # NEW: Detect explicit contact person request
         asks_contact_explicitly = any(k in q_l for k in [
             "contact name", "contact first", "contact last",
             "first name", "last name", "person name"
         ])
         
-        # ✅ NEW: Strong disambiguation for generic "names"
+        # NEW: Strong disambiguation for generic "names"
         if mentions_customer and asks_for_names and not asks_contact_explicitly:
             if "customername" in col_name or "customer_name" in col_name:
                 bonus += 0.9
@@ -572,12 +519,12 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
     mentions_orderdetails = any(k in q_l for k in ["order detail", "order details", "line item", "line items", "item pesanan", "detail pesanan"])
     mentions_employee = any(k in q_l for k in ["employee", "employees", "karyawan", "sales rep", "salesrep"])
 
-    # 🆕 Detect aggregate context - indicates we need detail tables
+    # Detect aggregate context - indicates we need detail tables
     math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata',
                      'percentage', 'percent', 'ratio', 'proportion', 'persentase', 'rasio']
     has_aggregation = any(kw in q_l for kw in math_keywords)
 
-    # 🆕 Check if we need numeric columns - based on RETRIEVED columns metadata (not hardcoded keywords)
+    # Check if we need numeric columns - based on RETRIEVED columns metadata (not hardcoded keywords)
     # Check if any retrieved column has numeric/aggregate characteristics
     needs_numeric_data = _check_needs_numeric_data_from_retrieved(reranked)
 
@@ -605,17 +552,16 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
         if mentions_productline and tl == "productlines": base += 0.8
         if mentions_orderdetails and tl == "orderdetails": base += 0.8
 
-        # 🆕 Don't penalize orderdetails in aggregate/numeric contexts
+        # Don't penalize orderdetails in aggregate/numeric contexts
         if penalize_orderdetails_default and tl == "orderdetails": base -= 0.4
 
-        # 🆕 Boost orderdetails when numeric data is needed (even if not explicitly mentioned)
+        # Boost orderdetails when numeric data is needed (even if not explicitly mentioned)
         if needs_numeric_data and tl == "orderdetails": base += 0.6
 
         if mentions_employee and tl == "employees": base += 0.8
 
         scores[tbl] += base
     return scores
-
 # ==============================================================================
 # NUMERIC DATA DETECTION (METADATA-DRIVEN)
 # ==============================================================================
@@ -667,8 +613,6 @@ def _check_needs_numeric_data_from_retrieved(reranked: List[Dict[str, Any]]) -> 
             return True
 
     return False
-
-
 # ==============================================================================
 # BRIDGE TABLE INFERENCE
 # ==============================================================================
@@ -727,7 +671,7 @@ def _infer_bridge_tables(
     # Convert selected_tables to lowercase for comparison
     selected_lower = {t.lower() for t in selected_tables}
 
-    # 🆕 NEW: Also consider tables with numeric columns in reranked results
+    # NEW: Also consider tables with numeric columns in reranked results
     # Uses metadata-driven approach: check datatype field + column patterns as fallback
     numeric_datatypes = {
         'int', 'integer', 'tinyint', 'smallint', 'mediumint', 'bigint',
@@ -776,7 +720,6 @@ def _infer_bridge_tables(
     # But if we need columns from A and C where A→B→C, we need B as bridge
 
     return bridge_tables
-
 
 def _find_fk_path(
     start: str,
@@ -837,7 +780,6 @@ def _find_fk_path(
                     queue.append((source, path + [source]))
 
     return None
-
 # ======================================================================
 # =========================== RETRIEVE NODE ============================
 # ======================================================================
@@ -1142,7 +1084,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                 else: filtered_allowed = dict(allowed)
         else:
             # -----------------------------
-            # 🆕 ENHANCED: Column-driven table selection
+            # ENHANCED: Column-driven table selection
             # -----------------------------
             # Instead of just top 2 tables, include tables that:
             # 1. Have high scores (mentioned in question)
@@ -1152,7 +1094,7 @@ def retrieve_node(state: RAGState) -> RAGState:
             if table_scores:
                 sorted_tbls = sorted(table_scores.items(), key=lambda x: x[1], reverse=True)
 
-                # 🆕 DEBUG: Print table scores
+                # DEBUG: Print table scores
                 if RETRIEVE_DEBUG:
                     print(f"\n[TABLE SCORES]")
                     for tbl, score in sorted_tbls:
@@ -1162,7 +1104,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                 max_top_tables = 3
                 top_tables = {name for name, score in sorted_tbls[:max_top_tables] if score > 0.0}
 
-                # 🆕 Addition: Include tables with any column in reranked results
+                # Addition: Include tables with any column in reranked results
                 # This captures tables that may not be mentioned but have needed columns
                 tables_with_reranked_cols = set()
                 for item in reranked[:MAX_CTX_DOCS]:
@@ -1175,7 +1117,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                 # Use all available table keys (from original allowed, not filtered)
                 all_table_keys_lower = {tbl.lower(): tbl for tbl in allowed.keys()}
 
-                # 🆕 DEBUG: Print what we're adding
+                # DEBUG: Print what we're adding
                 if RETRIEVE_DEBUG:
                     print(f"\n[COLUMN-DRIVEN SELECTION]")
                     print(f"  tables_with_reranked_cols: {tables_with_reranked_cols}")
@@ -1185,7 +1127,7 @@ def retrieve_node(state: RAGState) -> RAGState:
 
                 top_tables.update(t for t in tables_with_reranked_cols if t in all_table_keys_lower)
 
-                # 🆕 Addition: Bridge table inference
+                # Addition: Bridge table inference
                 # If we have multiple tables, check if we need bridge tables
                 if len(top_tables) >= 2:
                     bridge_tables = _infer_bridge_tables(top_tables, allowed, reranked)

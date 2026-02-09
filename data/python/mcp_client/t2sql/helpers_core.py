@@ -2,7 +2,8 @@
 # ========================== helpers_core.py ===========================
 # ======================================================================
 # Purpose:
-# - Heuristic Rules for SQL Generation Phase 0 - Phase 7
+# - Heuristic Rules for SQL Generation Phase 0 - Phase 7.
+# - Core helper functions used across multiple phases.
 
 # ======================================================================
 # ====================== STANDARD LIBRARY IMPORT =======================
@@ -12,9 +13,6 @@ from typing import Dict, List, Optional, Set
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
-# 🆕 ALIAS_OVERRIDES removed - let LLM decide the alias
-# Previously hardcoded aliases like "pmt" for payments, "emp" for employees
-# Now LLM generates aliases naturally
 _RESERVED_ALIASES = {
     "or", "and", "on", "as", "in", "is", "by", "from", "join", "where",
     "group", "order", "limit", "select", "left", "right", "inner", "outer",
@@ -22,6 +20,12 @@ _RESERVED_ALIASES = {
     # MySQL 8.0+ window function keywords (reserved)
     "rank", "dense_rank", "row_number", "ntile", "lead", "lag",
     "first_value", "last_value", "nth_value", "cume_dist", "percent_rank"
+}
+_SQL_KEYWORDS = {
+    "select","from","where","group","by","order","limit","join","left","right","inner",
+    "on","and","or","not","as","distinct","count","sum","avg","min","max","having",
+    "asc","desc","like","in","between","is","null","case","when","then","else","end",
+    "regexp","rlike","over","partition","row_number"
 }
 _JOIN_KW = r"(?:inner\s+join|left\s+join|right\s+join|full\s+join|join)"
 # =======================================================================
@@ -37,7 +41,6 @@ _JOIN_KW = r"(?:inner\s+join|left\s+join|right\s+join|full\s+join|join)"
 # - alias_for_table
 # - split_outside_quotes
 # - has_join
-# - ensure_join_aliases
 
 def _should_use_backtick(identifier: str) -> bool:
     if not identifier: return False
@@ -112,7 +115,6 @@ def _escape_reserved_column_aliases(sql: str) -> str:
         sql,
         flags=re.I
     )
-    
     return sql
 
 def _parse_allowed_identifiers(ctx: str) -> Dict[str, Set[str]]:
@@ -178,7 +180,7 @@ def _canonicalize_table_names(sql: str, ctx: str) -> str:
 
 def _alias_for_table(table: str, used: set[str]) -> str:
     """
-    🆕 Deterministic alias WITHOUT hardcoded overrides.
+    Deterministic alias WITHOUT hardcoded overrides.
     LLM is free to generate its own aliases - this function is only
     used when aliases need to be auto-generated (e.g., in heuristic fixes).
 
@@ -211,102 +213,6 @@ def _split_outside_quotes(sql: str) -> List[str]:
 def has_join(sql: str) -> bool:
     return re.search(rf"\b{_JOIN_KW}\b", sql, flags=re.I) is not None
 
-# def ensure_join_aliases(sql: str) -> str:
-#     """
-#     Enforce: if query has JOIN, every FROM/JOIN table must have an alias.
-#     Also rewrite qualifiers: table.col -> alias.col (outside quotes).
-#     Safe-only: no CTE, no subqueries/derived tables.
-#     """
-#     if not sql:
-#         return sql
-
-#     # Only enforce if there is a join
-#     if not has_join(sql):
-#         return sql
-
-#     # Skip complex forms (keep it non-brittle)
-#     if re.match(r"^\s*with\b", sql, flags=re.I):
-#         return sql
-#     if re.search(r"\bfrom\s*\(", sql, flags=re.I) or re.search(r"\bjoin\s*\(", sql, flags=re.I):
-#         return sql
-
-#     # Find FROM/JOIN tables + aliases (if present)
-#     # Matches: FROM table [AS] alias
-#     #          JOIN table [AS] alias
-#     tj_pat = re.compile(
-#         r"(?P<kw>\bFROM\b|\bJOIN\b)\s+"
-#         r"(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)"
-#         r"(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?",
-#         flags=re.I,
-#     )
-
-#     # 1) First pass: collect existing aliases & decide missing aliases
-#     used_aliases: set[str] = set()
-#     table_to_alias: dict[str, str] = {}   # lower(table)->alias
-#     spans_to_patch: list[tuple[int, int, str]] = []
-
-#     for m in tj_pat.finditer(sql):
-#         kw = m.group("kw")
-#         table_raw = m.group("table")
-#         alias = m.group("alias")
-
-#         table_norm = table_raw.strip("`")
-#         table_key = table_norm.split(".")[-1].lower()
-
-#         if alias and alias.lower() in _RESERVED_ALIASES:
-#             alias = None
-
-#         if alias:
-#             used_aliases.add(alias)
-#             table_to_alias[table_key] = alias
-#         else:
-#             spans_to_patch.append((m.start(), m.end(), table_raw))
-
-#     # 2) Second pass: assign aliases for missing ones
-#     # We need stable alias assignment order: FROM first, then JOINs in appearance order.
-#     used_aliases = set(used_aliases)  # ensure mutable
-#     patches: list[tuple[int, int, str]] = []
-
-#     for start, end, table_raw in spans_to_patch:
-#         table_key = table_raw.strip("`").split(".")[-1].lower()
-#         if table_key in table_to_alias:
-#             continue
-#         alias = _alias_for_table(table_key, used_aliases)
-#         table_to_alias[table_key] = alias
-
-#         # Inject " <alias>" right after table token (no AS needed)
-#         # We patch by reconstructing the matched segment.
-#         seg = sql[start:end]
-#         # seg looks like: "FROM customers" or "JOIN payments"
-#         seg_patched = re.sub(
-#             rf"(\b(?:FROM|JOIN)\b\s+{re.escape(table_raw)})(?!\s+\bAS\b|\s+[A-Za-z_])",
-#             rf"\1 {alias}",
-#             seg,
-#             flags=re.I,
-#         )
-#         patches.append((start, end, seg_patched))
-
-#     # Apply patches from the back to keep indices valid
-#     out = sql
-#     for start, end, seg_patched in sorted(patches, key=lambda x: x[0], reverse=True):
-#         out = out[:start] + seg_patched + out[end:]
-
-#     # 3) Rewrite qualifiers table.col -> alias.col (outside quotes/backticks/strings)
-#     parts = _split_outside_quotes(out)
-#     for i in range(0, len(parts), 2):  # code segments only
-#         seg = parts[i]
-#         for tbl, al in table_to_alias.items():
-#             # rewrite schema.tbl.col and tbl.col forms conservatively:
-#             # - if already alias.col, leave it
-#             seg = re.sub(
-#                 rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?\b{re.escape(tbl)}\s*\.\s*",
-#                 f"{al}.",
-#                 seg,
-#                 flags=re.I,
-#         )
-#         parts[i] = seg
-
-#     return "".join(parts)
 # =======================================================================
 # ======== Phase 1 — JOIN Semantics & Structural Rewrites (FINAL)========
 # ===== Decide JOIN necessity and semantics before touching aliases =====
@@ -361,7 +267,7 @@ def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
     if any(s in q for s in explicit_signals):
         return True
 
-    # 🆕 Pattern 0: "only X who have Y" - filtering pattern (NOT include-zero)
+    # Pattern 0: "only X who have Y" - filtering pattern (NOT include-zero)
     # This explicitly wants to filter out rows that don't match, so use INNER JOIN
     if re.search(rf"\bonly\s+{entity_kw}s?\s+(who|that)\s+(have|has|had|placed|made|ordered)\b", q, flags=re.I):
         return False  # Explicitly NOT include-zero, trigger INNER JOIN preference
@@ -638,7 +544,7 @@ def _move_rhs_filter_from_where_to_on(sql: str, question: str, ctx: str = "") ->
     result = f"{prefix}{from_part}{join_part} ON {new_on_clause}{new_where}{rest_after_where}"
     
     if result != sql:
-        print(f"[Logic] 🔄 Moved RHS filter to ON clause (preserving LEFT JOIN for 'ALL' query)")
+        print(f"[Logic] Moved RHS filter to ON clause (preserving LEFT JOIN for 'ALL' query)")
     
     return result
 
@@ -1165,15 +1071,15 @@ def _drop_unused_from_table_aliases(sql: str) -> str:
         return sql
     print(f"[DROP_ALIAS] Input: {sql[:100]}")
     print(f"[DROP_ALIAS] has_join: {has_join(sql)}")
-    # ✅ FIX 1: Kalau ada JOIN di mana pun, jangan sentuh (biar aman).
+    # FIX 1: Kalau ada JOIN di mana pun, jangan sentuh (biar aman).
     if has_join(sql):
         return sql
 
-    # ✅ FIX 2: Kalau ada GROUP BY, jangan sentuh (kemungkinan besar ada aggregasi multi-table)
+    # FIX 2: Kalau ada GROUP BY, jangan sentuh (kemungkinan besar ada aggregasi multi-table)
     if "GROUP BY" in sql.upper():
         return sql
 
-    # ✅ FIX 3: Kalau ada aggregate functions, jangan sentuh
+    # FIX 3: Kalau ada aggregate functions, jangan sentuh
     if re.search(r"\b(SUM|COUNT|AVG|MIN|MAX|GROUP_CONCAT)\s*\(", sql, flags=re.I):
         return sql
 
@@ -1198,7 +1104,7 @@ def _drop_unused_from_table_aliases(sql: str) -> str:
         if not alias or alias.lower() in _RESERVED_ALIASES:
             return m.group(0)
 
-        # ✅ FIX 4: Cek apakah alias dipakai di SELURUH query (bukan hanya setelah FROM)
+        # FIX 4: Cek apakah alias dipakai di SELURUH query (bukan hanya setelah FROM)
         # SEBELUMNYA: scan[m.end():] → hanya cek setelah FROM
         # SEKARANG: scan → cek di seluruh query (termasuk SELECT clause)
         if re.search(rf"\b{re.escape(alias)}\s*\.", scan, flags=re.I):
@@ -1454,7 +1360,7 @@ def _is_potential_winner_row(sql: str, question: str, force: bool = False) -> bo
     if "group by" not in s and "max(" not in s and "min(" not in s:
         return False
 
-    # 🆕 Winner-row patterns (robust, no hardcoded column names)
+    # Winner-row patterns (robust, no hardcoded column names)
     # Pattern 1: MAX()/MIN() on date/timestamp columns (e.g., orderDate, paymentDate, createdAt)
     # These indicate "most recent" or "earliest" queries → winner-row pattern
     has_max_min = ("max(" in s or "min(" in s)
@@ -1667,7 +1573,6 @@ def _normalize_alias_lengths(sql: str) -> str:
 
     return result
 
-
 def _enforce_explicit_group_by(sql: str) -> str:
     """
     Benchmark style:
@@ -1724,9 +1629,6 @@ def _enforce_explicit_group_by(sql: str) -> str:
 
     return ast.sql(dialect="mysql")
 
-
-# 🆕 NEW: Remove invalid columns from SELECT when GROUP BY is present
-# This fixes cases where LLM includes raw date columns in SELECT but doesn't group by them
 def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
     """
     When GROUP BY is present, remove SELECT columns that are:
@@ -1773,13 +1675,13 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
             if isinstance(base, (exp.Literal, exp.Star)):
                 continue
 
-            # 🆕 Skip CASE expressions (they define computed columns used in GROUP BY)
+            # Skip CASE expressions (they define computed columns used in GROUP BY)
             if isinstance(base, exp.Case):
                 continue
 
             base_sql = base.sql(dialect="mysql").strip().lower()
 
-            # 🆕 Also check if alias is in GROUP BY (MySQL compatibility)
+            # Also check if alias is in GROUP BY (MySQL compatibility)
             alias_in_groupby = False
             if alias:
                 alias_sql = alias.sql(dialect="mysql").strip().lower()
@@ -1795,7 +1697,7 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
         return ast.sql(dialect="mysql")
 
     except Exception:
-        # 🆕 FALLBACK: Use regex when sqlglot fails (syntax errors, etc.)
+        # FALLBACK: Use regex when sqlglot fails (syntax errors, etc.)
         # This handles cases where SQL has minor syntax issues
         if "GROUP BY" not in sql.upper():
             return sql
@@ -1876,10 +1778,10 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
                     is_aggregate = True
 
             is_window = bool(re.search(r'\bOVER\s*\(', base, re.IGNORECASE))
-            # 🆕 Check if it's a CASE expression (should always be kept)
+            # Check if it's a CASE expression (should always be kept)
             is_case = bool(re.search(r'\bCASE\s+WHEN\b', base, re.IGNORECASE))
 
-            # 🆕 Keep if: aggregate, window, CASE, base in GROUP BY, or alias in GROUP BY (MySQL compatibility)
+            # Keep if: aggregate, window, CASE, base in GROUP BY, or alias in GROUP BY (MySQL compatibility)
             # MySQL allows GROUP BY alias, so check both base expression and alias
             alias_in_groupby = alias and alias.lower() in group_set if alias else False
             if is_aggregate or is_window or is_case or base_lower in group_set or alias_in_groupby:
@@ -2335,7 +2237,7 @@ def _parse_select_from_groupby(sql: str) -> Optional[dict]:
 
     s = sql.strip().rstrip(";").strip()
     
-    # ✅ SAFETY: Detect malformed syntax and abort early
+    # SAFETY: Detect malformed syntax and abort early
     # Pattern: clause keywords stuck together without space
     if re.search(r"\b[A-Za-z0-9_]+(?:WHERE|GROUP|ORDER|HAVING|LIMIT)\b", s, flags=re.I):
         # Try one normalization pass
@@ -2344,7 +2246,7 @@ def _parse_select_from_groupby(sql: str) -> Optional[dict]:
         if re.search(r"\b[A-Za-z0-9_]+(?:WHERE|GROUP|ORDER|HAVING|LIMIT)\b", s, flags=re.I):
             return None
 
-    # ✅ PRE-NORMALIZE: Fix common spacing issues
+    # PRE-NORMALIZE: Fix common spacing issues
     s = re.sub(r"(\b[A-Za-z_][A-Za-z0-9_]*)\s*(?=\b(?:HAVING|ORDER|LIMIT|WHERE|GROUP)\b)", r"\1 ", s, flags=re.I)
     s = re.sub(r"\s{2,}", " ", s)  # collapse multiple spaces
 
@@ -2473,7 +2375,7 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
 
     s0 = sql.strip()
 
-    # ✅ CRITICAL: Detect truly malformed queries (not false positives from subqueries)
+    # CRITICAL: Detect truly malformed queries (not false positives from subqueries)
     # Pattern: ROW_NUMBER appears BEFORE GROUP BY (malformed window)
     if re.search(r"\bROW_NUMBER\s*\([^)]*\)\s+[^;]*\bGROUP\s+BY\b", s0, flags=re.I):
         return sql  # Already corrupted window + group mix
@@ -2648,7 +2550,7 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
         if norm_col(base) not in group_norm and _is_simple_column_expr(base):
             candidates.append(base)
 
-    # ✅ Strategy: collect ALL date/time columns as tie-breakers
+    # Strategy: collect ALL date/time columns as tie-breakers
     tie_exprs: List[str] = []
     
     # Priority 1: Date columns (most common tie-breaker)
@@ -2667,7 +2569,7 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
 
     metric_dir = "DESC" if agg_kind == "MAX" else "ASC"
 
-    # ✅ Detect tie-breaker direction from question
+    # Detect tie-breaker direction from question
     ql = (question or "").lower()
     
     # Explicit signals
@@ -2676,7 +2578,7 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
     elif any(k in ql for k in ["earliest", "oldest", "first", "terlama", "paling lama", "pertama"]):
         tie_dir = "ASC"
     else:
-        # ✅ Smart default based on context
+        # Smart default based on context
         # For date/time columns: default DESC (latest is usually desired)
         # For other columns: ASC
         if tie_exprs and any(k in tie_exprs[0].lower() for k in ["date", "time", "timestamp"]):
@@ -2690,7 +2592,7 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
 
     # Build ORDER BY: metric first, then tie-breakers (limit to 2 for stability)
     order_parts = [f"{agg_expr} {metric_dir}"]
-    for tie in tie_exprs[:2]:  # ✅ Take up to 2 tie-breakers
+    for tie in tie_exprs[:2]:  # Take up to 2 tie-breakers
         order_parts.append(f"{tie} {tie_dir}")
 
     order_window = ", ".join(order_parts)
@@ -2705,10 +2607,10 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
     for j, x in enumerate(select_items):
         orig_alias = _extract_alias_or_colname(x)
 
-        # --- 🔥 untuk kolom aggregate: GANTI MAX(...) -> raw metric expr ---
+        # --- untuk kolom aggregate: GANTI MAX(...) -> raw metric expr ---
         if j == agg_idx:
             base = agg_expr
-            # ✅ Use natural column name, not the aggregate alias
+            # Use natural column name, not the aggregate alias
             out_name = base  # "amount" instead of "max_amount"
             
         else:
@@ -2723,7 +2625,7 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
             agg_match = re.match(r"^(MAX|MIN)\s*\(\s*(.+?)\s*\)$", base, flags=re.I)
             if agg_match:
                 base = agg_match.group(2)
-                # ✅ Use natural column name for extracted aggregates
+                # Use natural column name for extracted aggregates
                 out_name = _strip_table_prefix(base)
             else:
                 # Keep original alias for true non-aggregate columns
@@ -3714,7 +3616,7 @@ def _remove_top_level_order_by_if_not_requested(sql: str, question: str) -> str:
     cleaned = sql[:order_pos].rstrip() + sql[order_pos + m.end():]
     
     if cleaned != sql:
-        print("[Logic] ✂️ Removed unrequested ORDER BY (Regex Force).")
+        print("[Logic] Removed unrequested ORDER BY (Regex Force).")
         
     return cleaned
 

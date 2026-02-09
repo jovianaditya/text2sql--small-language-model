@@ -1,4 +1,17 @@
+# ======================================================================
+# ============================= ingestion.py ===========================
+# ======================================================================
+# Purpose: 
+# - Node Ingestion (Simplified).
+# - Delegates to Auto-Ingest logic and reports existing stats IMMEDIATELY.
+
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 import os
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .config import CHROMA_DIR, COLLECTION_NAME
@@ -31,5 +44,4 @@ def ingest_node(state: RAGState) -> RAGState:
     abs_chroma = os.path.abspath(CHROMA_DIR)
     print(f"Chroma path: {abs_chroma} | Collection: {COLLECTION_NAME}")
     print(f"{line_sep}\n")
-
     return state

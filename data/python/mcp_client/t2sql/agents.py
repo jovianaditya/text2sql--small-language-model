@@ -1,16 +1,20 @@
 # ======================================================================
 # ============================ agents.py ===============================
 # ======================================================================
+# Purpose:
+# - Agents 0 --> Guardrail for question validation (hybrid regex + LLM)
+# - Agent 1 --> Router agent to determine query complexity and target model
+# - Agent 2 --> Drafting agent to generate initial SQL
+# - Agent 3 --> Refinement agent to improve SQL based on feedback
+
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
-
-_SQL_KEYWORDS: Set[str] = {
-    "select","from","where","group","by","order","limit","join","left","right","inner",
-    "on","and","or","not","as","distinct","count","sum","avg","min","max","having",
-    "asc","desc","like","in","between","is","null","case","when","then","else","end",
-    "regexp","rlike","over","partition","row_number"
-}
-
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .config import ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_URL, OLLAMA_KEEP_ALIVE, RETRIEVE_DEBUG
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -19,10 +23,9 @@ from .generation import regenerate_with_extra_constraint
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
     _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline,
     _find_tables_with_implicit_columns, _extract_fk_from_context)
-from .helpers_core import(has_join, _question_requires_word_boundary_regex, _parse_allowed_identifiers, _remove_top_level_order_by_if_not_requested)
-
+from .helpers_core import (has_join, _question_requires_word_boundary_regex, _parse_allowed_identifiers, _remove_top_level_order_by_if_not_requested, _SQL_KEYWORDS)
 # ======================================================================
-# ====================== QUESTION GUARD (HYBRID) =======================
+# ======================= AGENT 0 - QUESTION GUARD =====================
 # ======================================================================
 # Purpose: Reject non-SQL questions BEFORE hitting main LLM to prevent:
 #   1. Garbage output from irrelevant questions
@@ -248,7 +251,7 @@ def validate_question_intent(question: str) -> Tuple[bool, str]:
     # Layer 1: Instant reject obvious garbage
     should_reject, reason = _check_instant_reject(question)
     if should_reject:
-        print(f"[Guard] ❌ Layer 1 REJECT (regex): {reason[:50]}")
+        print(f"[Guard] Layer 1 REJECT (regex): {reason[:50]}")
         return False, reason
     
     # Layer 1b: Instant accept definite SQL
@@ -263,13 +266,10 @@ def validate_question_intent(question: str) -> Tuple[bool, str]:
     if is_valid:
         print(f"[Guard] ✓ Layer 2 ACCEPT (LLM approved)")
     else:
-        print(f"[Guard] ❌ Layer 2 REJECT (LLM): {reason[:50]}")
+        print(f"[Guard] Layer 2 REJECT (LLM): {reason[:50]}")
     
     return is_valid, reason
 
-# ======================================================================
-# =================== QUESTION GUARD NODE (GRAPH) ======================
-# ======================================================================
 def question_guard_node(state: RAGState) -> RAGState:
     """
     Standalone guard node - runs BEFORE retrieve to save resources.
@@ -285,7 +285,7 @@ def question_guard_node(state: RAGState) -> RAGState:
     is_valid, rejection_reason = validate_question_intent(question)
     
     if not is_valid:
-        print(f"\n❌ REJECTED: Question is not a valid data query")
+        print(f"\nREJECTED: Question is not a valid data query")
         print(f"   Reason: {rejection_reason[:100]}...")
         print(f"{line_sep}\n")
         return {
@@ -309,161 +309,9 @@ def question_guard_node(state: RAGState) -> RAGState:
             "is_valid_question": True,
         }
     }
-
 # ======================================================================
-# Update: agents.py -> router_agent (Final Robust Version)
+# ======================== AGENT 1 - ROUTER AGENT ======================
 # ======================================================================
-# def router_agent(state: RAGState) -> RAGState:
-#     print(f"\n[Router] Evidence-Based Analysis starting...")
-#     question = state.get("question", "").lower()
-#     ctx = state.get("context", "")
-    
-#     # 1. IDENTIFIKASI TABEL (Pattern-Based Exclusion)
-#     allowed_identifiers = _parse_allowed_identifiers(ctx)
-#     whitelisted_tables = allowed_identifiers.keys()
-    
-#     # [FIX] Definisi Pattern yang HARUS DIBUANG sebelum deteksi tabel
-#     ignore_patterns = {
-#         'order': [
-#             r"\border(ed|s)?\s+by\b",           # Remove: "order by", "ordered by"
-#             r"\b(descending|ascending)\s+order\b", # Remove: "descending order", "ascending order"
-#             r"\bin\s+order\b"                   # Remove: "in order" (e.g. "in order to")
-#         ],
-#         'group': [r"\bgroup\s+by\b"],           # Remove: "group by"
-#         'sort':  [r"\bsort(ed)?\s+by\b"],       # Remove: "sort by", "sorted by"
-#         'rank':  [r"\brank\s+over\b"]           # Remove: "rank over"
-#     }
-    
-#     relevant_tables = []
-#     for tbl in whitelisted_tables:
-#         # Cek 1: Pastikan tabel ada di Context
-#         if f"- {tbl}:" not in ctx and f"- `{tbl}`:" not in ctx:
-#             continue
-        
-#         table_word = tbl.lower().rstrip('s') # orders -> order
-        
-#         # --- [ROBUST MASKING] ---
-#         # Buat copy pertanyaan khusus untuk scanning tabel ini
-#         search_scope = question
-        
-#         if table_word in ignore_patterns:
-#             patterns = ignore_patterns[table_word]
-#             for pat in patterns:
-#                 # Hapus frasa pengganggu (ganti dengan spasi)
-#                 search_scope = re.sub(pat, " ", search_scope)
-#         # ------------------------
-        
-#         # Cek 2: Cari kata tabel di search_scope yang SUDAH BERSIH
-#         if re.search(rf"\b{table_word}s?\b", search_scope):
-            
-#             # Deteksi referensi ID saja (FK)
-#             is_just_id_ref = re.search(rf"\b{table_word}s?\s+(number|id|code|kode|nomor)\b", search_scope)
-            
-#             if is_just_id_ref:
-#                 # Ambil tabel jika ada penyebutan entitas di luar ID
-#                 if re.search(rf"\b{table_word}s?\b(?!\s+(number|id|code|kode|nomor))", search_scope):
-#                     relevant_tables.append(tbl)
-#             else:
-#                 relevant_tables.append(tbl)
-    
-#     # 🆕 [FK-ONLY FILTER] - Hapus tabel yang HANYA disebutkan sebagai filter nilai FK
-#     # Pattern: "offices with codes 1, 2, or 3" -> offices cuma jadi constraint, bukan JOIN
-#     filtered_tables = []
-#     for tbl in relevant_tables:
-#         table_word = tbl.lower().rstrip('s')
-#         # Deteksi pattern: "<table> with <code/id> <angka/list>"
-#         fk_only_pattern = rf"\b{table_word}s?\s+with\s+(code|number|id|kode|nomor)s?\s+[\d,\sor]+"
-        
-#         # Jika match FK-only pattern DAN tidak ada penyebutan lain dari tabel tersebut
-#         if re.search(fk_only_pattern, question):
-#             # Cek apakah ada penyebutan tabel di luar pattern FK-only
-#             temp_scope = re.sub(fk_only_pattern, "", question)
-            
-#             # 🆕 PENTING: Cek tabel tanpa 's' juga (office vs offices)
-#             # Karena "office codes" != "offices", harus cek strict word boundary
-#             has_other_mention = (
-#                 re.search(rf"\b{table_word}s\b", temp_scope) or  # Cek plural (offices)
-#                 re.search(rf"\b{table_word}\s+(?!(code|number|id|kode|nomor))", temp_scope)  # Cek singular tapi bukan "<table> code"
-#             )
-            
-#             if not has_other_mention:
-#                 # Skip tabel ini, karena cuma disebutkan sebagai FK filter
-#                 continue
-        
-#         filtered_tables.append(tbl)
-
-#     relevant_tables = filtered_tables
-#     # 🆕 [END FK-ONLY FILTER]
-    
-#     # 2. DETEKSI SINYAL
-#     math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata']
-#     has_math = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in math_keywords)
-    
-#     value_ranks = ["highest", "lowest", "top", "bottom", "most", "least", "largest", "smallest", "terbesar", "terkecil", "paling"]
-#     time_ranks = ["latest", "earliest", "newest", "oldest", "terbaru", "terlama"]
-#     is_ranking_value = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in value_ranks)
-#     is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in time_ranks)
-#     is_ranking = is_ranking_value or is_ranking_time
-    
-#     explicit_sort = ["sort by", "ordered by", "sorted by", "order by", "sorted from"]
-#     is_sorting = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in explicit_sort) or is_ranking
-    
-#     group_indicators = ["each", "per", "every", "masing-masing", "setiap", "for each", "classify"]
-#     has_group_word = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in group_indicators)
-#     is_by_logic = ("by " in question and not any(re.search(rf"\b{re.escape(s)}\b", question) for s in explicit_sort) and (has_math or is_ranking))
-#     has_grouping = has_group_word or is_by_logic
-    
-#     # 3. LOGIKA ESKALASI
-#     is_multi_table = len(relevant_tables) > 1
-#     is_winner_row = is_ranking_value and has_grouping
-    
-#     exclusion_keywords = ["no", "never", "without", "tidak pernah", "belum pernah", "tidak ada", "missing", "empty", "all customers", "all products"]
-#     has_exclusion = any(re.search(rf"\b{re.escape(kw)}\b", question) for kw in exclusion_keywords)
-    
-#     should_escalate = is_multi_table or is_winner_row
-    
-#     chosen_model = LARGE_MODEL if should_escalate else SMALL_MODEL
-#     complexity = "complex" if should_escalate else "simple"
-    
-#     # Tentukan QTYPE
-#     if is_winner_row: qtype = "rank"
-#     elif has_math or has_grouping: qtype = "aggregate"
-#     else: qtype = "lookup"
-    
-#     print(f"[Router] Detected Tables: {relevant_tables}")
-#     print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, Exclusion:{has_exclusion}")
-#     print(f"[Router] Decision: {complexity.upper()} -> {chosen_model}")
-    
-#     return {
-#         **state,
-#         "router_tables": relevant_tables,
-#         "target_model": chosen_model,
-#         "router_decision": {
-#             "complexity": complexity,
-#             "qtype": qtype,
-#             "has_grouping": has_grouping,
-#             "is_ranking": is_ranking,
-#             "is_winner_row": is_winner_row,
-#             "has_exclusion": has_exclusion
-#         }
-#     }
-# if is_aggregation and per_match:
-#     group_entity = per_match.group(1).rstrip('s')  # "customer"
-    
-#     # Build FK map
-#     for tbl in relevant_tables:
-#         tbl_cols = allowed_identifiers.get(tbl, set())
-#         for col in tbl_cols:
-#             fk_match = re.match(rf"^{group_entity}(Number|Code|Id)$", col, re.IGNORECASE)
-#             if fk_match:
-#                 fk_exists_in[col] = tbl
-    
-#     # Remove parent table if FK exists in child
-#     for fk_col, fk_table in fk_exists_in.items():
-#         parent_table = group_entity + 's'
-#         if parent_table in relevant_tables and parent_table != fk_table:
-#             print(f"[Router] 🎯 FK Inference: {fk_col} exists in {fk_table}, removing {parent_table}")
-#             relevant_tables.remove(parent_table)
 def router_agent(state: RAGState) -> RAGState:
     """
     Router agent - determines query complexity and target model.
@@ -557,7 +405,7 @@ def router_agent(state: RAGState) -> RAGState:
     relevant_tables = filtered_tables
 
     # ═══════════════════════════════════════════════════════════════════
-    # STEP 2.2: 🆕 INCLUDE TABLES WITH IMPLICITLY MENTIONED COLUMNS (AGNOSTIC)
+    # STEP 2.2: INCLUDE TABLES WITH IMPLICITLY MENTIONED COLUMNS (AGNOSTIC)
     # ═══════════════════════════════════════════════════════════════════
     # AGNOSTIC approach - works for ANY column type (numeric, string, date, etc.)
     # Uses retrieval results (ranked_cols) to find tables whose columns are
@@ -591,10 +439,10 @@ def router_agent(state: RAGState) -> RAGState:
                         if tbl_lower not in relevant_lower:
                             relevant_tables.append(original_tbl)
                             if RETRIEVE_DEBUG:
-                                print(f"[Router] ✋ Including {original_tbl} (implicit column mention)")
+                                print(f"[Router] Including {original_tbl} (implicit column mention)")
 
     # ═══════════════════════════════════════════════════════════════════
-    # STEP 2.5: 🆕 DETECT SIGNALS EARLY (needed for FK inference)
+    # STEP 2.5:  DETECT SIGNALS EARLY (needed for FK inference)
     # ═══════════════════════════════════════════════════════════════════
     question_lower = question.lower()
     
@@ -609,12 +457,12 @@ def router_agent(state: RAGState) -> RAGState:
     is_aggregation = has_math or has_group_word
     
     # ═══════════════════════════════════════════════════════════════════
-    # STEP 3: 🆕 GRAPH-BASED TABLE SELECTION (Robust, Schema-Agnostic)
+    # STEP 3: GRAPH-BASED TABLE SELECTION (Robust, Schema-Agnostic)
     # ═══════════════════════════════════════════════════════════════════
     # This approach uses graph theory to find the minimal set of tables needed:
     # 1. Build FK relationship graph
-    # 2. Identify "seed" tables (tables directly referenced in question)
-    # 3. Find minimal connecting subgraph (shortest paths between seeds)
+    # 2. Identify "evidence" tables (tables directly referenced in question)
+    # 3. Find minimal connecting subgraph (shortest paths between evidence tables)
     # 4. Remove tables not in the connecting subgraph
     #
     # Advantages:
@@ -674,14 +522,14 @@ def router_agent(state: RAGState) -> RAGState:
         fk_graph[target_table][source_table] = (None, source_col)
 
     # --- STEP 3.2: Identify Seed Tables ---
-    # Seed tables are tables that have direct evidence from the question:
+    # Evidence tables are tables that have direct evidence from the question:
     # 1. Columns mentioned (including camelCase variants)
     # 2. "For each X" patterns
     # 3. Table name + attribute patterns ("employee name", "customer number")
     # 4. Aggregate keywords with table context
 
-    seed_tables = set()
-    seed_evidence = {}  # {table: [evidence_strings]}
+    evidence_tables = set()
+    evidence_details = {}  # {table: [evidence_strings]}
 
     for tbl in relevant_tables:
         tbl_lower = tbl.lower()
@@ -689,7 +537,7 @@ def router_agent(state: RAGState) -> RAGState:
         evidence = []
 
         # Check 1: Direct column mentions (all columns, including FKs)
-        # 🆕 FK columns are treated as WEAK evidence if they exist in other tables
+        # FK columns are treated as WEAK evidence if they exist in other tables
         table_singular = tbl_lower.rstrip('s')
         for col in tbl_cols:
             col_lower = col.lower()
@@ -701,7 +549,7 @@ def router_agent(state: RAGState) -> RAGState:
 
             for variant in col_variants:
                 if variant in question_lower:
-                    # 🆕 Check if this is an FK column (e.g., customerNumber)
+                    # Check if this is an FK column (e.g., customerNumber)
                     fk_pattern = rf'^{re.escape(table_singular)}(number|code|id|id)$'
                     is_fk_col = bool(re.match(fk_pattern, col_lower, re.IGNORECASE))
 
@@ -769,20 +617,20 @@ def router_agent(state: RAGState) -> RAGState:
                 evidence.append("aggregate context")
 
         if evidence:
-            seed_tables.add(tbl_lower)
-            seed_evidence[tbl_lower] = evidence
+            evidence_tables.add(tbl_lower)
+            evidence_details[tbl_lower] = evidence
             if RETRIEVE_DEBUG:
-                print(f"[Router] 🌱 Seed table: {tbl} (evidence: {', '.join(evidence)})")
+                print(f"[Router] Evidence table: {tbl} (evidence: {', '.join(evidence)})")
 
-    # 🆕 STEP 2.8: Remove parent tables that are only referenced by "for each" pattern
+    # STEP 2.8: Remove parent tables that are only referenced by "for each" pattern
     # If a table is ONLY added because of "for each/per/each" pattern (no column mentions),
     # AND another table has the FK column linking to it, skip the parent table.
     # Example: "per customer" + payments.has(customerNumber) → skip customers table
     tables_to_remove = []
-    for tbl_lower in list(seed_tables):
-        evidence_list = seed_evidence.get(tbl_lower, [])
+    for tbl_lower in list(evidence_tables):
+        evidence_list = evidence_details.get(tbl_lower, [])
 
-        # 🆕 Check if evidence is ONLY weak patterns
+        # Check if evidence is ONLY weak patterns
         # Strong evidence: non-FK column mentions, aggregate context
         # Weak evidence: 'for each' pattern, table+attribute pattern, FK column mentions
         weak_evidence = {"'for each' pattern", "table+attribute pattern"}
@@ -835,12 +683,12 @@ def router_agent(state: RAGState) -> RAGState:
                     # Safe to remove - only referenced via "for each" and FK exists elsewhere
                     tables_to_remove.append(tbl_lower)
                     if RETRIEVE_DEBUG:
-                        print(f"[Router] ✂️ Skipping {tbl_lower}: only 'for each' ref, FK exists in other table")
+                        print(f"[Router] Skipping {tbl_lower}: only 'for each' ref, FK exists in other table")
 
     # Remove identified tables
     for tbl_lower in tables_to_remove:
-        seed_tables.discard(tbl_lower)
-        seed_evidence.pop(tbl_lower, None)
+        evidence_tables.discard(tbl_lower)
+        evidence_details.pop(tbl_lower, None)
         # Also remove from relevant_tables
         tbl_original = None
         for t in relevant_tables:
@@ -851,11 +699,17 @@ def router_agent(state: RAGState) -> RAGState:
             relevant_tables.remove(tbl_original)
 
     # --- STEP 3.3: Find Minimal Connecting Subgraph ---
-    # Use BFS to find shortest paths between all pairs of seed tables
-    # The union of all paths = minimal table set needed
+    # Use BFS (Breadth-First Search) to find shortest paths between all pairs of evidence tables
+    # BFS = explores all neighbors at current depth before moving deeper
+    # The union of all paths = minimal table set needed for valid JOINs
 
     def bfs_shortest_path(start, end, graph):
-        """Find shortest path between start and end using BFS."""
+        """
+        Find shortest path between start and end using BFS (Breadth-First Search).
+
+        BFS explores graph level by level, guaranteeing the shortest path in unweighted graphs.
+        Used here to find minimal JOIN path between two evidence tables via FK relationships.
+        """
         if start == end:
             return [start]
 
@@ -876,13 +730,13 @@ def router_agent(state: RAGState) -> RAGState:
         return None  # No path found
 
     # Collect all tables in the minimal connecting subgraph
-    tables_in_subgraph = set(seed_tables)
+    tables_in_subgraph = set(evidence_tables)
 
-    if len(seed_tables) >= 2:
-        # Find paths between all pairs of seed tables
-        seed_list = list(seed_tables)
-        for i, start in enumerate(seed_list):
-            for end in seed_list[i+1:]:
+    if len(evidence_tables) >= 2:
+        # Find paths between all pairs of evidence tables
+        evidence_list = list(evidence_tables)
+        for i, start in enumerate(evidence_list):
+            for end in evidence_list[i+1:]:
                 path = bfs_shortest_path(start, end, fk_graph)
                 if path:
                     tables_in_subgraph.update(path)
@@ -898,27 +752,27 @@ def router_agent(state: RAGState) -> RAGState:
     for tbl in relevant_tables:
         tbl_lower = tbl.lower()
 
-        # Keep if it's a seed table
-        if tbl_lower in seed_tables:
+        # Keep if it's an evidence table
+        if tbl_lower in evidence_tables:
             if RETRIEVE_DEBUG:
-                print(f"[Router] ✅ Keeping {tbl}: seed table")
+                print(f"[Router] Keeping {tbl}: evidence table")
             continue
 
         # Keep if it's in the connecting subgraph
         if tbl_lower in tables_in_subgraph:
             if RETRIEVE_DEBUG:
-                print(f"[Router] ✅ Keeping {tbl}: in connecting subgraph")
+                print(f"[Router] Keeping {tbl}: in connecting subgraph")
             continue
 
-        # Keep if it has outgoing FKs to a seed table (might be needed for query)
-        has_fk_to_seed = False
+        # Keep if it has outgoing FKs to an evidence table (might be needed for query)
+        has_fk_to_evidence = False
         for target in fk_graph.get(tbl_lower, {}):
-            if target in seed_tables:
-                has_fk_to_seed = True
+            if target in evidence_tables:
+                has_fk_to_evidence = True
                 break
 
-        if has_fk_to_seed:
-            # This table references a seed table via FK
+        if has_fk_to_evidence:
+            # This table references an evidence table via FK
             # Check if we need any non-FK columns from it
             non_fk_cols = [c for c in allowed_identifiers.get(tbl, [])
                           if c.lower() not in fk_columns_by_table.get(tbl_lower, {})]
@@ -934,25 +788,25 @@ def router_agent(state: RAGState) -> RAGState:
 
             if needs_non_fk:
                 if RETRIEVE_DEBUG:
-                    print(f"[Router] ✅ Keeping {tbl}: has FK to seed + needs non-FK columns")
+                    print(f"[Router] Keeping {tbl}: has FK to evidence table + needs non-FK columns")
                 continue
 
         # Mark for removal
         tables_to_remove.append(tbl)
         if RETRIEVE_DEBUG:
-            print(f"[Router] ❌ Removing {tbl}: not in minimal subgraph")
+            print(f"[Router] Removing {tbl}: not in minimal subgraph")
 
     # Apply removals
     for tbl in tables_to_remove:
         if tbl in relevant_tables:
             relevant_tables.remove(tbl)
 
-    # 🆕 SAFETY: Never leave relevant_tables empty - fallback to first whitelisted table
+    # SAFETY: Never leave relevant_tables empty - fallback to first whitelisted table
     if not relevant_tables and whitelisted_tables:
         fallback_table = list(whitelisted_tables)[0]
         relevant_tables.append(fallback_table)
         if RETRIEVE_DEBUG:
-            print(f"[Router] ⚠️ All tables removed, falling back to: {fallback_table}")
+            print(f"[Router] All tables removed, falling back to: {fallback_table}")
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 4: DETEKSI SINYAL (Complete Detection)
@@ -966,7 +820,7 @@ def router_agent(state: RAGState) -> RAGState:
     is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in time_ranks)
     is_ranking = is_ranking_value or is_ranking_time
     
-    # 🆕 EXPLICIT RANK FUNCTION DETECTION: "a rank of X" / "rank employees" / "ranking"
+    # EXPLICIT RANK FUNCTION DETECTION: "a rank of X" / "rank employees" / "ranking"
     # This means user explicitly wants RANK() OVER window function
     # E.g., "return a rank of employees within each job title"
     explicit_rank_patterns = [
@@ -978,14 +832,14 @@ def router_agent(state: RAGState) -> RAGState:
     ]
     is_explicit_rank_function = any(re.search(pat, question_lower) for pat in explicit_rank_patterns)
     
-    # 🆕 ORDINAL RANKING DETECTION: "second highest", "third largest", "2nd lowest", etc.
+    # ORDINAL RANKING DETECTION: "second highest", "third largest", "2nd lowest", etc.
     # These patterns ALWAYS need ROW_NUMBER() with rn = N, much more complex than simple MAX/MIN
     ordinal_words = ["second", "third", "fourth", "fifth", "2nd", "3rd", "4th", "5th",
                      "kedua", "ketiga", "keempat", "kelima"]
     ordinal_pattern = rf"\b({'|'.join(ordinal_words)})\s+(highest|lowest|largest|smallest|biggest|top|bottom|best|worst|most|least|terbesar|terkecil|tertinggi|terendah)\b"
     is_ordinal_ranking = bool(re.search(ordinal_pattern, question_lower))
     
-    # 🆕 WINDOW AGGREGATE DETECTION: "within the same X" / "in the same X" pattern
+    # WINDOW AGGREGATE DETECTION: "within the same X" / "in the same X" pattern
     # This pattern requires COUNT(*) OVER (PARTITION BY X), NOT GROUP BY
     # E.g., "total employees within the same office" → PARTITION BY officeCode
     within_same_pattern = r"\b(within|in)\s+the\s+same\s+(\w+)"
@@ -1064,14 +918,14 @@ def router_agent(state: RAGState) -> RAGState:
                     primary_reason = "'all X' pattern"
                     break
 
-        # Rule 4: Not yet found, use table with most seed evidence
+        # Rule 4: Not yet found, use table with most evidence
         if not primary_table:
-            # Use the seed_tables set from earlier (tables with direct evidence)
+            # Use the evidence_tables set from earlier (tables with direct evidence)
             best_score = -1
             for tbl in relevant_tables:
                 tbl_lower = tbl.lower()
-                if tbl_lower in seed_evidence:
-                    score = len(seed_evidence[tbl_lower])
+                if tbl_lower in evidence_details:
+                    score = len(evidence_details[tbl_lower])
                     if score > best_score:
                         best_score = score
                         primary_table = tbl
@@ -1083,7 +937,7 @@ def router_agent(state: RAGState) -> RAGState:
             primary_reason = "first table (fallback)"
 
     if RETRIEVE_DEBUG:
-        print(f"[Router] 🎯 Primary Table: {primary_table} (reason: {primary_reason})")
+        print(f"[Router] Primary Table: {primary_table} (reason: {primary_reason})")
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
@@ -1094,14 +948,14 @@ def router_agent(state: RAGState) -> RAGState:
     # Case 1: Multi-table + ranking + grouping (e.g., "customer with highest total payment")
     # Case 2: Single-table but explicit "X with largest/highest Y for each Z" pattern
     # Case 3: Tiebreaker pattern ("if multiple, choose the one with...")
-    # Case 4: 🆕 Ordinal ranking ("second highest", "third largest") - ALWAYS needs ROW_NUMBER
+    # Case 4: Ordinal ranking ("second highest", "third largest") - ALWAYS needs ROW_NUMBER
     is_winner_row = False
     
-    # 🆕 Pattern D: ORDINAL RANKING (highest priority - always complex)
+    # Pattern D: ORDINAL RANKING (highest priority - always complex)
     # "second highest", "third largest", "2nd lowest" - requires ROW_NUMBER() WHERE rn = N
     if is_ordinal_ranking:
         is_winner_row = True
-        print(f"[Router] ⚡ Ordinal ranking detected ('second highest' etc) -> requires ROW_NUMBER subquery")
+        print(f"[Router] Ordinal ranking detected ('second highest' etc) -> requires ROW_NUMBER subquery")
     
     # Pattern A: ranking + grouping + multi-table (original logic)
     if not is_winner_row and is_ranking_value and has_grouping and is_multi_table:
@@ -1127,7 +981,7 @@ def router_agent(state: RAGState) -> RAGState:
     if has_tiebreaker:
         is_winner_row = True
     
-    # 🆕 FIXED: Exclusion detection - only trigger for TRUE exclusion patterns
+    # FIXED: Exclusion detection - only trigger for TRUE exclusion patterns
     # These patterns imply NOT EXISTS / NOT IN / LEFT JOIN ... IS NULL (cross-table exclusion)
     # NOT triggered by: "missing" in single-table context (just IS NULL check)
     has_exclusion = False
@@ -1148,7 +1002,7 @@ def router_agent(state: RAGState) -> RAGState:
         if re.search(r"\b(missing|empty)\b", question_lower):
             has_exclusion = True
     
-    # 🆕 ESCALATION LOGIC
+    # ESCALATION LOGIC
     # Escalate to 7B when complexity truly requires it:
     # - Multi-table query (requires JOIN)
     # - Winner-row patterns (requires ROW_NUMBER/RANK subquery)
@@ -1160,9 +1014,9 @@ def router_agent(state: RAGState) -> RAGState:
     )
     
     if is_multi_table:
-        print(f"[Router] ⚡ Multi-table detected: {relevant_tables} -> escalating to 7B")
+        print(f"[Router] Multi-table detected: {relevant_tables} -> escalating to 7B")
     if is_winner_row and not is_multi_table:
-        print(f"[Router] ⚡ Winner-row pattern detected (tiebreaker/subquery needed) -> escalating to 7B")
+        print(f"[Router] Winner-row pattern detected (tiebreaker/subquery needed) -> escalating to 7B")
     
     chosen_model = LARGE_MODEL if should_escalate else SMALL_MODEL
     complexity = "complex" if should_escalate else "simple"
@@ -1204,8 +1058,6 @@ def router_agent(state: RAGState) -> RAGState:
 import time as _time  # For inference timing
 # Track last warmup time per model
 _last_model_warmup = {}
-
-
 # OOM retry settings
 OOM_WAIT_TIME = 35  # Wait 35 seconds for model to unload (keep_alive=30s + buffer)
 OOM_MAX_RETRIES = 3  # Max retry attempts on OOM
@@ -1280,7 +1132,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     if not model_ready:
         return {**state, "draft_sql": "SELECT 'Error: Model OOM after retries';"}
 
-    # 🆕 START TIMER: Model ready → Final SQL complete (for thesis latency benchmark)
+    # START TIMER: Model ready → Final SQL complete (for thesis latency benchmark)
     # This measures the core text-to-SQL processing time, excluding:
     # - Model loading/warmup (one-time cost)
     # - Retrieval (vector store, depends on index size)
@@ -1293,7 +1145,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     
     # Panggil Dynamic Prompt Builder (helpers_main.py)
     # Segala aturan heuristik (Anti-MAX, Anti-1055, Anti-Inner Join) sudah diurus di sana.
-    # 🆕 Pass state for dynamic join context from retrieval results
+    # Pass state for dynamic join context from retrieval results
     prompt = make_generation_prompt(ctx, question, decision, state)
     
     # ===== TIMED INFERENCE (model already loaded) =====
@@ -1316,7 +1168,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # Regex ini mencari DESC/ASC sebelum FROM (hanya di SELECT clause, bukan di ORDER BY)
     # Hanya strip DESC/ASC yang langsung sebelum FROM (dalam SELECT list)
     draft_sql = re.sub(r"\s+(DESC|ASC)\s*(?=FROM)", " ", draft_sql, flags=re.IGNORECASE)
-    # 🆕 FIX: Jangan strip DESC/ASC sebelum koma jika ada di dalam ORDER BY atau OVER clause
+    # FIX: Jangan strip DESC/ASC sebelum koma jika ada di dalam ORDER BY atau OVER clause
     # Pattern lama: r"\s+(DESC|ASC)\s*(?=,)" - ini salah strip "ORDER BY amount DESC, date"
     # Pattern baru: hanya strip jika di SELECT clause (sebelum FROM)
     # Gunakan negative lookbehind untuk memastikan bukan dalam ORDER BY context
@@ -1355,7 +1207,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         return state  # Pass through unchanged
     
     # DYNAMIC MODEL SELECTION berdasarkan draft quality
-    draft_model = state.get("target_model") or SMALL_MODEL  # 🆕 Track model asal
+    draft_model = state.get("target_model") or SMALL_MODEL  # Track model asal
     target_model = LARGE_MODEL  # Default untuk regeneration
     
     llm = build_llm_repair(model=target_model)
@@ -1377,14 +1229,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     sql_for_tokenizing = final_sql
     sql_for_tokenizing = re.sub(r"'(?:''|[^'])*'", " ", sql_for_tokenizing)
     sql_for_tokenizing = re.sub(r'"(?:""|[^"])*"', " ", sql_for_tokenizing)
-    # 🆕 FIX 1: Remove function calls (word followed by parenthesis)
+    # FIX 1: Remove function calls (word followed by parenthesis)
     sql_for_tokenizing = re.sub(
         r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(",
         "(",
         sql_for_tokenizing
     )
 
-    # 🆕 FIX 2: Remove table names from tokenizing
+    # FIX 2: Remove table names from tokenizing
     # This prevents "payments" in "FROM payments" or subquery being treated as column
     allowed_ids = _parse_allowed_identifiers(ctx)
     for tbl in allowed_ids.keys():
@@ -1413,13 +1265,13 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     quoted_aliases = re.findall(r"\bAS\s+['\"`]?([a-zA-Z0-9_]+)['\"`]?", sql_up, re.IGNORECASE)
     defined_aliases.update(quoted_aliases)
     
-    # 🆕 Also capture subquery aliases: FROM (...) alias or FROM (...) AS alias
+    # Also capture subquery aliases: FROM (...) alias or FROM (...) AS alias
     subquery_aliases = re.findall(r'\)\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b', sql_up, re.IGNORECASE)
     for sa in subquery_aliases:
         if sa.lower() not in ('where', 'group', 'order', 'having', 'limit', 'on', 'and', 'or'):
             defined_aliases.add(sa)
 
-    # 🆕 Also capture table aliases: FROM orders o, JOIN customers c
+    # Also capture table aliases: FROM orders o, JOIN customers c
     # Pattern: FROM table alias or JOIN table alias (with or without AS)
     table_alias_pattern = r'\b(?:FROM|JOIN)\s+[a-zA-Z_][a-zA-Z0-9_]*\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b'
     for m in re.finditer(table_alias_pattern, sql_up, re.IGNORECASE):
@@ -1430,7 +1282,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     reserved.update(a.lower() for a in defined_aliases)
 
-    # 🆕 Fix: For subqueries, FROM (SELECT...) matches "SELECT" - skip that
+    # Fix: For subqueries, FROM (SELECT...) matches "SELECT" - skip that
     # Look for real table name or subquery alias
     primary_match = re.search(r"FROM\s+([A-Za-z0-9_]+)", sql_up)
     primary_tbl = ""
@@ -1452,12 +1304,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # 3. DECISION MATRIX
     needs_regeneration = False
-    regeneration_model = LARGE_MODEL  # 🆕 Default 7B untuk regeneration
+    regeneration_model = LARGE_MODEL  # Default 7B untuk regeneration
     extra_instruction = ""
 
     # --- KASUS A: Schema Validation & Hallucination Check (HARD ERROR) ---
     if alien_cols and "JOIN" not in sql_up:
-        # 🆕 SMART SUBQUERY HANDLING
+        # SMART SUBQUERY HANDLING
         # Only skip validation if alien columns are INSIDE subquery (not in main SELECT)
         has_subquery = re.search(r"\(\s*SELECT\b", sql_up, re.IGNORECASE)
         
@@ -1478,7 +1330,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 if aliens_in_main:
                     # Alien columns in main SELECT → NOT safe to skip
                     _dbg_print_two(
-                        "[Agent3] 🚨 HARD ERROR - Hallucination in Main Query", 
+                        "[Agent3] HARD ERROR - Hallucination in Main Query", 
                         f"Columns {aliens_in_main} in SELECT but not in FROM table"
                     )
                     
@@ -1516,12 +1368,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 else:
                     # Alien columns only in subquery → safe to skip
                     _dbg_print_two(
-                        "[Agent3] ⚠️ Skipping hallucination check", 
+                        "[Agent3] Skipping hallucination check", 
                         "Alien columns only in subquery (different scope)"
                     )
             else:
                 # Can't parse SELECT clause → skip conservatively
-                _dbg_print_two("[Agent3] ⚠️ Skipping hallucination check", "Cannot parse SELECT clause")
+                _dbg_print_two("[Agent3] Skipping hallucination check", "Cannot parse SELECT clause")
         else:
             # No subquery → original logic
             can_be_solved_by_join = False
@@ -1535,7 +1387,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     break
             
             if can_be_solved_by_join:
-                _dbg_print_two("[Agent3] 🚨 HARD ERROR - Missing JOIN", f"Columns {alien_cols} belong to {potential_table}")
+                _dbg_print_two("[Agent3] HARD ERROR - Missing JOIN", f"Columns {alien_cols} belong to {potential_table}")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: Columns {alien_cols} do NOT exist in table '{primary_tbl}', but they belong to '{potential_table}'. "
                     f"Detected intent implies multiple tables: {detected_tables}. "
@@ -1545,7 +1397,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 regeneration_model = LARGE_MODEL
                 
             elif not can_be_solved_by_join:
-                _dbg_print_two("[Agent3] 🚨 HARD ERROR - Hallucination", f"Columns {alien_cols} do not exist in Schema.")
+                _dbg_print_two("[Agent3] HARD ERROR - Hallucination", f"Columns {alien_cols} do not exist in Schema.")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: The columns {alien_cols} do NOT exist in the database schema. "
                     "1. Check the exact column names in the schema context. "
@@ -1559,7 +1411,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     is_winner_row = decision.get("is_winner_row", False)
     if is_winner_row and not needs_regeneration:
         if re.search(r"SELECT\s+.*?\brn\b.*?FROM", sql_up):
-             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Winner-Row Leak", "rn column found in outer select.")
+             _dbg_print_two("[Agent3] HARD ERROR - Winner-Row Leak", "rn column found in outer select.")
              extra_instruction = (
                 "STRICT REQUIREMENT: Use standard Winner-Row pattern. "
                 "Do NOT include the 'rn' (row number) column in the final output."
@@ -1570,7 +1422,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # --- KASUS C: ANTI-PATTERN (WHERE IN Subquery) (HARD ERROR) ---
     tuple_in_pattern = re.search(r"WHERE\s*\([^)]+,[^)]+\)\s*IN\s*\(SELECT", sql_up)
     if tuple_in_pattern and not needs_regeneration:
-        _dbg_print_two("[Agent3] 🚨 HARD ERROR - Anti-Pattern", "Tuple comparison inside WHERE IN (...)")
+        _dbg_print_two("[Agent3] HARD ERROR - Anti-Pattern", "Tuple comparison inside WHERE IN (...)")
         extra_instruction = (
             "STRICT REQUIREMENT: Do NOT use the `WHERE (col1, col2) IN (SELECT ...)` pattern. "
             "It causes Error 1055. INSTEAD, use the Window Function pattern:\n"
@@ -1588,7 +1440,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             if select_clause_match:
                 select_clause = select_clause_match.group(1)
                 if part_col not in select_clause.upper():
-                    _dbg_print_two("[Agent3] 🚨 HARD ERROR - Missing Partition Key", f"'{part_col}' missing from SELECT")
+                    _dbg_print_two("[Agent3] HARD ERROR - Missing Partition Key", f"'{part_col}' missing from SELECT")
                     extra_instruction = (
                         f"STRICT REQUIREMENT: The query partitions by '{part_col}', but it is MISSING from the final SELECT list. "
                         f"You MUST include '{part_col}' in the output so we know who the record belongs to. "
@@ -1610,7 +1462,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             group_refs = set(re.findall(r"\b([a-z0-9_]+)\.", group_clause))
             risky_filters = where_refs - group_refs
             if risky_filters:
-                 _dbg_print_two("[Agent3] 🚨 HARD ERROR - INNER JOIN Trap", f"Filtering child table {risky_filters}")
+                 _dbg_print_two("[Agent3] HARD ERROR - INNER JOIN Trap", f"Filtering child table {risky_filters}")
                  extra_instruction = (
                     "STRICT REQUIREMENT: You are aggregating data (GROUP BY), but you are filtering a related table in the WHERE clause. "
                     "This behaves like an INNER JOIN and removes master records with no matches. "
@@ -1624,14 +1476,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if not needs_regeneration:
         missing_cols = []
         
-        # 🆕 STEP 1: Ambil tokens HANYA dari klausa SELECT (Bukan seluruh SQL)
+        # STEP 1: Ambil tokens HANYA dari klausa SELECT (Bukan seluruh SQL)
         # Tujuannya agar kolom yang hanya ada di WHERE/ORDER BY tetap terdeteksi sebagai "missing" di output
         select_match_chk = re.search(r"^SELECT\s+(.*?)\s+FROM", final_sql, re.IGNORECASE | re.DOTALL)
         select_text_chk = select_match_chk.group(1).lower() if select_match_chk else ""
         # Tokenize hanya bagian SELECT
         select_tokens_chk = set(re.findall(r"\b([a-z][a-z0-9_]*)\b", select_text_chk))
         
-        # 🆕 STEP 1b: Ambil tokens dari WHERE/HAVING/subquery (kolom yang dipakai sebagai filter)
+        # STEP 1b: Ambil tokens dari WHERE/HAVING/subquery (kolom yang dipakai sebagai filter)
         # Kolom yang sudah dipakai di WHERE tidak perlu ada di SELECT (bukan "missing")
         sql_lower = final_sql.lower()
         where_having_tokens = set()
@@ -1658,12 +1510,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         for col_raw in all_valid_cols:
             col_lower = col_raw.lower()
             
-            # 🆕 STEP 2: Logic Check yang Lebih Akurat
+            # STEP 2: Logic Check yang Lebih Akurat
             # Skip jika kolom sudah ada di SELECT tokens, atau jika ada wildcard (*)
             if col_lower in select_tokens_chk or "*" in select_text_chk: 
                 continue
             
-            # 🆕 Skip jika kolom sudah dipakai di WHERE/HAVING (artinya dipakai sebagai filter, bukan output)
+            # Skip jika kolom sudah dipakai di WHERE/HAVING (artinya dipakai sebagai filter, bukan output)
             if col_lower in where_having_tokens:
                 continue
             
@@ -1676,7 +1528,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             if last_word in suffix_synonyms:
                 prefix = " ".join(parts[:-1])
                 pattern_suffix = suffix_synonyms[last_word]
-                # 🆕 FIX: Allow optional words BEFORE the pattern (e.g., "earliest order date" should match "orderDate")
+                # FIX: Allow optional words BEFORE the pattern (e.g., "earliest order date" should match "orderDate")
                 # Pattern: (any words) + prefix + suffix
                 pattern = rf'\b(?:\w+\s+)*{re.escape(prefix)}\s*{pattern_suffix}\b|\b{re.escape(prefix)}\s*{pattern_suffix}\b'
             else:
@@ -1687,12 +1539,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 missing_cols.append(col_raw)
 
         if missing_cols:
-            # 🆕 TIERING LOGIC - Smart escalation based on complexity
+            # TIERING LOGIC - Smart escalation based on complexity
             if complexity == "simple" and qtype == "lookup":
                 # SOFT ERROR: Auto-fix tanpa regenerate
-                _dbg_print_two("[Agent3] 🟡 SOFT FIX - Missing Columns", f"Auto-appending {missing_cols}")
+                _dbg_print_two("[Agent3] SOFT FIX - Missing Columns", f"Auto-appending {missing_cols}")
                 
-                # 🆕 STEP 3: Safe Injection (Menangani DISTINCT)
+                # STEP 3: Safe Injection (Menangani DISTINCT)
                 is_distinct = re.search(r"^SELECT\s+DISTINCT\s+", final_sql, re.IGNORECASE)
                 
                 if is_distinct:
@@ -1718,7 +1570,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             
             elif draft_model == SMALL_MODEL and complexity == "simple":
                 # MEDIUM ERROR: Regenerate dengan 3B (simple query dari 3B yang salah)
-                _dbg_print_two("[Agent3] 🟠 MEDIUM ERROR - Missing Columns", f"Retry with 3B: {missing_cols}")
+                _dbg_print_two("[Agent3] MEDIUM ERROR - Missing Columns", f"Retry with 3B: {missing_cols}")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
                     f"But they are MISSING from the SELECT clause. "
@@ -1729,7 +1581,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             
             else:
                 # HARD ERROR: Complex query atau 7B draft → escalate ke 7B
-                _dbg_print_two("[Agent3] 🚨 HARD ERROR - Critical Omission", f"{missing_cols}")
+                _dbg_print_two("[Agent3] HARD ERROR - Critical Omission", f"{missing_cols}")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
                     f"Please add {missing_cols} to the SELECT clause."
@@ -1740,7 +1592,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # --- KASUS G: BROKEN ALIAS SYNTAX (HARD ERROR) ---
     if not needs_regeneration:
         if re.search(r"\b[a-z0-9_]+\.\(", sql_up.lower()):
-             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Syntax Error", "Broken alias syntax `alias.(...)` detected.")
+             _dbg_print_two("[Agent3] HARD ERROR - Syntax Error", "Broken alias syntax `alias.(...)` detected.")
              extra_instruction = (
                 "SYNTAX ERROR: You generated invalid SQL syntax like `table_alias.(condition)`. "
                 "CORRECT: `(table_alias.column IS NULL ...)`."
@@ -1761,7 +1613,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         uses_simple_like = "LIKE" in sql_up and "REGEXP" not in sql_up and "RLIKE" not in sql_up
         
         if requires_strict_pattern and uses_simple_like:
-             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Pattern Mismatch", "Question asks for strict pattern (digits), but SQL uses simple LIKE.")
+             _dbg_print_two("[Agent3] HARD ERROR - Pattern Mismatch", "Question asks for strict pattern (digits), but SQL uses simple LIKE.")
              extra_instruction = (
                 "STRICT REQUIREMENT: The user asks for a strict pattern (e.g. 'digits' vs 'characters', or exact length). "
                 "Simple 'LIKE' cannot distinguish digits from characters. "
@@ -1775,7 +1627,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # --- KASUS I: UNSAFE MONTH SORTING (HARD ERROR) ---
     if "MONTH" in sql_up and "ORDER" in sql_up and not needs_regeneration:
         has_month_name_group = re.search(r"GROUP\s+BY\s+.*?DATE_FORMAT", sql_up, re.DOTALL)
-        # 🆕 FIX: Accept sorting by date columns (any alias) as safe - gives chronological order
+        # FIX: Accept sorting by date columns (any alias) as safe - gives chronological order
         # Pattern matches: MONTH(date), YEAR(date), MIN(...), MAX(...), or any *Date column
         has_safe_sort = re.search(
             r"ORDER\s+BY\s+(.*?\.)?(MONTH|YEAR|MIN|MAX|STR_TO_DATE)\(",
@@ -1786,7 +1638,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         )
 
         if has_month_name_group and not has_safe_sort:
-             _dbg_print_two("[Agent3] 🚨 HARD ERROR - Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
+             _dbg_print_two("[Agent3] HARD ERROR - Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
              extra_instruction = (
                 "STRICT REQUIREMENT: You are grouping by Month Name, which sorts Alphabetically (Apr, Aug...). "
                 "FIX: You MUST Group and Sort by the Month Number as well. "
@@ -1818,7 +1670,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     is_alias = "AS " in prev_text or "AS" in prev_text
                     
                     if not is_func and not is_alias:
-                         _dbg_print_two("[Agent3] 🚨 HARD ERROR - Aggregation Violation", f"Raw column '{col}' selected but grouped by derived value.")
+                         _dbg_print_two("[Agent3] HARD ERROR - Aggregation Violation", f"Raw column '{col}' selected but grouped by derived value.")
                          extra_instruction = (
                             f"STRICT REQUIREMENT: You are grouping by a derived value of '{col}' (e.g. CASE or DATE_FORMAT), "
                             f"but you are selecting the raw '{col}' column. This causes SQL Error 1055. "
@@ -1832,7 +1684,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # 4. EXECUTE REGENERATION (dengan dynamic model selection)
     final_model = state.get("target_model", "")  # Default to initial model
     if needs_regeneration:
-        # 🆕 Use dynamic model selection
+        # Use dynamic model selection
         llm_regen = build_llm_repair(model=regeneration_model)
         model_label = "7B" if regeneration_model == LARGE_MODEL else "3B"
         _dbg_print_two("[Agent3] Regenerating with", model_label)
@@ -1853,7 +1705,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     final_sql = final_sql.strip()
     if not final_sql.endswith(";"): final_sql += ";"
 
-    # 🆕 END TIMER: Calculate processing time (Model ready → Final SQL complete)
+    # END TIMER: Calculate processing time (Model ready → Final SQL complete)
     # This is the core text-to-SQL processing latency for thesis benchmark
     processing_start = state.get("processing_start_time")
     if processing_start:

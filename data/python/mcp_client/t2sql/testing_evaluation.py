@@ -1,11 +1,15 @@
-"""
-Batch Evaluation Script untuk Text-to-SQL Pipeline.
-Membaca test set dari YAML dan menjalankan semua pertanyaan secara otomatis.
+# ======================================================================
+# ========================= testing_evaluation .py =====================
+# ======================================================================
+# Purpose:
+# - Batch evaluation script for Text-to-SQL pipeline using MCP client.
+# - Loads test cases from YAML file.
+# - Executes predicted SQL and groundtruth SQL against MCP database.
+# - Currently only compares results for Execution Accuracy (EX) and Valid SQL (VA) checks.
 
-Usage:
-    python -m t2sql.batch_eval --testset path/to/testset.yml
-"""
-
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 import asyncio
 import argparse
 import csv
@@ -13,12 +17,9 @@ import os
 import time
 from pathlib import Path
 from datetime import datetime
-
 import yaml
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
-
-# Excel support
 try:
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -26,28 +27,22 @@ try:
     HAS_EXCEL = True
 except ImportError:
     HAS_EXCEL = False
-
-# ============================================================
-# Set default OLLAMA_URL untuk Docker environment
-# ============================================================
 os.environ.setdefault("OLLAMA_URL", "http://ollama:11434")
-
+import httpx
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .config import MCP_BASE, CHROMA_DIR, COLLECTION_NAME, JSON_INPUT, OLLAMA_URL, ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_KEEP_ALIVE
 from .state import make_state
 from .graph import build_app
 from .mcp_execution import query_db_full, _mcp_call  # Pakai FULL query tanpa LIMIT dan _mcp_call helper
 from .utils import resolve_jsonl_paths
 
-# For direct Ollama warmup
-import httpx
-
-
 def load_testset(yaml_path: str) -> list[dict]:
     """Load test cases dari file YAML."""
     with open(yaml_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return data.get("cases", [])
-
 
 def normalize_value(val, tolerance: float = 0.0001) -> str:
     """
@@ -68,7 +63,6 @@ def normalize_value(val, tolerance: float = 0.0001) -> str:
         return f"{num:.2f}"
     
     return str(val).strip()
-
 
 def values_match(val1, val2, tolerance: float = 0.01) -> bool:
     """
@@ -103,7 +97,6 @@ def values_match(val1, val2, tolerance: float = 0.01) -> bool:
     except (ValueError, TypeError):
         # Fall back to string comparison
         return str(val1).strip().lower() == str(val2).strip().lower()
-
 
 def compare_results(predicted_rows: list, groundtruth_rows: list, order_sensitive: bool = False, numeric_tolerance: float = 0.01) -> tuple[bool, str]:
     """
@@ -345,8 +338,6 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     wb.save(output_path)
     print(f"\nResults saved to Excel: {output_path}")
 
-
-
 async def execute_sql(mcp: Client, sql: str) -> tuple[bool, list | None, str | None]:
     """
     Execute SQL via MCP (FULL mode - tanpa LIMIT) and return (success, rows, error).
@@ -385,7 +376,6 @@ async def check_valid_sql(mcp: Client, sql: str) -> tuple[bool, str | None]:
         return False, err
     except Exception as e:
         return False, str(e)
-
 
 async def run_single_case(
     app,
@@ -518,7 +508,7 @@ async def run_single_case(
             result["result_match"] = is_match
             result["match_reason"] = reason
             
-            status = "✅ MATCH" if is_match else "❌ MISMATCH"
+            status = "MATCH" if is_match else "MISMATCH"
             print(f"[EVALUATION] {status} - {reason}")
             print(f"       (pred: {result['pred_row_count']} rows, gt: {result['gt_row_count']} rows)")
         else:
@@ -535,7 +525,7 @@ async def warmup_models(app, paths: list[str]):
     Eliminates cold start bias in latency measurements.
     """
     print("\n" + "=" * 60)
-    print("🔥 WARMUP PHASE - Loading models into memory...")
+    print("WARMUP PHASE - Loading models into memory...")
     print("=" * 60)
     
     # Models to warm up (directly call Ollama, bypass pipeline)
@@ -580,7 +570,7 @@ async def warmup_models(app, paths: list[str]):
                 print(f"  ⚠ Failed to load {desc}: {e}")
     
     print("=" * 60)
-    print("✅ Warmup complete - all models are now in memory")
+    print("Warmup complete - all models are now in memory")
     print("=" * 60 + "\n")
 
 
@@ -803,7 +793,6 @@ Examples:
         skip_warmup=args.skip_warmup,
         difficulties=difficulties if difficulties else None,
     ))
-
 
 if __name__ == "__main__":
     main()

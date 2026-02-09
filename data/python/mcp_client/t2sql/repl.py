@@ -1,16 +1,25 @@
-# import asyncio
-from pathlib import Path
+# ======================================================================
+# ============================== repl.py ===============================
+# ======================================================================
+# Purpose:
+# - REPL for interacting with the MCP client to ask questions about data.
+# - Handles user input, invokes the application logic, and displays results.
 
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
+from pathlib import Path
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
-
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .config import MCP_BASE, CHROMA_DIR, COLLECTION_NAME
 from .state import make_state
 from .graph import build_app
 from .chroma_embedding import build_vector_store
 from .mcp_execution import query_db
 from .utils import _now, _log_total, _print_banner, display_table_from_json
-
 
 async def _exec_via_mcp(
     mcp: Client,
@@ -41,7 +50,6 @@ async def _exec_via_mcp(
         print(f"MCP query_db error: {e}")
         return None
 
-
 async def repl(paths):
     app = build_app()
     transport = StreamableHttpTransport(MCP_BASE)
@@ -62,7 +70,7 @@ async def repl(paths):
 
         _log_total("End-to-end total time (first run)", t0_total)
 
-        # 🆕 Log processing time (Model ready → Final SQL) for thesis benchmark
+        # Log processing time (Model ready → Final SQL) for thesis benchmark
         processing_time = state.get("processing_time")
         if processing_time:
             print(f"[BENCHMARK] Processing latency (Model ready → Final SQL): {processing_time:.3f}s")
@@ -85,7 +93,7 @@ async def repl(paths):
 
             _log_total("End-to-end total time (this question)", t0_total)
 
-            # 🆕 Log processing time (Model ready → Final SQL) for thesis benchmark
+            # Log processing time (Model ready → Final SQL) for thesis benchmark
             processing_time = out.get("processing_time")
             if processing_time:
                 print(f"[BENCHMARK] Processing latency (Model ready → Final SQL): {processing_time:.3f}s")

@@ -1,7 +1,16 @@
 # ======================================================================
-# ============================ CONFIG (ENV) ============================
+# ============================= config.py ==============================
 # ======================================================================
+# Purpose:
+# - Configuration file for MCP client application.
+# - Loads settings from environment variables with default fallbacks.
+# - Defines constants for application behavior.
+# - Organized into sections for clarity.
+# - Handles settings for general app behavior, retrieval parameters, MCP server interaction, and debugging options.
 
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 import os
 # ======================================================================
 # ============================ APP/GENERAL =============================

@@ -1,8 +1,21 @@
+# ======================================================================
+# =============================== cli.py ===============================
+# ======================================================================
+# Purpose:
+# - Command-line interface for the T2SQL REPL.
+# - Loads environment variables and initializes the REPL with JSONL input files.
+# - Handles asynchronous execution and compatibility with existing event loops.
+# - Provides user feedback when no input files are found.
+
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 import asyncio
 from dotenv import load_dotenv, find_dotenv
-
 load_dotenv(find_dotenv(), override=False)
-
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .config import JSON_INPUT
 from .utils import resolve_jsonl_paths
 from .repl import repl

@@ -1,17 +1,27 @@
+# ======================================================================
+# ========================== chroma_embedding.py =======================
+# ======================================================================
+# Purpose:
+# - Modified build_vector_store to include auto-ingest logic if collection is empty.
+# - Added logging to indicate whether auto-ingest was triggered or skipped.
+# - Retained existing ingestion logic and Ollama embedding function.
+
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 import os
 import json
 import requests
 from typing import Any, Dict, List
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 import chromadb
-
-# Load config
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .config import CHROMA_DIR, COLLECTION_NAME, OLLAMA_URL, EXPORT_JSONL_OUTPUT
-
 _CHROMA_COL = None
-
 # ==============================================================================
-# ✨ 1. MODIFIED BUILD_VECTOR_STORE (AUTO-INGEST LOGIC)
+#  1. MODIFIED BUILD_VECTOR_STORE (AUTO-INGEST LOGIC)
 # ==============================================================================
 def build_vector_store():
     """
@@ -57,7 +67,6 @@ def build_vector_store():
         print(f"[Chroma] No update needed. Skipping auto-ingest.")
 
     return _CHROMA_COL
-
 # ==============================================================================
 # 2. INGESTION LOGIC (SAMA SEPERTI SEBELUMNYA)
 # ==============================================================================

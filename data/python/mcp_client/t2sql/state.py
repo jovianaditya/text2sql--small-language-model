@@ -1,3 +1,13 @@
+# ======================================================================
+# ============================== state.py ==============================
+# ======================================================================
+# Purpose:
+# - Define the RAGState TypedDict for tracking state in the RAG process.
+# - Provide a function to initialize the RAGState with default values.
+
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 from typing import TypedDict, List, Dict, Any
 
 class RAGState(TypedDict, total=False):
@@ -63,4 +73,7 @@ def make_state(paths, question: str) -> RAGState:
         # Benchmark policy / audit trail
         "group_by_policy": "explicit_select_cols",
         "group_by_added_exprs": [],
+        # Benchmark timing
+        "processing_start_time": 0.0,
+        "processing_time": 0.0,
     }

@@ -1,6 +1,17 @@
-from __future__ import annotations
+# ======================================================================
+# ============================= llm_utils.py ===========================
+# ======================================================================
+# - Purpose:
+# - LLM Builders untuk T2SQL Agents (JSON Mode & Repair Mode).
 
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
+from __future__ import annotations
 from langchain_ollama import ChatOllama
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .config import LARGE_MODEL, OLLAMA_URL, OLLAMA_KEEP_ALIVE
 
 def build_llm_json(model: str | None = None) -> ChatOllama:

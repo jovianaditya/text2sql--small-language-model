@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 from .utils import _dbg_print_two
 from .helpers_core import (
     _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
+    _SQL_KEYWORDS,  # SQL keywords constant
     # phase 0
     _fix_bad_backticks, _canonicalize_table_names, _escape_reserved_column_aliases,
     # phase 1
@@ -56,12 +57,6 @@ from .helpers_core import (
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
-_SQL_KEYWORDS: Set[str] = {
-    "select","from","where","group","by","order","limit","join","left","right","inner",
-    "on","and","or","not","as","distinct","count","sum","avg","min","max","having",
-    "asc","desc","like","in","between","is","null","case","when","then","else","end",
-    "regexp","rlike","over","partition","row_number"
-}
 TRANSACTION_TABLES = {"payments", "orderdetails", "orders"}
 _ANCHOR_SIGNALS = {
     "payments": {"amount", "paymentDate", "customerNumber"},
@@ -88,117 +83,6 @@ def get_single_allowed_table(ctx: str) -> Optional[str]:
 # -------------------- HELPER CROSS MODULE ------------------
 # ------------------------- agents.py -----------------------
 # -----------------------------------------------------------
-# def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
-#     """
-#     Return mapping:
-#       - qualifier -> set(columns)  e.g. {"p": {"amount","paymentDate"}}
-#       - None      -> set(unqualified tokens) e.g. {None: {"amount"}}
-
-#     Konservatif:
-#     - Strip string literals dari scanning.
-#     - Exclude keywords, table names, aliases (FROM/JOIN/derived/output).
-#     - Skip token yang terlihat seperti function call: token(...).
-#     """
-#     if not sql:
-#         return {}
-
-#     out: Dict[Optional[str], Set[str]] = {}
-#     # ---------------------------------------------------------------------------
-#     # 1) Hapus string literals/double quotes supaya token scan tidak ke-distract
-#     # ---------------------------------------------------------------------------
-#     code_only = re.sub(r"'(?:''|[^'])*'", "''", sql)
-#     code_only = re.sub(r'"(?:""|[^"])*"', '""', code_only)
-#     keywords = _SQL_KEYWORDS
-#     # ---------------------------------------------------------------------------
-#     # 2) Ambil table names yang muncul di FROM/JOIN (untuk exclude)
-#     #    Support schema.table dan backticks secara sederhana.
-#     # ---------------------------------------------------------------------------
-#     table_names: Set[str] = set()
-#     for m in re.finditer(
-#         r"\b(?:from|join)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)",
-#         code_only,
-#         flags=re.I,
-#     ):
-#         raw = (m.group(1) or "").replace("`", "")
-#         tbl = raw.split(".")[-1]
-#         if tbl:
-#             table_names.add(tbl.lower())
-#     # Exclude aliases (table + derived + output)
-#     exclude: Set[str] = set()
-#     # ---------------------------------------------------------------------------
-#     # 3) table aliases from FROM/JOIN
-#     # ---------------------------------------------------------------------------
-#     a2t = _parse_from_join_aliases(sql)  # alias -> table
-#     exclude.update({a.lower() for a in a2t.keys() if a})
-#     # ---------------------------------------------------------------------------
-#     # 4) derived-table aliases: FROM ( ... ) AS t / JOIN ( ... ) AS t
-#     # ---------------------------------------------------------------------------
-#     for m in re.finditer(
-#         r"\b(?:from|join)\s*\([^)]*\)\s*(?:as\s+)?([A-Za-z_]\w*)\b",
-#         code_only,
-#         flags=re.I | re.S,
-#     ):
-#         exclude.add(m.group(1).lower())
-#     # ---------------------------------------------------------------------------
-#     # 5) output aliases: SELECT ... AS alias (hanya area SELECT ... FROM)
-#     # ---------------------------------------------------------------------------
-#     m_sel = re.search(r"\bselect\b(.*?)\bfrom\b", code_only, flags=re.I | re.S)
-#     if m_sel:
-#         select_part = m_sel.group(1)
-#         for m in re.finditer(r"\bas\s+([A-Za-z_]\w*)\b", select_part, flags=re.I):
-#             exclude.add(m.group(1).lower())
-#     # ---------------------------------------------------------------------------
-#     # 6) Collect qualified usages: alias.col / table.col
-#     # ---------------------------------------------------------------------------
-#     # Simpan dulu semua pattern qualifier.column
-#     for m in re.finditer(
-#         r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
-#         code_only,
-#         flags=re.I,
-#     ):
-#         qual = m.group(1)
-#         col = m.group(2)
-#         ql = (qual or "").lower()
-
-#         if not qual or not col:
-#             continue
-#         if ql in keywords:
-#             continue
-#         if ql in exclude:
-#             continue
-
-#         out.setdefault(qual, set()).add(col)
-#     # Remove qualified occurrences so they don't pollute unqualified scan
-#     code_no_qual = re.sub(
-#         r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\b",
-#         " ",
-#         code_only,
-#         flags=re.I,
-#     )
-#     # ---------------------------------------------------------------------------
-#     # 7) Unqualified token scan (konservatif)
-#     # ---------------------------------------------------------------------------
-#     tok_pat = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
-#     for m in tok_pat.finditer(code_no_qual):
-#         tok = m.group(1)
-#         low = tok.lower()
-
-#         if low in keywords:
-#             continue
-#         if low in table_names:
-#             continue
-#         if low in exclude:
-#             continue
-#         # skip jika terlihat seperti function call: tok(...)
-#         j = m.end()
-#         while j < len(code_no_qual) and code_no_qual[j].isspace():
-#             j += 1
-#         if j < len(code_no_qual) and code_no_qual[j] == "(":
-#             continue
-
-#         out.setdefault(None, set()).add(tok)
-
-#     return out
 def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
     """
     Return mapping:
@@ -1067,7 +951,7 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
 
 def _extract_fk_from_context(ctx: str) -> Dict[str, Dict[str, str]]:
     """
-    🆕 Dynamically extract FK relationships from retrieval context.
+    Dynamically extract FK relationships from retrieval context.
 
     Parses context for "FK to X.Y" patterns (from JSONL metadata).
 
@@ -1107,7 +991,7 @@ def _infer_tables_from_question_columns(
     router_tables: list
 ) -> Dict[str, List[str]]:
     """
-    🆕 Infer which tables are needed based on question mentions of columns.
+    Infer which tables are needed based on question mentions of columns.
 
     When question doesn't explicitly mention table names (e.g., "total amount", "quantity ordered"),
     use retrieval results to find which tables have matching columns.
@@ -1159,12 +1043,12 @@ def _build_fk_join_chain(
     primary_table: str = None
 ) -> List[Dict[str, str]]:
     """
-    🆕 Build FK join chain for multi-table queries.
+    Build FK join chain for multi-table queries.
 
     For questions that mention columns from multiple tables but don't explicitly
     specify the join path, use FK relationships to construct the join chain.
 
-    🆕 Uses primary_table to determine the correct FROM/JOIN order.
+    Uses primary_table to determine the correct FROM/JOIN order.
 
     Returns:
         [
@@ -1184,7 +1068,7 @@ def _build_fk_join_chain(
     # Build FK join chain
     join_chain = []
 
-    # 🆕 If primary_table is specified, start with it and find joins to other tables
+    # If primary_table is specified, start with it and find joins to other tables
     if primary_table:
         primary_lower = primary_table.lower()
         router_tables_lower = [t.lower() for t in router_tables]
@@ -1240,7 +1124,7 @@ def _infer_target_column(
     ranked_cols: list
 ) -> str:
     """
-    🆕 Infer the target column name for a FK relationship.
+    Infer the target column name for a FK relationship.
 
     Example: If fk_col is "customerNumber" and target_table is "customers",
     the target column is likely "customerNumber".
@@ -1262,7 +1146,7 @@ def _build_dynamic_join_context(
     router_decision: dict = None
 ) -> str:
     """
-    🆕 Build dynamic join context from retrieval results and FK relationships.
+    Build dynamic join context from retrieval results and FK relationships.
 
     Uses:
     1. ranked_cols from state (what retrieval found)
@@ -1339,7 +1223,7 @@ def _find_tables_with_implicit_columns(
     ctx: str
 ) -> Set[str]:
     """
-    🆕 Find tables whose columns are implicitly mentioned in the question.
+    Find tables whose columns are implicitly mentioned in the question.
 
     AGNOSTIC approach - works for ANY column type (numeric, string, date, etc.).
     Uses retrieval results (ranked_cols) to find columns mentioned in the question,
@@ -1406,7 +1290,7 @@ def _find_tables_with_implicit_columns(
     if not mentioned_tables:
         return set()
 
-    # 🆕 [FIX] Filter out tables whose columns are already available in existing relevant tables
+    # [FIX] Filter out tables whose columns are already available in existing relevant tables
     # Example: If payments.customerNumber exists, don't add customers just for customerNumber
     # This prevents single-table queries from being detected as multi-table
     available_cols_in_existing = set()
@@ -1533,7 +1417,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     2. Melarang UNION untuk binning.
     3. Memaksa Single Line SQL untuk mencegah JSON Crash pada query panjang.
     4. Menangani Error 1055 dengan strict column selection.
-    5. 🆕 Dynamic join context from retrieval results.
+    5. Dynamic join context from retrieval results.
     """
     router_decision = router_decision or {}
     complexity = router_decision.get("complexity", "simple")
@@ -1568,7 +1452,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
 
     if is_top_n_global_ranking:
         constraints.append(
-            "⚠️ TOP N QUERY (HIGHEST PRIORITY): This question asks for 'Top N' or 'N highest/lowest'. "
+            "TOP N QUERY (HIGHEST PRIORITY): This question asks for 'Top N' or 'N highest/lowest'. "
             "YOU MUST USE: ORDER BY column DESC LIMIT N. "
             "EXAMPLE: 'Show 10 products with highest stock' → SELECT productCode, productName, quantityInStock FROM products ORDER BY quantityInStock DESC LIMIT 10. "
             "FORBIDDEN: Do NOT use MAX() in WHERE clause. Do NOT use subquery with LIMIT. "
@@ -1638,21 +1522,21 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 "Just SELECT the column directly. Use 'ORDER BY column DESC' for 'latest/newest/highest'."
             )
         elif qtype == "aggregate":
-            # 🆕 Simple aggregate queries must use GROUP BY
+            # Simple aggregate queries must use GROUP BY
             constraints.append(
                 "AGGREGATE RULE: When computing aggregates (COUNT, SUM, AVG, MIN, MAX) 'per each X', "
                 "you MUST use GROUP BY on the grouping column. Use HAVING for filters on aggregates, NOT WHERE."
             )
 
     # [C] RANKING RULES
-    # 🆕 Check winner-row pattern FIRST (before qtype check)
+    # Check winner-row pattern FIRST (before qtype check)
     # This ensures winner-row constraints are applied even when qtype="aggregate" due to grouping
     if is_winner_row or qtype == "rank":
         constraints.append(
             "WINNER-ROW STRATEGY: You MUST use the standard 'Select-Filter-Rank' pattern."
         )
 
-        # 🆕 ORDINAL RANKING: Detect the specific rank number from question
+        # ORDINAL RANKING: Detect the specific rank number from question
         if is_ordinal_ranking:
             # Extract the ordinal number from question
             q_lower = question.lower()
@@ -1695,7 +1579,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     "DO NOT use MAX(), GROUP BY, LEFT JOIN, or correlated subquery - just the simple subquery pattern!"
                 )
 
-            # 🆕 ANTI-PATTERN PROHIBITION: Prevent mixing MAX() GROUP BY with ROW_NUMBER()
+            # ANTI-PATTERN PROHIBITION: Prevent mixing MAX() GROUP BY with ROW_NUMBER()
             constraints.append(
                 "STRICT PROHIBITION (SYNTAX ERROR): DO NOT mix MAX()/MIN()/GROUP BY with ROW_NUMBER(). "
                 "These are MUTUALLY EXCLUSIVE patterns. Choose ONE:\n"
@@ -1710,7 +1594,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         )
 
     # [D] PRIMARY TABLE GUIDANCE (CRITICAL FOR ALL MULTI-TABLE QUERIES)
-    # 🆕 Apply to ALL non-simple queries (lookup, aggregate, ranking) to prevent wrong FROM clause order
+    # Apply to ALL non-simple queries (lookup, aggregate, ranking) to prevent wrong FROM clause order
     # This ensures the LLM uses the correct primary table as the first table in FROM clause
     if complexity != "simple" and state:
         primary_table = state.get("primary_table")
@@ -1734,7 +1618,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             print(f"[PROMPT DEBUG] Adding hint: {hint_msg}")
             constraints.append(hint_msg)
 
-            # 🆕 JOIN TYPE GUIDANCE (CRITICAL)
+            # JOIN TYPE GUIDANCE (CRITICAL)
             # Check for "only X who have Y" filtering pattern - requires INNER JOIN
             q_lower = question.lower()
             only_who_has_pattern = re.search(rf"\bonly\s+\w+.*?\s+(who|that)\s+(have|has|had|placed|made|ordered)\b", q_lower, flags=re.I)
@@ -1754,7 +1638,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 )
 
     # [E] REPORTING/AGGREGATION RULES
-    # 🆕 Skip aggregation rules for winner-row queries (they use ROW_NUMBER, not GROUP BY)
+    # Skip aggregation rules for winner-row queries (they use ROW_NUMBER, not GROUP BY)
     is_reporting = (qtype == "aggregate") or has_grouping or has_exclusion
     if is_reporting and not is_winner_row:
         constraints.append(
@@ -1783,7 +1667,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     import re as _re
     q_lower = question.lower()
 
-    # 🆕 PRIORITY: Check for "Include X, Y, and Z" pattern (highest priority)
+    # PRIORITY: Check for "Include X, Y, and Z" pattern (highest priority)
     include_pattern = r'\binclude\s+(?:the\s+)?(.+?)(?:\.|$)'
     include_match = _re.search(include_pattern, q_lower)
 
@@ -1826,7 +1710,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 f"EXPLICIT COLUMN REQUIREMENT: The user explicitly requested these items: {cols_list}. "
                 f"You MUST include ALL of them in your SELECT clause. Do not skip any."
             )
-            # 🆕 Stronger constraint: prohibit extra columns
+            # Stronger constraint: prohibit extra columns
             constraints.append(
                 f"STRICT COLUMN LIMIT: Select ONLY these columns: {cols_list}. "
                 f"Do NOT add any other columns (IDs, codes, names) that were not explicitly requested."
@@ -2093,7 +1977,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         # This is a plain column, remove the AS alias
         return column_ref
 
-    # 🆕 FIX: First, protect CASE WHEN...END AS alias patterns by temporarily replacing them
+    # FIX: First, protect CASE WHEN...END AS alias patterns by temporarily replacing them
     # This prevents the regex from incorrectly matching "END AS alias"
     case_aliases = {}
     def protect_case_aliases(match):
@@ -2124,11 +2008,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         flags=re.IGNORECASE
     )
 
-    # 🆕 FIX: Restore protected CASE WHEN aliases
+    # FIX: Restore protected CASE WHEN aliases
     for alias, original in case_aliases.items():
         s = s.replace(alias, original)
 
-    # 🆕 NEW: Normalize overly long aliases by removing filler words
+    # NEW: Normalize overly long aliases by removing filler words
     s = _normalize_alias_lengths(s)
     # ---------------------------------------------------------------------------
     # Phase 3 — Column Naming & GROUP BY Consistency
@@ -2137,11 +2021,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _prefer_friendly_names(s, question)
     s = _expand_group_by_aliases_regex(s)
     if not _is_potential_winner_row(s, question, force=True):
-        # 🆕 REMOVE invalid columns FIRST, then enforce GROUP BY consistency
+        # REMOVE invalid columns FIRST, then enforce GROUP BY consistency
         # This prevents columns from being added to GROUP BY unnecessarily
         s = _remove_invalid_select_columns_with_group_by(s)
         s = _enforce_explicit_group_by(s)
-        # 🆕 Fix ORDER BY to use GROUP BY expressions instead of raw columns
+        # Fix ORDER BY to use GROUP BY expressions instead of raw columns
         # e.g., ORDER BY o.orderDate → ORDER BY MONTH(o.orderDate)
         s = _fix_order_by_group_by_consistency(s)
     # ---------------------------------------------------------------------------
@@ -2209,7 +2093,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         fixed_sql = window_agg_pattern.sub(remove_over_clause, s)
         if fixed_sql != s:
             if DEBUG_WR:
-                print("[PH3.5] 🔧 Fixed window function + GROUP BY anti-pattern")
+                print("[PH3.5] Fixed window function + GROUP BY anti-pattern")
                 print(f"[PH3.5] Before: {s[:200]}")
                 print(f"[PH3.5] After:  {fixed_sql[:200]}")
             s = fixed_sql
@@ -2235,11 +2119,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _strip_having_max_self_subquery(s)
     if DEBUG_WR: print("[PH4] after strip having max self subquery:", s)
 
-    # 🆕 NEW: Detect and fix malformed MAX/GROUP BY + ROW_NUMBER mixed pattern
+    # NEW: Detect and fix malformed MAX/GROUP BY + ROW_NUMBER mixed pattern
     # This catches cases where 7B model incorrectly combines aggregate and window function patterns
     fixed_mixed = _fix_mixed_max_groupby_rownumber(s)
     if fixed_mixed:
-        if DEBUG_WR: print("[PH4] 🔧 Fixed malformed MAX/GROUP BY + ROW_NUMBER pattern")
+        if DEBUG_WR: print("[PH4] Fixed malformed MAX/GROUP BY + ROW_NUMBER pattern")
         s = fixed_mixed
 
     # -------------------------------------------------------------
@@ -2309,12 +2193,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     # Phase 5 — Pattern, REGEXP, and Predicate Normalization
     # ---------------------------------------------------------------------------
-    # print("\n[PH5] start ----")  # ✅ ADD THIS
+    # print("\n[PH5] start ----")  # ADD THIS
     # s = _guardrail_fix_like_regex_anchors(s, question)
-    # print(f"[PH5] after fix_anchors: {s[:200]}")  # ✅ ADD THIS
+    # print(f"[PH5] after fix_anchors: {s[:200]}")  # ADD THIS
     # s = _rewrite_simple_regexp_to_like(s, question)
     # s = _guardrail_fix_mysql_regexp_literals(s)
-    # print(f"[PH5] end ---- {s}\n")  # ✅ ADD THIS
+    # print(f"[PH5] end ---- {s}\n")  # ADD THIS
     # ---------------------------------------------------------------------------
     # Phase 6 — NULL / DISTINCT / Result Cardinality Policies
     # ---------------------------------------------------------------------------

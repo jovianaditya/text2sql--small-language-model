@@ -1,11 +1,20 @@
-import asyncio
+# ======================================================================
+# =========================== mcp_execution.py =========================
+# ======================================================================
+# Purpose:
+# - MCP client functions to execute SQL queries via MCP tools.
 
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
+import asyncio
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
-
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .utils import _extract_payload, _ensure_json
 from .config import MCP_TIMEOUT, MCP_BASE
-
 
 async def _mcp_call(
     client: Client,
@@ -15,7 +24,6 @@ async def _mcp_call(
 ):
     coro = client.call_tool(tool, payload or {})
     return await asyncio.wait_for(coro, timeout=timeout)
-
 
 async def query_db(
     sql: str,
@@ -42,7 +50,6 @@ async def query_db(
     transport = StreamableHttpTransport(MCP_BASE)
     async with Client(transport=transport) as client:
         return await _do_call(client)
-
 
 async def query_db_full(
     sql: str,
