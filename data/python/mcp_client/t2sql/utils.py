@@ -8,11 +8,10 @@
 # - MCP payload parsing helpers
 # - Ingest canonicalization helpers (stable hashing, sanitize)
 # - CLI display helpers (tabulate preview)
-# ============================================================
 
-# --------------------------------------------------
-# Standard library imports
-# --------------------------------------------------
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 from __future__ import annotations
 import re
 import hashlib
@@ -23,13 +22,10 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 from langchain_core.messages import BaseMessage
 from collections import defaultdict
-# --------------------------------------------------
-# Third-party imports
-# --------------------------------------------------
 from tabulate import tabulate
-# --------------------------------------------------
-# Local imports
-# --------------------------------------------------
+# ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
 from .config import SQL_DEBUG
 
 if TYPE_CHECKING:
@@ -58,7 +54,6 @@ def _dbg_print_two(label: str, sql: str):
     if SQL_DEBUG:
         print(f"\n{label}")
         print(sql)
-
 # ======================================================================
 # ==================== JSONL PATH RESOLUTION + READER ==================
 # ======================================================================
@@ -94,7 +89,6 @@ def read_jsonl(path: str) -> Iterable[tuple[str, Optional[Dict[str, Any]]]]:
             except Exception:
                 obj = None
             yield s, obj
-
 # ======================================================================
 # =================== METADATA ACCESSORS (TABLE/COLUMN) ================
 # ======================================================================
@@ -103,7 +97,6 @@ def _meta_table(md: Dict[str, Any]) -> str:
 
 def _meta_column(md: Dict[str, Any]) -> str:
     return str(md.get("column") or md.get("columnName") or "").strip()
-
 # ======================================================================
 # =================== MCP RESULT NORMALIZATION HELPERS =================
 # ======================================================================
@@ -125,11 +118,9 @@ def _ensure_json(d: Any) -> Optional[dict]:
         except Exception:
             return None
     return None
-
 # ======================================================================
 # ======================== INGEST CANONICALIZATION =====================
 # ======================================================================
-
 # -------------------------------------------------------------
 # 5A) Metadata parsing & normalization helpers
 # -------------------------------------------------------------
@@ -176,7 +167,6 @@ def _extract_aliases_for_map(md: Dict[str, Any]) -> List[str]:
     return _parse_str_or_list_lower(
         md.get("aliases") or md.get("tags_alias") or md.get("synonyms") or []
     )
-
 # -------------------------------------------------------------
 # 5B) Canonicalization & hashing helpers
 # -------------------------------------------------------------
