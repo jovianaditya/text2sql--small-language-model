@@ -24,7 +24,7 @@ from .utils import _dbg_print_two
 from .helpers_core import (
     _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
     # phase 0
-    _fix_bad_backticks, _canonicalize_table_names, ensure_join_aliases, _escape_reserved_column_aliases,
+    _fix_bad_backticks, _canonicalize_table_names, _escape_reserved_column_aliases,
     # phase 1
     _move_rhs_filter_from_where_to_on,  # Only triggers for "ALL entities" questions
     _rewrite_left_join_to_inner_if_not_needed, _rewrite_left_join_to_inner_if_rhs_filtered,
@@ -35,6 +35,8 @@ from .helpers_core import (
     # phase 3
     _wants_customer_name_only, _wants_product_name_only, _prefer_friendly_names, _wants_name_only,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
+    _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
+    _normalize_alias_lengths,
     # phase 4
     _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _looks_like_max_date_tiebreaker,
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
@@ -1153,13 +1155,16 @@ def _build_fk_join_chain(
     question: str,
     ranked_cols: list,
     router_tables: list,
-    fk_map: Dict[str, Dict[str, str]]
+    fk_map: Dict[str, Dict[str, str]],
+    primary_table: str = None
 ) -> List[Dict[str, str]]:
     """
     🆕 Build FK join chain for multi-table queries.
 
     For questions that mention columns from multiple tables but don't explicitly
     specify the join path, use FK relationships to construct the join chain.
+
+    🆕 Uses primary_table to determine the correct FROM/JOIN order.
 
     Returns:
         [
@@ -1179,20 +1184,52 @@ def _build_fk_join_chain(
     # Build FK join chain
     join_chain = []
 
-    # For each pair of tables, check if there's a FK relationship
-    router_tables_lower = [t.lower() for t in router_tables]
+    # 🆕 If primary_table is specified, start with it and find joins to other tables
+    if primary_table:
+        primary_lower = primary_table.lower()
+        router_tables_lower = [t.lower() for t in router_tables]
 
-    for i, source_tbl in enumerate(router_tables_lower):
-        if source_tbl not in fk_map:
-            continue
+        # Get other tables (excluding primary)
+        other_tables = [t for t in router_tables_lower if t != primary_lower]
 
-        for fk_col, target_tbl in fk_map[source_tbl].items():
-            if target_tbl in router_tables_lower:
-                join_chain.append({
-                    "from": source_tbl,
-                    "join": target_tbl,
-                    "on": f"{source_tbl}.{fk_col} = {target_tbl}.{_infer_target_column(fk_col, target_tbl, ranked_cols)}"
-                })
+        # For each other table, find the FK relationship
+        for other_tbl in other_tables:
+            # Check if primary_table has FK to other_tbl
+            if primary_lower in fk_map:
+                for fk_col, target in fk_map[primary_lower].items():
+                    if target.lower() == other_tbl:
+                        join_chain.append({
+                            "from": primary_lower,
+                            "join": other_tbl,
+                            "on": f"{primary_lower}.{fk_col} = {other_tbl}.{_infer_target_column(fk_col, other_tbl, ranked_cols)}"
+                        })
+                        break
+
+            # Check if other_tbl has FK to primary_table (reverse FK)
+            if other_tbl in fk_map:
+                for fk_col, target in fk_map[other_tbl].items():
+                    if target.lower() == primary_lower:
+                        join_chain.append({
+                            "from": primary_lower,
+                            "join": other_tbl,
+                            "on": f"{other_tbl}.{fk_col} = {primary_lower}.{_infer_target_column(fk_col, primary_lower, ranked_cols)}"
+                        })
+                        break
+    else:
+        # Fallback: For each pair of tables, check if there's a FK relationship
+        router_tables_lower = [t.lower() for t in router_tables]
+
+        for i, source_tbl in enumerate(router_tables_lower):
+            if source_tbl not in fk_map:
+                continue
+
+            for fk_col, target_tbl in fk_map[source_tbl].items():
+                if target_tbl in router_tables_lower:
+                    join_chain.append({
+                        "from": source_tbl,
+                        "join": target_tbl,
+                        "on": f"{source_tbl}.{fk_col} = {target_tbl}.{_infer_target_column(fk_col, target_tbl, ranked_cols)}"
+                    })
 
     return join_chain
 
@@ -1249,8 +1286,9 @@ def _build_dynamic_join_context(
     lines = []
     lines.append("\n### JOIN RELATIONSHIPS")
 
-    # Build FK join chain
-    join_chain = _build_fk_join_chain(question, ranked_cols, router_tables, fk_map)
+    # Build FK join chain (pass primary_table to determine correct FROM/JOIN order)
+    primary_table = state.get("primary_table", "")
+    join_chain = _build_fk_join_chain(question, ranked_cols, router_tables, fk_map, primary_table)
 
     if join_chain:
         lines.append("# Detected FK join chain:")
@@ -1540,8 +1578,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
 
     # === [PRIORITY 2] GENERAL ANTI-HALLUCINATION RULE ===
     constraints.append(
+        "CRITICAL RULE: Copy ALL column names EXACTLY as shown in the Schema cards. "
+        "Do NOT change the casing style or spelling of schema columns."
+    )
+    constraints.append(
         "CRITICAL RULE: Do NOT add SQL clauses (WHERE, HAVING, LIMIT, ORDER BY) "
-        "unless the user EXPLICITLY requests them. "
+        "unless the user EXPLICITLY requests them in the question. "
+        "NEVER add filters based on STATS or sample values - only use what the user asks for."
     )
     # === [NEW] FOR EACH = ALL VALUES, NO WHERE FILTER ===
     for_each_triggers = ["for each", "each ", "per ", "every "]
@@ -1594,14 +1637,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 "SIMPLE LOOKUP RULE: Do NOT use aggregation functions like MAX(), MIN(), or SUM(). "
                 "Just SELECT the column directly. Use 'ORDER BY column DESC' for 'latest/newest/highest'."
             )
-
-    # [B.1] GLOBAL ALIAS RULE (applies to all query types)
-    constraints.append(
-        "COLUMN ALIAS RULE: Do NOT rename plain table columns using AS. "
-        "Only use AS for computed expressions (aggregations, CASE WHEN, window functions). "
-        "CORRECT: `SELECT employeeNumber, COUNT(*) AS total, CASE WHEN x>0 THEN 'Y' END AS flag`. "
-        "WRONG: `SELECT employeeNumber AS empNum` - never alias plain columns."
-    )
+        elif qtype == "aggregate":
+            # 🆕 Simple aggregate queries must use GROUP BY
+            constraints.append(
+                "AGGREGATE RULE: When computing aggregates (COUNT, SUM, AVG, MIN, MAX) 'per each X', "
+                "you MUST use GROUP BY on the grouping column. Use HAVING for filters on aggregates, NOT WHERE."
+            )
 
     # [C] RANKING RULES
     # 🆕 Check winner-row pattern FIRST (before qtype check)
@@ -1668,52 +1709,59 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "Do NOT use `HAVING` for ranking. Use the subquery pattern above."
         )
 
-    # [D] REPORTING/AGGREGATION RULES
-    # 🆕 Skip aggregation rules for winner-row queries (they use ROW_NUMBER, not GROUP BY)
-    is_reporting = (qtype == "aggregate") or has_grouping or has_exclusion
-    if is_reporting and complexity == "complex" and not is_winner_row:
-        # 🆕 PRIMARY TABLE GUIDANCE (Soft Hint)
-        # Get primary_table from router decision for multi-table queries
-        primary_table = state.get("primary_table") if state else None
-        primary_reason = state.get("primary_table_reason") if state else None
+    # [D] PRIMARY TABLE GUIDANCE (CRITICAL FOR ALL MULTI-TABLE QUERIES)
+    # 🆕 Apply to ALL non-simple queries (lookup, aggregate, ranking) to prevent wrong FROM clause order
+    # This ensures the LLM uses the correct primary table as the first table in FROM clause
+    if complexity != "simple" and state:
+        primary_table = state.get("primary_table")
+        primary_reason = state.get("primary_table_reason")
+
+        print(f"[PROMPT DEBUG] complexity={complexity}, state provided, primary_table={primary_table}")
 
         if primary_table:
-            other_tables = state.get("router_tables", []) if state else []
+            other_tables = state.get("router_tables", [])
             other_tables = [t for t in other_tables if t != primary_table]
             other_tables_str = ", ".join(other_tables) if other_tables else "none"
 
-            # Add soft hint (not hard requirement)
-            hint_msg = f"TABLE SELECTION GUIDANCE: Based on query analysis, '{primary_table}' appears to be the primary table"
+            # More explicit guidance - tell LLM exactly which table should be first
+            hint_msg = f"TABLE ORDER (CRITICAL): Start your query with FROM {primary_table}"
+            if other_tables_str != "none":
+                hint_msg += f", then LEFT JOIN {other_tables_str}"
             if primary_reason:
-                hint_msg += f" (reason: {primary_reason})"
-            hint_msg += f". This suggests using FROM {primary_table} and JOINing {other_tables_str} if needed."
-            hint_msg += " Use your judgment to confirm this is the optimal structure."
+                hint_msg += f". Reason: {primary_reason}"
+            hint_msg += f". Follow this exact table order."
 
+            print(f"[PROMPT DEBUG] Adding hint: {hint_msg}")
             constraints.append(hint_msg)
 
-        # 🆕 Check for "only X who have Y" filtering pattern
-        # This pattern requires INNER JOIN (filter out non-matching rows), not LEFT JOIN
-        q_lower = question.lower()
-        only_who_has_pattern = re.search(rf"\bonly\s+\w+.*?\s+(who|that)\s+(have|has|had|placed|made|ordered)\b", q_lower, flags=re.I)
+            # 🆕 JOIN TYPE GUIDANCE (CRITICAL)
+            # Check for "only X who have Y" filtering pattern - requires INNER JOIN
+            q_lower = question.lower()
+            only_who_has_pattern = re.search(rf"\bonly\s+\w+.*?\s+(who|that)\s+(have|has|had|placed|made|ordered)\b", q_lower, flags=re.I)
 
-        if only_who_has_pattern:
-            # Filtering pattern: use INNER JOIN to exclude non-matching rows
-            constraints.append(
-                "FILTERING LOGIC: This query uses 'only X who have Y' pattern. Use **INNER JOIN** to exclude entities without matching data."
-            )
-        else:
-            # Default reporting: use LEFT JOIN to preserve all entities
-            constraints.append(
-                "REPORTING LOGIC: When aggregating a Master Table with a Transaction Table, use **LEFT JOIN**."
-            )
-            constraints.append(
-                "CRITICAL FILTER RULE: If using LEFT JOIN, filters for the RIGHT table MUST be in the **ON** clause."
-            )
+            if only_who_has_pattern:
+                # Filtering pattern: use INNER JOIN to exclude non-matching rows
+                constraints.append(
+                    "JOIN TYPE (CRITICAL): This query uses 'only X who have Y' pattern. Use **INNER JOIN** to exclude entities without matching data."
+                )
+            else:
+                # Default: use LEFT JOIN to preserve all entities from primary table
+                constraints.append(
+                    "JOIN TYPE (CRITICAL): Use **LEFT JOIN** to preserve all entities from the primary table."
+                )
+                constraints.append(
+                    "FILTER RULE (CRITICAL): If using LEFT JOIN, filters for the JOINED table MUST be in the **ON** clause, NOT WHERE."
+                )
+
+    # [E] REPORTING/AGGREGATION RULES
+    # 🆕 Skip aggregation rules for winner-row queries (they use ROW_NUMBER, not GROUP BY)
+    is_reporting = (qtype == "aggregate") or has_grouping or has_exclusion
+    if is_reporting and not is_winner_row:
         constraints.append(
             "GROUP BY RULE: Every column in the SELECT list that is not aggregated MUST be in the GROUP BY clause."
         )
 
-    # [D.1] PERCENTAGE/RATIO CALCULATION RULES
+    # [E.1] PERCENTAGE/RATIO CALCULATION RULES
     percentage_triggers = ["percentage", "percent", "ratio", "proportion"]
     if any(t in question.lower() for t in percentage_triggers):
         constraints.append(
@@ -1721,7 +1769,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "Do NOT just return counts; return the actual percentage value."
         )
 
-    # [E] DATE RULES
+    # [F] DATE RULES
     constraints.append(
         "DATE LABEL STRICT RULE: If asking for Month Name, GROUP BY both MONTH(date) and DATE_FORMAT(date, '%M')."
         "DATE FILTERING RULES:\n"
@@ -1730,7 +1778,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "   - For range filtering: Use `date_column BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`."
     )
 
-    # [F] COLUMN INTEGRITY RULES (BENCHMARK MODE)
+    # [G] COLUMN INTEGRITY RULES (BENCHMARK MODE)
     # Extract explicitly mentioned columns from question for stricter enforcement
     import re as _re
     q_lower = question.lower()
@@ -1802,13 +1850,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "Bad: `SELECT p.id, name FROM ...` | Good: `SELECT p.id, p.name FROM ...`"
     )
     # [G] ANTI-HALLUCINATION & LOGIC EFFICIENCY
-    # 1. Casing Strictness
-    constraints.append(
-        "CASE SENSITIVITY RULE: The database uses specific casing (often camelCase like `orderDate`). "
-        "You MUST use the exact column names from the Schema. NEVER use snake_case."
-    )
-
-    # 2. Month Sorting
+    # 1. Month Sorting
     if "month" in question.lower() and ("order" in question.lower() or "sort" in question.lower()):
         constraints.append(
             "CHRONOLOGICAL SORTING RULE: If grouping by Month Name, you MUST also ORDER BY the month number `MONTH(dateColumn)`."
@@ -1999,7 +2041,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     s = _fix_bad_backticks(s)
     s = _canonicalize_table_names(s, ctx)
-    s = ensure_join_aliases(s)
+    # s = ensure_join_aliases(s)  # DISABLED: Let LLM handle its own alias consistency
     s = _escape_reserved_column_aliases(s)  # Escape reserved words used as column aliases (e.g., AS rank -> AS `rank`)
     # ---------------------------------------------------------------------------
     # Phase 1 — JOIN Semantics & Structural Rewrites (FINAL)
@@ -2021,13 +2063,87 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _drop_unused_from_table_aliases(s)
     s = _strip_alias_if_single_table(s)
     # ---------------------------------------------------------------------------
+    # Phase 2.5 — Force Remove AS from Plain Columns (keep for computed expressions)
+    # Plain columns: columnName AS alias → columnName (remove ALL aliases)
+    # Computed expressions: COUNT(*) AS alias → KEEP (functions need aliases)
+    # ---------------------------------------------------------------------------
+    # List of SQL functions that indicate computed expressions
+    computed_func_patterns = [
+        r'COUNT\s*\(', r'SUM\s*\(', r'AVG\s*\(', r'MIN\s*\(', r'MAX\s*\(',
+        r'CASE\s+WHEN', r'IF\s*\(', r'COALESCE\s*\(', r'NULLIF\s*\(',
+        r'CAST\s*\(', r'CONVERT\s*\(', r'DATE_FORMAT\s*\(',
+        r'ROW_NUMBER\s*\(', r'RANK\s*\(', r'DENSE_RANK\s*\(',
+        r'LAG\s*\(', r'LEAD\s*\(', r'FIRST_VALUE\s*\(', r'LAST_VALUE\s*\(',
+        r'CONCAT\s*\(', r'GROUP_CONCAT\s*\(', r'SUBSTRING\s*\(', r'SUBSTR\s*\(',
+        r'UPPER\s*\(', r'LOWER\s*\(', r'TRIM\s*\(', r'LENGTH\s*\('
+    ]
+    # Pattern to match: plain_column AS alias or table.column AS alias
+    # Only match if NOT preceded by a function call
+    def remove_plain_column_alias(match):
+        column_ref = match.group(1)  # e.g., 'status' or 't.status'
+        alias_name = match.group(2) if len(match.groups()) > 1 else match.group(0).split(' AS ')[-1]
+        # Strip quotes from alias name for checking
+        alias_clean = alias_name.strip('\'"`')
+        # Check if this is a computed expression by looking for function patterns
+        combined = column_ref + ' ' + alias_clean
+        for func_pattern in computed_func_patterns:
+            if re.search(func_pattern, combined, re.IGNORECASE):
+                # This is a computed expression, keep the AS alias
+                return match.group(0)
+        # This is a plain column, remove the AS alias
+        return column_ref
+
+    # 🆕 FIX: First, protect CASE WHEN...END AS alias patterns by temporarily replacing them
+    # This prevents the regex from incorrectly matching "END AS alias"
+    case_aliases = {}
+    def protect_case_aliases(match):
+        alias = f"__CASE_ALIAS_{len(case_aliases)}__"
+        case_aliases[alias] = match.group(0)
+        return alias
+    s = re.sub(
+        r'\bCASE\s+WHEN\b.+?\bEND\b\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)',
+        protect_case_aliases,
+        s,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Pattern 1: Quoted aliases (single or double quotes)
+    # Matches: status AS 'total orders', status AS "total", t.status AS "alias"
+    s = re.sub(
+        r"([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+AS\s+(['\"])([^'\"]+)\2",
+        lambda m: remove_plain_column_alias(type('obj', (object,), {'group': lambda self, i: m.group(1) if i == 1 else m.group(3), 'groups': lambda self: (m.group(1), m.group(3))})()),
+        s,
+        flags=re.IGNORECASE
+    )
+    # Pattern 2: Unquoted aliases
+    # Matches: status AS total_orders, t.status AS total
+    s = re.sub(
+        r"([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+        remove_plain_column_alias,
+        s,
+        flags=re.IGNORECASE
+    )
+
+    # 🆕 FIX: Restore protected CASE WHEN aliases
+    for alias, original in case_aliases.items():
+        s = s.replace(alias, original)
+
+    # 🆕 NEW: Normalize overly long aliases by removing filler words
+    s = _normalize_alias_lengths(s)
+    # ---------------------------------------------------------------------------
     # Phase 3 — Column Naming & GROUP BY Consistency
     # Operate on final column identities
     # ---------------------------------------------------------------------------
     s = _prefer_friendly_names(s, question)
     s = _expand_group_by_aliases_regex(s)
     if not _is_potential_winner_row(s, question, force=True):
+        # 🆕 REMOVE invalid columns FIRST, then enforce GROUP BY consistency
+        # This prevents columns from being added to GROUP BY unnecessarily
+        s = _remove_invalid_select_columns_with_group_by(s)
         s = _enforce_explicit_group_by(s)
+        # 🆕 Fix ORDER BY to use GROUP BY expressions instead of raw columns
+        # e.g., ORDER BY o.orderDate → ORDER BY MONTH(o.orderDate)
+        s = _fix_order_by_group_by_consistency(s)
     # ---------------------------------------------------------------------------
     # Phase 3b — Fix invalid GROUP BY syntax (strip DESC/ASC)
     # DESC/ASC is only valid in ORDER BY, not GROUP BY
@@ -2067,6 +2183,36 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
                 reordered = key_cols + desc_cols
                 new_group_clause = ', '.join(reordered)
                 s = s[:group_match.start(1)] + new_group_clause + s[group_match.end(1):]
+    # ---------------------------------------------------------------------------
+    # Phase 3.5 — Fix Window Function + GROUP BY Anti-Pattern
+    # LLM 7B sometimes incorrectly uses MIN()/MAX()/COUNT() OVER (PARTITION BY ...)
+    # when simple GROUP BY aggregate would suffice. This causes Error 1055.
+    # Fix: Remove OVER (PARTITION BY ...) from aggregates when GROUP BY is present.
+    # Example: MIN(orderDate) OVER (PARTITION BY status) -> MIN(orderDate)
+    # ---------------------------------------------------------------------------
+    s_upper = s.upper()
+    if "GROUP BY" in s_upper and "OVER" in s_upper and "PARTITION" in s_upper:
+        # Only fix if OVER is used with aggregate functions (MIN, MAX, COUNT, SUM, AVG)
+        # Pattern: AGG(...) OVER (PARTITION BY ...) [ORDER BY ...]
+        # We want: AGG(...)
+        window_agg_pattern = re.compile(
+            r'\b(MIN|MAX|COUNT|SUM|AVG)\s*\(\s*(.*?)\s*\)\s+OVER\s*\(\s*PARTITION\s+BY\s+.*?\)',
+            re.IGNORECASE | re.DOTALL
+        )
+
+        def remove_over_clause(match):
+            func_name = match.group(1)  # MIN, MAX, etc.
+            func_args = match.group(2)  # column name(s)
+            return f"{func_name}({func_args})"
+
+        # Apply fix to the entire SQL
+        fixed_sql = window_agg_pattern.sub(remove_over_clause, s)
+        if fixed_sql != s:
+            if DEBUG_WR:
+                print("[PH3.5] 🔧 Fixed window function + GROUP BY anti-pattern")
+                print(f"[PH3.5] Before: {s[:200]}")
+                print(f"[PH3.5] After:  {fixed_sql[:200]}")
+            s = fixed_sql
     # ---------------------------------------------------------------------------
     # Phase 4 — Winner-Row & Aggregate Guardrails
     # Ensure semantic correctness for ranking-style queries

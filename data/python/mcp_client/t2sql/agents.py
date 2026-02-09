@@ -689,6 +689,8 @@ def router_agent(state: RAGState) -> RAGState:
         evidence = []
 
         # Check 1: Direct column mentions (all columns, including FKs)
+        # 🆕 FK columns are treated as WEAK evidence if they exist in other tables
+        table_singular = tbl_lower.rstrip('s')
         for col in tbl_cols:
             col_lower = col.lower()
             col_variants = [col_lower]
@@ -699,7 +701,33 @@ def router_agent(state: RAGState) -> RAGState:
 
             for variant in col_variants:
                 if variant in question_lower:
-                    evidence.append(f"column '{col}'")
+                    # 🆕 Check if this is an FK column (e.g., customerNumber)
+                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id|id)$'
+                    is_fk_col = bool(re.match(fk_pattern, col_lower, re.IGNORECASE))
+
+                    if is_fk_col:
+                        # Check if this FK column exists in ANOTHER table
+                        fk_exists_elsewhere = False
+                        for other_tbl in relevant_tables:
+                            if other_tbl.lower() == tbl_lower:
+                                continue
+                            other_cols = allowed_identifiers.get(other_tbl, [])
+                            for other_col in other_cols:
+                                if other_col.lower() == col_lower:
+                                    fk_exists_elsewhere = True
+                                    break
+                            if fk_exists_elsewhere:
+                                break
+
+                        if fk_exists_elsewhere:
+                            # FK column that exists elsewhere → weak evidence
+                            evidence.append(f"FK column '{col}'")
+                        else:
+                            # FK column that ONLY exists here (parent table) → strong evidence
+                            evidence.append(f"column '{col}'")
+                    else:
+                        # Non-FK column → strong evidence
+                        evidence.append(f"column '{col}'")
                     break
 
         # Check 2: "For each X" patterns
@@ -727,10 +755,15 @@ def router_agent(state: RAGState) -> RAGState:
 
         # Check 4: Aggregate keywords with table mention
         if has_math or has_group_word:
-            # Patterns like "total orders", "count of customers", etc.
+            # Patterns like "total orders", "count of customers", "number of orders", etc.
+            # More flexible: allows extra words after table name (e.g., "orders placed")
             aggregate_patterns = [
-                rf"\b(total|sum|count|average|avg)\s+(of\s+)?{tbl_lower}\b",
-                rf"\b{tbl_lower}\s+(total|sum|count|average)\b",
+                # "count of orders", "total of orders", "number of orders"
+                rf"\b(total|sum|count|average|avg|number)\s+(of\s+)?{tbl_lower}\b",
+                # "count of orders placed", "number of orders placed" (with extra words)
+                rf"\b(total|sum|count|average|avg|number)\s+(of\s+)?{tbl_lower}\s+\w+",
+                # "orders total", "customers count"
+                rf"\b{tbl_lower}\s+(total|sum|count|average|number)\b",
             ]
             if any(re.search(p, question_lower) for p in aggregate_patterns):
                 evidence.append("aggregate context")
@@ -740,6 +773,82 @@ def router_agent(state: RAGState) -> RAGState:
             seed_evidence[tbl_lower] = evidence
             if RETRIEVE_DEBUG:
                 print(f"[Router] 🌱 Seed table: {tbl} (evidence: {', '.join(evidence)})")
+
+    # 🆕 STEP 2.8: Remove parent tables that are only referenced by "for each" pattern
+    # If a table is ONLY added because of "for each/per/each" pattern (no column mentions),
+    # AND another table has the FK column linking to it, skip the parent table.
+    # Example: "per customer" + payments.has(customerNumber) → skip customers table
+    tables_to_remove = []
+    for tbl_lower in list(seed_tables):
+        evidence_list = seed_evidence.get(tbl_lower, [])
+
+        # 🆕 Check if evidence is ONLY weak patterns
+        # Strong evidence: non-FK column mentions, aggregate context
+        # Weak evidence: 'for each' pattern, table+attribute pattern, FK column mentions
+        weak_evidence = {"'for each' pattern", "table+attribute pattern"}
+        # Also check for FK column evidence (format: "FK column 'X'")
+        is_only_weak = all(e in weak_evidence or e.startswith("FK column") for e in evidence_list)
+
+        if is_only_weak and evidence_list:  # Has evidence, but all are weak
+            table_singular = tbl_lower.rstrip('s')
+
+            # Check if any other table has FK column linking to this table
+            fk_exists_in_other_table = False
+            for other_tbl in relevant_tables:
+                if other_tbl.lower() == tbl_lower:
+                    continue
+                other_cols = allowed_identifiers.get(other_tbl, [])
+                for col in other_cols:
+                    # Check if this is an FK column (e.g., customerNumber → customers)
+                    col_lower = col.lower()
+                    # Pattern: <table_singular>(Number|Code|Id|ID)
+                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id|id)$'
+                    if re.match(fk_pattern, col_lower, re.IGNORECASE):
+                        fk_exists_in_other_table = True
+                        break
+                if fk_exists_in_other_table:
+                    break
+
+            if fk_exists_in_other_table:
+                # Check if question mentions any non-FK columns from this table
+                tbl_cols = allowed_identifiers.get(tbl_lower, [])
+                # Get FK columns
+                fk_cols = set()
+                for col in tbl_cols:
+                    col_lower = col.lower()
+                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id|id)$'
+                    if re.match(fk_pattern, col_lower, re.IGNORECASE):
+                        fk_cols.add(col_lower)
+
+                # Check if any non-FK column is mentioned in question
+                non_fk_mentioned = False
+                for col in tbl_cols:
+                    if col.lower() in fk_cols:
+                        continue
+                    # Check if column is mentioned (including spaced variant)
+                    spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
+                    if col.lower() in question_lower or spaced in question_lower:
+                        non_fk_mentioned = True
+                        break
+
+                if not non_fk_mentioned:
+                    # Safe to remove - only referenced via "for each" and FK exists elsewhere
+                    tables_to_remove.append(tbl_lower)
+                    if RETRIEVE_DEBUG:
+                        print(f"[Router] ✂️ Skipping {tbl_lower}: only 'for each' ref, FK exists in other table")
+
+    # Remove identified tables
+    for tbl_lower in tables_to_remove:
+        seed_tables.discard(tbl_lower)
+        seed_evidence.pop(tbl_lower, None)
+        # Also remove from relevant_tables
+        tbl_original = None
+        for t in relevant_tables:
+            if t.lower() == tbl_lower:
+                tbl_original = t
+                break
+        if tbl_original and tbl_original in relevant_tables:
+            relevant_tables.remove(tbl_original)
 
     # --- STEP 3.3: Find Minimal Connecting Subgraph ---
     # Use BFS to find shortest paths between all pairs of seed tables
@@ -1309,7 +1418,16 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     for sa in subquery_aliases:
         if sa.lower() not in ('where', 'group', 'order', 'having', 'limit', 'on', 'and', 'or'):
             defined_aliases.add(sa)
-    
+
+    # 🆕 Also capture table aliases: FROM orders o, JOIN customers c
+    # Pattern: FROM table alias or JOIN table alias (with or without AS)
+    table_alias_pattern = r'\b(?:FROM|JOIN)\s+[a-zA-Z_][a-zA-Z0-9_]*\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b'
+    for m in re.finditer(table_alias_pattern, sql_up, re.IGNORECASE):
+        alias = m.group(1).lower()
+        # Skip SQL keywords that might be captured
+        if alias not in ('where', 'group', 'order', 'having', 'limit', 'on', 'and', 'or', 'select'):
+            defined_aliases.add(alias)
+
     reserved.update(a.lower() for a in defined_aliases)
 
     # 🆕 Fix: For subqueries, FROM (SELECT...) matches "SELECT" - skip that
@@ -1430,9 +1548,9 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 _dbg_print_two("[Agent3] 🚨 HARD ERROR - Hallucination", f"Columns {alien_cols} do not exist in Schema.")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: The columns {alien_cols} do NOT exist in the database schema. "
-                    "1. Check for typos (e.g. `order_date` vs `orderDate`). "
-                    "2. Use ONLY columns listed in the schema context. "
-                    "3. Do NOT hallucinate snake_case names if the schema uses camelCase."
+                    "1. Check the exact column names in the schema context. "
+                    "2. Use the exact same casing and spelling as shown in the schema. "
+                    "3. Do NOT change the casing style (e.g., do NOT convert camelCase to snake_case)."
                 )
                 needs_regeneration = True
                 regeneration_model = LARGE_MODEL
@@ -1558,10 +1676,13 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             if last_word in suffix_synonyms:
                 prefix = " ".join(parts[:-1])
                 pattern_suffix = suffix_synonyms[last_word]
-                pattern = rf"\b{re.escape(prefix)}\s*{pattern_suffix}\b"
+                # 🆕 FIX: Allow optional words BEFORE the pattern (e.g., "earliest order date" should match "orderDate")
+                # Pattern: (any words) + prefix + suffix
+                pattern = rf'\b(?:\w+\s+)*{re.escape(prefix)}\s*{pattern_suffix}\b|\b{re.escape(prefix)}\s*{pattern_suffix}\b'
             else:
-                pattern = rf"\b{re.escape(clean_name)}\b"
-            
+                # Also allow optional words before for non-suffix columns
+                pattern = rf'\b(?:\w+\s+)*{re.escape(clean_name)}\b|\b{re.escape(clean_name)}\b'
+
             if re.search(pattern, question, re.IGNORECASE):
                 missing_cols.append(col_raw)
 
@@ -1654,8 +1775,16 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # --- KASUS I: UNSAFE MONTH SORTING (HARD ERROR) ---
     if "MONTH" in sql_up and "ORDER" in sql_up and not needs_regeneration:
         has_month_name_group = re.search(r"GROUP\s+BY\s+.*?DATE_FORMAT", sql_up, re.DOTALL)
-        has_safe_sort = re.search(r"ORDER\s+BY\s+.*?(MONTH|YEAR|MIN|MAX|STR_TO_DATE)\(", sql_up, re.DOTALL)
-        
+        # 🆕 FIX: Accept sorting by date columns (any alias) as safe - gives chronological order
+        # Pattern matches: MONTH(date), YEAR(date), MIN(...), MAX(...), or any *Date column
+        has_safe_sort = re.search(
+            r"ORDER\s+BY\s+(.*?\.)?(MONTH|YEAR|MIN|MAX|STR_TO_DATE)\(",
+            sql_up, re.DOTALL | re.IGNORECASE
+        ) or re.search(
+            r"ORDER\s+BY\s+.*?\w*Date\b",  # Matches: orderDate, o.orderDate, t.paymentDate, etc.
+            sql_up, re.IGNORECASE
+        )
+
         if has_month_name_group and not has_safe_sort:
              _dbg_print_two("[Agent3] 🚨 HARD ERROR - Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
              extra_instruction = (
@@ -1701,22 +1830,25 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 if needs_regeneration: break
 
     # 4. EXECUTE REGENERATION (dengan dynamic model selection)
+    final_model = state.get("target_model", "")  # Default to initial model
     if needs_regeneration:
         # 🆕 Use dynamic model selection
         llm_regen = build_llm_repair(model=regeneration_model)
         model_label = "7B" if regeneration_model == LARGE_MODEL else "3B"
         _dbg_print_two("[Agent3] Regenerating with", model_label)
-        
+
         new_sql, _ = regenerate_with_extra_constraint(
-            llm_regen, 
-            make_generation_prompt, 
-            ctx, 
-            question, 
+            llm_regen,
+            make_generation_prompt,
+            ctx,
+            question,
             extra_instruction
         )
         if new_sql:
             final_sql = normalize_sql_pipeline(new_sql, question, ctx)
             corrections.append(f"Regenerated ({model_label}) & Re-Normalized")
+            # Track final model used
+            final_model = regeneration_model
 
     final_sql = final_sql.strip()
     if not final_sql.endswith(";"): final_sql += ";"
@@ -1733,5 +1865,6 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         **state,
         "final_sql": final_sql,
         "answer": final_sql,
-        "critic_feedback": " | ".join(corrections)
+        "critic_feedback": " | ".join(corrections),
+        "final_model": final_model,
     }

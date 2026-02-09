@@ -11,7 +11,10 @@ class RAGState(TypedDict, total=False):
     # ROUTING
     router_decision: Dict[str, Any]  # Output JSON Router
     router_tables: List[str]
-    target_model: str
+    primary_table: str  # Primary table determined by router
+    primary_table_reason: str  # Reason for primary table selection
+    target_model: str  # Initial model chosen by router
+    final_model: str  # Final model used (may differ if regeneration occurred)
     # generation outputs
     answer: str
     draft_sql: str
@@ -44,7 +47,10 @@ def make_state(paths, question: str) -> RAGState:
         "context": "",
         "router_decision": {},
         "router_tables": [],
+        "primary_table": "",
+        "primary_table_reason": "",
         "target_model": "",
+        "final_model": "",  # Track final model after any regeneration
         "answer": "",
         "draft_sql": "",
         "ranked_cols": [],

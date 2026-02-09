@@ -137,31 +137,42 @@ def compare_results(predicted_rows: list, groundtruth_rows: list, order_sensitiv
             return False, f"Column count mismatch: pred={pred_col_count}, gt={gt_col_count}"
     
     try:
-        # Normalize rows - convert each row to tuple of SORTED VALUES
+        # Normalize rows - convert each row to tuple of SORTED VALUES (within the row)
         def row_to_tuple(row: dict) -> tuple:
             return tuple(sorted(normalize_value(v) for v in row.values()))
-        
+
         pred_tuples = [row_to_tuple(r) for r in predicted_rows]
         gt_tuples = [row_to_tuple(r) for r in groundtruth_rows]
-        
+
+        # ORDER SENSITIVE: Compare row by row in order (for ORDER BY queries)
+        if order_sensitive:
+            for i, (p_row, g_row) in enumerate(zip(pred_tuples, gt_tuples)):
+                if len(p_row) != len(g_row):
+                    return False, f"Column count mismatch at row {i+1}"
+                for j, (p_val, g_val) in enumerate(zip(p_row, g_row)):
+                    if not values_match(p_val, g_val, numeric_tolerance):
+                        return False, f"Row {i+1}, column {j+1} mismatch: {p_val} vs {g_val}"
+            return True, "Exact match (ordered)"
+
+        # ORDER INSENSITIVE: Treat as SET comparison (row order doesn't matter)
         # First try exact match (fast path)
         pred_set = set(pred_tuples)
         gt_set = set(gt_tuples)
-        
+
         if pred_set == gt_set:
             return True, "Exact match (unordered)"
-        
+
         # If no exact match, try with numeric tolerance
         # Compare row by row with tolerance
         def rows_match_with_tolerance(pred_list, gt_list) -> bool:
             """Check if all rows match with numeric tolerance."""
             if len(pred_list) != len(gt_list):
                 return False
-            
+
             # Sort both lists for comparison
             pred_sorted = sorted(pred_list)
             gt_sorted = sorted(gt_list)
-            
+
             for p_row, g_row in zip(pred_sorted, gt_sorted):
                 if len(p_row) != len(g_row):
                     return False
@@ -169,20 +180,20 @@ def compare_results(predicted_rows: list, groundtruth_rows: list, order_sensitiv
                     if not values_match(p_val, g_val, numeric_tolerance):
                         return False
             return True
-        
+
         if rows_match_with_tolerance(pred_tuples, gt_tuples):
             return True, f"Match with tolerance ({numeric_tolerance*100:.1f}%)"
-        
+
         # No match - find differences for debugging
         missing = gt_set - pred_set
         extra = pred_set - gt_set
-        
+
         reason = []
         if missing:
             reason.append(f"missing {len(missing)} rows")
         if extra:
             reason.append(f"extra {len(extra)} rows")
-        
+
         return False, "; ".join(reason) if reason else "Content mismatch"
             
     except Exception as e:
@@ -319,7 +330,7 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     col_widths = {
         "id": 8, "difficulty": 10, "question": 50,
         "groundtruth_sql": 40, "predicted_sql": 40,
-        "model_used": 10,  # Model 3b/7b
+        "initial_model_used": 12, "final_model_used": 12,  # Model tracking
         "exec_success": 12, "result_match": 12, "match_reason": 25,
         "pred_row_count": 12, "gt_row_count": 12,
         "latency_s": 12, "error": 30
@@ -401,15 +412,16 @@ async def run_single_case(
         "question": question,
         "groundtruth_sql": groundtruth_sql,
         "predicted_sql": "",
-        "model_used": "",       # Model yang digunakan (3b/7b)
-        "va_success": False,     # Valid SQL (EXPLAIN)
-        "va_error": None,        # Error message if not valid
+        "initial_model_used": "",  # Initial model chosen by router (3b/7b)
+        "final_model_used": "",    # Final model used (may differ if regeneration occurred)
+        "va_success": False,       # Valid SQL (EXPLAIN)
+        "va_error": None,          # Error message if not valid
         "exec_success": False,
-        "result_match": False,  # Execution Accuracy (hasil sama)
-        "match_reason": "",     # Alasan match/mismatch
+        "result_match": False,     # Execution Accuracy (hasil sama)
+        "match_reason": "",        # Alasan match/mismatch
         "pred_row_count": 0,
         "gt_row_count": 0,
-        "latency_s": 0,  # Latency dalam detik
+        "latency_s": 0,            # Latency dalam detik
         "error": None,
     }
     
@@ -434,17 +446,26 @@ async def run_single_case(
             result["latency_s"] = round(inference_time, 2)
         else:
             result["latency_s"] = round((time.perf_counter() - t0), 2)
-        
-        # Get model used (extract short name: 3b/7b)
+
+        # Get initial model used (extract short name: 3b/7b)
         target_model = state.get("target_model", "")
         if "3b" in target_model.lower():
-            result["model_used"] = "3b"
+            result["initial_model_used"] = "3b"
         elif "7b" in target_model.lower():
-            result["model_used"] = "7b"
+            result["initial_model_used"] = "7b"
         else:
-            result["model_used"] = target_model or "unknown"
-        
-        print(f"[MODEL] {result['model_used']}")
+            result["initial_model_used"] = target_model or "unknown"
+
+        # Get final model used (may differ if regeneration occurred)
+        final_model = state.get("final_model", target_model)
+        if "3b" in final_model.lower():
+            result["final_model_used"] = "3b"
+        elif "7b" in final_model.lower():
+            result["final_model_used"] = "7b"
+        else:
+            result["final_model_used"] = final_model or result["initial_model_used"]
+
+        print(f"[MODEL] Initial: {result['initial_model_used']} → Final: {result['final_model_used']}")
         
         print(f"[PREDICTED] {predicted_sql}")
         
@@ -481,9 +502,19 @@ async def run_single_case(
         
         if gt_success:
             result["gt_row_count"] = len(gt_rows or [])
-            
+
+            # Check if either SQL has ORDER BY - if so, row order matters
+            has_order_by = (
+                "ORDER BY" in predicted_sql.upper() or
+                "ORDER BY" in groundtruth_sql.upper()
+            )
+
+            # Debug: show ORDER BY detection
+            order_mode = "ORDERED" if has_order_by else "UNORDERED"
+            print(f"[EVALUATION] Comparison mode: {order_mode} (ORDER BY detected: {has_order_by})")
+
             # Compare results
-            is_match, reason = compare_results(pred_rows, gt_rows, order_sensitive=False)
+            is_match, reason = compare_results(pred_rows, gt_rows, order_sensitive=has_order_by)
             result["result_match"] = is_match
             result["match_reason"] = reason
             
@@ -662,9 +693,9 @@ async def run_batch_eval(
 
     if output_path:
         fieldnames = [
-            "id", "difficulty", "question", 
+            "id", "difficulty", "question",
             "groundtruth_sql", "predicted_sql",
-            "model_used",  # Model yang digunakan (3b/7b)
+            "initial_model_used", "final_model_used",  # Model tracking
             "va_success", "va_error",
             "exec_success", "result_match", "match_reason",
             "pred_row_count", "gt_row_count",

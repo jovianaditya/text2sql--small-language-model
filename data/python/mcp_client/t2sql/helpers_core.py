@@ -211,102 +211,102 @@ def _split_outside_quotes(sql: str) -> List[str]:
 def has_join(sql: str) -> bool:
     return re.search(rf"\b{_JOIN_KW}\b", sql, flags=re.I) is not None
 
-def ensure_join_aliases(sql: str) -> str:
-    """
-    Enforce: if query has JOIN, every FROM/JOIN table must have an alias.
-    Also rewrite qualifiers: table.col -> alias.col (outside quotes).
-    Safe-only: no CTE, no subqueries/derived tables.
-    """
-    if not sql:
-        return sql
+# def ensure_join_aliases(sql: str) -> str:
+#     """
+#     Enforce: if query has JOIN, every FROM/JOIN table must have an alias.
+#     Also rewrite qualifiers: table.col -> alias.col (outside quotes).
+#     Safe-only: no CTE, no subqueries/derived tables.
+#     """
+#     if not sql:
+#         return sql
 
-    # Only enforce if there is a join
-    if not has_join(sql):
-        return sql
+#     # Only enforce if there is a join
+#     if not has_join(sql):
+#         return sql
 
-    # Skip complex forms (keep it non-brittle)
-    if re.match(r"^\s*with\b", sql, flags=re.I):
-        return sql
-    if re.search(r"\bfrom\s*\(", sql, flags=re.I) or re.search(r"\bjoin\s*\(", sql, flags=re.I):
-        return sql
+#     # Skip complex forms (keep it non-brittle)
+#     if re.match(r"^\s*with\b", sql, flags=re.I):
+#         return sql
+#     if re.search(r"\bfrom\s*\(", sql, flags=re.I) or re.search(r"\bjoin\s*\(", sql, flags=re.I):
+#         return sql
 
-    # Find FROM/JOIN tables + aliases (if present)
-    # Matches: FROM table [AS] alias
-    #          JOIN table [AS] alias
-    tj_pat = re.compile(
-        r"(?P<kw>\bFROM\b|\bJOIN\b)\s+"
-        r"(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)"
-        r"(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?",
-        flags=re.I,
-    )
+#     # Find FROM/JOIN tables + aliases (if present)
+#     # Matches: FROM table [AS] alias
+#     #          JOIN table [AS] alias
+#     tj_pat = re.compile(
+#         r"(?P<kw>\bFROM\b|\bJOIN\b)\s+"
+#         r"(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)"
+#         r"(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?",
+#         flags=re.I,
+#     )
 
-    # 1) First pass: collect existing aliases & decide missing aliases
-    used_aliases: set[str] = set()
-    table_to_alias: dict[str, str] = {}   # lower(table)->alias
-    spans_to_patch: list[tuple[int, int, str]] = []
+#     # 1) First pass: collect existing aliases & decide missing aliases
+#     used_aliases: set[str] = set()
+#     table_to_alias: dict[str, str] = {}   # lower(table)->alias
+#     spans_to_patch: list[tuple[int, int, str]] = []
 
-    for m in tj_pat.finditer(sql):
-        kw = m.group("kw")
-        table_raw = m.group("table")
-        alias = m.group("alias")
+#     for m in tj_pat.finditer(sql):
+#         kw = m.group("kw")
+#         table_raw = m.group("table")
+#         alias = m.group("alias")
 
-        table_norm = table_raw.strip("`")
-        table_key = table_norm.split(".")[-1].lower()
+#         table_norm = table_raw.strip("`")
+#         table_key = table_norm.split(".")[-1].lower()
 
-        if alias and alias.lower() in _RESERVED_ALIASES:
-            alias = None
+#         if alias and alias.lower() in _RESERVED_ALIASES:
+#             alias = None
 
-        if alias:
-            used_aliases.add(alias)
-            table_to_alias[table_key] = alias
-        else:
-            spans_to_patch.append((m.start(), m.end(), table_raw))
+#         if alias:
+#             used_aliases.add(alias)
+#             table_to_alias[table_key] = alias
+#         else:
+#             spans_to_patch.append((m.start(), m.end(), table_raw))
 
-    # 2) Second pass: assign aliases for missing ones
-    # We need stable alias assignment order: FROM first, then JOINs in appearance order.
-    used_aliases = set(used_aliases)  # ensure mutable
-    patches: list[tuple[int, int, str]] = []
+#     # 2) Second pass: assign aliases for missing ones
+#     # We need stable alias assignment order: FROM first, then JOINs in appearance order.
+#     used_aliases = set(used_aliases)  # ensure mutable
+#     patches: list[tuple[int, int, str]] = []
 
-    for start, end, table_raw in spans_to_patch:
-        table_key = table_raw.strip("`").split(".")[-1].lower()
-        if table_key in table_to_alias:
-            continue
-        alias = _alias_for_table(table_key, used_aliases)
-        table_to_alias[table_key] = alias
+#     for start, end, table_raw in spans_to_patch:
+#         table_key = table_raw.strip("`").split(".")[-1].lower()
+#         if table_key in table_to_alias:
+#             continue
+#         alias = _alias_for_table(table_key, used_aliases)
+#         table_to_alias[table_key] = alias
 
-        # Inject " <alias>" right after table token (no AS needed)
-        # We patch by reconstructing the matched segment.
-        seg = sql[start:end]
-        # seg looks like: "FROM customers" or "JOIN payments"
-        seg_patched = re.sub(
-            rf"(\b(?:FROM|JOIN)\b\s+{re.escape(table_raw)})(?!\s+\bAS\b|\s+[A-Za-z_])",
-            rf"\1 {alias}",
-            seg,
-            flags=re.I,
-        )
-        patches.append((start, end, seg_patched))
+#         # Inject " <alias>" right after table token (no AS needed)
+#         # We patch by reconstructing the matched segment.
+#         seg = sql[start:end]
+#         # seg looks like: "FROM customers" or "JOIN payments"
+#         seg_patched = re.sub(
+#             rf"(\b(?:FROM|JOIN)\b\s+{re.escape(table_raw)})(?!\s+\bAS\b|\s+[A-Za-z_])",
+#             rf"\1 {alias}",
+#             seg,
+#             flags=re.I,
+#         )
+#         patches.append((start, end, seg_patched))
 
-    # Apply patches from the back to keep indices valid
-    out = sql
-    for start, end, seg_patched in sorted(patches, key=lambda x: x[0], reverse=True):
-        out = out[:start] + seg_patched + out[end:]
+#     # Apply patches from the back to keep indices valid
+#     out = sql
+#     for start, end, seg_patched in sorted(patches, key=lambda x: x[0], reverse=True):
+#         out = out[:start] + seg_patched + out[end:]
 
-    # 3) Rewrite qualifiers table.col -> alias.col (outside quotes/backticks/strings)
-    parts = _split_outside_quotes(out)
-    for i in range(0, len(parts), 2):  # code segments only
-        seg = parts[i]
-        for tbl, al in table_to_alias.items():
-            # rewrite schema.tbl.col and tbl.col forms conservatively:
-            # - if already alias.col, leave it
-            seg = re.sub(
-                rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?\b{re.escape(tbl)}\s*\.\s*",
-                f"{al}.",
-                seg,
-                flags=re.I,
-        )
-        parts[i] = seg
+#     # 3) Rewrite qualifiers table.col -> alias.col (outside quotes/backticks/strings)
+#     parts = _split_outside_quotes(out)
+#     for i in range(0, len(parts), 2):  # code segments only
+#         seg = parts[i]
+#         for tbl, al in table_to_alias.items():
+#             # rewrite schema.tbl.col and tbl.col forms conservatively:
+#             # - if already alias.col, leave it
+#             seg = re.sub(
+#                 rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?\b{re.escape(tbl)}\s*\.\s*",
+#                 f"{al}.",
+#                 seg,
+#                 flags=re.I,
+#         )
+#         parts[i] = seg
 
-    return "".join(parts)
+#     return "".join(parts)
 # =======================================================================
 # ======== Phase 1 — JOIN Semantics & Structural Rewrites (FINAL)========
 # ===== Decide JOIN necessity and semantics before touching aliases =====
@@ -1454,15 +1454,219 @@ def _is_potential_winner_row(sql: str, question: str, force: bool = False) -> bo
     if "group by" not in s and "max(" not in s and "min(" not in s:
         return False
 
-    # classic misuse patterns
-    if "max(" in s and "paymentdate" in s:
-        return True
-    if "max(" in s and "orderdate" in s:
-        return True
-    if "having" in s and "max(" in s:
+    # 🆕 Winner-row patterns (robust, no hardcoded column names)
+    # Pattern 1: MAX()/MIN() on date/timestamp columns (e.g., orderDate, paymentDate, createdAt)
+    # These indicate "most recent" or "earliest" queries → winner-row pattern
+    has_max_min = ("max(" in s or "min(" in s)
+    if has_max_min:
+        # Check for date/timestamp column patterns: *date, *time, *at
+        has_date_col = bool(re.search(r'\b\w*date\b', s)) or bool(re.search(r'\b\w*time\b', s))
+        if has_date_col:
+            return True
+
+    # Pattern 2: HAVING clause with aggregate → likely filtering for max/min value
+    if "having" in s and ("max(" in s or "min(" in s):
         return True
 
-    return True
+    # If no specific winner-row pattern matched, it's NOT a winner-row query
+    return False
+
+
+def _fix_order_by_group_by_consistency(sql: str) -> str:
+    """
+    Fix ORDER BY items that reference columns not in GROUP BY (causes Error 1055).
+
+    When GROUP BY has expressions like MONTH(orderDate) and ORDER BY has orderDate,
+    replace the ORDER BY item with the matching GROUP BY expression.
+
+    Example:
+        GROUP BY MONTH(o.orderDate), DATE_FORMAT(o.orderDate, '%M')
+        ORDER BY o.orderDate DESC
+    →  ORDER BY MONTH(o.orderDate) DESC
+    """
+    if not sql:
+        return sql
+
+    if "GROUP BY" not in sql.upper() or "ORDER BY" not in sql.upper():
+        return sql
+
+    # Extract GROUP BY clause
+    gb_match = re.search(r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:ORDER\s+BY|HAVING|LIMIT|;|$))', sql, re.IGNORECASE | re.DOTALL)
+    if not gb_match:
+        return sql
+
+    group_clause = gb_match.group(1).strip()
+    group_items = _split_top_level_commas(group_clause)
+
+    # Build a mapping: column_name → group_by_expression
+    # e.g., "orderdate" → "MONTH(o.orderDate)"
+    col_to_gb_expr = {}
+    for item in group_items:
+        # Extract column names referenced in this GROUP BY expression
+        # Pattern: matches table.column or column names
+        cols_in_expr = re.findall(r'\b(\w+(?:\.\w+)?)\b', item)
+        for col in cols_in_expr:
+            col_lower = col.lower()
+            # Skip function names and common keywords
+            if col_lower.upper() in {'MONTH', 'YEAR', 'DAY', 'DATE', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
+                                     'DATE_FORMAT', 'STR_TO_DATE', 'IF', 'IFNULL', 'COALESCE', 'CONCAT'}:
+                continue
+            # Map this column to the GROUP BY expression
+            if col_lower not in col_to_gb_expr:
+                col_to_gb_expr[col_lower] = item
+
+    # Extract and fix ORDER BY clause
+    ob_match = re.search(r'\bORDER\s+BY\s+(.*?)(?=\s*(?:LIMIT|;|$))', sql, re.IGNORECASE | re.DOTALL)
+    if not ob_match:
+        return sql
+
+    order_clause = ob_match.group(1).strip()
+    order_items = _split_top_level_commas(order_clause)
+
+    new_order_items = []
+    for item in order_items:
+        # Extract the base column/expression (before ASC/DESC)
+        base_match = re.match(r'(.*?)\s+(ASC|DESC)\s*$', item, re.IGNORECASE)
+        if base_match:
+            base = base_match.group(1).strip()
+            direction = base_match.group(2).strip()
+        else:
+            base = item.strip()
+            direction = ""
+
+        # Check if this is a simple column reference (not a function)
+        is_simple_col = bool(re.match(r'^\w+(?:\.\w+)?$', base))
+
+        if is_simple_col:
+            base_lower = base.lower()
+            # Check if this column appears in GROUP BY expressions
+            if base_lower in col_to_gb_expr:
+                # Replace with the GROUP BY expression
+                base = col_to_gb_expr[base_lower]
+
+        # Reconstruct with direction
+        if direction:
+            new_order_items.append(f"{base} {direction}")
+        else:
+            new_order_items.append(base)
+
+    if new_order_items:
+        new_order = ', '.join(new_order_items)
+        sql = sql[:ob_match.start(1)] + new_order + sql[ob_match.end(1):]
+
+    return sql
+
+
+def _normalize_alias_lengths(sql: str) -> str:
+    """
+    Normalize overly long aliases by removing common filler words.
+
+    Examples:
+    - 'earliest_order_date_associated_with_that_status' → 'earliest_order_date'
+    - 'total_number_of_orders' → 'total_orders'
+    - 'shipped_percentage_of_orders' → 'shipped_percentage'
+
+    Preserves technical meaning while removing non-descriptive filler words.
+    """
+    if not sql:
+        return sql
+
+    # Don't process if no AS clause
+    if " AS " not in sql.upper():
+        return sql
+
+    # Common filler word patterns in snake_case aliases
+    # These are words that appear in questions but shouldn't be in aliases
+    filler_patterns = [
+        r'_associated_with_(?:this|that|the)_',  # "associated_with_this/that"
+        r'_for_(?:this|that|the)_',             # "for_this/that"
+        r'_of_(?:the|this|that)_',              # "of_the/this/that"
+        r'_in_(?:the|this|that)_',              # "in_the/this/that"
+        r'_number_of_',                         # "number_of"
+        r'_count_of_',                          # "count_of"
+        r'_of_(?:orders?|customers?|items?)_',  # "of_orders/customers/items"
+        r'_(?:of|for|by|with|per)_each_',       # "of/for/by/with/per_each"
+    ]
+
+    # Function to shorten a single alias
+    def shorten_alias(alias: str) -> str:
+        """Shorten a single alias by removing filler words."""
+        if not alias:
+            return alias
+
+        # Skip if already short (<= 3 words or <= 20 chars)
+        word_count = len([w for w in re.split(r'_', alias) if w])
+        if word_count <= 3 and len(alias) <= 20:
+            return alias
+
+        shortened = alias
+        for pattern in filler_patterns:
+            shortened = re.sub(pattern, '_', shortened, flags=re.IGNORECASE)
+            # Clean up multiple underscores
+            shortened = re.sub(r'_+', '_', shortened).strip('_')
+
+        # If still long, truncate to first 2-3 key words
+        word_count = len([w for w in re.split(r'_', shortened) if w])
+        if word_count > 3:
+            parts = [p for p in shortened.split('_') if p]
+            shortened = '_'.join(parts[:2]) if len(parts) >= 2 else parts[0]
+
+        return shortened
+
+    def replace_alias(match):
+        """Replace a long alias with a shortened version."""
+        # Extract the alias from whichever group matched
+        # groups[0] = content inside single quotes
+        # groups[1] = content inside double quotes
+        # groups[2] = content inside backticks
+        # groups[3] = unquoted alias
+
+        groups = match.groups()
+
+        if groups[0] is not None:
+            # Single-quoted alias
+            alias = groups[0]
+            quote_char = "'"
+        elif groups[1] is not None:
+            # Double-quoted alias
+            alias = groups[1]
+            quote_char = '"'
+        elif groups[2] is not None:
+            # Backtick-quoted alias
+            alias = groups[2]
+            quote_char = '`'
+        elif groups[3] is not None:
+            # Unquoted alias
+            alias = groups[3]
+            quote_char = None
+        else:
+            # No match, return original
+            return match.group(0)
+
+        # For quoted aliases with spaces, convert to snake_case first
+        if quote_char and ' ' in alias:
+            alias = alias.lower().replace(' ', '_').replace('-', '_')
+            # Remove special characters except underscore
+            alias = re.sub(r'[^\w]', '', alias)
+
+        shortened = shorten_alias(alias)
+
+        if quote_char:
+            return f" AS {quote_char}{shortened}{quote_char}"
+        else:
+            return f" AS {shortened}"
+
+    # Match AS followed by quoted or unquoted alias
+    # Pattern handles: AS 'name', AS "name", AS `name`, AS identifier
+    pattern = r"\s+AS\s+(?:'([^']*)'|"          # Single quoted
+    pattern += r'"([^"]*)"'                     # Double quoted
+    pattern += r'|`([^`]*)`'                    # Backtick quoted
+    pattern += r'|([a-zA-Z_][a-zA-Z0-9_]*))'    # Unquoted identifier
+
+    result = re.sub(pattern, replace_alias, sql, flags=re.IGNORECASE)
+
+    return result
+
 
 def _enforce_explicit_group_by(sql: str) -> str:
     """
@@ -1519,6 +1723,174 @@ def _enforce_explicit_group_by(sql: str) -> str:
         grp.set("expressions", grp.expressions + missing)
 
     return ast.sql(dialect="mysql")
+
+
+# 🆕 NEW: Remove invalid columns from SELECT when GROUP BY is present
+# This fixes cases where LLM includes raw date columns in SELECT but doesn't group by them
+def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
+    """
+    When GROUP BY is present, remove SELECT columns that are:
+    - NOT aggregate functions (COUNT, SUM, AVG, MIN, MAX, etc.)
+    - NOT in GROUP BY
+    - NOT window functions (OVER)
+    - NOT literals/stars
+
+    This prevents Error 1055: "not functionally dependent on columns in GROUP BY clause"
+
+    Safe for all correct queries - only removes hallucinated columns.
+    """
+    if not sql:
+        return sql
+
+    # Try sqlglot first (more accurate)
+    try:
+        import sqlglot
+        from sqlglot import exp
+        ast = sqlglot.parse_one(sql, read="mysql")
+        sel = ast.find(exp.Select)
+        if not sel:
+            return sql
+
+        grp = sel.args.get("group")
+        if not grp or not grp.expressions:
+            return sql
+
+        # Get GROUP BY columns
+        group_sql = grp.sql(dialect="mysql")
+        group_set = {g.strip().lower() for g in re.findall(r'(\w+(?:\.\w+)?)', group_sql, re.IGNORECASE)}
+
+        # Check SELECT expressions
+        expressions_to_remove = []
+        for item in sel.expressions:
+            base = item.this if isinstance(item, exp.Alias) else item
+            alias = item.alias if isinstance(item, exp.Alias) else None
+
+            # Skip if aggregate, window, literal, or star
+            if base.find(exp.AggFunc):
+                continue
+            if base.find(exp.Window):
+                continue
+            if isinstance(base, (exp.Literal, exp.Star)):
+                continue
+
+            # 🆕 Skip CASE expressions (they define computed columns used in GROUP BY)
+            if isinstance(base, exp.Case):
+                continue
+
+            base_sql = base.sql(dialect="mysql").strip().lower()
+
+            # 🆕 Also check if alias is in GROUP BY (MySQL compatibility)
+            alias_in_groupby = False
+            if alias:
+                alias_sql = alias.sql(dialect="mysql").strip().lower()
+                alias_in_groupby = alias_sql in group_set
+
+            if base_sql not in group_set and not alias_in_groupby:
+                expressions_to_remove.append(item)
+
+        if expressions_to_remove:
+            new_expressions = [e for e in sel.expressions if e not in expressions_to_remove]
+            sel.set("expressions", new_expressions)
+
+        return ast.sql(dialect="mysql")
+
+    except Exception:
+        # 🆕 FALLBACK: Use regex when sqlglot fails (syntax errors, etc.)
+        # This handles cases where SQL has minor syntax issues
+        if "GROUP BY" not in sql.upper():
+            return sql
+
+        # Extract GROUP BY clause
+        gb_match = re.search(r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:ORDER\s+BY|HAVING|LIMIT|;|$))', sql, re.IGNORECASE | re.DOTALL)
+        if not gb_match:
+            return sql
+
+        group_clause = gb_match.group(1).strip()
+
+        # Helper: split by top-level commas (not inside parentheses)
+        def split_top_level_commas(clause):
+            items = []
+            current = []
+            depth = 0
+            for char in clause:
+                if char == '(':
+                    depth += 1
+                    current.append(char)
+                elif char == ')':
+                    depth -= 1
+                    current.append(char)
+                elif char == ',' and depth == 0:
+                    items.append(''.join(current).strip())
+                    current = []
+                else:
+                    current.append(char)
+            if current:
+                items.append(''.join(current).strip())
+            return [i for i in items if i]
+
+        group_items = split_top_level_commas(group_clause)
+        # For each GROUP BY item, extract the base expression (before AS, if any)
+        group_base_expressions = []
+        for item in group_items:
+            # Remove AS alias if present
+            as_match = re.search(r'\s+AS\s+(?:[\w"]+|"[^"]*"|\'[^\']*\'|`[^`]*`)\s*$', item, re.IGNORECASE)
+            if as_match:
+                base = item[:as_match.start()].strip()
+            else:
+                base = item.strip()
+            group_base_expressions.append(base.lower())
+
+        group_set = set(group_base_expressions)
+
+        # Extract SELECT clause
+        select_match = re.search(r'\bSELECT\s+(.*?)\s+FROM', sql, re.IGNORECASE | re.DOTALL)
+        if not select_match:
+            return sql
+
+        select_clause = select_match.group(1).strip()
+        select_items = split_top_level_commas(select_clause)
+
+        # Rebuild SELECT, removing items that are NOT in GROUP BY (except aggregates/windows)
+        new_select_parts = []
+        agg_funcs = {'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'DATEDIFF', 'DATE_ADD', 'TIMESTAMPDIFF',
+                     'DATE_FORMAT', 'YEAR', 'MONTH', 'DAY', 'CONCAT', 'IF', 'IFNULL', 'COALESCE'}
+
+        for item in select_items:
+            # Extract base expression (before AS)
+            as_match = re.search(r'\s+AS\s+(?:[\w"]+|"[^"]*"|\'[^\']*\'|`[^`]*`)\s*$', item, re.IGNORECASE)
+            if as_match:
+                base = item[:as_match.start()].strip()
+                alias = as_match.group(0).replace('AS', '').strip().strip('"\'`')
+            else:
+                base = item.strip()
+                alias = None
+
+            base_lower = base.lower()
+
+            # Check if it's an aggregate or window function
+            is_aggregate = False
+            func_match = re.match(r'(\w+)\s*\(', base)
+            if func_match:
+                func_name = func_match.group(1).upper()
+                if func_name in agg_funcs:
+                    is_aggregate = True
+
+            is_window = bool(re.search(r'\bOVER\s*\(', base, re.IGNORECASE))
+            # 🆕 Check if it's a CASE expression (should always be kept)
+            is_case = bool(re.search(r'\bCASE\s+WHEN\b', base, re.IGNORECASE))
+
+            # 🆕 Keep if: aggregate, window, CASE, base in GROUP BY, or alias in GROUP BY (MySQL compatibility)
+            # MySQL allows GROUP BY alias, so check both base expression and alias
+            alias_in_groupby = alias and alias.lower() in group_set if alias else False
+            if is_aggregate or is_window or is_case or base_lower in group_set or alias_in_groupby:
+                new_select_parts.append(item)
+            # Otherwise, remove it (hallucinated column)
+
+        if new_select_parts:
+            new_select = ', '.join(new_select_parts)
+            sql = sql[:select_match.start(1)] + new_select + sql[select_match.end(1):]
+
+        return sql
 # =======================================================================
 # ============ Phase 4 — Winner-Row & Aggregate Guardrails ==============
 # ======= Ensure semantic correctness for ranking-style queries =========
