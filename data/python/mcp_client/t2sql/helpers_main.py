@@ -21,6 +21,7 @@ from collections import defaultdict
 if TYPE_CHECKING:
     from .state import RAGState
 from .utils import _dbg_print_two
+from .schema_analyzer import get_transaction_tables, get_anchor_columns, get_all_tables, get_fk_relationships
 from .helpers_core import (
     _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
     _SQL_KEYWORDS,  # SQL keywords constant
@@ -57,12 +58,17 @@ from .helpers_core import (
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
-TRANSACTION_TABLES = {"payments", "orderdetails", "orders"}
-_ANCHOR_SIGNALS = {
-    "payments": {"amount", "paymentDate", "customerNumber"},
-    "orderdetails": {"quantityOrdered", "priceEach", "orderLineNumber", "orderNumber", "productCode"},
-    "orders": {"orderDate", "status", "shippedDate", "requiredDate", "customerNumber"},
-}
+# 🆕 Dynamic schema-based configuration (agnostic)
+TRANSACTION_TABLES = get_transaction_tables()  # Auto-detected from schema metadata
+
+# 🆕 Dynamic anchor signals (Metric columns from metadata)
+# Build from schema: for each table, get columns with Role: Metric
+_ANCHOR_SIGNALS = {}
+for table in get_all_tables():
+    anchors = get_anchor_columns(table)
+    if anchors:
+        _ANCHOR_SIGNALS[table] = set(anchors)
+
 _ALNUM = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # ======================================================================
 # ============================ WHITELIST ===============================
