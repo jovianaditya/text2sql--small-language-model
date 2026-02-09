@@ -279,6 +279,11 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
     """
     Get or create singleton SchemaAnalyzer instance.
 
+    Priority:
+    1. Explicit jsonl_path parameter
+    2. *_dense.jsonl (rich metadata with synonyms/roles)
+    3. Any .jsonl file (fallback)
+
     Args:
         jsonl_path: Path to JSONL file. If None, uses default from config.
 
@@ -292,10 +297,20 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
             from .config import JSON_INPUT
             jsonl_path = JSON_INPUT
 
-        # Find first JSONL file
-        jsonl_files = list(Path(jsonl_path).parent.glob("*.jsonl"))
-        if jsonl_files:
-            jsonl_path = str(jsonl_files[0])
+        # Priority: Look for *_dense.jsonl first
+        jsonl_dir = Path(jsonl_path).parent
+        dense_files = list(jsonl_dir.glob("*_dense.jsonl"))
+
+        if dense_files:
+            # Use the dense JSONL file (prioritizes rich metadata)
+            jsonl_path = str(dense_files[0])
+        else:
+            # Fallback: use the wildcard pattern as-is
+            # (allows explicit path like "classicmodels_dense.jsonl")
+            if "*" in jsonl_path or "?" in jsonl_path:
+                jsonl_files = list(jsonl_dir.glob(Path(jsonl_path).name))
+                if jsonl_files:
+                    jsonl_path = str(jsonl_files[0])
 
         _analyzer_instance = SchemaAnalyzer(jsonl_path)
 

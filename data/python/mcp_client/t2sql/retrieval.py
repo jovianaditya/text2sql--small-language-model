@@ -34,6 +34,7 @@ from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
 from .helpers_main import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _get_qtype, build_dynamic_probe
+from .schema_analyzer import get_all_tables, get_table_synonyms, get_singular_form, find_table_by_keyword
 # ======================================================================
 # ========================== CONTEXT BUILDER ===========================
 # ======================================================================
@@ -294,15 +295,12 @@ def _doc_tokens_from_meta(meta: Dict[str, Any]) -> List[str]:
     extra: List[str] = []
     has_semantic = bool(aliases or roles)
 
-    # Table-level synonyms (manual fallback)
-    if table == "productlines":
-        extra += ["product", "products", "product line", "product lines", "line", "category", "kategori"]
-    else:
-        if not has_semantic:
-            if table == "products": extra += ["product", "products", "item", "items", "barang", "produk"]
-            elif table == "customers": extra += ["customer", "customers", "pelanggan", "client", "account"]
-            elif table == "orders": extra += ["order", "orders", "pesanan", "transaksi"]
-            elif table == "payments": extra += ["payment", "payments", "pembayaran"]
+    # Table-level synonyms from schema metadata (dynamic)
+    # Get synonyms from JSONL metadata for all tables
+    if not has_semantic:
+        table_synonyms = get_table_synonyms(table)
+        if table_synonyms:
+            extra.extend(table_synonyms)
 
     # Column-level synonyms (manual fallback)
     if column == "msrp": extra += ["price", "list price", "retail price", "harga jual"]
@@ -801,16 +799,100 @@ def _has_join_intent(question: str) -> bool:
     return False
 
 def _detect_primary_entity_table(question: str) -> Optional[str]:
+    """
+    Detect primary entity table from question using schema metadata.
+
+    Dynamic version - uses synonyms from JSONL metadata instead of hardcoded patterns.
+    Searches through all tables and their synonyms to find matches in the question.
+
+    Args:
+        question: User question text
+
+    Returns:
+        First matching table name (lowercase), or None if no match
+    """
     q = (question or "").lower()
-    if "product line" in q or "product lines" in q or "lini produk" in q or "line produk" in q: return "productlines"
-    if "order detail" in q or "order details" in q or "line item" in q or "line items" in q or "detail pesanan" in q: return "orderdetails"
-    if "payment" in q or "payments" in q or "pembayaran" in q: return "payments"
-    if "office" in q or "offices" in q or "kantor" in q or "territory" in q: return "offices"
-    if "employee" in q or "employees" in q or "karyawan" in q: return "employees"
-    if "order" in q or "orders" in q or "pesanan" in q or "transaksi" in q: return "orders"
-    if "customer" in q or "customers" in q or "pelanggan" in q: return "customers"
-    if "product" in q or "products" in q or "produk" in q: return "products"
+
+    # Get all tables from schema
+    all_tables = get_all_tables()
+
+    # Build synonym map: {synonym: table}
+    synonym_to_table = {}
+
+    # Add table names themselves (both singular and plural)
+    for table in all_tables:
+        # Direct table name match
+        synonym_to_table[table] = table
+        # Singular form
+        synonym_to_table[get_singular_form(table)] = table
+
+        # Synonyms from metadata (aggregated from all columns)
+        for synonym in get_table_synonyms(table):
+            synonym_to_table[synonym] = table
+
+    # Find first matching table (check in order of specificity)
+    # Priority: multi-word phrases > single words
+    # Sort by length (descending) to prioritize longer, more specific matches
+    sorted_synonyms = sorted(synonym_to_table.items(), key=lambda x: len(x[0]), reverse=True)
+
+    for synonym, table in sorted_synonyms:
+        # Check for phrase match first (more specific)
+        if " " in synonym:
+            if synonym in q:
+                return table
+        # Then single word match
+        elif synonym.replace("_", "") in q.split():
+            return table
+
     return None
+
+
+def _is_table_mentioned(question: str, table: str) -> bool:
+    """
+    Check if a table is mentioned in the question using schema metadata.
+
+    Dynamic replacement for hardcoded mention checks like:
+    - mentions_customer = any(k in q for k in ["customer", "customers", "pelanggan"])
+    - mentions_product = any(k in q for k in ["product", "products", "produk"])
+
+    Args:
+        question: User question text
+        table: Table name to check (lowercase)
+
+    Returns:
+        True if table is mentioned, False otherwise
+    """
+    if not question or not table:
+        return False
+
+    q = question.lower()
+    table_lower = table.lower()
+
+    # 1. Direct table name match
+    if table_lower in q:
+        return True
+
+    # 2. Singular form match
+    singular = get_singular_form(table_lower)
+    if singular and singular in q:
+        return True
+
+    # 3. Synonyms from schema metadata
+    for synonym in get_table_synonyms(table):
+        if synonym in q:
+            return True
+
+    # 4. Common phrase patterns (split by space to avoid substring false positives)
+    # e.g., "product line" should match "product line" but not "line item"
+    q_words = set(q.split())
+    for synonym in get_table_synonyms(table):
+        if " " in synonym:
+            synonym_words = set(synonym.split())
+            if synonym_words.issubset(q_words):
+                return True
+
+    return False
+
 
 def _should_lock_single_table_ctx(question: str, qtype: str) -> bool:
     if qtype not in {"lookup", "aggregate", "rank"}: return False
