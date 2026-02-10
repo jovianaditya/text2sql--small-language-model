@@ -718,19 +718,8 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
     all_tables = get_all_tables()
 
     # Build mentions map dynamically using schema metadata
-    # Instead of: mentions_customer = any(k in q_l for k in ["customer", "customers", ...])
-    # We now use: _is_mentioned(q_l, "customers") which checks table name + synonyms from JSONL
+    # Uses _is_mentioned() which checks table name + synonyms from JSONL (schema-agnostic)
     mentions_map = {tbl: _is_mentioned(q_l, tbl) for tbl in all_tables}
-
-    # Extract commonly used mentions for readability (backward compatible)
-    mentions_customer = mentions_map.get("customers", False)
-    mentions_product = mentions_map.get("products", False)
-    mentions_order = mentions_map.get("orders", False)
-    mentions_payment = mentions_map.get("payments", False)
-    mentions_office = mentions_map.get("offices", False)
-    mentions_productline = mentions_map.get("productlines", False)
-    mentions_orderdetails = mentions_map.get("orderdetails", False)
-    mentions_employee = mentions_map.get("employees", False)
 
     # Detect aggregate context - indicates we need detail tables
     math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata',
@@ -742,7 +731,13 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
     needs_numeric_data = _check_needs_numeric_data_from_retrieved(reranked)
 
     # Only penalize orderdetails if NOT in aggregate context AND NOT needing numeric data
-    penalize_orderdetails_default = mentions_order and not mentions_orderdetails and not has_aggregation and not needs_numeric_data
+    # Use mentions_map directly (dynamic, schema-agnostic)
+    penalize_orderdetails_default = (
+        mentions_map.get("orders", False) and
+        not mentions_map.get("orderdetails", False) and
+        not has_aggregation and
+        not needs_numeric_data
+    )
 
     for it in reranked:
         md = it.get("meta") or {}

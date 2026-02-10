@@ -629,9 +629,9 @@ def pick_preferred_anchor_from_ranked_cols(
 
     head = ranked_cols[:max(1, top_n)]
 
-    # 1) signal-based (lebih kuat)
-    for tbl in ("payments", "orderdetails", "orders"):
-        sig = _ANCHOR_SIGNALS[tbl]
+    # 1) signal-based (lebih kuat) - use dynamic transaction tables
+    for tbl in TRANSACTION_TABLES:
+        sig = _ANCHOR_SIGNALS.get(tbl, set())
         for t, c in head:
             if (t or "").lower() == tbl and c in sig:
                 return tbl
@@ -734,10 +734,12 @@ def _fix_undefined_alias_typos(sql: str) -> str:
     
     # Find all alias.column patterns used
     used_aliases = set()
+    # Get all valid table names dynamically from schema
+    all_tables_lower = {t.lower() for t in get_all_tables()}
     for m in re.finditer(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b', sql, re.IGNORECASE):
         used_alias = m.group(1).lower()
-        # Skip table names that look like real tables
-        if used_alias not in ('payments', 'customers', 'orders', 'orderdetails', 'products', 'employees', 'offices', 'productlines'):
+        # Skip aliases that match actual table names (dynamic, schema-agnostic)
+        if used_alias not in all_tables_lower:
             used_aliases.add(used_alias)
     
     # Find undefined aliases and try to match to defined ones
