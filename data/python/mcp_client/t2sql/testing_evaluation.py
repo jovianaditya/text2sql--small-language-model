@@ -44,6 +44,47 @@ def load_testset(yaml_path: str) -> list[dict]:
         data = yaml.safe_load(f)
     return data.get("cases", [])
 
+def parse_difficulty_filter(filter_spec: str | None) -> tuple[str, set[int] | None]:
+    """
+    Parse difficulty filter specification.
+
+    Returns:
+        (difficulty, ids_set) where:
+        - difficulty: "easy", "medium", "hard"
+        - ids_set: None for all IDs, or set of specific IDs to include
+
+    Examples:
+        "" -> ("easy", None)
+        "4" -> ("easy", {4})
+        "4-7" -> ("easy", {4, 5, 6, 7})
+        "1,3,5" -> ("easy", {1, 3, 5})
+    """
+    if not filter_spec:
+        return "", None
+
+    filter_spec = filter_spec.strip()
+
+    # Parse range: "4-7" -> {4, 5, 6, 7}
+    if "-" in filter_spec:
+        try:
+            start, end = filter_spec.split("-", 1)
+            return "", set(range(int(start), int(end) + 1))
+        except ValueError:
+            return "", None
+
+    # Parse comma-separated: "1,3,5" -> {1, 3, 5}
+    if "," in filter_spec:
+        try:
+            return "", set(int(x.strip()) for x in filter_spec.split(","))
+        except ValueError:
+            return "", None
+
+    # Single ID: "4" -> {4}
+    try:
+        return "", {int(filter_spec)}
+    except ValueError:
+        return "", None
+
 def normalize_value(val, tolerance: float = 0.0001) -> str:
     """
     Normalize a single value for comparison.
@@ -580,7 +621,7 @@ async def run_batch_eval(
     paths: list[str] | None = None,
     execute_groundtruth: bool = True,
     skip_warmup: bool = False,
-    difficulties: list[str] | None = None,
+    difficulty_filters: dict[str, set[int] | None] | None = None,
 ):
     """
     Main batch evaluation function.
@@ -591,17 +632,65 @@ async def run_batch_eval(
         paths: JSONL paths for context
         execute_groundtruth: Whether to execute groundtruth SQL for comparison
         skip_warmup: Skip warmup phase (not recommended)
-        difficulties: List of difficulties to filter (e.g., ['easy', 'hard']). None = all
+        difficulty_filters: Dict mapping difficulty to ID filter (e.g., {'easy': {4, 5, 6, 7}})
+                          None value means all IDs for that difficulty.
+                          Example: {'easy': {4, 5, 6, 7}, 'hard': None}
     """
     # Load test cases
     all_cases = load_testset(testset_path)
     print(f"Loaded {len(all_cases)} test cases from {testset_path}")
 
-    # Filter by difficulty if specified
-    if difficulties:
-        difficulties_lower = [d.lower() for d in difficulties]
-        cases = [c for c in all_cases if c.get("difficulty", "").lower() in difficulties_lower]
-        print(f"Filtered to {len(cases)} test cases with difficulty: {', '.join(difficulties)}")
+    # Filter by difficulty and optional ID range if specified
+    if difficulty_filters:
+        filtered_cases = []
+        for case in all_cases:
+            difficulty = case.get("difficulty", "").lower()
+            if difficulty in difficulty_filters:
+                id_filter = difficulty_filters[difficulty]
+                # No ID filter specified - include all cases for this difficulty
+                if id_filter is None:
+                    filtered_cases.append(case)
+                else:
+                    # Check if case ID is in the filter set
+                    case_id = case.get("id", "")
+                    # Extract numeric ID from strings like "easy1", "E1", etc.
+                    import re
+                    id_match = re.search(r'\d+', str(case_id))
+                    if id_match:
+                        numeric_id = int(id_match.group())
+                        if numeric_id in id_filter:
+                            filtered_cases.append(case)
+
+        # Build description for logging
+        filter_desc = []
+        for diff, id_set in difficulty_filters.items():
+            if id_set is None:
+                filter_desc.append(diff)
+            else:
+                # Format the ID set as ranges for cleaner display
+                sorted_ids = sorted(id_set)
+                ranges = []
+                start = sorted_ids[0]
+                prev = start
+                for curr in sorted_ids[1:]:
+                    if curr == prev + 1:
+                        prev = curr
+                    else:
+                        if start == prev:
+                            ranges.append(f"{start}")
+                        else:
+                            ranges.append(f"{start}-{prev}")
+                        start = curr
+                        prev = curr
+                        # Add final range
+                        if start == prev:
+                            ranges.append(f"{start}")
+                        else:
+                            ranges.append(f"{start}-{prev}")
+                filter_desc.append(f"{diff}({','.join(ranges)})")
+
+        cases = filtered_cases
+        print(f"Filtered to {len(cases)} test cases with difficulty: {', '.join(filter_desc)}")
     else:
         cases = all_cases
         print(f"No difficulty filter - running all {len(cases)} test cases")
@@ -710,7 +799,30 @@ async def run_batch_eval(
     return results
 
 
+def preprocess_argv(argv: list[str]) -> list[str]:
+    """
+    Preprocess argv to convert patterns like --easy4, --easy4-7, --hard1,3,5
+    into --easy 4, --easy 4-7, --hard 1,3,5
+    """
+    import re
+    processed = []
+    for arg in argv:
+        # Match patterns: --easy<number>, --medium<number>, --hard<number>
+        # where number can be: 4, 4-7, 1,3,5
+        match = re.match(r'--(easy|medium|hard)(.+)', arg)
+        if match:
+            difficulty = match.group(1)
+            value = match.group(2)
+            processed.extend([f"--{difficulty}", value])
+        else:
+            processed.append(arg)
+    return processed
+
 def main():
+    # Preprocess argv to handle --easy4, --easy4-7 patterns
+    import sys
+    sys.argv = preprocess_argv(sys.argv)
+
     parser = argparse.ArgumentParser(
         description="Batch evaluation for Text-to-SQL pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -725,8 +837,14 @@ Examples:
   # Test easy and medium questions
   python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy --medium
 
-  # Test only medium questions (single difficulty)
-  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --medium
+  # Test only easy question #4
+  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy4
+
+  # Test easy questions #4-7
+  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy4-7
+
+  # Test specific questions: easy #1, #3, #5
+  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy1,3,5
         """
     )
     parser.add_argument(
@@ -749,33 +867,34 @@ Examples:
         action="store_true",
         help="Skip warmup phase (not recommended - will cause cold start bias)"
     )
-    # Difficulty filter arguments
+    # Difficulty filter arguments (supports: --easy, --easy4, --easy4-7, etc.)
     parser.add_argument(
         "--easy",
-        action="store_true",
-        help="Only test easy questions"
+        nargs="?",
+        const="",
+        help="Only test easy questions. Optionally specify ID/range: --easy4 or --easy4-7"
     )
     parser.add_argument(
         "--medium",
-        action="store_true",
-        help="Only test medium questions"
+        nargs="?",
+        const="",
+        help="Only test medium questions. Optionally specify ID/range: --medium4 or --medium4-7"
     )
     parser.add_argument(
         "--hard",
-        action="store_true",
-        help="Only test hard questions"
+        nargs="?",
+        const="",
+        help="Only test hard questions. Optionally specify ID/range: --hard4 or --hard4-7"
     )
 
     args = parser.parse_args()
 
-    # Build difficulty filter list
-    difficulties = []
-    if args.easy:
-        difficulties.append("easy")
-    if args.medium:
-        difficulties.append("medium")
-    if args.hard:
-        difficulties.append("hard")
+    # Build difficulty filter dict with optional ID ranges
+    difficulty_filters = {}
+    for difficulty_name, arg_value in [("easy", args.easy), ("medium", args.medium), ("hard", args.hard)]:
+        if arg_value is not None:  # Flag was used (with or without value)
+            _, id_filter = parse_difficulty_filter(arg_value)
+            difficulty_filters[difficulty_name] = id_filter
 
     # Generate default output filename if not specified
     if args.output is None:
@@ -783,7 +902,20 @@ Examples:
         # Default to Excel if available
         ext = ".xlsx" if HAS_EXCEL else ".csv"
         # Add difficulty suffix if filtering
-        suffix = f"_{'-'.join(difficulties)}" if difficulties else ""
+        if difficulty_filters:
+            parts = []
+            for diff, id_filter in difficulty_filters.items():
+                if id_filter is None:
+                    parts.append(diff)
+                else:
+                    sorted_ids = sorted(id_filter)
+                    if len(sorted_ids) == 1:
+                        parts.append(f"{diff}{sorted_ids[0]}")
+                    else:
+                        parts.append(f"{diff}{sorted_ids[0]}-{sorted_ids[-1]}")
+            suffix = f"_{'-'.join(parts)}"
+        else:
+            suffix = ""
         args.output = f"eval_results{suffix}_{timestamp}{ext}"
 
     asyncio.run(run_batch_eval(
@@ -791,7 +923,7 @@ Examples:
         output_path=args.output,
         execute_groundtruth=not args.no_groundtruth_exec,
         skip_warmup=args.skip_warmup,
-        difficulties=difficulties if difficulties else None,
+        difficulty_filters=difficulty_filters if difficulty_filters else None,
     ))
 
 if __name__ == "__main__":

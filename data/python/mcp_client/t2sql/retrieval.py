@@ -34,7 +34,7 @@ from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
 from .helpers_main import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _get_qtype, build_dynamic_probe
-from .schema_analyzer import get_all_tables, get_table_synonyms, get_singular_form, find_table_by_keyword, get_table_type, is_transaction_table
+from .schema_analyzer import get_all_tables, get_table_synonyms, get_singular_form, find_table_by_keyword, get_table_type, is_transaction_table, get_column_synonyms
 # ======================================================================
 # ========================== CONTEXT BUILDER ===========================
 # ======================================================================
@@ -437,15 +437,11 @@ def _doc_tokens_from_meta(meta: Dict[str, Any]) -> List[str]:
         if table_synonyms:
             extra.extend(table_synonyms)
 
-    # Column-level synonyms (manual fallback)
-    if column == "msrp": extra += ["price", "list price", "retail price", "harga jual"]
-    elif column == "priceeach": extra += ["unit price", "selling price", "harga satuan"]
-    elif column == "quantityinstock": extra += ["stock", "stok", "qty", "quantity", "on hand"]
-    elif column == "quantityordered": extra += ["qty", "quantity ordered", "jumlah pesanan"]
-    elif column == "paymentdate": extra += ["payment date", "tanggal pembayaran"]
-    elif column == "amount": extra += ["amount", "nominal", "jumlah pembayaran"]
-    if column == "htmldescription": extra += ["html", "description", "html description"]
-    if column == "textdescription": extra += ["text", "description", "text description"]
+    # Column-level synonyms from schema metadata (dynamic, schema-agnostic)
+    # Get synonyms from JSONL metadata for specific columns
+    col_synonyms = get_column_synonyms(table, column)
+    if col_synonyms:
+        extra.extend(col_synonyms)
 
     bag = " ".join([table, column, desc] + aliases + roles + extra)
     return _tokenize_bm25_query(bag)

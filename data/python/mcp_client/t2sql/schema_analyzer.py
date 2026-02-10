@@ -197,6 +197,23 @@ class SchemaAnalyzer:
 
         return list(synonyms)
 
+    def get_column_synonyms(self, table: str, column: str) -> List[str]:
+        """
+        Get synonyms for a specific column from metadata.
+
+        Returns synonyms from JSONL metadata for the given table.column.
+        If no synonyms found, returns empty list (safe fallback).
+
+        Args:
+            table: Table name
+            column: Column name
+
+        Returns:
+            List of synonyms for the column
+        """
+        key = f"{table.lower()}.{column.lower()}"
+        return self._column_synonyms.get(key, [])
+
     def get_anchor_columns(self, table: str) -> List[str]:
         """
         Get key columns for scoring boost (Role: Metric).
@@ -364,6 +381,11 @@ def get_dimension_tables() -> Set[str]:
 def get_table_synonyms(table: str) -> List[str]:
     """Get synonyms for a table from metadata."""
     return get_schema_analyzer().get_table_synonyms(table)
+
+
+def get_column_synonyms(table: str, column: str) -> List[str]:
+    """Get synonyms for a specific column from metadata (schema-agnostic)."""
+    return get_schema_analyzer().get_column_synonyms(table, column)
 
 
 def get_anchor_columns(table: str) -> List[str]:
