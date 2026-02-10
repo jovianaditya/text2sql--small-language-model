@@ -34,7 +34,7 @@ from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
 from .helpers_main import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _get_qtype, build_dynamic_probe
-from .schema_analyzer import get_all_tables, get_table_synonyms, get_singular_form, find_table_by_keyword
+from .schema_analyzer import get_all_tables, get_table_synonyms, get_singular_form, find_table_by_keyword, get_table_type, is_transaction_table
 # ======================================================================
 # ========================== CONTEXT BUILDER ===========================
 # ======================================================================
@@ -503,19 +503,62 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
     
     return bonus
 
+def _is_mentioned(q_l: str, table: str, synonyms: List[str] = None) -> bool:
+    """
+    Dynamic mention check using table name and synonyms from schema metadata.
+
+    Args:
+        q_l: Lowercased question text
+        table: Table name to check (lowercase)
+        synonyms: Optional list of synonyms (fetched from schema if not provided)
+
+    Returns:
+        True if table is mentioned in question, False otherwise
+    """
+    if not q_l or not table:
+        return False
+
+    # 1. Direct table name match
+    if table in q_l:
+        return True
+
+    # 2. Singular form match (e.g., "customer" matches "customers")
+    singular = get_singular_form(table)
+    if singular and singular in q_l:
+        return True
+
+    # 3. Synonyms from schema metadata (dynamic - not hardcoded)
+    if synonyms is None:
+        synonyms = get_table_synonyms(table)
+    for synonym in synonyms:
+        if synonym in q_l:
+            return True
+
+    return False
+
+
 def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: List[str]) -> Dict[str, float]:
     scores: Dict[str, float] = defaultdict(float)
     qt = [t.lower() for t in query_tokens]
     q_l = " ".join(qt)
 
-    mentions_customer = ("customer" in q_l) or ("customers" in q_l) or ("pelanggan" in q_l)
-    mentions_product  = ("product" in q_l) or ("products" in q_l) or ("produk" in q_l)
-    mentions_order    = "order" in q_l or "orders" in q_l
-    mentions_payment  = ("payment" in q_l) or ("payments" in q_l) or ("pembayaran" in q_l)
-    mentions_office = any(k in q_l for k in ["office", "offices", "kantor", "territory", "territories", "region", "regional"])
-    mentions_productline = any(k in q_l for k in ["product line", "product lines", "kategori", "category", "lini produk", "line produk"])
-    mentions_orderdetails = any(k in q_l for k in ["order detail", "order details", "line item", "line items", "item pesanan", "detail pesanan"])
-    mentions_employee = any(k in q_l for k in ["employee", "employees", "karyawan", "sales rep", "salesrep"])
+    # Get all tables from schema (dynamic)
+    all_tables = get_all_tables()
+
+    # Build mentions map dynamically using schema metadata
+    # Instead of: mentions_customer = any(k in q_l for k in ["customer", "customers", ...])
+    # We now use: _is_mentioned(q_l, "customers") which checks table name + synonyms from JSONL
+    mentions_map = {tbl: _is_mentioned(q_l, tbl) for tbl in all_tables}
+
+    # Extract commonly used mentions for readability (backward compatible)
+    mentions_customer = mentions_map.get("customers", False)
+    mentions_product = mentions_map.get("products", False)
+    mentions_order = mentions_map.get("orders", False)
+    mentions_payment = mentions_map.get("payments", False)
+    mentions_office = mentions_map.get("offices", False)
+    mentions_productline = mentions_map.get("productlines", False)
+    mentions_orderdetails = mentions_map.get("orderdetails", False)
+    mentions_employee = mentions_map.get("employees", False)
 
     # Detect aggregate context - indicates we need detail tables
     math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata',
@@ -542,21 +585,25 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
         for t in qt:
             if t and t in desc: base += 0.3
 
-        if mentions_customer and tl == "customers": base += 0.9
-        if mentions_product and tl == "products": base += 0.9
-        if mentions_order and tl == "orders": base += 0.7
-        if mentions_payment and tl == "payments": base += 0.7
-        if mentions_office and tl == "offices": base += 0.8
-        if mentions_productline and tl == "productlines": base += 0.8
-        if mentions_orderdetails and tl == "orderdetails": base += 0.8
+        # Dynamic table mention boost (instead of hardcoded "customers", "products", etc.)
+        # Uses mentions_map built from schema metadata
+        if tl in mentions_map and mentions_map[tl]:
+            # High boost for dimension/master tables (customers, products)
+            if get_table_type(tl) in ("dimension", "unknown"):
+                base += 0.9
+            # Medium boost for transaction tables (orders, payments)
+            elif is_transaction_table(tl):
+                base += 0.7
+            # High boost for bridge/lookup tables (offices, productlines, orderdetails, employees)
+            else:
+                base += 0.8
 
+        # Special handling for orderdetails (bridge table with numeric columns)
         # Don't penalize orderdetails in aggregate/numeric contexts
         if penalize_orderdetails_default and tl == "orderdetails": base -= 0.4
 
         # Boost orderdetails when numeric data is needed (even if not explicitly mentioned)
         if needs_numeric_data and tl == "orderdetails": base += 0.6
-
-        if mentions_employee and tl == "employees": base += 0.8
 
         scores[tbl] += base
     return scores
