@@ -40,7 +40,7 @@ from .helpers_core import (
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
     _normalize_alias_lengths,
     # phase 4
-    _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _looks_like_max_date_tiebreaker,
+    _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _fix_redundant_groupby_with_rn_filter, _fix_inconsistent_subquery_alias, _looks_like_max_date_tiebreaker,
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _rewrite_winner_row_aggregate_misuse, _winner_row_final_sanity,
@@ -773,68 +773,16 @@ def _fix_undefined_alias_typos(sql: str) -> str:
 
 def _normalize_subquery_alias_to_standard(sql: str) -> str:
     """
-    Normalize subquery aliases to use standard table aliases from _ALIAS_OVERRIDES.
-    
-    Example: 
-    - FROM (SELECT ... FROM payments) p WHERE p.rn = 2
-    - -> FROM (SELECT ... FROM payments) pmt WHERE pmt.rn = 2
-    
-    This ensures consistency with table alias conventions.
+    Normalize subquery aliases - DEPRECATED: Now just returns SQL unchanged.
+
+    Previously normalized aliases to hardcoded standards (pmt, emp, cust, etc.)
+    but this caused issues when LLM used different aliases in different places.
+
+    The fix_inconsistent_subquery_alias function now handles the case where
+    LLM hallucinates inconsistent aliases within a single query.
     """
-    # Standard aliases (from helpers_core._ALIAS_OVERRIDES)
-    TABLE_ALIAS_MAP = {
-        "payments": "pmt",
-        "employees": "emp",
-        "customers": "cust",
-        "orderdetails": "od",
-        "orders": "ord",
-        "offices": "ofc",
-        "products": "prod",
-        "productlines": "pline",
-    }
-    
-    # Find subquery patterns: FROM (SELECT ... FROM table) alias
-    # We need to identify which table is inside the subquery
-    subquery_pattern = re.compile(
-        r'\(\s*SELECT\s+.*?\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b',
-        re.IGNORECASE | re.DOTALL
-    )
-    
-    result = sql
-    for m in subquery_pattern.finditer(sql):
-        inner_table = m.group(1).lower()
-        current_alias = m.group(2)
-        
-        # Check if this table has a standard alias
-        if inner_table in TABLE_ALIAS_MAP:
-            standard_alias = TABLE_ALIAS_MAP[inner_table]
-            
-            # Only fix if current alias is non-standard (e.g., 'p' instead of 'pmt')
-            if current_alias.lower() != standard_alias:
-                print(f"[SUBQUERY_ALIAS] Normalizing: {current_alias} -> {standard_alias} (for {inner_table})")
-                
-                # Replace the subquery alias definition
-                # Pattern: ) p WHERE -> ) pmt WHERE or ) AS p WHERE -> ) AS pmt WHERE
-                result = re.sub(
-                    rf'\)\s*(?:AS\s+)?{re.escape(current_alias)}\b',
-                    f') {standard_alias}',
-                    result,
-                    count=1,
-                    flags=re.IGNORECASE
-                )
-                
-                # Replace all references to this alias
-                result = re.sub(
-                    rf'\b{re.escape(current_alias)}\.',
-                    f'{standard_alias}.',
-                    result,
-                    flags=re.IGNORECASE
-                )
-                
-                # Also replace standalone alias references (e.g., WHERE p.rn -> WHERE pmt.rn)
-                # Already handled by the above pattern
-    
-    return result
+    # Simply return the SQL unchanged - let LLM choose its own aliases
+    return sql
 
 def _fix_missing_space_before_clauses(sql: str) -> str:
     # Normalize whitespace before SQL clauses
@@ -1480,8 +1428,15 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     for_each_triggers = ["for each", "each ", "per ", "every "]
     if any(t in question.lower() for t in for_each_triggers):
         constraints.append(
-            "FOR EACH RULE: When the question says 'For each X' or 'Per X', you MUST return ALL values of X. "
+            "FOR EACH RULE (CRITICAL): When the question says 'For each X' or 'Per X', you MUST return ALL values of X. "
             "Do NOT add WHERE filters on the grouping column unless the user explicitly filters it. "
+            "Do NOT add subqueries to filter grouping columns. "
+            "TABLE SELECTION RULE: When counting 'number of Y' per each X, use FROM the Y table (the entity being counted), "
+            "NOT the dimension table for X. "
+            "Example: 'for each product line, count products' -> FROM products GROUP BY productLine (NOT FROM productlines). "
+            "The COUNT(*) counts rows in the FROM table, so use the table containing the entities to count. "
+            "CORRECT: SELECT groupingCol, COUNT(*) FROM entity_table GROUP BY groupingCol "
+            "WRONG: SELECT groupingCol, COUNT(*) FROM dimension_table GROUP BY groupingCol (this counts dimension rows, not entities)"
         )
 
     # === [NEW] EXPLICIT RANK() FUNCTION RULE ===
@@ -1567,6 +1522,17 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 f"STRICT SYNTAX (FOLLOW EXACTLY): "
                 f"`SELECT t.col1, t.col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY valueCol DESC) AS rn FROM table) t WHERE t.rn = {rank_n}` "
                 f"Do NOT use GROUP BY, HAVING, or MAX(CASE WHEN...) - just WHERE rn = {rank_n} is enough!"
+            )
+            constraints.append(
+                f"REDUNDANT PATTERN WARNING: When you use `WHERE rn = {rank_n}`, each group already has exactly ONE row. "
+                f"THEREFORE: (1) NO GROUP BY needed - it's redundant! (2) NO MAX(CASE WHEN rn = {rank_n}...) needed - just select the column directly! "
+                f"WRONG: `SELECT t.customer, MAX(CASE WHEN rn = {rank_n} THEN amount END) FROM (...) t WHERE t.rn = {rank_n} GROUP BY t.customer` "
+                f"CORRECT: `SELECT t.customer, t.amount FROM (...) t WHERE t.rn = {rank_n}`"
+            )
+            constraints.append(
+                f"ALIAS CONSISTENCY (CRITICAL): Use the SAME alias everywhere! "
+                f"WRONG: `SELECT p.col FROM (...) t WHERE t.rn = {rank_n}` - 'p' is undefined! "
+                f"CORRECT: `SELECT t.col FROM (...) t WHERE t.rn = {rank_n}` - same alias 't' everywhere!"
             )
         else:
             constraints.append(
@@ -2079,14 +2045,25 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # when simple GROUP BY aggregate would suffice. This causes Error 1055.
     # Fix: Remove OVER (PARTITION BY ...) from aggregates when GROUP BY is present.
     # Example: MIN(orderDate) OVER (PARTITION BY status) -> MIN(orderDate)
+    #
+    # CRITICAL: DO NOT strip OVER from window functions (ROW_NUMBER, RANK, etc.)
+    # These REQUIRE the OVER clause - removing it makes invalid SQL!
     # ---------------------------------------------------------------------------
     s_upper = s.upper()
-    if "GROUP BY" in s_upper and "OVER" in s_upper and "PARTITION" in s_upper:
+
+    # Skip if query uses window functions that REQUIRE OVER clause
+    window_funcs_requiring_over = ["ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD",
+                                    "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE",
+                                    "NTILE", "PERCENT_RANK", "CUME_DIST"]
+    has_window_func = any(f"{wf}()" in s_upper or f"{wf} (" in s_upper for wf in window_funcs_requiring_over)
+
+    if "GROUP BY" in s_upper and "OVER" in s_upper and "PARTITION" in s_upper and not has_window_func:
         # Only fix if OVER is used with aggregate functions (MIN, MAX, COUNT, SUM, AVG)
         # Pattern: AGG(...) OVER (PARTITION BY ...) [ORDER BY ...]
         # We want: AGG(...)
+        # Use negated character class instead of .*? to avoid issues with nested parens
         window_agg_pattern = re.compile(
-            r'\b(MIN|MAX|COUNT|SUM|AVG)\s*\(\s*(.*?)\s*\)\s+OVER\s*\(\s*PARTITION\s+BY\s+.*?\)',
+            r'\b(MIN|MAX|COUNT|SUM|AVG)\s*\(\s*([^()]*(?:\([^()]*\)[^()]*)*)\s*\)\s+OVER\s*\(\s*PARTITION\s+BY\s+[^)]+\)',
             re.IGNORECASE | re.DOTALL
         )
 
@@ -2131,6 +2108,24 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     if fixed_mixed:
         if DEBUG_WR: print("[PH4] Fixed malformed MAX/GROUP BY + ROW_NUMBER pattern")
         s = fixed_mixed
+
+    # NEW: Fix redundant GROUP BY + MAX(CASE WHEN rn = N...) when WHERE rn = N is present
+    # When WHERE rn = N exists, each group has exactly ONE row, so GROUP BY is redundant
+    fixed_redundant = _fix_redundant_groupby_with_rn_filter(s)
+    if fixed_redundant:
+        if DEBUG_WR: print("[PH4] Fixed redundant GROUP BY with WHERE rn = N pattern")
+        if DEBUG_WR: print(f"[PH4] Before: {s[:200]}")
+        if DEBUG_WR: print(f"[PH4] After:  {fixed_redundant[:200]}")
+        s = fixed_redundant
+
+    # NEW: Fix inconsistent subquery alias hallucination
+    # LLM sometimes uses different alias in outer SELECT than the subquery alias
+    fixed_alias = _fix_inconsistent_subquery_alias(s)
+    if fixed_alias:
+        if DEBUG_WR: print("[PH4] Fixed inconsistent subquery alias")
+        if DEBUG_WR: print(f"[PH4] Before: {s[:200]}")
+        if DEBUG_WR: print(f"[PH4] After:  {fixed_alias[:200]}")
+        s = fixed_alias
 
     # -------------------------------------------------------------
     # CASE 1 — pattern clearly indicates MAX + date tie-breaker
@@ -2220,11 +2215,38 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         group_match = re.search(r'\bGROUP\s+BY\s+([a-zA-Z0-9_`.]+)', s, re.IGNORECASE)
         if group_match:
             group_col = group_match.group(1).strip().strip('`').lower()
-            # Pattern 1: WHERE col IN (...) - hardcoded list of values
-            where_in_match = re.search(
-                r'\bWHERE\s+' + re.escape(group_col) + r'\s+IN\s*\([^)]+\)',
+            # Pattern 1: WHERE col IN (...) - ONLY simple value lists, NOT subqueries
+            # Use balanced parenthesis matching to detect subqueries
+            where_in_match = None
+            in_pattern = re.search(
+                r'\bWHERE\s+' + re.escape(group_col) + r'\s+IN\s*\(',
                 s, re.IGNORECASE
             )
+            if in_pattern:
+                # Check if the content inside parens is a simple list (no SELECT)
+                start = in_pattern.end() - 1  # position of opening (
+                depth = 0
+                end = start
+                for i, ch in enumerate(s[start:], start):
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+                inner_content = s[start+1:end]
+                # Only treat as hallucinated filter if it's NOT a subquery
+                if 'SELECT' not in inner_content.upper():
+                    where_in_match = in_pattern
+                    # Extend match to include the full IN clause
+                    class _Match:
+                        def __init__(self, start, end, string):
+                            self._start, self._end, self._string = start, end, string
+                        def start(self): return self._start
+                        def end(self): return self._end
+                    where_in_match = _Match(in_pattern.start(), end + 1, s[in_pattern.start():end+1])
+
             # Pattern 2: WHERE col IS NOT NULL - unnecessary null check on grouping col
             where_not_null_match = re.search(
                 r'\bWHERE\s+' + re.escape(group_col) + r'\s+IS\s+NOT\s+NULL\b',
@@ -2235,8 +2257,36 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
                 # Remove the WHERE clause entirely - "for each" means ALL values
                 s = s[:where_match.start()] + s[where_match.end():]
                 s = re.sub(r'\s{2,}', ' ', s)  # collapse extra spaces
-                if DEBUG_WR: 
+                if DEBUG_WR:
                     print(f"[PH6.5] Removed hallucinated WHERE on GROUP BY column '{group_col}' for 'for each' query")
+
+    # ---------------------------------------------------------------------------
+    # Phase 6.6 — Fix Redundant Subquery Anti-Pattern for GROUP BY + HAVING
+    # Pattern: WHERE col IN (SELECT col FROM same_table GROUP BY col HAVING AGG(...) > N)
+    # Fix: Remove the WHERE subquery, move HAVING to outer query
+    # ---------------------------------------------------------------------------
+    # Detect the anti-pattern:
+    # SELECT col, AGG(...) FROM table WHERE col IN (SELECT col FROM table GROUP BY col HAVING AGG(...) op N) GROUP BY col
+    having_subquery_pattern = re.compile(
+        r'\bWHERE\s+(\w+)\s+IN\s*\(\s*SELECT\s+\1\s+FROM\s+(\w+)\s+GROUP\s+BY\s+\1\s+HAVING\s+(.+?)\s*\)\s+GROUP\s+BY\s+\1\b',
+        re.IGNORECASE
+    )
+    having_match = having_subquery_pattern.search(s)
+    if having_match:
+        outer_col = having_match.group(1)
+        inner_table = having_match.group(2)
+        having_clause = having_match.group(3).strip()
+
+        # Check if outer query uses the same table
+        outer_from_match = re.search(r'\bFROM\s+(\w+)\b', s, re.IGNORECASE)
+        if outer_from_match and outer_from_match.group(1).lower() == inner_table.lower():
+            # This is the anti-pattern - convert to simple GROUP BY + HAVING
+            # Remove the WHERE ... IN (...) subquery and add HAVING to outer
+            s = s[:having_match.start()] + 'GROUP BY ' + outer_col + ' HAVING ' + having_clause + s[having_match.end():]
+            s = re.sub(r'\s{2,}', ' ', s)
+            if DEBUG_WR:
+                print(f"[PH6.6] Fixed redundant subquery anti-pattern: moved HAVING to outer query")
+
     # ---------------------------------------------------------------------------
     # Phase 7 — Ordering, Limits, and Output Formatting
     # Cosmetic and execution-safety adjustments only

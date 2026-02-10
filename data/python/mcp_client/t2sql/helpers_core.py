@@ -1382,13 +1382,20 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
     """
     Fix ORDER BY items that reference columns not in GROUP BY (causes Error 1055).
 
-    When GROUP BY has expressions like MONTH(orderDate) and ORDER BY has orderDate,
-    replace the ORDER BY item with the matching GROUP BY expression.
+    Two fix modes:
+    1. When ORDER BY has simple column and GROUP BY has expression → replace ORDER BY with GROUP BY expr
+    2. When ORDER BY has expression not in GROUP BY → add ORDER BY expr to GROUP BY
 
-    Example:
-        GROUP BY MONTH(o.orderDate), DATE_FORMAT(o.orderDate, '%M')
+    Example 1 (replace ORDER BY):
+        GROUP BY MONTH(o.orderDate)
         ORDER BY o.orderDate DESC
-    →  ORDER BY MONTH(o.orderDate) DESC
+    →   ORDER BY MONTH(o.orderDate) DESC
+
+    Example 2 (add to GROUP BY):
+        GROUP BY DATE_FORMAT(o.orderDate, '%M')
+        ORDER BY MONTH(o.orderDate) DESC
+    →   GROUP BY DATE_FORMAT(o.orderDate, '%M'), MONTH(o.orderDate)
+        ORDER BY MONTH(o.orderDate) DESC
     """
     if not sql:
         return sql
@@ -1403,6 +1410,9 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
 
     group_clause = gb_match.group(1).strip()
     group_items = _split_top_level_commas(group_clause)
+
+    # Normalize GROUP BY items for comparison (strip whitespace, lowercase)
+    group_items_normalized = [item.strip().lower() for item in group_items]
 
     # Build a mapping: column_name → group_by_expression
     # e.g., "orderdate" → "MONTH(o.orderDate)"
@@ -1430,6 +1440,8 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
     order_items = _split_top_level_commas(order_clause)
 
     new_order_items = []
+    items_to_add_to_group_by = []
+
     for item in order_items:
         # Extract the base column/expression (before ASC/DESC)
         base_match = re.match(r'(.*?)\s+(ASC|DESC)\s*$', item, re.IGNORECASE)
@@ -1449,6 +1461,22 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
             if base_lower in col_to_gb_expr:
                 # Replace with the GROUP BY expression
                 base = col_to_gb_expr[base_lower]
+        else:
+            # ORDER BY item is a function expression (e.g., MONTH(o.orderDate))
+            # Check if this expression is already in GROUP BY
+            base_normalized = base.lower().replace(" ", "")  # Normalize for comparison
+
+            # Also check without table alias prefix for flexibility
+            # MONTH(o.orderDate) should match MONTH(orderDate) in GROUP BY
+            base_no_space = base.replace(" ", "").lower()
+            is_in_group_by = any(
+                base_no_space in gi.replace(" ", "").lower()
+                for gi in group_items_normalized
+            )
+
+            if not is_in_group_by:
+                # Add this ORDER BY expression to GROUP BY
+                items_to_add_to_group_by.append(base)
 
         # Reconstruct with direction
         if direction:
@@ -1456,9 +1484,19 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
         else:
             new_order_items.append(base)
 
+    # Update ORDER BY clause
     if new_order_items:
         new_order = ', '.join(new_order_items)
         sql = sql[:ob_match.start(1)] + new_order + sql[ob_match.end(1):]
+
+    # Add missing items to GROUP BY clause
+    if items_to_add_to_group_by:
+        # Find GROUP BY clause again (position may have changed)
+        gb_match = re.search(r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:ORDER\s+BY|HAVING|LIMIT|;|$))', sql, re.IGNORECASE | re.DOTALL)
+        if gb_match:
+            new_group_items = group_items + items_to_add_to_group_by
+            new_group_clause = ', '.join(new_group_items)
+            sql = sql[:gb_match.start(1)] + new_group_clause + sql[gb_match.end(1):]
 
     return sql
 
@@ -2095,6 +2133,182 @@ def _fix_mixed_max_groupby_rownumber(sql: str) -> Optional[str]:
     )
 
     return fixed_sql
+
+
+def _fix_redundant_groupby_with_rn_filter(sql: str) -> Optional[str]:
+    """
+    Fix redundant GROUP BY + MAX(CASE WHEN rn = N...) when WHERE rn = N is already present.
+
+    Anti-pattern (WRONG):
+        SELECT t.customer, MAX(CASE WHEN rn = 2 THEN amount END) AS amount
+        FROM (... ROW_NUMBER() OVER (...) AS rn ...) t
+        WHERE t.rn = 2
+        GROUP BY t.customer;
+
+    Correct:
+        SELECT t.customer, t.amount
+        FROM (... ROW_NUMBER() OVER (...) AS rn ...) t
+        WHERE t.rn = 2;
+
+    When WHERE rn = N is present, each group already has exactly ONE row,
+    so GROUP BY is redundant and MAX(CASE WHEN rn = N...) is unnecessary.
+
+    Returns fixed SQL or None if pattern not detected.
+    """
+    if not sql:
+        return None
+
+    s_upper = sql.upper()
+
+    # Must have: ROW_NUMBER, WHERE rn = N, GROUP BY, MAX(CASE WHEN...)
+    if "ROW_NUMBER" not in s_upper:
+        return None
+    if "GROUP BY" not in s_upper:
+        return None
+
+    # Detect WHERE rn = N pattern (N is 1-9 for ordinal)
+    where_rn_match = re.search(r"\bWHERE\s+(\w+\.)?rn\s*=\s*(\d)", sql, re.IGNORECASE)
+    if not where_rn_match:
+        return None
+
+    rn_value = where_rn_match.group(2)
+
+    # Detect MAX(CASE WHEN rn = N THEN col END) pattern
+    # Pattern: MAX(CASE WHEN [alias.]rn [=<>] N THEN column END)
+    max_case_pattern = re.compile(
+        r"\b(MAX|MIN)\s*\(\s*CASE\s+WHEN\s+(?:\w+\.)?rn\s*=\s*" + rn_value + r"\s+THEN\s+(\w+(?:\.\w+)?)\s+END\s*\)",
+        re.IGNORECASE
+    )
+
+    has_max_case = max_case_pattern.search(sql)
+    if not has_max_case:
+        return None
+
+    # ===== FIX: Remove GROUP BY and simplify MAX(CASE WHEN...) =====
+    fixed = sql
+
+    # 1. Replace MAX(CASE WHEN rn = N THEN col END) with just the column
+    def replace_max_case(match):
+        # group(2) is the column (may include alias like "pmt.amount")
+        return match.group(2)
+
+    fixed = max_case_pattern.sub(replace_max_case, fixed)
+
+    # 2. Remove GROUP BY clause from outer query (not subquery)
+    # We need to remove GROUP BY that comes after the closing paren of subquery
+    # Pattern: ) alias WHERE ... GROUP BY ...
+    # Use careful regex to only match GROUP BY in outer query
+
+    # Find the outer GROUP BY position (after subquery closing paren)
+    # First, find WHERE rn = N position
+    where_pos = fixed.upper().find("WHERE")
+    if where_pos == -1:
+        return None
+
+    # Look for GROUP BY after WHERE (in the outer query)
+    group_by_after_where = re.search(
+        r"\bGROUP\s+BY\s+[^;)]+(?:;|$|\s*HAVING|\s*ORDER|\s*LIMIT)",
+        fixed[where_pos:],
+        re.IGNORECASE
+    )
+
+    if group_by_after_where:
+        # Remove the GROUP BY clause
+        # Find exact position
+        start = where_pos + group_by_after_where.start()
+        end = where_pos + group_by_after_where.end()
+
+        # Trim trailing keywords that might have been captured
+        fixed_group = fixed[start:end].rstrip()
+        # Don't remove trailing semicolon, ORDER BY, LIMIT, HAVING
+        for kw in ["ORDER", "LIMIT", "HAVING", ";"]:
+            if fixed_group.upper().endswith(kw):
+                fixed_group = fixed_group[:-len(kw)].rstrip()
+
+        fixed = fixed[:start] + fixed[end:]
+
+    # Clean up extra spaces
+    fixed = re.sub(r"\s+", " ", fixed).strip()
+
+    # Ensure semicolon at end if original had one
+    if sql.rstrip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+
+    return fixed
+
+
+def _fix_inconsistent_subquery_alias(sql: str) -> Optional[str]:
+    """
+    Fix LLM hallucination where outer SELECT uses a different alias than the subquery.
+
+    Example WRONG:
+        SELECT p.customerNumber, t.amount FROM (...) t WHERE t.rn = 2
+        -- 'p' is undefined! Only 't' is valid.
+
+    Example CORRECT:
+        SELECT t.customerNumber, t.amount FROM (...) t WHERE t.rn = 2
+        -- Consistent alias 't' everywhere.
+
+    Returns fixed SQL or None if pattern not detected.
+    """
+    if not sql:
+        return None
+
+    s_upper = sql.upper()
+
+    # Only process queries with subqueries
+    if "ROW_NUMBER" not in s_upper:
+        return None
+
+    # Find the subquery pattern: FROM (SELECT ... FROM table) alias
+    # Extract the actual subquery alias
+    subquery_match = re.search(
+        r'\)\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+WHERE',
+        sql,
+        re.IGNORECASE
+    )
+
+    if not subquery_match:
+        return None
+
+    correct_alias = subquery_match.group(1)  # e.g., 'pmt' or 't'
+
+    # Find the outer SELECT columns (before the FROM with subquery)
+    select_match = re.search(
+        r'SELECT\s+(.*?)\s+FROM\s*\(',
+        sql,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    if not select_match:
+        return None
+
+    outer_cols = select_match.group(1)  # e.g., 'p.customerNumber, t.amount'
+
+    # Find all aliases used in the outer SELECT
+    alias_refs = set(re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.\w+', outer_cols))
+
+    # Check if any alias is different from the correct one
+    inconsistent_aliases = alias_refs - {correct_alias.lower(), correct_alias}
+
+    if not inconsistent_aliases:
+        return None  # All aliases are consistent
+
+    # Fix: Replace all inconsistent aliases with the correct one
+    fixed = sql
+
+    for wrong_alias in inconsistent_aliases:
+        # Only replace in the outer SELECT (before FROM with subquery)
+        # Pattern: alias.col in the SELECT clause
+        old_select = select_match.group(0)
+        new_select = old_select.replace(f"{wrong_alias}.", f"{correct_alias}.")
+        fixed = fixed.replace(old_select, new_select, 1)
+
+    # Debug output
+    # print(f"[ALIAS FIX] Fixed inconsistent alias: {inconsistent_aliases} -> {correct_alias}")
+
+    return fixed
+
 
 def _split_top_level_commas(expr: str) -> List[str]:
     """

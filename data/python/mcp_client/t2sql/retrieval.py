@@ -108,7 +108,130 @@ def _format_stats_for_llm(stats_raw: Any) -> str:
     
     return " | STATS: " + ", ".join(parts)
 # ==============================================================================
-# 2. CORE LOGIC: CARD BUILDER (Update fungsi ini)
+# 2. CORE LOGIC: COLUMN RELEVANCE FILTERING (Metadata-Driven)
+# ==============================================================================
+def _is_column_relevant_to_query(
+    column: str,
+    table: str,
+    question: str,
+    qtype: str,
+    metadata: Dict[str, Any]
+) -> bool:
+    """
+    Determine if a column is relevant to the query using metadata-driven logic.
+
+    Prevents hallucination by excluding columns that:
+    - Are not mentioned in the question
+    - Have metric/measure roles but query doesn't ask for that specific metric
+    - Are numeric measure columns in count queries
+
+    This is ROBUST because it uses:
+    - Column metadata (role, description) from JSONL
+    - Query type detection
+    - Pattern matching (not hardcoded lists)
+
+    Args:
+        column: Column name
+        table: Table name
+        question: User's question
+        qtype: Query type (lookup, aggregate, rank)
+        metadata: Column metadata from retrieval
+
+    Returns:
+        True if column should be included in context, False otherwise
+    """
+    col_lower = column.lower()
+    q_l = question.lower()
+    table_lower = table.lower()
+
+    # === RULE 1: Always include primary keys and identifying columns ===
+    roles = _parse_str_or_list_lower(metadata.get("tags_role") or metadata.get("roles") or [])
+    if any(r in ["id", "key", "primary", "identifier"] for r in roles):
+        return True
+
+    # === RULE 2: Always include if explicitly mentioned in question ===
+    # Check column name (exact word match, not substring)
+    # Use word boundary to avoid false positives like "products" matching "quantityInStock"
+    q_words = set(q_l.split())
+    if col_lower in q_words:
+        return True
+
+    # Also check with underscores removed (quantity_in_stock -> quantityinstock)
+    col_no_underscore = col_lower.replace("_", "")
+    if col_no_underscore in q_words:
+        return True
+
+    # Check column description (with word boundary matching)
+    desc = str(metadata.get("description") or "").lower()
+    # Extract key terms from description (first few words)
+    desc_words = set(desc.split()[:5])
+    # Only match if description words actually appear as whole words in question
+    if desc_words.intersection(q_words):
+        # But exclude generic terms that could cause false positives
+        generic_terms = {"number", "total", "each", "per", "for", "the", "a", "an"}
+        # Only match if there's a specific term match (not just generic terms)
+        specific_matches = desc_words.intersection(q_words) - generic_terms
+        if specific_matches:
+            return True
+
+    # === RULE 3: For COUNT queries, exclude metric columns not mentioned ===
+    if qtype == "aggregate" and "count" in q_l:
+        # Count queries only need: PK, name columns, and explicitly mentioned columns
+        # Exclude: quantityInStock, buyPrice, etc. unless mentioned
+        is_metric = any(r in ["metric", "measure", "amount", "quantity"] for r in roles)
+
+        # Check if column is a numeric measure
+        datatype = (metadata.get("datatype") or "").lower()
+        is_numeric = any(t in datatype for t in ["int", "decimal", "numeric", "float", "double"])
+
+        # Numeric column patterns (generic, not table-specific)
+        numeric_patterns = ["quantity", "stock", "amount", "price", "cost", "value"]
+
+        # Check if column name contains any numeric pattern
+        has_numeric_pattern = any(p in col_lower for p in numeric_patterns)
+
+        if is_metric or (is_numeric and has_numeric_pattern):
+            # Only include if COLUMN NAME is explicitly mentioned in question
+            # (not just generic numeric keywords like "total")
+            # Check column name variants
+            col_variants = [
+                col_lower,                    # quantityinstock
+                col_no_underscore,             # same for no underscore
+                col_lower.replace("quantity", "").replace("instock", "in stock"),  # handle compound words
+            ]
+            mentioned_in_question = any(v in q_l for v in col_variants if v)
+
+            if not mentioned_in_question:
+                # DEBUG: Show why column is being excluded
+                if RETRIEVE_DEBUG and col_lower in ["quantityinstock", "buyprice", "msrp"]:
+                    print(f"   [FILTER-RULE3] Excluding {table}.{column}: is_metric={is_metric}, is_numeric={is_numeric}, has_pattern={has_numeric_pattern}")
+                return False
+            else:
+                # DEBUG: Show why column is being kept
+                if RETRIEVE_DEBUG and col_lower in ["quantityinstock", "buyprice", "msrp"]:
+                    print(f"   [FILTER-RULE3] KEPT {table}.{column}: column name explicitly mentioned")
+
+    # === RULE 4: For aggregate queries (SUM/AVG), include relevant metric columns ===
+    if qtype == "aggregate" and any(kw in q_l for kw in ["sum", "avg", "average", "total"]):
+        # These queries need numeric columns, but only relevant ones
+        # Default: include (will be filtered by relevance scoring)
+        return True
+
+    # === RULE 5: For lookup queries, include filterable and display columns ===
+    if qtype == "lookup":
+        # Name columns are always relevant
+        if "name" in col_lower:
+            return True
+        # Include if table is mentioned
+        if table_lower in q_l or get_singular_form(table_lower) in q_l:
+            return True
+
+    # Default: include (backward compatible)
+    return True
+
+
+# ==============================================================================
+# 3. CORE LOGIC: CARD BUILDER
 # ==============================================================================
 def _build_cards(
     filtered_allowed: Dict[str, List[str]],
@@ -116,6 +239,8 @@ def _build_cards(
     max_cards: int = 15,
     max_inject: int = 12,
     desc_max_len: int = 100,
+    question: str = "",  # Add question parameter
+    qtype: str = "",     # Add qtype parameter
 ) -> str:
     cards: List[str] = []
     present = set()
@@ -130,11 +255,21 @@ def _build_cards(
         md = it.get("meta") or {}
         table = _meta_table(md)
         column = _meta_column(md)
-        
+
         if not table or not column:
             continue
         if table not in filtered_allowed:
             continue
+
+        # === FILTER: Check if column is relevant to query (metadata-driven) ===
+        # This prevents hallucination by excluding irrelevant columns
+        # Only applies when question and qtype are provided
+        if question and qtype:
+            if not _is_column_relevant_to_query(column, table, question, qtype, md):
+                # Skip this column - not relevant to the query
+                if RETRIEVE_DEBUG:
+                    print(f"   [FILTER] Excluding {table}.{column} (not relevant to query)")
+                continue
 
         # --- LOGIKA DESKRIPSI (WATERFALL PRIORITY) ---
         desc = ""
@@ -453,54 +588,91 @@ def _doc_matches_sparse(md: Dict[str, Any], sparse_ids: List[str]) -> bool:
 # ======= SCORING =========
 # =========================
 def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List[str], aliases: List[str]) -> float:
+    """
+    Apply column-specific priority boost based on query and column metadata.
+
+    Dynamic version - uses table type and column patterns instead of hardcoded table names.
+    """
     bonus = 0.0
-    
-    # Generic name boosting
+    tl = table.lower()
+    col_lower = col_name.lower()
+
+    # Generic name boosting (table-agnostic)
     if any(k in q_l for k in ["name"]):
-        if any(r == "name" or "name" in r for r in roles) or "name" in col_name:
+        if any(r == "name" or "name" in r for r in roles) or "name" in col_lower:
             bonus += NAME_QUERY_BONUS
-    
-    # Customers table
-    if table.lower() == "customers":
-        mentions_customer = any(k in q_l for k in ["customer", "customers"])
-        asks_id_like = any(k in q_l for k in [" id", "id ", " id,", "identifier", "code", "customer number"])
-        asks_for_names = any(k in q_l for k in ["name", "names", "nama"])  # ← NEW
-        
-        # NEW: Detect explicit contact person request
+
+    # Check if table is mentioned (dynamic - uses schema metadata)
+    table_mentioned = _is_mentioned(q_l, tl)
+
+    if table_mentioned:
+        # Detect query intent: ID vs Name
+        asks_id_like = any(k in q_l for k in [" id", "id ", " id,", "identifier", "code", "number"])
+        asks_for_names = any(k in q_l for k in ["name", "names", "nama"])
+
+        # Detect if asking for "contact" specifically (for tables with contact columns)
         asks_contact_explicitly = any(k in q_l for k in [
             "contact name", "contact first", "contact last",
             "first name", "last name", "person name"
         ])
-        
-        # NEW: Strong disambiguation for generic "names"
-        if mentions_customer and asks_for_names and not asks_contact_explicitly:
-            if "customername" in col_name or "customer_name" in col_name:
-                bonus += 0.9
-            if "contactfirstname" in col_name or "contactlastname" in col_name:
-                bonus -= 0.8
-        
-        # Existing logic (keep as-is)
-        elif mentions_customer and not asks_id_like:
-            if "customername" in col_name or "customer_name" in col_name:
-                bonus += 0.6
-            if "customernumber" in col_name or col_name.endswith("number"):
-                bonus -= 0.35
-    
-    # Products table (unchanged)
-    if table.lower() == "products":
-        mentions_product = any(k in q_l for k in ["product", "products"])
-        asks_id_like = any(k in q_l for k in [" id", "id ", " id,", "identifier", "code", "product code"])
-        if mentions_product and not asks_id_like:
-            if "productname" in col_name or "product_name" in col_name:
-                bonus += 0.5
-            if "productcode" in col_name or col_name.endswith("code"):
-                bonus -= 0.3
-    
-    # Generic ID boosting (unchanged)
+
+        # Dynamic column name pattern: {table}name (e.g., customername, productname)
+        # Handle both concatenated and underscored forms
+        table_prefix = tl.rstrip('s')  # Remove trailing 's' to get base (customers -> customer)
+        expected_name_cols = [
+            f"{table_prefix}name",      # customername, productname
+            f"{table_prefix}_name",     # customer_name, product_name
+            f"{tl}name",                # customersname (less common)
+            f"{tl}_name",               # customers_name (less common)
+        ]
+
+        # Dynamic ID column patterns
+        is_id_column = (
+            any(r == "id" or "id" in r for r in roles) or
+            col_lower.endswith("id") or
+            col_lower.endswith("code") or
+            col_lower.endswith("number") or
+            "number" in col_lower
+        )
+
+        # Dynamic contact column detection (for tables with contact info)
+        is_contact_column = "contact" in col_lower
+
+        # Apply table-type-based boosts (dynamic based on table type, not hardcoded names)
+        table_type = get_table_type(tl)
+
+        # High boost for dimension tables (customers, products, employees)
+        if table_type in ("dimension", "unknown"):
+            if asks_for_names and not asks_contact_explicitly:
+                # Boost {table}name columns
+                if any(expected in col_lower for expected in expected_name_cols):
+                    bonus += 0.9
+                # Penalize contact columns when asking for generic names
+                elif is_contact_column:
+                    bonus -= 0.8
+            elif not asks_id_like:
+                # Boost name columns when not asking for ID
+                if any(expected in col_lower for expected in expected_name_cols):
+                    bonus += 0.6
+                # Penalize ID columns when asking for names
+                if is_id_column:
+                    bonus -= 0.35
+
+        # Medium boost for other table types (transaction, bridge, reference)
+        else:
+            if not asks_id_like:
+                # Boost name columns
+                if any(expected in col_lower for expected in expected_name_cols):
+                    bonus += 0.5
+                # Penalize ID columns when asking for names
+                if is_id_column:
+                    bonus -= 0.3
+
+    # Generic ID boosting (table-agnostic, already dynamic)
     if any(k in q_l for k in [" id ", "id ", " id,", "identifier", "code"]):
-        if (any(r == "id" or "id" in r for r in roles) or "number" in col_name or col_name.lower().endswith("id")):
+        if (any(r == "id" or "id" in r for r in roles) or "number" in col_lower or col_lower.endswith("id")):
             bonus += ID_QUERY_BONUS
-    
+
     return bonus
 
 def _is_mentioned(q_l: str, table: str, synonyms: List[str] = None) -> bool:
@@ -1168,7 +1340,7 @@ def retrieve_node(state: RAGState) -> RAGState:
         print(f"{line}\n")
 
     # -----------------------------
-    # 8) Build allowed + alias_map
+    # 8) Build allowed + alias_map (with column filtering)
     # -----------------------------
     allowed = defaultdict(list)
     alias_map = defaultdict(dict)
@@ -1178,6 +1350,21 @@ def retrieve_node(state: RAGState) -> RAGState:
         t = _meta_table(md)
         c = _meta_column(md)
         if not (t and c): continue
+
+        # === FILTER: Check if column is relevant to query (metadata-driven) ===
+        # Apply the same filtering logic here to prevent irrelevant columns
+        # from appearing in ALLOWED IDENTIFIERS block
+        if q and qtype:
+            is_relevant = _is_column_relevant_to_query(c, t, q, qtype, md)
+            if not is_relevant:
+                # Skip this column - not relevant to the query
+                if RETRIEVE_DEBUG:
+                    print(f"   [FILTER-ALLOWED] Excluding {t}.{c} from allowed identifiers")
+                continue
+            elif RETRIEVE_DEBUG and c.lower() in ["quantityinstock", "buyprice", "msrp"]:
+                # Debug: show why numeric columns passed the filter
+                print(f"   [FILTER-ALLOWED] KEPT {t}.{c} - passed relevance check")
+
         t_key = t.strip().lower()
         c_key = c.strip()
         allowed[t_key].append(c_key)
@@ -1285,10 +1472,19 @@ def retrieve_node(state: RAGState) -> RAGState:
         max_cards=15,
         max_inject=12,
         desc_max_len=100,
+        question=q,      # Pass question for column filtering
+        qtype=qtype,     # Pass qtype for column filtering
     )
 
     context = (allowed_block + "\n\n### CARDS\n" + cards_text).strip()
     context += f"\n\n### _INTERNAL_HINT\n{json.dumps({'alias_map': alias_map}, ensure_ascii=False)}"
+
+    # DEBUG: Show if quantityInStock is in the allowed_identifiers block
+    if RETRIEVE_DEBUG and "quantityinstock" in allowed_block.lower():
+        print(f"\n[DEBUG] quantityInStock FOUND IN ALLOWED IDENTIFIERS BLOCK!")
+        # Show which products columns are in allowed
+        products_cols = filtered_allowed.get("products", [])
+        print(f"[DEBUG] Products columns in allowed: {products_cols}")
 
     state["context"] = context
     return state

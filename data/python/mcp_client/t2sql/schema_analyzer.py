@@ -285,7 +285,7 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
     3. Any .jsonl file (fallback)
 
     Args:
-        jsonl_path: Path to JSONL file. If None, uses default from config.
+        jsonl_path: Path to JSONL file or directory. If None, uses default from config.
 
     Returns:
         SchemaAnalyzer instance
@@ -297,22 +297,47 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
             from .config import JSON_INPUT
             jsonl_path = JSON_INPUT
 
-        # Priority: Look for *_dense.jsonl first
-        jsonl_dir = Path(jsonl_path).parent
+        # Convert to Path object
+        jsonl_path_obj = Path(jsonl_path)
+
+        # Handle case where path is a directory (not a file)
+        if jsonl_path_obj.is_dir():
+            # It's a directory, search for jsonl files inside
+            jsonl_dir = jsonl_path_obj
+        else:
+            # It's a file path (or wildcard pattern), get the parent directory
+            jsonl_dir = jsonl_path_obj.parent
+
+        # Priority 1: Look for *_dense.jsonl first (rich metadata with synonyms/roles)
         dense_files = list(jsonl_dir.glob("*_dense.jsonl"))
 
         if dense_files:
             # Use the dense JSONL file (prioritizes rich metadata)
             jsonl_path = str(dense_files[0])
         else:
-            # Fallback: use the wildcard pattern as-is
-            # (allows explicit path like "classicmodels_dense.jsonl")
+            # Priority 2: Use any .jsonl file
+            # Handle wildcard patterns or find any jsonl file
             if "*" in jsonl_path or "?" in jsonl_path:
+                # It's a wildcard pattern, use it as-is
                 jsonl_files = list(jsonl_dir.glob(Path(jsonl_path).name))
                 if jsonl_files:
                     jsonl_path = str(jsonl_files[0])
+            elif jsonl_path_obj.is_dir() or not jsonl_path_obj.exists():
+                # Path is a directory or doesn't exist, find any jsonl file
+                jsonl_files = list(jsonl_dir.glob("*.jsonl"))
+                if jsonl_files:
+                    jsonl_path = str(jsonl_files[0])
 
-        _analyzer_instance = SchemaAnalyzer(jsonl_path)
+        # Validate the final path
+        final_path = Path(jsonl_path)
+        if not final_path.exists() or final_path.is_dir():
+            raise ValueError(
+                f"Cannot find valid JSONL file. Path: {jsonl_path}. "
+                f"Directory: {jsonl_dir}. "
+                f"Please ensure at least one .jsonl file exists."
+            )
+
+        _analyzer_instance = SchemaAnalyzer(str(jsonl_path))
 
     return _analyzer_instance
 
