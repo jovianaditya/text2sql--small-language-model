@@ -855,44 +855,51 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
             elif global_map[al] != canon:
                 global_map[al] = None
 
-    # fallback untuk classicmodels
-    classic_fallback = {
-        "products": {
-            "name": "productName",
-            "productname": "productName",
-            "listprice": "MSRP",
-        },
-        "orderdetails": {
-            "listprice": "priceEach",
-            "price": "priceEach",
-        },
-        "customers": {
-            "name": "customerName",
-            "customername": "customerName",
-            "id": "customerNumber",
-            "customerid": "customerNumber",
-            "customer_id": "customerNumber",
-            "id_customer": "customerNumber",
-            "contactfirstname": "contactFirstName",
-            "contactlastname": "contactLastName", 
-        },
-        "employees": {
-            "contactfirstname": "firstName",
-            "contactlastname": "lastName",
-            "phoneextension": "extension",
-            "firstname": "firstName",
-            "lastname": "lastName",
-            "extension": "extension",
-            "employeenumber": "employeeNumber",
-        },
+    # Build dynamic fallback from schema metadata
+    dynamic_fallback: Dict[str, str] = {}
+
+    for table in get_all_tables():
+        # Add name column mapping
+        name_col = get_name_column(table)
+        if name_col:
+            # "name" -> actual name column (only if not already mapped)
+            if "name" not in dynamic_fallback:
+                dynamic_fallback["name"] = name_col
+            # Self-reference for case normalization (productname -> productName)
+            dynamic_fallback[name_col.lower()] = name_col
+
+        # Add ID column mapping
+        id_col = get_id_column(table)
+        if id_col:
+            # Common ID aliases
+            id_aliases = ["id", f"{table[:-1]}id", f"{table[:-1]}_id", f"id_{table[:-1]}", id_col.lower()]
+            for alias in id_aliases:
+                if alias not in dynamic_fallback:
+                    dynamic_fallback[alias] = id_col
+
+    # Schema-specific aliases (kept as-is for safety)
+    # These are patterns that can't be inferred from metadata
+    specific_aliases = {
+        "listprice": "MSRP",          # products-specific
+        "price": "priceEach",          # orderdetails-specific
+        "contactfirstname": "contactFirstName",  # customers
+        "contactlastname": "contactLastName",    # customers
+        "phoneextension": "extension",           # employees
+        "firstname": "firstName",     # employees
+        "lastname": "lastName",       # employees
+        "extension": "extension",     # employees
     }
-    for _t, amap in classic_fallback.items():
-        for al, canon in amap.items():
-            al = al.lower()
-            if al not in global_map:
-                global_map[al] = canon
-            elif global_map[al] is None:
-                pass
+    for alias, canon in specific_aliases.items():
+        if alias not in dynamic_fallback:
+            dynamic_fallback[alias] = canon
+
+    # Merge: dynamic_fallback only if not already in global_map
+    for al, canon in dynamic_fallback.items():
+        al = al.lower()
+        if al not in global_map:
+            global_map[al] = canon
+        elif global_map[al] is None:
+            pass
 
     keywords = _SQL_KEYWORDS
     token_pat = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
