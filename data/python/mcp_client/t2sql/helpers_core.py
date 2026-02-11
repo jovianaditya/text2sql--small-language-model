@@ -11,6 +11,10 @@
 import re
 from typing import Dict, List, Optional, Set
 # ======================================================================
+# ======================== LOCAL MODULE IMPORT =========================
+# ======================================================================
+from .schema_analyzer import get_name_column, get_id_column
+# ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
 _RESERVED_ALIASES = {
@@ -1256,24 +1260,32 @@ def _prefer_friendly_names(sql: str, question: str) -> str:
     - customers: customerNumber -> customerName
     - products : productCode    -> productName
     (hanya kalau user tidak minta id/number/code)
-    """
-    # customers
-    sql = _prefer_name_over_id_generic(
-        sql=sql,
-        question=question,
-        wants_name_fn=_wants_customer_name_only,
-        name_column="customerName",
-        id_columns=["customerNumber"],
-    )
 
-    # products
-    sql = _prefer_name_over_id_generic(
-        sql=sql,
-        question=question,
-        wants_name_fn=_wants_product_name_only,
-        name_column="productName",
-        id_columns=["productCode"],
-    )
+    Now uses dynamic column inference from schema metadata.
+    """
+    # customers - dynamic column names
+    customer_name = get_name_column("customers")
+    customer_id = get_id_column("customers")
+    if customer_name and customer_id:
+        sql = _prefer_name_over_id_generic(
+            sql=sql,
+            question=question,
+            wants_name_fn=_wants_customer_name_only,
+            name_column=customer_name,
+            id_columns=[customer_id],
+        )
+
+    # products - dynamic column names
+    product_name = get_name_column("products")
+    product_id = get_id_column("products")
+    if product_name and product_id:
+        sql = _prefer_name_over_id_generic(
+            sql=sql,
+            question=question,
+            wants_name_fn=_wants_product_name_only,
+            name_column=product_name,
+            id_columns=[product_id],
+        )
 
     return sql
 
