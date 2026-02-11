@@ -34,7 +34,7 @@ from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
 from .helpers_main import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _get_qtype, build_dynamic_probe
-from .schema_analyzer import get_all_tables, get_table_synonyms, get_singular_form, find_table_by_keyword, get_table_type, is_transaction_table, get_column_synonyms
+from .schema_analyzer import get_all_tables, get_table_synonyms, get_singular_form, find_table_by_keyword, get_table_type, is_transaction_table, get_column_synonyms, get_name_column
 # ======================================================================
 # ========================== CONTEXT BUILDER ===========================
 # ======================================================================
@@ -1168,10 +1168,14 @@ def retrieve_node(state: RAGState) -> RAGState:
             sparse_metas = []
             if RETRIEVE_DEBUG: print(f"[WARN] Sparse meta fetch failed: {e!r}")
 
+    # Get customer name column dynamically (schema-agnostic)
+    customer_name_col = get_name_column("customers")
+    customer_name_col_lower = (customer_name_col or "").lower()
+
     sparse_has_customername = any(
-        ((_meta_table(m) or "").lower() == "customers") and ((_meta_column(m) or "").lower() == "customername")
+        ((_meta_table(m) or "").lower() == "customers") and ((_meta_column(m) or "").lower() == customer_name_col_lower)
         for m in sparse_metas if isinstance(m, dict)
-    )
+    ) if customer_name_col else False
 
     base_k = max(12, TOP_K)
     dense_k = base_k
@@ -1207,9 +1211,9 @@ def retrieve_node(state: RAGState) -> RAGState:
     dense_ids = (dense_ids or [""] * n)[:n]
 
     dense_has_customername = any(
-        ((_meta_table(md) or "").lower() == "customers") and ((_meta_column(md) or "").lower() in ("customername", "customer_name"))
+        ((_meta_table(md) or "").lower() == "customers") and ((_meta_column(md) or "").lower() in (customer_name_col_lower, customer_name_col_lower.replace("n", "_n")))
         for md in dense_metas
-    )
+    ) if customer_name_col else False
 
     # -----------------------------
     # 4) Scoring + rerank (dense + sparse bonus + priority boost)
@@ -1233,12 +1237,13 @@ def retrieve_node(state: RAGState) -> RAGState:
         })
 
     # -----------------------------
-    # 5) Auto-inject sangat terbatas (customerName)
+    # 5) Auto-inject sangat terbatas (customerName) - now schema-agnostic
     # -----------------------------
-    if wants_customer_no_id and sparse_has_customername and not dense_has_customername:
+    if wants_customer_no_id and sparse_has_customername and not dense_has_customername and customer_name_col:
         sparse_customername_urn = None
+        urn_suffix = f"::{customer_name_col_lower}"
         for u in sparse_field_urns:
-            if u.lower().endswith("::customername"):
+            if u.lower().endswith(urn_suffix):
                 sparse_customername_urn = u
                 break
         if sparse_customername_urn:
@@ -1447,11 +1452,11 @@ def retrieve_node(state: RAGState) -> RAGState:
             else:
                 filtered_allowed = dict(allowed)
 
-    if wants_customer_no_id:
+    if wants_customer_no_id and customer_name_col:
         for t_key in list(filtered_allowed.keys()):
             if t_key.lower() == "customers":
-                if "customerName" not in filtered_allowed[t_key]:
-                    filtered_allowed[t_key].append("customerName")
+                if customer_name_col not in filtered_allowed[t_key]:
+                    filtered_allowed[t_key].append(customer_name_col)
 
     # -----------------------------
     # 10) Context build
