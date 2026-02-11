@@ -47,6 +47,8 @@ class SchemaAnalyzer:
         self._fk_relationships: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {fk_col: target_table}}
         self._column_roles: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: role}}
         self._column_datatypes: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: datatype}}
+        # Store original case for column names (lowercase -> original)
+        self._column_original_case: Dict[str, str] = {}
 
         self._parse_jsonl()
 
@@ -76,6 +78,10 @@ class SchemaAnalyzer:
 
         self._tables.add(table.lower())
         self._table_columns[table.lower()].append(column.lower())
+
+        # Store original case for column name
+        col_key = f"{table.lower()}.{column.lower()}"
+        self._column_original_case[col_key] = column
 
         # Extract synonyms
         text = data.get("text", "")
@@ -418,6 +424,163 @@ def get_singular_form(table: str) -> str:
     return get_schema_analyzer().get_singular_form(table)
 
 
+# ======================================================================
+# ==================== DYNAMIC COLUMN INFERENCE =========================
+# ======================================================================
+
+def _get_original_case(table_lower: str, col_lower: str) -> str:
+    """Get original column name case from metadata, fallback to lowercase."""
+    analyzer = get_schema_analyzer()
+    col_key = f"{table_lower}.{col_lower}"
+    return analyzer._column_original_case.get(col_key, col_lower)
+
+
+def get_id_column(table: str) -> Optional[str]:
+    """
+    Get the primary key/ID column for a table from schema metadata.
+
+    Finds column with:
+    1. Synonyms containing 'id', 'code', or 'primary key'
+    2. Column name patterns: *Number (customerNumber), *Code (productCode), *id
+    3. Column name matching table name (e.g., productlines.productLine)
+
+    Args:
+        table: Table name
+
+    Returns:
+        Column name (original case) if found, None otherwise
+    """
+    analyzer = get_schema_analyzer()
+    table_lower = table.lower()
+    columns = analyzer._table_columns.get(table_lower, [])
+
+    # 1. Check synonyms for 'id', 'code', or 'primary key'
+    for col in columns:
+        synonyms = analyzer._column_synonyms.get(f"{table_lower}.{col}", [])
+        for syn in synonyms:
+            syn_lower = syn.lower()
+            if 'id' in syn_lower or 'code' in syn_lower or 'primary key' in syn_lower:
+                return _get_original_case(table_lower, col)
+
+    # 2. Pattern matching (order matters - matches classicmodels pattern)
+    # Priority: *number > *code > *id
+    for col in columns:
+        if col.endswith("number") and col != "ordernumber":
+            return _get_original_case(table_lower, col)
+
+    for col in columns:
+        if col.endswith("code") and col not in ("zipcode", "postcode"):
+            return _get_original_case(table_lower, col)
+
+    for col in columns:
+        if col.endswith("id") and "employeenumber" not in col:
+            return _get_original_case(table_lower, col)
+
+    # 3. Fallback: column name matches table singular (e.g., productlines.productLine)
+    singular = get_singular_form(table_lower)
+    for col in columns:
+        if col.lower() == singular or col.lower() == singular + "line":
+            return _get_original_case(table_lower, col)
+
+    return None
+
+
+def get_name_column(table: str) -> Optional[str]:
+    """
+    Get the main name/display column for a table from schema metadata.
+
+    Finds column with:
+    1. Role = 'name' in metadata
+    2. Pattern {table_singular}name (e.g., customerName, productName)
+    3. Any column ending with 'name'
+
+    Args:
+        table: Table name
+
+    Returns:
+        Column name (original case) if found, None otherwise
+    """
+    analyzer = get_schema_analyzer()
+    table_lower = table.lower()
+    columns = analyzer._table_columns.get(table_lower, [])
+
+    # 1. Check role metadata
+    for col in columns:
+        role = analyzer._column_roles.get(table_lower, {}).get(col, "")
+        if role == "name":
+            return _get_original_case(table_lower, col)
+
+    # 2. Pattern matching for {singular}name
+    singular = get_singular_form(table_lower)
+    # Check for column ending with "name" (case-insensitive)
+    for col in columns:
+        if col.lower().endswith("name"):
+            return _get_original_case(table_lower, col)
+
+    # 3. Check synonyms for "name"
+    for col in columns:
+        synonyms = analyzer._column_synonyms.get(f"{table_lower}.{col}", [])
+        if "name" in synonyms:
+            return _get_original_case(table_lower, col)
+
+    return None
+
+
+def get_all_mentioned_tables(question: str) -> Set[str]:
+    """
+    Get all tables mentioned in the question using schema metadata.
+
+    Uses table name, singular form, and synonyms from JSONL.
+
+    Args:
+        question: User question text
+
+    Returns:
+        Set of table names that are mentioned
+    """
+    if not question:
+        return set()
+
+    analyzer = get_schema_analyzer()
+    q = question.lower()
+
+    mentioned = set()
+    for table in analyzer._tables:
+        # Direct match
+        if table in q:
+            mentioned.add(table)
+            continue
+
+        # Singular form
+        singular = get_singular_form(table)
+        if singular and singular in q:
+            mentioned.add(table)
+            continue
+
+        # Synonyms from metadata
+        synonyms = analyzer.get_table_synonyms(table)
+        for syn in synonyms:
+            if syn in q:
+                mentioned.add(table)
+                break
+
+    return mentioned
+
+
+def is_table_mentioned(question: str, table: str) -> bool:
+    """
+    Check if a table is mentioned in the question using schema metadata.
+
+    Args:
+        question: User question text
+        table: Table name to check
+
+    Returns:
+        True if table is mentioned, False otherwise
+    """
+    return table.lower() in get_all_mentioned_tables(question)
+
+
 # Export convenience
 __all__ = [
     'SchemaAnalyzer',
@@ -432,4 +595,9 @@ __all__ = [
     'find_table_by_keyword',
     'get_table_type',
     'get_singular_form',
+    # New functions for schema-agnostic column inference
+    'get_id_column',
+    'get_name_column',
+    'get_all_mentioned_tables',
+    'is_table_mentioned',
 ]

@@ -21,7 +21,7 @@ from collections import defaultdict
 if TYPE_CHECKING:
     from .state import RAGState
 from .utils import _dbg_print_two
-from .schema_analyzer import get_transaction_tables, get_anchor_columns, get_all_tables, get_fk_relationships
+from .schema_analyzer import get_transaction_tables, get_anchor_columns, get_all_tables, get_fk_relationships, get_id_column, get_name_column
 from .helpers_core import (
     _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
     _SQL_KEYWORDS,  # SQL keywords constant
@@ -475,33 +475,52 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         if has_time_word:
             base += ["date"]
     # ---------------------------------------------------------------------------
-    # 2) Entity-specific hints
+    # 2) Entity-specific hints (now using dynamic column inference)
     # ---------------------------------------------------------------------------
     if mentions_customer:
         base += ["customer"]
         if not id_like:
-            base += ["customerName"]
+            name_col = get_name_column("customers")
+            if name_col:
+                base.append(name_col)
         else:
-            base += ["customerNumber"]
+            id_col = get_id_column("customers")
+            if id_col:
+                base.append(id_col)
 
     if mentions_product:
         base += ["product"]
         if not id_like:
-            base += ["productName"]
+            name_col = get_name_column("products")
+            if name_col:
+                base.append(name_col)
         else:
-            base += ["productCode"]
+            id_col = get_id_column("products")
+            if id_col:
+                base.append(id_col)
 
     if mentions_order:
-        base += ["order", "orderNumber"]
+        base += ["order"]
+        id_col = get_id_column("orders")
+        if id_col:
+            base.append(id_col)
 
     if mentions_employee:
-        base += ["employee", "employeeNumber"]
+        base += ["employee"]
+        id_col = get_id_column("employees")
+        if id_col:
+            base.append(id_col)
 
     if mentions_productline:
-        base += ["productLine"]
+        id_col = get_id_column("productlines")
+        if id_col:
+            base.append(id_col)
 
     if mentions_office:
-        base += ["officeCode", "city", "country", "territory"]
+        id_col = get_id_column("offices")
+        if id_col:
+            base.append(id_col)
+        base += ["city", "country", "territory"]
 
     if mentions_payment:
         base += ["payments", "amount", "paymentDate"]
