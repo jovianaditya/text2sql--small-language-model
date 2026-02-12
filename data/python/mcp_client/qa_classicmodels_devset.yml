@@ -314,3 +314,17 @@ cases:
           emp.employeeNumber,
           emp.firstName,
           emp.lastName;
+    - id: H6
+      difficulty: hard
+      question: "Show only products that have been ordered, and for each such product display the product code, product name, and rank the products by total sales value in descending order."
+      groundtruth_sql: |
+        SELECT
+          p.productCode,
+          p.productName,
+          RANK() OVER (
+            ORDER BY SUM(od.quantityOrdered * od.priceEach) DESC
+          ) AS sales_rank
+        FROM products AS p
+        JOIN orderdetails AS od
+          ON p.productCode = od.productCode
+        GROUP BY p.productCode, p.productName;
