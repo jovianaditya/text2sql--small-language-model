@@ -1475,12 +1475,11 @@ def retrieve_node(state: RAGState) -> RAGState:
     context = (allowed_block + "\n\n### CARDS\n" + cards_text).strip()
     context += f"\n\n### _INTERNAL_HINT\n{json.dumps({'alias_map': alias_map}, ensure_ascii=False)}"
 
-    # DEBUG: Show if quantityInStock is in the allowed_identifiers block
-    if RETRIEVE_DEBUG and "quantityinstock" in allowed_block.lower():
-        print(f"\n[DEBUG] quantityInStock FOUND IN ALLOWED IDENTIFIERS BLOCK!")
-        # Show which products columns are in allowed
-        products_cols = filtered_allowed.get("products", [])
-        print(f"[DEBUG] Products columns in allowed: {products_cols}")
+    # DEBUG: Show key info about context being built
+    if RETRIEVE_DEBUG:
+        print(f"\n[DEBUG] Building context with {len(filtered_allowed)} tables")
+        for tbl, cols in filtered_allowed.items():
+            print(f"[DEBUG] {tbl}: {len(cols)} columns")
 
     state["context"] = context
     return state
