@@ -158,7 +158,13 @@ def _entity_terms_from_ctx(ctx: str = "") -> Set[str]:
     terms: Set[str] = set()
 
     allowed = _parse_allowed_identifiers(ctx)
-    source_tables = list(allowed.keys()) if allowed else list(get_all_tables())
+    if allowed:
+        source_tables = list(allowed.keys())
+    else:
+        try:
+            source_tables = list(get_all_tables())
+        except Exception:
+            source_tables = []
 
     for table in source_tables:
         t = (table or "").lower().strip().strip("`")
@@ -2792,17 +2798,29 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
     # PARTITION KEY (entity key)
     # =====================================================
     q_low = (question or "").lower()
-    partition_items: List[str] = []
+    q_tokens = set(re.findall(r"[a-z0-9]+", q_low))
+    stop_tokens = {
+        "for", "each", "per", "the", "a", "an", "of", "with", "and", "or",
+        "id", "ids", "code", "codes", "number", "numbers", "name", "names",
+        "date", "dates", "record", "row", "latest", "earliest", "largest",
+        "highest", "lowest", "payment", "payments", "amount", "total"
+    }
+    q_tokens -= stop_tokens
 
-    def looks_like_customer(g: str) -> bool:
-        gn = g.replace("`","").lower()
-        return "customer" in gn
+    def _group_item_score(g: str) -> int:
+        gn = g.replace("`", "").lower()
+        gn = re.sub(r"[^\w]+", " ", gn)
+        g_tokens = set(re.findall(r"[a-z0-9]+", gn))
+        g_tokens -= stop_tokens
+        if not g_tokens:
+            return 0
+        return len(g_tokens & q_tokens)
 
-    if "customer" in q_low:
-        partition_items = [g for g in group_items if looks_like_customer(g)]
-
-    # fallback — tetap harus ada PARTITION
-    if not partition_items:
+    best_group = max(group_items, key=_group_item_score)
+    if _group_item_score(best_group) > 0:
+        partition_items = [best_group]
+    else:
+        # fallback — tetap harus ada PARTITION
         partition_items = [group_items[0]]
 
     # =====================================================
@@ -3362,12 +3380,22 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str) -> str:
             return ""
 
     # Partition columns:
-    # Prefer columns mentioning the entity in the question (e.g., customer)
+    # Prefer expressions with lexical overlap to question entities.
+    q_tokens = set(re.findall(r"[a-z0-9]+", q_low))
+    stop_tokens = {
+        "for", "each", "per", "the", "a", "an", "of", "with", "and", "or",
+        "id", "ids", "code", "codes", "number", "numbers", "name", "names",
+        "date", "dates", "record", "row", "latest", "earliest", "largest",
+        "highest", "lowest", "payment", "payments", "amount", "total"
+    }
+    q_tokens -= stop_tokens
+
     partition_exprs = []
     for item in nonagg_items:
         base = item.this if isinstance(item, exp.Alias) else item
         s = norm_name(base)
-        if "customer" in q_low and "customer" in s:
+        expr_tokens = set(re.findall(r"[a-z0-9]+", s)) - stop_tokens
+        if expr_tokens and (expr_tokens & q_tokens):
             partition_exprs.append(base)
 
     # Fallback: id/number/code-like
@@ -3827,23 +3855,45 @@ def _parse_from_join_aliases(sql: str) -> Dict[str, str]:
     return out
 
 def _strip_unneeded_count_distinct(sql: str) -> str:
-    low = sql.lower()
-    if "from customers" in low and "join orders" in low:
-        a2t = _parse_from_join_aliases(sql)
-        # cari alias untuk orders
-        orders_alias = None
-        for a, t in a2t.items():
-            if t.lower() == "orders" and a.islower():  # ambil versi normal
-                orders_alias = a
-                break
-        if orders_alias:
-            sql = re.sub(
-                rf"COUNT\s*\(\s*DISTINCT\s+{re.escape(orders_alias)}\.orderNumber\s*\)",
-                f"COUNT({orders_alias}.orderNumber)",
-                sql,
-                flags=re.I,
-            )
-    return sql
+    """
+    Remove unnecessary DISTINCT in COUNT(DISTINCT alias.id_col) for single-join queries.
+
+    Previous behavior was hardcoded for customers/orders + orderNumber only.
+    New behavior is schema-driven:
+    - only when query has exactly one JOIN
+    - only for DISTINCT on the joined table's inferred ID column
+    """
+    if not sql:
+        return sql
+    if join_count(sql) != 1:
+        return sql
+
+    alias_to_table = _parse_from_join_aliases(sql)
+    if not alias_to_table:
+        return sql
+
+    pat = re.compile(
+        r"COUNT\s*\(\s*DISTINCT\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        flags=re.I,
+    )
+
+    def _repl(m: re.Match) -> str:
+        alias = m.group(1)
+        col = m.group(2)
+        table = alias_to_table.get(alias) or alias_to_table.get(alias.lower())
+        if not table:
+            return m.group(0)
+
+        id_col = get_id_column(table)
+        if not id_col:
+            return m.group(0)
+
+        if col.lower() != id_col.lower():
+            return m.group(0)
+
+        return f"COUNT({alias}.{col})"
+
+    return pat.sub(_repl, sql)
 # =======================================================================
 # ========== Phase 7 — Ordering, Limits, and Output Formatting ==========
 # ============== UI and execution-safety adjustments only ===============

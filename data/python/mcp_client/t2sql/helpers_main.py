@@ -28,6 +28,8 @@ from .schema_analyzer import (
     get_fk_relationships,
     get_id_column,
     get_name_column,
+    get_column_synonyms,
+    get_schema_analyzer,
     get_all_mentioned_tables,
     get_singular_form,
 )
@@ -887,16 +889,54 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
 
     # Build dynamic fallback from schema metadata
     dynamic_fallback: Dict[str, str] = {}
+    allowed_cols_case: Dict[str, str] = {}
+    for _t, _cols in _parse_allowed_identifiers(ctx).items():
+        for _c in _cols:
+            lc = str(_c).lower()
+            if lc not in allowed_cols_case:
+                allowed_cols_case[lc] = _c
 
-    for table in get_all_tables():
+    def _canon_col(col: str) -> str:
+        return allowed_cols_case.get(str(col).lower(), col)
+
+    def _put_fallback(alias: str, canon: str):
+        a = str(alias or "").strip().lower()
+        if not a:
+            return
+        c = _canon_col(canon)
+        prev = dynamic_fallback.get(a)
+        if prev is None and a not in dynamic_fallback:
+            dynamic_fallback[a] = c
+        elif prev != c:
+            # ambiguous alias -> disable automatic replacement for this alias
+            dynamic_fallback[a] = None
+
+    # Always map canonical columns to themselves in normalized form.
+    # This provides case-style normalization like firstname -> firstName.
+    for canon_col in allowed_cols_case.values():
+        cc = str(canon_col)
+        _put_fallback(cc.lower(), cc)
+        _put_fallback(cc.lower().replace("_", ""), cc)
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    try:
+        schema_tables = list(get_all_tables())
+    except Exception:
+        schema_tables = list(_parse_allowed_identifiers(ctx).keys())
+
+    for table in schema_tables:
         # Add name column mapping
         name_col = get_name_column(table)
         if name_col:
             # "name" -> actual name column (only if not already mapped)
             if "name" not in dynamic_fallback:
-                dynamic_fallback["name"] = name_col
+                _put_fallback("name", name_col)
             # Self-reference for case normalization (productname -> productName)
-            dynamic_fallback[name_col.lower()] = name_col
+            _put_fallback(name_col.lower(), name_col)
 
         # Add ID column mapping
         id_col = get_id_column(table)
@@ -904,27 +944,43 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
             # Common ID aliases
             id_aliases = ["id", f"{table[:-1]}id", f"{table[:-1]}_id", f"id_{table[:-1]}", id_col.lower()]
             for alias in id_aliases:
-                if alias not in dynamic_fallback:
-                    dynamic_fallback[alias] = id_col
+                _put_fallback(alias, id_col)
 
-    # Schema-specific aliases (kept as-is for safety)
-    # These are patterns that can't be inferred from metadata
+        # Add metadata synonym mappings (schema-driven, no table hardcode).
+        if analyzer is not None:
+            try:
+                for col in analyzer.get_table_columns(table):
+                    canon = _canon_col(col)
+                    for syn in get_column_synonyms(table, col):
+                        syn_low = str(syn).strip().lower()
+                        if not syn_low:
+                            continue
+                        candidates = {
+                            syn_low,
+                            syn_low.replace(" ", ""),
+                            syn_low.replace(" ", "_"),
+                            syn_low.replace("-", ""),
+                            syn_low.replace("-", "_"),
+                        }
+                        for cand in candidates:
+                            if re.match(r"^[a-z_][a-z0-9_]*$", cand):
+                                _put_fallback(cand, canon)
+            except Exception:
+                pass
+
+    # Minimal schema-specific fallback for ambiguous generic pricing terms.
     specific_aliases = {
-        "listprice": "MSRP",          # products-specific
-        "price": "priceEach",          # orderdetails-specific
-        "contactfirstname": "contactFirstName",  # customers
-        "contactlastname": "contactLastName",    # customers
-        "phoneextension": "extension",           # employees
-        "firstname": "firstName",     # employees
-        "lastname": "lastName",       # employees
-        "extension": "extension",     # employees
+        "listprice": "MSRP",
+        "price": "priceEach",
     }
     for alias, canon in specific_aliases.items():
         if alias not in dynamic_fallback:
-            dynamic_fallback[alias] = canon
+            dynamic_fallback[alias] = _canon_col(canon)
 
     # Merge: dynamic_fallback only if not already in global_map
     for al, canon in dynamic_fallback.items():
+        if canon is None:
+            continue
         al = al.lower()
         if al not in global_map:
             global_map[al] = canon
