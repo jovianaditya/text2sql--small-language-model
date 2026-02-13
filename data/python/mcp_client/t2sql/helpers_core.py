@@ -243,6 +243,68 @@ def join_count(sql: str) -> int:
         return 0
     return len(re.findall(r"\bjoin\b", sql, flags=re.I))
 
+def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
+    """
+    Detect explicit filtering intent that should EXCLUDE non-matching parent rows.
+    This implies INNER JOIN semantics for multi-table queries.
+    """
+    q = (question or "").lower()
+    if not q:
+        return False
+
+    # include-zero intent should win over inner-join filtering
+    include_zero_overrides = [
+        "including customers with no", "customers with no", "with no payments",
+        "never paid", "all customers", "even if no", "include those without",
+        "termasuk", "meskipun tidak", "walaupun tidak", "yang tidak punya",
+        "tanpa pembayaran", "pelanggan yang belum", "customer yang belum",
+    ]
+    if any(s in q for s in include_zero_overrides):
+        return False
+
+    if not re.search(r"\bonly\b", q):
+        return False
+
+    # Dynamic entity list from context
+    allowed_tables = _parse_allowed_identifiers(ctx).keys()
+    if allowed_tables:
+        entities = []
+        for t in allowed_tables:
+            t_low = t.lower()
+            entities.append(re.escape(t_low))
+            if t_low.endswith("s"):
+                entities.append(re.escape(t_low[:-1]))
+        entity_kw = f"(?:{'|'.join(entities)})"
+    else:
+        entity_kw = r"(?:customer|product|employee|order|office|payment)"
+
+    # "only products that have been ordered", "only customers who have placed orders"
+    pat_relative_clause = rf"""
+        \bonly\s+{entity_kw}s?\b
+        .*?
+        \b(?:who|that|which)\b
+        .*?
+        \b(?:have|has|had)\b
+        (?:\s+\w+){{0,4}}
+        \s+
+        \b(?:ordered|placed|made|paid|purchased|bought|orders?|payments?|transactions?|purchases?)\b
+    """
+    if re.search(pat_relative_clause, q, flags=re.I | re.X):
+        return True
+
+    # "only customers with orders", "only products having transactions"
+    pat_with_having = rf"""
+        \bonly\s+{entity_kw}s?\b
+        .*?
+        \b(?:with|having)\b
+        (?:\s+\w+){{0,4}}
+        \b(?:orders?|payments?|transactions?|purchases?)\b
+    """
+    if re.search(pat_with_having, q, flags=re.I | re.X):
+        return True
+
+    return False
+
 def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
     q = (question or "").lower()
 
@@ -271,9 +333,9 @@ def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
     if any(s in q for s in explicit_signals):
         return True
 
-    # Pattern 0: "only X who have Y" - filtering pattern (NOT include-zero)
-    # This explicitly wants to filter out rows that don't match, so use INNER JOIN
-    if re.search(rf"\bonly\s+{entity_kw}s?\s+(who|that)\s+(have|has|had|placed|made|ordered)\b", q, flags=re.I):
+    # Pattern 0: explicit existence filtering (NOT include-zero)
+    # "only products that have been ordered", "only customers with orders", etc.
+    if _question_requires_inner_join(question, ctx):
         return False  # Explicitly NOT include-zero, trigger INNER JOIN preference
 
     # Pattern 1: "for each X"
@@ -1415,6 +1477,30 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
     if "GROUP BY" not in sql.upper() or "ORDER BY" not in sql.upper():
         return sql
 
+    # IMPORTANT: only consider TOP-LEVEL ORDER BY (outside window functions).
+    # Otherwise ORDER BY inside OVER(...) will corrupt GROUP BY rewrites.
+    def _find_top_level_order_by(s: str) -> Optional[int]:
+        s_upper = s.upper()
+        depth = 0
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth = max(0, depth - 1)
+            elif depth == 0 and s_upper[i:i+8] == 'ORDER BY':
+                left_ok = (i == 0 or not s[i-1].isalnum())
+                right_ok = (i + 8 >= len(s) or not s[i+8].isalnum())
+                if left_ok and right_ok:
+                    return i
+            i += 1
+        return None
+
+    order_pos = _find_top_level_order_by(sql)
+    if order_pos is None:
+        return sql
+
     # Extract GROUP BY clause
     gb_match = re.search(r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:ORDER\s+BY|HAVING|LIMIT|;|$))', sql, re.IGNORECASE | re.DOTALL)
     if not gb_match:
@@ -1444,7 +1530,7 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
                 col_to_gb_expr[col_lower] = item
 
     # Extract and fix ORDER BY clause
-    ob_match = re.search(r'\bORDER\s+BY\s+(.*?)(?=\s*(?:LIMIT|;|$))', sql, re.IGNORECASE | re.DOTALL)
+    ob_match = re.search(r'\bORDER\s+BY\s+(.*?)(?=\s*(?:LIMIT|;|$))', sql[order_pos:], re.IGNORECASE | re.DOTALL)
     if not ob_match:
         return sql
 
@@ -1499,7 +1585,9 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
     # Update ORDER BY clause
     if new_order_items:
         new_order = ', '.join(new_order_items)
-        sql = sql[:ob_match.start(1)] + new_order + sql[ob_match.end(1):]
+        abs_start = order_pos + ob_match.start(1)
+        abs_end = order_pos + ob_match.end(1)
+        sql = sql[:abs_start] + new_order + sql[abs_end:]
 
     # Add missing items to GROUP BY clause
     if items_to_add_to_group_by:

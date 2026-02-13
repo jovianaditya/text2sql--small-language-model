@@ -304,7 +304,7 @@ cases:
         SELECT
           emp.employeeNumber,
           CONCAT(emp.firstName, ' ', emp.lastName) AS employee_name,
-          COALESCE(SUM(pmt.amount), 0) AS total_payment_amount
+          SUM(pmt.amount) AS total_payment_amount
         FROM employees AS emp
         LEFT JOIN customers AS cust
           ON emp.employeeNumber = cust.salesRepEmployeeNumber

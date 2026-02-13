@@ -24,6 +24,7 @@ from .utils import _dbg_print_two
 from .schema_analyzer import get_transaction_tables, get_anchor_columns, get_all_tables, get_fk_relationships, get_id_column, get_name_column
 from .helpers_core import (
     _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
+    _question_requires_inner_join,
     _SQL_KEYWORDS,  # SQL keywords constant
     # phase 0
     _fix_bad_backticks, _canonicalize_table_names, _escape_reserved_column_aliases,
@@ -985,28 +986,50 @@ def _infer_tables_from_question_columns(
     """
     q_lower = question.lower()
 
-    # Build spaced variants for camelCase columns (e.g., "quantityOrdered" -> "quantity ordered")
+    def _question_mentions_column(q_text: str, column: str) -> bool:
+        """
+        Robust column mention check:
+        - direct column name
+        - camelCase/snake_case spaced form
+        - informative token-level match (e.g., quantityOrdered -> "ordered")
+        """
+        if not column:
+            return False
+
+        col_lower = column.lower()
+        spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', column).replace("_", " ").lower()
+
+        # 1) Direct full-name match
+        if col_lower in q_text:
+            return True
+
+        # 2) Spaced variant for camelCase/snake_case
+        if spaced != col_lower and spaced in q_text:
+            return True
+
+        # 3) Informative token boundary match (avoid weak generic tokens)
+        stop_tokens = {
+            "id", "ids", "code", "codes", "number", "numbers",
+            "name", "names", "date", "dates", "line", "lines",
+            "type", "types", "status", "each", "table", "order",
+            "quantity", "price", "amount", "total", "average", "value"
+        }
+        for token in re.findall(r"[a-z0-9]+", spaced):
+            if len(token) < 4 or token in stop_tokens:
+                continue
+            # "ordered by ..." usually indicates sorting intent, not orderdetails semantics
+            if token == "ordered" and re.search(r"\bordered\s+by\b", q_text):
+                continue
+            if re.search(rf"\b{re.escape(token)}\b", q_text):
+                return True
+
+        return False
+
     table_matches = defaultdict(list)
 
     for tbl, col in ranked_cols:
-        col_lower = col.lower()
-        # Direct match
-        if col_lower in q_lower:
+        if _question_mentions_column(q_lower, col):
             table_matches[tbl.lower()].append(col)
-            continue
-
-        # Spaced variant for camelCase
-        spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
-        if spaced in q_lower and spaced != col_lower:
-            table_matches[tbl.lower()].append(col)
-            continue
-
-        # Check for word boundary matches (e.g., "amount" matches "paymentAmount")
-        col_words = set(col_lower.split('_'))
-        for word in col_words:
-            if len(word) >= 3 and f'\\b{word}\\b' in q_lower:
-                table_matches[tbl.lower()].append(col)
-                break
 
     # Always include tables explicitly mentioned in router_tables
     for tbl in router_tables:
@@ -1231,42 +1254,52 @@ def _find_tables_with_implicit_columns(
     q_lower = question.lower()
     relevant_lower = {t.lower() for t in relevant_tables}
 
+    def _question_mentions_column(q_text: str, column: str) -> bool:
+        """
+        Robust mention detector for implicit table discovery.
+        Handles camelCase/snake_case + token-level semantic matches.
+        """
+        if not column:
+            return False
+
+        col_lower = column.lower()
+        spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', column).replace("_", " ").lower()
+
+        # Direct / phrase match
+        if col_lower in q_text:
+            return True
+        if spaced != col_lower and spaced in q_text:
+            return True
+
+        # Token boundary match for informative tokens only
+        stop_tokens = {
+            "id", "ids", "code", "codes", "number", "numbers",
+            "name", "names", "date", "dates", "line", "lines",
+            "type", "types", "status", "each", "table", "order",
+            "quantity", "price", "amount", "total", "average", "value"
+        }
+        for token in re.findall(r"[a-z0-9]+", spaced):
+            if len(token) < 4 or token in stop_tokens:
+                continue
+            # "ordered by ..." usually indicates sorting intent, not orderdetails semantics
+            if token == "ordered" and re.search(r"\bordered\s+by\b", q_text):
+                continue
+            if re.search(rf"\b{re.escape(token)}\b", q_text):
+                return True
+
+        return False
+
     # Find tables whose columns are mentioned in question
     mentioned_tables = defaultdict(set)  # {table: {matched_columns}}
 
     for tbl, col in ranked_cols:
         tbl_lower = tbl.lower()
-        col_lower = col.lower()
 
         # Skip if already in relevant tables
         if tbl_lower in relevant_lower:
             continue
 
-        # Check if column is mentioned in question
-        matched = False
-
-        # 1. Direct match
-        if col_lower in q_lower:
-            matched = True
-
-        # 2. CamelCase split (e.g., "customerName" -> "customer name")
-        if not matched:
-            spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
-            if spaced in q_lower and spaced != col_lower:
-                matched = True
-
-        # 3. Word boundary match (e.g., "name" matches "customerName")
-        if not matched:
-            col_words = set(col_lower.split('_'))
-            for word in col_words:
-                if len(word) >= 3:
-                    # Use regex for word boundary
-                    pattern = rf'\b{re.escape(word)}\b'
-                    if re.search(pattern, q_lower):
-                        matched = True
-                        break
-
-        if matched:
+        if _question_mentions_column(q_lower, col):
             mentioned_tables[tbl_lower].add(col)
 
     if not mentioned_tables:
@@ -1276,10 +1309,25 @@ def _find_tables_with_implicit_columns(
     # Example: If payments.customerNumber exists, don't add customers just for customerNumber
     # This prevents single-table queries from being detected as multi-table
     available_cols_in_existing = set()
+    allowed_identifiers = _parse_allowed_identifiers(ctx)
+
+    # Prefer full schema columns from ALLOWED IDENTIFIERS for selected tables
+    # (ranked_cols can be sparse and miss shared columns like productLine).
     for tbl_lower in relevant_lower:
-        for rel_tbl, col in ranked_cols:
-            if rel_tbl.lower() == tbl_lower:
-                available_cols_in_existing.add(col.lower())
+        matched_table = None
+        for original_tbl in allowed_identifiers.keys():
+            if original_tbl.lower() == tbl_lower:
+                matched_table = original_tbl
+                break
+
+        if matched_table:
+            for col in allowed_identifiers.get(matched_table, set()):
+                available_cols_in_existing.add(str(col).lower())
+        else:
+            # Fallback when ALLOWED block is incomplete
+            for rel_tbl, col in ranked_cols:
+                if rel_tbl.lower() == tbl_lower:
+                    available_cols_in_existing.add(col.lower())
 
     # Filter out tables whose columns are already covered
     filtered_mentioned_tables = {}
@@ -1606,11 +1654,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             other_tables = state.get("router_tables", [])
             other_tables = [t for t in other_tables if t != primary_table]
             other_tables_str = ", ".join(other_tables) if other_tables else "none"
+            requires_inner_join = _question_requires_inner_join(question, ctx)
+            join_keyword = "INNER JOIN" if requires_inner_join else "LEFT JOIN"
 
             # More explicit guidance - tell LLM exactly which table should be first
             hint_msg = f"TABLE ORDER (CRITICAL): Start your query with FROM {primary_table}"
             if other_tables_str != "none":
-                hint_msg += f", then LEFT JOIN {other_tables_str}"
+                hint_msg += f", then {join_keyword} {other_tables_str}"
             if primary_reason:
                 hint_msg += f". Reason: {primary_reason}"
             hint_msg += f". Follow this exact table order."
@@ -1619,14 +1669,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             constraints.append(hint_msg)
 
             # JOIN TYPE GUIDANCE (CRITICAL)
-            # Check for "only X who have Y" filtering pattern - requires INNER JOIN
-            q_lower = question.lower()
-            only_who_has_pattern = re.search(rf"\bonly\s+\w+.*?\s+(who|that)\s+(have|has|had|placed|made|ordered)\b", q_lower, flags=re.I)
-
-            if only_who_has_pattern:
+            if requires_inner_join:
                 # Filtering pattern: use INNER JOIN to exclude non-matching rows
                 constraints.append(
-                    "JOIN TYPE (CRITICAL): This query uses 'only X who have Y' pattern. Use **INNER JOIN** to exclude entities without matching data."
+                    "JOIN TYPE (CRITICAL): This query has explicit filtering intent (e.g., 'only ... that have/with ...'). "
+                    "Use **INNER JOIN** to exclude entities without matching data. "
+                    "This takes precedence over 'for each' phrasing."
                 )
             else:
                 # Default: use LEFT JOIN to preserve all entities from primary table

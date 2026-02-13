@@ -309,6 +309,45 @@ def question_guard_node(state: RAGState) -> RAGState:
             "is_valid_question": True,
         }
     }
+
+
+def _question_mentions_column(question_lower: str, column: str) -> bool:
+    """
+    Robust column mention detector:
+    - direct full column name
+    - spaced camelCase/snake_case variant
+    - informative token-level match (e.g., quantityOrdered -> "ordered")
+    """
+    if not column:
+        return False
+
+    col_lower = column.lower()
+    spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', column).replace("_", " ").lower()
+
+    # Full-form matches
+    if col_lower in question_lower:
+        return True
+    if spaced != col_lower and spaced in question_lower:
+        return True
+
+    # Token-level fallback (skip weak generic tokens)
+    stop_tokens = {
+        "id", "ids", "code", "codes", "number", "numbers",
+        "name", "names", "date", "dates", "line", "lines",
+        "type", "types", "status", "each", "table", "order",
+        "quantity", "price", "amount", "total", "average", "value"
+    }
+    for token in re.findall(r"[a-z0-9]+", spaced):
+        if len(token) < 4 or token in stop_tokens:
+            continue
+        # "ordered by ..." usually indicates sorting intent, not orderdetails semantics
+        if token == "ordered" and re.search(r"\bordered\s+by\b", question_lower):
+            continue
+        if re.search(rf"\b{re.escape(token)}\b", question_lower):
+            return True
+
+    return False
+
 # ======================================================================
 # ======================== AGENT 1 - ROUTER AGENT ======================
 # ======================================================================
@@ -541,42 +580,37 @@ def router_agent(state: RAGState) -> RAGState:
         table_singular = tbl_lower.rstrip('s')
         for col in tbl_cols:
             col_lower = col.lower()
-            col_variants = [col_lower]
-            # Add space-separated variant for camelCase
-            spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
-            if spaced != col_lower:
-                col_variants.append(spaced)
+            if not _question_mentions_column(question_lower, col):
+                continue
 
-            for variant in col_variants:
-                if variant in question_lower:
-                    # Check if this is an FK column (e.g., customerNumber)
-                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id|id)$'
-                    is_fk_col = bool(re.match(fk_pattern, col_lower, re.IGNORECASE))
+            # Check if this is an FK column (e.g., customerNumber)
+            fk_pattern = rf'^{re.escape(table_singular)}(number|code|id|id)$'
+            is_fk_col = bool(re.match(fk_pattern, col_lower, re.IGNORECASE))
 
-                    if is_fk_col:
-                        # Check if this FK column exists in ANOTHER table
-                        fk_exists_elsewhere = False
-                        for other_tbl in relevant_tables:
-                            if other_tbl.lower() == tbl_lower:
-                                continue
-                            other_cols = allowed_identifiers.get(other_tbl, [])
-                            for other_col in other_cols:
-                                if other_col.lower() == col_lower:
-                                    fk_exists_elsewhere = True
-                                    break
-                            if fk_exists_elsewhere:
-                                break
+            if is_fk_col:
+                # Check if this FK column exists in ANOTHER table
+                fk_exists_elsewhere = False
+                for other_tbl in relevant_tables:
+                    if other_tbl.lower() == tbl_lower:
+                        continue
+                    other_cols = allowed_identifiers.get(other_tbl, [])
+                    for other_col in other_cols:
+                        if other_col.lower() == col_lower:
+                            fk_exists_elsewhere = True
+                            break
+                    if fk_exists_elsewhere:
+                        break
 
-                        if fk_exists_elsewhere:
-                            # FK column that exists elsewhere → weak evidence
-                            evidence.append(f"FK column '{col}'")
-                        else:
-                            # FK column that ONLY exists here (parent table) → strong evidence
-                            evidence.append(f"column '{col}'")
-                    else:
-                        # Non-FK column → strong evidence
-                        evidence.append(f"column '{col}'")
-                    break
+                if fk_exists_elsewhere:
+                    # FK column that exists elsewhere → weak evidence
+                    evidence.append(f"FK column '{col}'")
+                else:
+                    # FK column that ONLY exists here (parent table) → strong evidence
+                    evidence.append(f"column '{col}'")
+            else:
+                # Non-FK column → strong evidence
+                evidence.append(f"column '{col}'")
+            break
 
         # Check 2: "For each X" patterns
         # Handle both plural and singular, with optional words in between (e.g., "for each such customer")
@@ -825,10 +859,12 @@ def router_agent(state: RAGState) -> RAGState:
     # E.g., "return a rank of employees within each job title"
     explicit_rank_patterns = [
         r"\ba\s+rank\s+of\b",           # "a rank of employees"
-        r"\brand\s+employees\b",         # "rank employees"
+        r"\brand\s+\w+\s+by\b",          # "rank products by"
         r"\branking\s+of\b",             # "ranking of X"
-        r"\breturn.*\brank\b.*\bwithin\b",  # "return X and rank within"
-        r"\brank\s+.*\bbased\s+on\b",    # "rank X based on Y"
+        r"\breturn.*\brank\b.*\bwithin\b",
+        r"\brank\s+.*\bbased\s+on\b",
+        r"\brank\s+the\s+\w+\b",         # "rank the products"
+        r"\branked\s+by\b",              # "ranked by sales"
     ]
     is_explicit_rank_function = any(re.search(pat, question_lower) for pat in explicit_rank_patterns)
     
@@ -992,9 +1028,25 @@ def router_agent(state: RAGState) -> RAGState:
     if any(kw in question_lower for kw in cross_table_exclusion):
         has_exclusion = True
     
-    # Pattern 2: "no" + entity noun (no orders, no payments) → implies cross-table
-    if not has_exclusion and re.search(r"\bno\s+(orders?|payments?|customers?|products?|employees?)\b", question_lower):
-        has_exclusion = True
+    # Pattern 2: "no" + entity noun (dynamic, schema-driven) → implies cross-table
+    # Examples: "no orders", "no payments", "no customers"
+    if not has_exclusion:
+        entity_terms = set()
+        for tbl in whitelisted_tables:
+            t = (tbl or "").lower().strip()
+            if not t:
+                continue
+            entity_terms.add(re.escape(t))
+            # Singular fallback: customers -> customer, categories -> category
+            if t.endswith("ies") and len(t) > 3:
+                entity_terms.add(re.escape(t[:-3] + "y"))
+            elif t.endswith("s") and not t.endswith("ss") and len(t) > 1:
+                entity_terms.add(re.escape(t[:-1]))
+
+        if entity_terms:
+            entity_pattern = "|".join(sorted(entity_terms, key=len, reverse=True))
+            if re.search(rf"\bno\s+(?:{entity_pattern})\b", question_lower):
+                has_exclusion = True
     
     # Pattern 3: "missing" or "empty" ONLY if multi-table context
     # Single-table "missing" = just IS NULL (simple, 3B can handle)
