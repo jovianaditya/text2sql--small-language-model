@@ -28,9 +28,9 @@ from .schema_analyzer import (
     get_fk_relationships,
     get_id_column,
     get_name_column,
+    get_table_synonyms,
     get_column_synonyms,
     get_schema_analyzer,
-    get_all_mentioned_tables,
     get_singular_form,
 )
 from .helpers_core import (
@@ -82,6 +82,14 @@ for table in get_all_tables():
         _ANCHOR_SIGNALS[table] = set(anchors)
 
 _ALNUM = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+try:
+    _TABLE_SINGULAR_ROOTS = {
+        get_singular_form(t.lower().strip())
+        for t in get_all_tables()
+        if t
+    }
+except Exception:
+    _TABLE_SINGULAR_ROOTS = set()
 # ======================================================================
 # ============================ WHITELIST ===============================
 # ======================================================================
@@ -412,7 +420,47 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     q_raw = question or ""
     q = q_raw.lower()
     toks_q = q.split()
-    mentioned_tables_dynamic = get_all_mentioned_tables(q_raw)
+    # Strict table mention detection for probe expansion.
+    # Do NOT use broad schema synonyms here; they can introduce false positives
+    # (e.g., generic words like "name" accidentally implying customers table).
+    def _strict_table_mentioned(q_text: str, table: str) -> bool:
+        t = (table or "").strip().lower()
+        if not t:
+            return False
+
+        candidates = {t}
+        singular = get_singular_form(t)
+        if singular:
+            candidates.add(singular.lower())
+        if "_" in t:
+            candidates.add(t.replace("_", " "))
+        if singular and "_" in singular:
+            candidates.add(singular.replace("_", " "))
+
+        # Split concatenated table names using schema roots:
+        # productlines -> product lines, orderdetails -> order details
+        for base in list(candidates):
+            compact = base.replace(" ", "")
+            if not compact.isalpha():
+                continue
+            for root in _TABLE_SINGULAR_ROOTS:
+                if not root or root == compact:
+                    continue
+                if compact.startswith(root):
+                    tail = compact[len(root):]
+                    if len(tail) >= 3 and tail.isalpha():
+                        candidates.add(f"{root} {tail}")
+
+        for cand in candidates:
+            pattern = re.escape(cand).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pattern}\b", q_text):
+                return True
+        return False
+
+    mentioned_tables_dynamic = {
+        t for t in get_all_tables()
+        if _strict_table_mentioned(q, t)
+    }
 
     # fitur dasar
     has_metric_word = any(k in q for k in [
@@ -621,6 +669,56 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     probe_tail = " ".join(tokens).strip()
     return f"{q_raw.strip()} {probe_tail}".strip()
 
+def _table_mention_candidates(table: str, include_synonyms: bool = True) -> Set[str]:
+    """
+    Build mention candidates from schema metadata without table-specific hardcoding.
+    """
+    t = (table or "").strip().lower()
+    if not t:
+        return set()
+
+    candidates = {t}
+    singular = get_singular_form(t)
+    if singular:
+        candidates.add(singular.lower())
+
+    if "_" in t:
+        candidates.add(t.replace("_", " "))
+    if singular and "_" in singular:
+        candidates.add(singular.replace("_", " "))
+
+    # Split concatenated names using other schema roots:
+    # productlines -> product lines, orderdetails -> order details
+    for base in list(candidates):
+        compact = base.replace(" ", "")
+        if not compact.isalpha():
+            continue
+        for root in _TABLE_SINGULAR_ROOTS:
+            if not root or root == compact:
+                continue
+            if compact.startswith(root):
+                tail = compact[len(root):]
+                if len(tail) >= 3 and tail.isalpha():
+                    candidates.add(f"{root} {tail}")
+
+    if include_synonyms:
+        for syn in get_table_synonyms(t):
+            syn_low = str(syn).strip().lower()
+            if syn_low:
+                candidates.add(syn_low)
+
+    return {c for c in candidates if c}
+
+def _table_mentioned(q_text: str, table: str, include_synonyms: bool = True) -> bool:
+    q = (q_text or "").lower()
+    if not q:
+        return False
+    for cand in _table_mention_candidates(table, include_synonyms=include_synonyms):
+        pattern = re.escape(cand).replace(r"\ ", r"\s+")
+        if re.search(rf"\b{pattern}\b", q):
+            return True
+    return False
+
 def _is_productline_lookup(question: str) -> bool:
     """
     True kalau user lagi minta daftar product lines (bukan agregat).
@@ -631,9 +729,11 @@ def _is_productline_lookup(question: str) -> bool:
     """
     q = (question or "").lower()
 
-    # fokus ke frasa product line(s)
-    if "product line" not in q and "product lines" not in q and "lini produk" not in q and "line produk" not in q:
-        return False
+    if not _table_mentioned(q, "productlines", include_synonyms=True):
+        # Backward-compat fallback for legacy bilingual phrasing.
+        legacy_terms = ["product line", "product lines", "lini produk", "line produk"]
+        if not any(term in q for term in legacy_terms):
+            return False
 
     # kalau ada kata-kata agregasi → biar classifier saja yang urus, jangan paksa single table
     if any(kw in q for kw in ["total", "sum", "avg", "average", "mean", "count", "berapa banyak", "how many"]):
@@ -651,20 +751,28 @@ def _is_simple_orders_lookup(question: str) -> bool:
     """
     q = (question or "").lower()
 
-    # harus ada frasa 'order number(s)' biar ini spesifik
-    if "order number" not in q and "order numbers" not in q:
+    if not _table_mentioned(q, "orders", include_synonyms=True):
+        return False
+
+    order_id_col = get_id_column("orders")
+    order_id_col_lower = (order_id_col or "").lower()
+    order_id_spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', order_id_col or "").replace("_", " ").lower()
+    mentions_order_identifier = (
+        bool(order_id_col_lower and re.search(rf"\b{re.escape(order_id_col_lower)}\b", q))
+        or bool(order_id_spaced and order_id_spaced in q)
+        or bool(re.search(r"\border(s)?\s+(id|ids|number|numbers|code|codes|nomor|kode|no)\b", q))
+    )
+    if not mentions_order_identifier:
         return False
 
     # kalau ngomong detail/line items → biar classifier & join yang urus
-    if any(kw in q for kw in ["order detail", "order details", "line item", "line items"]):
+    if _table_mentioned(q, "orderdetails", include_synonyms=True):
         return False
 
     # kalau ada kata agregasi → jangan paksa single-table
-    if any(
-        kw in q
-        for kw in ["total", "sum", "avg", "average", "mean", "count",
-                   "berapa banyak", "how many", "jumlah "]
-    ):
+    if any(kw in q for kw in ["total", "sum", "avg", "average", "mean", "count", "how many"]):
+        return False
+    if re.search(r"\bberapa\s+banyak\b", q) or re.search(r"\bjumlah\b", q):
         return False
 
     return True

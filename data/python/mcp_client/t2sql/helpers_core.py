@@ -13,7 +13,13 @@ from typing import Dict, List, Optional, Set
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .schema_analyzer import get_name_column, get_id_column, get_all_tables
+from .schema_analyzer import (
+    get_name_column,
+    get_id_column,
+    get_all_tables,
+    get_table_synonyms,
+    get_singular_form,
+)
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
@@ -1363,21 +1369,79 @@ def _wants_name_only(question: str, entity_words: List[str]) -> bool:
     # buang "number of" supaya tidak dianggap id-like
     q = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
 
-    mention_entity = any(w in q for w in entity_words)
+    def _phrase_mentioned(text: str, phrase: str) -> bool:
+        p = str(phrase or "").strip().lower()
+        if not p:
+            return False
+        pattern = re.escape(p).replace(r"\ ", r"\s+")
+        return re.search(rf"\b{pattern}\b", text) is not None
+
+    mention_entity = any(_phrase_mentioned(q, w) for w in entity_words)
     mention_id_like = (
-        re.search(r"\b(id|number|nomor|no|code|kode)\b", q)
-        or any(f"{w} code" in q for w in entity_words)
+        re.search(r"\b(ids?|numbers?|nomors?|nos?|codes?|kodes?)\b", q)
+        or any(_phrase_mentioned(q, f"{w} code") for w in entity_words)
+        or any(_phrase_mentioned(q, f"{w} codes") for w in entity_words)
     )
     return mention_entity and not mention_id_like
+
+def _entity_words_for_table(table: str) -> List[str]:
+    """
+    Build entity words dynamically from schema metadata.
+    Includes table name, singular form, and table synonyms.
+    """
+    words: Set[str] = set()
+    t = (table or "").strip().lower()
+    if not t:
+        return []
+
+    words.add(t)
+    try:
+        s = get_singular_form(t)
+        if s:
+            words.add(s.lower())
+    except Exception:
+        if t.endswith("s") and len(t) > 1:
+            words.add(t[:-1])
+
+    generic_terms = {
+        "name", "names", "id", "ids", "code", "codes", "number", "numbers",
+        "date", "dates", "status", "type", "types", "value", "values",
+        "amount", "amounts", "total", "totals", "count", "counts",
+        "description", "descriptions", "detail", "details", "record", "records",
+        "row", "rows", "entry", "entries", "unit", "units",
+    }
+
+    try:
+        for syn in get_table_synonyms(t):
+            syn_low = str(syn).strip().lower()
+            if not syn_low:
+                continue
+            syn_tokens = [tok for tok in re.findall(r"[a-z0-9]+", syn_low) if tok]
+            if not syn_tokens:
+                continue
+            # Skip generic synonyms that cause false entity hits (e.g., "name", "unit").
+            if all(tok in generic_terms for tok in syn_tokens):
+                continue
+            if len(syn_tokens) == 1 and len(syn_tokens[0]) < 4:
+                continue
+            syn_norm = " ".join(syn_tokens)
+            if syn_norm:
+                words.add(syn_norm)
+            # Also include compact form for underscore/space variations.
+            compact = syn_norm.replace(" ", "")
+            if compact and len(compact) >= 5:
+                words.add(compact)
+    except Exception:
+        pass
+
+    return sorted(words)
     
 def _wants_customer_name_only(question: str) -> bool:
-    # pelanggan/customer tapi tidak minta id/number/code
-    return _wants_name_only(question, ["customer", "customers", "pelanggan"])
+    return _wants_name_only(question, _entity_words_for_table("customers"))
 
 # ini belum diterapkan
 def _wants_product_name_only(question: str) -> bool:
-    # produk/product tapi tidak minta id/number/code
-    return _wants_name_only(question, ["product", "products", "produk"])
+    return _wants_name_only(question, _entity_words_for_table("products"))
 
 def _prefer_friendly_names(sql: str, question: str) -> str:
     """

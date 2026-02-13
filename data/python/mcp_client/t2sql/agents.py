@@ -20,7 +20,7 @@ from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
 from .utils import _dbg_print_two, try_llm_json, build_router_schema
 from .generation import regenerate_with_extra_constraint
-from .schema_analyzer import get_all_tables, get_singular_form, get_schema_analyzer
+from .schema_analyzer import get_all_tables, get_singular_form, get_schema_analyzer, get_id_column, get_fk_relationships
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
     _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline,
     _find_tables_with_implicit_columns, _extract_fk_from_context)
@@ -54,9 +54,6 @@ _INSTANT_REJECT_PATTERNS = [
 
 # --- Patterns that BYPASS LLM check (definitely SQL-related) ---
 _DEFINITE_SQL_PATTERNS = [
-    # Explicit data entity mentions
-    r"\b(customer|order|product|employee|payment|office|orderdetail)\s*(s|es)?\b",
-    r"\b(pelanggan|pesanan|produk|karyawan|pembayaran|kantor)\b",
     # Explicit query verbs
     r"\b(show|list|display|get|find|retrieve|fetch|count|total|sum|average)\b",
     r"\b(tampilkan|tunjukkan|lihat|ambil|cari|hitung|berapa)\b",
@@ -67,6 +64,62 @@ _DEFINITE_SQL_PATTERNS = [
     r"\b(tertinggi|terendah|terbesar|terkecil|terbaru|terlama)\b",
 ]
 
+try:
+    _TABLE_SINGULAR_ROOTS = {
+        get_singular_form(t.lower().strip())
+        for t in get_all_tables()
+        if t
+    }
+except Exception:
+    _TABLE_SINGULAR_ROOTS = set()
+
+def _table_name_variants(table: str) -> Set[str]:
+    """
+    Build robust table-name variants from schema names only (no column synonyms).
+    Includes table name, singular form, and underscore-spaced forms.
+    """
+    t = (table or "").lower().strip()
+    if not t:
+        return set()
+
+    variants = {t}
+    singular = get_singular_form(t)
+    if singular:
+        variants.add(singular.lower())
+
+    if "_" in t:
+        variants.add(t.replace("_", " "))
+    if singular and "_" in singular:
+        variants.add(singular.replace("_", " "))
+
+    # Build spaced variants for concatenated table names using other schema roots.
+    # Example: productlines -> product lines, orderdetails -> order details
+    for base in list(variants):
+        compact = base.replace(" ", "")
+        if not compact.isalpha():
+            continue
+        for root in _TABLE_SINGULAR_ROOTS:
+            if not root or root == compact:
+                continue
+            if compact.startswith(root):
+                tail = compact[len(root):]
+                if len(tail) >= 3 and tail.isalpha():
+                    variants.add(f"{root} {tail}")
+
+    return {v for v in variants if v}
+
+def _table_entity_pattern(table: str) -> str:
+    """
+    Regex alternation pattern for table variants.
+    Example output: '(?:orders|order)'
+    """
+    variants = sorted(_table_name_variants(table), key=len, reverse=True)
+    if not variants:
+        return r"(?:)"
+
+    escaped = [re.escape(v).replace(r"\ ", r"\s+") for v in variants]
+    return "(?:" + "|".join(escaped) + ")"
+
 def _question_mentions_schema_entity(question_lower: str) -> bool:
     """
     Schema-driven entity detection for guard bypass.
@@ -74,18 +127,7 @@ def _question_mentions_schema_entity(question_lower: str) -> bool:
     """
     try:
         for table in get_all_tables():
-            t = (table or "").lower().strip()
-            if not t:
-                continue
-
-            variants = {t, get_singular_form(t)}
-            if "_" in t:
-                variants.add(t.replace("_", " "))
-            singular = get_singular_form(t)
-            if "_" in singular:
-                variants.add(singular.replace("_", " "))
-
-            for v in variants:
+            for v in _table_name_variants(table):
                 if v and re.search(rf"\b{re.escape(v)}\b", question_lower):
                     return True
     except Exception:
@@ -397,7 +439,17 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
         # "ordered by ..." usually indicates sorting intent, not orderdetails semantics
         if token == "ordered" and re.search(r"\bordered\s+by\b", question_lower):
             continue
-        if re.search(rf"\b{re.escape(token)}\b", question_lower):
+        token_forms = {token}
+        if token.endswith("y") and len(token) > 3:
+            token_forms.add(token[:-1] + "ies")
+        elif token.endswith("ies") and len(token) > 4:
+            token_forms.add(token[:-3] + "y")
+        elif token.endswith("s") and len(token) > 4:
+            token_forms.add(token[:-1])
+        else:
+            token_forms.add(token + "s")
+
+        if any(re.search(rf"\b{re.escape(tok)}\b", question_lower) for tok in token_forms if tok):
             return True
 
     return False
@@ -423,6 +475,22 @@ def router_agent(state: RAGState) -> RAGState:
     # ═══════════════════════════════════════════════════════════════════
     allowed_identifiers = _parse_allowed_identifiers(ctx)
     whitelisted_tables = allowed_identifiers.keys()
+    whitelisted_lower = {t.lower() for t in whitelisted_tables}
+
+    # Use full schema columns as fallback when context cards are column-pruned.
+    analyzer = get_schema_analyzer()
+    allowed_cols_by_lower: Dict[str, Set[str]] = {}
+    for t, cols in allowed_identifiers.items():
+        allowed_cols_by_lower.setdefault(t.lower(), set()).update(c.lower() for c in cols)
+
+    def _get_table_cols(table_name: str) -> Set[str]:
+        t = (table_name or "").lower()
+        cols = set(allowed_cols_by_lower.get(t, set()))
+        try:
+            cols.update(c.lower() for c in analyzer.get_table_columns(t))
+        except Exception:
+            pass
+        return cols
     
     # [FIX] Definisi Pattern yang HARUS DIBUANG sebelum deteksi tabel
     ignore_patterns = {
@@ -441,24 +509,31 @@ def router_agent(state: RAGState) -> RAGState:
         if f"- {tbl}:" not in ctx and f"- `{tbl}`:" not in ctx:
             continue
 
-        table_word = tbl.lower().rstrip('s')
+        table_singular = get_singular_form(tbl.lower())
+        table_pattern = _table_entity_pattern(tbl)
 
         # Buat copy pertanyaan khusus untuk scanning tabel ini
         search_scope = question
 
-        if table_word in ignore_patterns:
-            patterns = ignore_patterns[table_word]
+        if table_singular in ignore_patterns:
+            patterns = ignore_patterns[table_singular]
             for pat in patterns:
                 search_scope = re.sub(pat, " ", search_scope)
 
         # Cek 2: Cari kata tabel di search_scope yang SUDAH BERSIH
-        if re.search(rf"\b{table_word}s?\b", search_scope):
+        if re.search(rf"\b{table_pattern}\b", search_scope):
 
             # Deteksi referensi ID saja (FK)
-            is_just_id_ref = re.search(rf"\b{table_word}s?\s+(number|id|code|kode|nomor)\b", search_scope)
+            is_just_id_ref = re.search(
+                rf"\b{table_pattern}\b\s+(number|id|code|kode|nomor)\b",
+                search_scope
+            )
 
             if is_just_id_ref:
-                if re.search(rf"\b{table_word}s?\b(?!\s+(number|id|code|kode|nomor))", search_scope):
+                if re.search(
+                    rf"\b{table_pattern}\b(?!\s+(number|id|code|kode|nomor))",
+                    search_scope
+                ):
                     relevant_tables.append(tbl)
                     if RETRIEVE_DEBUG:
                         print(f"[Router] ✓ Added {tbl} (with ID ref check)")
@@ -467,7 +542,7 @@ def router_agent(state: RAGState) -> RAGState:
                 if RETRIEVE_DEBUG:
                     print(f"[Router] ✓ Added {tbl} (direct match)")
         elif RETRIEVE_DEBUG:
-            pattern_str = rf"\b{table_word}s?\b"
+            pattern_str = rf"\b{table_pattern}\b"
             print(f"[Router] ✗ Skipped {tbl} (no match in question)")
             print(f"[Router]   Pattern: {pattern_str}")
             print(f"[Router]   In question? {bool(re.search(pattern_str, search_scope))}")
@@ -477,19 +552,19 @@ def router_agent(state: RAGState) -> RAGState:
     # ═══════════════════════════════════════════════════════════════════
     filtered_tables = []
     for tbl in relevant_tables:
-        table_word = tbl.lower().rstrip('s')
-        
+        table_pattern = _table_entity_pattern(tbl)
+
         # Pattern: "<table> with <code/id> <angka/list>"
-        fk_only_pattern = rf"\b{table_word}s?\s+with\s+(code|number|id|kode|nomor)s?\s+[\d,\sor]+"
-        
+        fk_only_pattern = rf"\b{table_pattern}\b\s+with\s+(code|number|id|kode|nomor)s?\s+[\d,\sor]+"
+
         if re.search(fk_only_pattern, question):
             temp_scope = re.sub(fk_only_pattern, "", question)
-            
-            has_other_mention = (
-                re.search(rf"\b{table_word}s\b", temp_scope) or
-                re.search(rf"\b{table_word}\s+(?!(code|number|id|kode|nomor))", temp_scope)
+
+            has_other_mention = re.search(
+                rf"\b{table_pattern}\b(?!\s+(code|number|id|kode|nomor))",
+                temp_scope
             )
-            
+
             if not has_other_mention:
                 continue
         
@@ -614,6 +689,32 @@ def router_agent(state: RAGState) -> RAGState:
         fk_graph[source_table][target_table] = (source_col, None)
         fk_graph[target_table][source_table] = (None, source_col)
 
+    # Pattern 3: Global schema FK metadata fallback (works even when cards are sparse)
+    try:
+        schema_fk = get_fk_relationships()
+    except Exception:
+        schema_fk = {}
+    for source_table, fk_map in schema_fk.items():
+        src = (source_table or "").lower()
+        if src not in whitelisted_lower:
+            continue
+        for source_col, target_table in (fk_map or {}).items():
+            tgt = (target_table or "").lower()
+            if tgt not in whitelisted_lower:
+                continue
+
+            if src not in fk_columns_by_table:
+                fk_columns_by_table[src] = {}
+            fk_columns_by_table[src][str(source_col).lower()] = tgt
+
+            if src not in fk_graph:
+                fk_graph[src] = {}
+            if tgt not in fk_graph:
+                fk_graph[tgt] = {}
+            fk_graph[src][tgt] = (str(source_col).lower(), None)
+            if src not in fk_graph[tgt]:
+                fk_graph[tgt][src] = (None, str(source_col).lower())
+
     # --- STEP 3.2: Identify Seed Tables ---
     # Evidence tables are tables that have direct evidence from the question:
     # 1. Columns mentioned (including camelCase variants)
@@ -631,60 +732,78 @@ def router_agent(state: RAGState) -> RAGState:
 
         # Check 1: Direct column mentions (all columns, including FKs)
         # FK columns are treated as WEAK evidence if they exist in other tables
-        table_singular = tbl_lower.rstrip('s')
+        table_singular = get_singular_form(tbl_lower)
+        table_entity_pattern = _table_entity_pattern(tbl_lower)
+        weak_col = None
+        strong_col = None
         for col in tbl_cols:
             col_lower = col.lower()
             if not _question_mentions_column(question_lower, col):
                 continue
 
-            # Check if this is an FK column (e.g., customerNumber)
-            fk_pattern = rf'^{re.escape(table_singular)}(number|code|id|id)$'
+            # Check if this is an FK/bridge-like key reference:
+            # 1) Conventional FK naming (<entity>Number/<entity>Code/<entity>Id)
+            # 2) Explicit FK metadata from context (fk_columns_by_table)
+            # 3) Parent key reused in child tables (e.g., productLine shared by products/productlines)
+            fk_pattern = rf'^{re.escape(table_singular)}(number|code|id)$'
             is_fk_col = bool(re.match(fk_pattern, col_lower, re.IGNORECASE))
+            if col_lower in fk_columns_by_table.get(tbl_lower, {}):
+                is_fk_col = True
+            table_id_col = (get_id_column(tbl_lower) or "").lower()
+            is_parent_key = bool(table_id_col and col_lower == table_id_col)
+            matches_other_table_id = False
+            for other_tbl in relevant_tables:
+                if other_tbl.lower() == tbl_lower:
+                    continue
+                other_id_col = (get_id_column(other_tbl.lower()) or "").lower()
+                if other_id_col and other_id_col == col_lower:
+                    matches_other_table_id = True
+                    break
+            if matches_other_table_id and not is_parent_key:
+                is_fk_col = True
 
-            if is_fk_col:
-                # Check if this FK column exists in ANOTHER table
-                fk_exists_elsewhere = False
-                for other_tbl in relevant_tables:
-                    if other_tbl.lower() == tbl_lower:
-                        continue
-                    other_cols = allowed_identifiers.get(other_tbl, [])
-                    for other_col in other_cols:
-                        if other_col.lower() == col_lower:
-                            fk_exists_elsewhere = True
-                            break
-                    if fk_exists_elsewhere:
+            # Check if this column exists in ANOTHER table
+            col_exists_elsewhere = False
+            for other_tbl in relevant_tables:
+                if other_tbl.lower() == tbl_lower:
+                    continue
+                other_cols = _get_table_cols(other_tbl)
+                for other_col in other_cols:
+                    if other_col.lower() == col_lower:
+                        col_exists_elsewhere = True
                         break
+                if col_exists_elsewhere:
+                    break
 
-                if fk_exists_elsewhere:
-                    # FK column that exists elsewhere → weak evidence
-                    evidence.append(f"FK column '{col}'")
-                else:
-                    # FK column that ONLY exists here (parent table) → strong evidence
-                    evidence.append(f"column '{col}'")
+            is_shared_key_like = col_exists_elsewhere and (is_fk_col or is_parent_key)
+
+            if is_shared_key_like:
+                # Keep first weak match, but continue scanning for stronger column evidence.
+                if weak_col is None:
+                    weak_col = col
             else:
                 # Non-FK column → strong evidence
-                evidence.append(f"column '{col}'")
-            break
+                strong_col = col
+                break
+
+        if strong_col:
+            evidence.append(f"column '{strong_col}'")
+        elif weak_col:
+            evidence.append(f"FK column '{weak_col}'")
 
         # Check 2: "For each X" patterns
         # Handle both plural and singular, with optional words in between (e.g., "for each such customer")
-        table_singular = tbl_lower.rstrip('s')
         for_each_patterns = [
-            rf"\bfor\s+each\s+(?:\w+\s+)?{tbl_lower}\b",      # "for each customers", "for each such customers"
-            rf"\bfor\s+each\s+(?:\w+\s+)?{table_singular}\b",  # "for each customer", "for each such customer"
-            rf"\bper\s+(?:\w+\s+)?{tbl_lower}\b",             # "per customers", "per such customers"
-            rf"\bper\s+(?:\w+\s+)?{table_singular}\b",         # "per customer", "per such customer"
-            rf"\beach\s+(?:\w+\s+)?{tbl_lower}\b",            # "each customers", "each such customers"
-            rf"\beach\s+(?:\w+\s+)?{table_singular}\b",        # "each customer", "each such customer"
+            rf"\bfor\s+each\s+(?:\w+\s+)?{table_entity_pattern}\b",
+            rf"\bper\s+(?:\w+\s+)?{table_entity_pattern}\b",
+            rf"\beach\s+(?:\w+\s+)?{table_entity_pattern}\b",
         ]
         if any(re.search(p, question_lower) for p in for_each_patterns):
             evidence.append("'for each' pattern")
 
         # Check 3: Table name + attribute patterns
-        table_singular = tbl_lower.rstrip('s')
         table_patterns = [
-            rf"\b{table_singular}\s+(name|number|id|code)\b",
-            rf"\b{tbl_lower}\s+(name|number|id|code)\b",
+            rf"\b{table_entity_pattern}\b\s+(name|number|id|code)\b",
         ]
         if any(re.search(p, question_lower) for p in table_patterns):
             evidence.append("table+attribute pattern")
@@ -694,12 +813,14 @@ def router_agent(state: RAGState) -> RAGState:
             # Patterns like "total orders", "count of customers", "number of orders", etc.
             # More flexible: allows extra words after table name (e.g., "orders placed")
             aggregate_patterns = [
-                # "count of orders", "total of orders", "number of orders"
-                rf"\b(total|sum|count|average|avg|number)\s+(of\s+)?{tbl_lower}\b",
-                # "count of orders placed", "number of orders placed" (with extra words)
-                rf"\b(total|sum|count|average|avg|number)\s+(of\s+)?{tbl_lower}\s+\w+",
+                # "count of orders", "total of orders", "avg customers"
+                rf"\b(total|sum|count|average|avg)\s+(of\s+)?{table_entity_pattern}\b",
+                # "count of orders placed" (with extra words)
+                rf"\b(total|sum|count|average|avg)\s+(of\s+)?{table_entity_pattern}\s+\w+",
+                # "number of orders" (explicit aggregate phrase only)
+                rf"\bnumber\s+of\s+{table_entity_pattern}\b",
                 # "orders total", "customers count"
-                rf"\b{tbl_lower}\s+(total|sum|count|average|number)\b",
+                rf"\b{table_entity_pattern}\b\s+(total|sum|count|average)\b",
             ]
             if any(re.search(p, question_lower) for p in aggregate_patterns):
                 evidence.append("aggregate context")
@@ -726,20 +847,21 @@ def router_agent(state: RAGState) -> RAGState:
         is_only_weak = all(e in weak_evidence or e.startswith("FK column") for e in evidence_list)
 
         if is_only_weak and evidence_list:  # Has evidence, but all are weak
-            table_singular = tbl_lower.rstrip('s')
+            table_singular = get_singular_form(tbl_lower)
+            table_id_col = (get_id_column(tbl_lower) or "").lower()
 
             # Check if any other table has FK column linking to this table
             fk_exists_in_other_table = False
             for other_tbl in relevant_tables:
                 if other_tbl.lower() == tbl_lower:
                     continue
-                other_cols = allowed_identifiers.get(other_tbl, [])
+                other_cols = _get_table_cols(other_tbl)
                 for col in other_cols:
                     # Check if this is an FK column (e.g., customerNumber → customers)
-                    col_lower = col.lower()
+                    col_lower = str(col).lower()
                     # Pattern: <table_singular>(Number|Code|Id|ID)
-                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id|id)$'
-                    if re.match(fk_pattern, col_lower, re.IGNORECASE):
+                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id)$'
+                    if (table_id_col and col_lower == table_id_col) or re.match(fk_pattern, col_lower, re.IGNORECASE):
                         fk_exists_in_other_table = True
                         break
                 if fk_exists_in_other_table:
@@ -747,23 +869,24 @@ def router_agent(state: RAGState) -> RAGState:
 
             if fk_exists_in_other_table:
                 # Check if question mentions any non-FK columns from this table
-                tbl_cols = allowed_identifiers.get(tbl_lower, [])
+                tbl_cols = sorted(_get_table_cols(tbl_lower))
                 # Get FK columns
                 fk_cols = set()
                 for col in tbl_cols:
-                    col_lower = col.lower()
-                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id|id)$'
-                    if re.match(fk_pattern, col_lower, re.IGNORECASE):
+                    col_lower = str(col).lower()
+                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id)$'
+                    if (table_id_col and col_lower == table_id_col) or re.match(fk_pattern, col_lower, re.IGNORECASE):
                         fk_cols.add(col_lower)
 
                 # Check if any non-FK column is mentioned in question
                 non_fk_mentioned = False
                 for col in tbl_cols:
-                    if col.lower() in fk_cols:
+                    col_low = str(col).lower()
+                    if col_low in fk_cols:
                         continue
                     # Check if column is mentioned (including spaced variant)
-                    spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
-                    if col.lower() in question_lower or spaced in question_lower:
+                    spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', str(col)).lower()
+                    if col_low in question_lower or spaced in question_lower:
                         non_fk_mentioned = True
                         break
 
@@ -772,6 +895,42 @@ def router_agent(state: RAGState) -> RAGState:
                     tables_to_remove.append(tbl_lower)
                     if RETRIEVE_DEBUG:
                         print(f"[Router] Skipping {tbl_lower}: only 'for each' ref, FK exists in other table")
+            else:
+                # Fallback: remove weak-only table if another table has strong evidence
+                # and shares the weak FK column(s). This handles key-sharing schemas like
+                # products.productLine <-> productlines.productLine even without explicit FK cards.
+                weak_fk_cols = set()
+                for ev in evidence_list:
+                    m_fk = re.match(r"^FK column '([^']+)'$", ev)
+                    if m_fk:
+                        weak_fk_cols.add(m_fk.group(1).lower())
+
+                if weak_fk_cols:
+                    has_strong_other = False
+                    for other_tbl in relevant_tables:
+                        other_lower = other_tbl.lower()
+                        if other_lower == tbl_lower:
+                            continue
+                        other_evidence = evidence_details.get(other_lower, [])
+                        if any((e not in weak_evidence) and (not e.startswith("FK column")) for e in other_evidence):
+                            has_strong_other = True
+                            break
+
+                    if has_strong_other:
+                        shared_with_other = False
+                        for other_tbl in relevant_tables:
+                            other_lower = other_tbl.lower()
+                            if other_lower == tbl_lower:
+                                continue
+                            other_cols = _get_table_cols(other_tbl)
+                            if weak_fk_cols & other_cols:
+                                shared_with_other = True
+                                break
+
+                        if shared_with_other:
+                            tables_to_remove.append(tbl_lower)
+                            if RETRIEVE_DEBUG:
+                                print(f"[Router] Skipping {tbl_lower}: weak-only FK evidence, strong sibling table covers shared key")
 
     # Remove identified tables
     for tbl_lower in tables_to_remove:
@@ -862,8 +1021,10 @@ def router_agent(state: RAGState) -> RAGState:
         if has_fk_to_evidence:
             # This table references an evidence table via FK
             # Check if we need any non-FK columns from it
-            non_fk_cols = [c for c in allowed_identifiers.get(tbl, [])
-                          if c.lower() not in fk_columns_by_table.get(tbl_lower, {})]
+            non_fk_cols = [
+                c for c in _get_table_cols(tbl)
+                if c.lower() not in fk_columns_by_table.get(tbl_lower, {})
+            ]
             needs_non_fk = False
             for col in non_fk_cols:
                 col_variants = [col.lower()]
@@ -970,14 +1131,11 @@ def router_agent(state: RAGState) -> RAGState:
         # Handle both plural and singular, with optional words in between
         for tbl in relevant_tables:
             tbl_lower = tbl.lower()
-            table_singular = tbl_lower.rstrip('s')
+            table_entity_pattern = _table_entity_pattern(tbl_lower)
             for_each_patterns = [
-                rf"\bfor\s+each\s+(?:\w+\s+)?{tbl_lower}\b",
-                rf"\bfor\s+each\s+(?:\w+\s+)?{table_singular}\b",
-                rf"\bper\s+(?:\w+\s+)?{tbl_lower}\b",
-                rf"\bper\s+(?:\w+\s+)?{table_singular}\b",
-                rf"\beach\s+(?:\w+\s+)?{tbl_lower}\b",
-                rf"\beach\s+(?:\w+\s+)?{table_singular}\b",
+                rf"\bfor\s+each\s+(?:\w+\s+)?{table_entity_pattern}\b",
+                rf"\bper\s+(?:\w+\s+)?{table_entity_pattern}\b",
+                rf"\beach\s+(?:\w+\s+)?{table_entity_pattern}\b",
             ]
             if any(re.search(p, question_lower) for p in for_each_patterns):
                 primary_table = tbl
@@ -988,11 +1146,12 @@ def router_agent(state: RAGState) -> RAGState:
         if not primary_table:
             for tbl in relevant_tables:
                 tbl_lower = tbl.lower()
+                table_entity_pattern = _table_entity_pattern(tbl_lower)
                 # Patterns: "customers who placed", "offices in", "products from"
                 from_in_patterns = [
-                    rf"\b\w+\s+(from|in)\s+{tbl_lower}\b",
-                    rf"\b{tbl_lower}\s+who\s+",
-                    rf"\b{tbl_lower}\s+that\s+",
+                    rf"\b\w+\s+(from|in)\s+{table_entity_pattern}\b",
+                    rf"\b{table_entity_pattern}\b\s+who\s+",
+                    rf"\b{table_entity_pattern}\b\s+that\s+",
                 ]
                 if any(re.search(p, question_lower) for p in from_in_patterns):
                     primary_table = tbl
@@ -1002,8 +1161,8 @@ def router_agent(state: RAGState) -> RAGState:
         # Rule 3: Not yet found, check "all X that Y" pattern
         if not primary_table:
             for tbl in relevant_tables:
-                tbl_lower = tbl.lower()
-                if re.search(rf"\ball\s+{tbl_lower}\s+", question_lower):
+                table_entity_pattern = _table_entity_pattern(tbl.lower())
+                if re.search(rf"\ball\s+{table_entity_pattern}\b", question_lower):
                     primary_table = tbl
                     primary_reason = "'all X' pattern"
                     break
@@ -1087,15 +1246,8 @@ def router_agent(state: RAGState) -> RAGState:
     if not has_exclusion:
         entity_terms = set()
         for tbl in whitelisted_tables:
-            t = (tbl or "").lower().strip()
-            if not t:
-                continue
-            entity_terms.add(re.escape(t))
-            # Singular fallback: customers -> customer, categories -> category
-            if t.endswith("ies") and len(t) > 3:
-                entity_terms.add(re.escape(t[:-3] + "y"))
-            elif t.endswith("s") and not t.endswith("ss") and len(t) > 1:
-                entity_terms.add(re.escape(t[:-1]))
+            for v in _table_name_variants(tbl):
+                entity_terms.add(re.escape(v).replace(r"\ ", r"\s+"))
 
         if entity_terms:
             entity_pattern = "|".join(sorted(entity_terms, key=len, reverse=True))

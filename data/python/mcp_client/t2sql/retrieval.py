@@ -34,7 +34,17 @@ from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
 from .helpers_main import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _get_qtype, build_dynamic_probe
-from .schema_analyzer import get_all_tables, get_table_synonyms, get_singular_form, find_table_by_keyword, get_table_type, is_transaction_table, get_column_synonyms, get_name_column
+from .schema_analyzer import (
+    get_all_tables,
+    get_table_synonyms,
+    get_singular_form,
+    find_table_by_keyword,
+    get_table_type,
+    is_transaction_table,
+    get_column_synonyms,
+    get_name_column,
+    get_id_column,
+)
 # ======================================================================
 # ========================== CONTEXT BUILDER ===========================
 # ======================================================================
@@ -369,6 +379,77 @@ _STOPWORDS = (set(ENGLISH_STOP_WORDS) - {"name", "names"}) | {"show", "all", "li
     "tampilkan", "daftar",
 }
 
+# Generic alias/synonym words that are too broad for table mention detection.
+_GENERIC_MENTION_TERMS = {
+    "name", "names", "id", "ids", "code", "codes", "number", "numbers",
+    "date", "dates", "time", "status", "type", "types", "value", "values",
+    "amount", "amounts", "total", "totals", "count", "counts", "description",
+    "descriptions", "detail", "details", "record", "records", "row", "rows",
+    "address", "city", "country", "state", "phone", "email", "contact",
+}
+
+try:
+    _TABLE_SINGULAR_ROOTS = {
+        get_singular_form(t.lower().strip())
+        for t in get_all_tables()
+        if t
+    }
+except Exception:
+    _TABLE_SINGULAR_ROOTS = set()
+
+def _table_mention_candidates(table: str, include_synonyms: bool = True) -> List[str]:
+    t = (table or "").strip().lower()
+    if not t:
+        return []
+
+    candidates = {t}
+    singular = get_singular_form(t)
+    if singular:
+        candidates.add(singular.lower())
+    if "_" in t:
+        candidates.add(t.replace("_", " "))
+    if singular and "_" in singular:
+        candidates.add(singular.replace("_", " "))
+
+    # Split concatenated table names (productlines -> product lines).
+    for base in list(candidates):
+        compact = base.replace(" ", "")
+        if not compact.isalpha():
+            continue
+        for root in _TABLE_SINGULAR_ROOTS:
+            if not root or root == compact:
+                continue
+            if compact.startswith(root):
+                tail = compact[len(root):]
+                if len(tail) >= 3 and tail.isalpha():
+                    candidates.add(f"{root} {tail}")
+
+    if include_synonyms:
+        for syn in get_table_synonyms(t):
+            s = str(syn).strip().lower()
+            if not s:
+                continue
+            tokens = [tok for tok in re.findall(r"[a-z0-9]+", s) if tok]
+            if not tokens:
+                continue
+            # Skip overly generic synonyms.
+            if all(tok in _GENERIC_MENTION_TERMS for tok in tokens):
+                continue
+            candidates.add(" ".join(tokens))
+
+    # Prioritize longer/more specific terms first.
+    return sorted(candidates, key=len, reverse=True)
+
+def _text_mentions_table(text: str, table: str, include_synonyms: bool = True) -> bool:
+    q = (text or "").lower()
+    if not q:
+        return False
+    for cand in _table_mention_candidates(table, include_synonyms=include_synonyms):
+        pattern = re.escape(cand).replace(r"\ ", r"\s+")
+        if re.search(rf"\b{pattern}\b", q):
+            return True
+    return False
+
 def _normalize_text(txt: str) -> str:
     txt = txt.lower()
     txt = re.sub(r"(\d)[,\.](\d{3})(\b|$)", r"\1\2", txt)
@@ -686,23 +767,18 @@ def _is_mentioned(q_l: str, table: str, synonyms: List[str] = None) -> bool:
     if not q_l or not table:
         return False
 
-    # 1. Direct table name match
-    if table in q_l:
-        return True
+    if synonyms is not None:
+        # Preserve compatibility for explicit synonym calls, but keep boundary-safe matching.
+        for synonym in synonyms:
+            s = str(synonym or "").strip().lower()
+            if not s:
+                continue
+            pattern = re.escape(s).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pattern}\b", q_l):
+                return True
 
-    # 2. Singular form match (e.g., "customer" matches "customers")
-    singular = get_singular_form(table)
-    if singular and singular in q_l:
-        return True
-
-    # 3. Synonyms from schema metadata (dynamic - not hardcoded)
-    if synonyms is None:
-        synonyms = get_table_synonyms(table)
-    for synonym in synonyms:
-        if synonym in q_l:
-            return True
-
-    return False
+    # Default robust detection: strict table mentions + filtered synonyms.
+    return _text_mentions_table(q_l, table, include_synonyms=True)
 
 
 def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: List[str]) -> Dict[str, float]:
@@ -1022,38 +1098,14 @@ def _detect_primary_entity_table(question: str) -> Optional[str]:
         First matching table name (lowercase), or None if no match
     """
     q = (question or "").lower()
+    if not q:
+        return None
 
-    # Get all tables from schema
-    all_tables = get_all_tables()
-
-    # Build synonym map: {synonym: table}
-    synonym_to_table = {}
-
-    # Add table names themselves (both singular and plural)
+    # Prefer explicit table-name mentions (no broad synonyms) for single-table lock.
+    all_tables = sorted(get_all_tables(), key=len, reverse=True)
     for table in all_tables:
-        # Direct table name match
-        synonym_to_table[table] = table
-        # Singular form
-        synonym_to_table[get_singular_form(table)] = table
-
-        # Synonyms from metadata (aggregated from all columns)
-        for synonym in get_table_synonyms(table):
-            synonym_to_table[synonym] = table
-
-    # Find first matching table (check in order of specificity)
-    # Priority: multi-word phrases > single words
-    # Sort by length (descending) to prioritize longer, more specific matches
-    sorted_synonyms = sorted(synonym_to_table.items(), key=lambda x: len(x[0]), reverse=True)
-
-    for synonym, table in sorted_synonyms:
-        # Check for phrase match first (more specific)
-        if " " in synonym:
-            if synonym in q:
-                return table
-        # Then single word match
-        elif synonym.replace("_", "") in q.split():
+        if _text_mentions_table(q, table, include_synonyms=False):
             return table
-
     return None
 
 
@@ -1074,34 +1126,7 @@ def _is_table_mentioned(question: str, table: str) -> bool:
     """
     if not question or not table:
         return False
-
-    q = question.lower()
-    table_lower = table.lower()
-
-    # 1. Direct table name match
-    if table_lower in q:
-        return True
-
-    # 2. Singular form match
-    singular = get_singular_form(table_lower)
-    if singular and singular in q:
-        return True
-
-    # 3. Synonyms from schema metadata
-    for synonym in get_table_synonyms(table):
-        if synonym in q:
-            return True
-
-    # 4. Common phrase patterns (split by space to avoid substring false positives)
-    # e.g., "product line" should match "product line" but not "line item"
-    q_words = set(q.split())
-    for synonym in get_table_synonyms(table):
-        if " " in synonym:
-            synonym_words = set(synonym.split())
-            if synonym_words.issubset(q_words):
-                return True
-
-    return False
+    return _text_mentions_table(question.lower(), table, include_synonyms=False)
 
 
 def _should_lock_single_table_ctx(question: str, qtype: str) -> bool:
@@ -1369,6 +1394,28 @@ def retrieve_node(state: RAGState) -> RAGState:
             al = al.strip()
             if al: alias_map[t_key][al] = c_key
 
+    # Robustness guard:
+    # for single-table queries, ensure primary table columns from sparse hits are retained
+    # so dense noise cannot drop obvious relevant columns (e.g., quantityInStock).
+    lock_single = _should_lock_single_table_ctx(question=q, qtype=qtype)
+    primary_for_lock = _detect_primary_entity_table(q) if lock_single else None
+    if primary_for_lock:
+        sparse_primary_cols = {
+            (_meta_column(md) or "").strip()
+            for md in sparse_metas
+            if (_meta_table(md) or "").strip().lower() == primary_for_lock and (_meta_column(md) or "").strip()
+        }
+        if sparse_primary_cols:
+            for c in sorted(sparse_primary_cols):
+                if c not in allowed[primary_for_lock]:
+                    allowed[primary_for_lock].append(c)
+
+        # For lookup-style prompts, keep the entity's ID/name columns if available.
+        if qtype == "lookup":
+            for c in [get_id_column(primary_for_lock), get_name_column(primary_for_lock)]:
+                if c and c not in allowed[primary_for_lock]:
+                    allowed[primary_for_lock].append(c)
+
     # -----------------------------
     # 9) Table scoring + filtered_allowed
     # -----------------------------
@@ -1384,8 +1431,8 @@ def retrieve_node(state: RAGState) -> RAGState:
         only_orders = {t: cols for t, cols in allowed.items() if t.lower() == "orders"}
         filtered_allowed = only_orders if only_orders else dict(allowed)
     else:
-        if _should_lock_single_table_ctx(question=q, qtype=qtype):
-            primary = _detect_primary_entity_table(q)
+        if lock_single:
+            primary = primary_for_lock
             only_primary = {t: cols for t, cols in allowed.items() if t.lower() == (primary or "")}
             if only_primary: filtered_allowed = only_primary
             else:
