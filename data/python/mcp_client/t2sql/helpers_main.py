@@ -21,7 +21,16 @@ from collections import defaultdict
 if TYPE_CHECKING:
     from .state import RAGState
 from .utils import _dbg_print_two
-from .schema_analyzer import get_transaction_tables, get_anchor_columns, get_all_tables, get_fk_relationships, get_id_column, get_name_column
+from .schema_analyzer import (
+    get_transaction_tables,
+    get_anchor_columns,
+    get_all_tables,
+    get_fk_relationships,
+    get_id_column,
+    get_name_column,
+    get_all_mentioned_tables,
+    get_singular_form,
+)
 from .helpers_core import (
     _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
     _question_requires_inner_join,
@@ -401,6 +410,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     q_raw = question or ""
     q = q_raw.lower()
     toks_q = q.split()
+    mentioned_tables_dynamic = get_all_mentioned_tables(q_raw)
 
     # fitur dasar
     has_metric_word = any(k in q for k in [
@@ -417,10 +427,10 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     ])
 
     # entity utama classicmodels
-    mentions_customer = any(k in q for k in ["customer", "customers", "pelanggan"])
-    mentions_product  = any(k in q for k in ["product", "products", "produk"])
-    mentions_order    = any(k in q for k in ["order", "orders", "pesanan"])
-    mentions_employee = any(k in q for k in ["employee", "employees", "karyawan"])
+    mentions_customer = any(k in q for k in ["customer", "customers", "pelanggan"]) or ("customers" in mentioned_tables_dynamic)
+    mentions_product  = any(k in q for k in ["product", "products", "produk"]) or ("products" in mentioned_tables_dynamic)
+    mentions_order    = any(k in q for k in ["order", "orders", "pesanan"]) or ("orders" in mentioned_tables_dynamic)
+    mentions_employee = any(k in q for k in ["employee", "employees", "karyawan"]) or ("employees" in mentioned_tables_dynamic)
 
     # entity tambahan (tabel lain)
     mentions_productline = any(
@@ -430,21 +440,21 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
             "lini produk", "line produk",
             "kategori", "category"
         ]
-    )
+    ) or ("productlines" in mentioned_tables_dynamic)
     mentions_office = any(
         k in q
         for k in [
             "office", "offices", "kantor",
             "territory", "territories", "region", "regional"
         ]
-    )
+    ) or ("offices" in mentioned_tables_dynamic)
     mentions_payment = any(
         k in q
         for k in [
             "payment", "payments", "pembayaran",
             "check ", "cheque", "cheques"
         ]
-    )
+    ) or ("payments" in mentioned_tables_dynamic)
     mentions_orderdetails = any(
         k in q
         for k in [
@@ -452,7 +462,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
             "line item", "line items",
             "item pesanan", "detail pesanan"
         ]
-    )
+    ) or ("orderdetails" in mentioned_tables_dynamic)
 
     id_like = _mentions_id_like_for_probe(q)
     # ---------------------------------------------------------------------------
@@ -528,6 +538,25 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
 
     if mentions_orderdetails:
         base += ["orderdetails", "quantityOrdered", "priceEach"]
+    # Generic table coverage for non-classicmodels schemas:
+    # add lightweight hints for any other mentioned table.
+    static_tables = {
+        "customers", "products", "orders", "employees",
+        "productlines", "offices", "payments", "orderdetails"
+    }
+    for table in sorted(mentioned_tables_dynamic):
+        if table in static_tables:
+            continue
+        singular = get_singular_form(table)
+        if singular:
+            base.append(singular)
+        id_col = get_id_column(table)
+        if id_col:
+            base.append(id_col)
+        if not id_like:
+            name_col = get_name_column(table)
+            if name_col:
+                base.append(name_col)
     # ---------------------------------------------------------------------------
     # 2b) Geo hints (lebih dinamis)
     # ---------------------------------------------------------------------------
@@ -1271,6 +1300,26 @@ def _find_tables_with_implicit_columns(
         if spaced != col_lower and spaced in q_text:
             return True
 
+        # Guardrail: avoid false positives like customerName matching only "customer id".
+        semantic_suffix_keywords = {
+            "name": {"name", "names", "nama"},
+            "date": {"date", "dates", "tanggal", "tgl", "time", "waktu"},
+            "number": {"number", "numbers", "id", "ids", "code", "codes", "nomor", "kode", "no"},
+            "code": {"code", "codes", "id", "ids", "number", "numbers", "nomor", "kode", "no"},
+            "id": {"id", "ids", "number", "numbers", "code", "codes", "nomor", "kode", "no"},
+        }
+        col_tokens = re.findall(r"[a-z0-9]+", spaced)
+        if len(col_tokens) >= 2:
+            suffix = col_tokens[-1]
+            suffix_terms = semantic_suffix_keywords.get(suffix)
+            if suffix_terms:
+                has_suffix_intent = any(
+                    re.search(rf"\b{re.escape(term)}\b", q_text)
+                    for term in suffix_terms
+                )
+                if not has_suffix_intent:
+                    return False
+
         # Token boundary match for informative tokens only
         stop_tokens = {
             "id", "ids", "code", "codes", "number", "numbers",
@@ -1985,7 +2034,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _rewrite_left_join_to_inner_if_not_needed(s, question, ctx)
     s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question, ctx)
     s = _rewrite_inner_join_filter_to_exists(s)
-    s = _rewrite_inner_join_existence_to_exists(s, question)
+    s = _rewrite_inner_join_existence_to_exists(s, question, ctx)
     s = _remove_redundant_and_ornamental_joins(s)
     # ---------------------------------------------------------------------------
     # Phase 2 — Alias Hygiene & FROM Cleanup
@@ -2344,7 +2393,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Detect the anti-pattern:
     # SELECT col, AGG(...) FROM table WHERE col IN (SELECT col FROM table GROUP BY col HAVING AGG(...) op N) GROUP BY col
     having_subquery_pattern = re.compile(
-        r'\bWHERE\s+(\w+)\s+IN\s*\(\s*SELECT\s+\1\s+FROM\s+(\w+)\s+GROUP\s+BY\s+\1\s+HAVING\s+(.+?)\s*\)\s+GROUP\s+BY\s+\1\b',
+        r'\bWHERE\s+(\w+)\s+IN\s*\(\s*SELECT\s+(?:DISTINCT\s+)?\1\s+FROM\s+(\w+)\s+GROUP\s+BY\s+\1\s+HAVING\s+(.+?)\s*\)\s+GROUP\s+BY\s+\1\b',
         re.IGNORECASE
     )
     having_match = having_subquery_pattern.search(s)
@@ -2353,9 +2402,26 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         inner_table = having_match.group(2)
         having_clause = having_match.group(3).strip()
 
-        # Check if outer query uses the same table
+        # Check if rewrite is safe:
+        # 1) Original same-table anti-pattern
+        # 2) Inner subquery references a column that does NOT exist in inner table
+        #    (hallucinated cross-table subquery, e.g. orderdetails.productLine)
         outer_from_match = re.search(r'\bFROM\s+(\w+)\b', s, re.IGNORECASE)
-        if outer_from_match and outer_from_match.group(1).lower() == inner_table.lower():
+        allowed_identifiers = _parse_allowed_identifiers(ctx)
+        inner_cols = {
+            str(c).strip("`").lower()
+            for c in allowed_identifiers.get(inner_table, set())
+        }
+
+        should_rewrite = False
+        if outer_from_match:
+            outer_table = outer_from_match.group(1).lower()
+            if outer_table == inner_table.lower():
+                should_rewrite = True
+            elif outer_col.lower() not in inner_cols:
+                should_rewrite = True
+
+        if should_rewrite:
             # This is the anti-pattern - convert to simple GROUP BY + HAVING
             # Remove the WHERE ... IN (...) subquery and add HAVING to outer
             s = s[:having_match.start()] + 'GROUP BY ' + outer_col + ' HAVING ' + having_clause + s[having_match.end():]

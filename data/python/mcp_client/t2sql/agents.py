@@ -20,6 +20,7 @@ from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
 from .utils import _dbg_print_two, try_llm_json, build_router_schema
 from .generation import regenerate_with_extra_constraint
+from .schema_analyzer import get_all_tables, get_singular_form, get_schema_analyzer
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
     _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline,
     _find_tables_with_implicit_columns, _extract_fk_from_context)
@@ -65,6 +66,33 @@ _DEFINITE_SQL_PATTERNS = [
     r"\b(highest|lowest|top|most|least|largest|smallest|latest|earliest)\b",
     r"\b(tertinggi|terendah|terbesar|terkecil|terbaru|terlama)\b",
 ]
+
+def _question_mentions_schema_entity(question_lower: str) -> bool:
+    """
+    Schema-driven entity detection for guard bypass.
+    Uses dynamic table names (plus singular forms) instead of fixed table list.
+    """
+    try:
+        for table in get_all_tables():
+            t = (table or "").lower().strip()
+            if not t:
+                continue
+
+            variants = {t, get_singular_form(t)}
+            if "_" in t:
+                variants.add(t.replace("_", " "))
+            singular = get_singular_form(t)
+            if "_" in singular:
+                variants.add(singular.replace("_", " "))
+
+            for v in variants:
+                if v and re.search(rf"\b{re.escape(v)}\b", question_lower):
+                    return True
+    except Exception:
+        # Keep guard permissive if schema analyzer is unavailable
+        return False
+
+    return False
 
 def _check_instant_reject(question: str) -> Tuple[bool, str]:
     """
@@ -174,6 +202,11 @@ def _check_definite_sql(question: str) -> bool:
     Check if question definitely has SQL intent (bypass LLM check).
     """
     q_lower = question.lower()
+
+    # Prefer schema-driven detection first
+    if _question_mentions_schema_entity(q_lower):
+        return True
+
     for pattern in _DEFINITE_SQL_PATTERNS:
         if re.search(pattern, q_lower, re.IGNORECASE):
             return True
@@ -329,6 +362,27 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
         return True
     if spaced != col_lower and spaced in question_lower:
         return True
+
+    # Guardrail: avoid false positives like customerName matching just "customer id".
+    # For semantic suffix columns, require suffix intent in question unless full phrase matched.
+    semantic_suffix_keywords = {
+        "name": {"name", "names", "nama"},
+        "date": {"date", "dates", "tanggal", "tgl", "time", "waktu"},
+        "number": {"number", "numbers", "id", "ids", "code", "codes", "nomor", "kode", "no"},
+        "code": {"code", "codes", "id", "ids", "number", "numbers", "nomor", "kode", "no"},
+        "id": {"id", "ids", "number", "numbers", "code", "codes", "nomor", "kode", "no"},
+    }
+    col_tokens = re.findall(r"[a-z0-9]+", spaced)
+    if len(col_tokens) >= 2:
+        suffix = col_tokens[-1]
+        suffix_terms = semantic_suffix_keywords.get(suffix)
+        if suffix_terms:
+            has_suffix_intent = any(
+                re.search(rf"\b{re.escape(term)}\b", question_lower)
+                for term in suffix_terms
+            )
+            if not has_suffix_intent:
+                return False
 
     # Token-level fallback (skip weak generic tokens)
     stop_tokens = {
@@ -1291,6 +1345,32 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # FIX 2: Remove table names from tokenizing
     # This prevents "payments" in "FROM payments" or subquery being treated as column
     allowed_ids = _parse_allowed_identifiers(ctx)
+    allowed_cols_by_table_lower = {
+        str(t).strip("`").lower(): {str(c).strip("`").lower() for c in cols}
+        for t, cols in allowed_ids.items()
+    }
+    try:
+        schema_analyzer = get_schema_analyzer()
+    except Exception:
+        schema_analyzer = None
+
+    def _table_cols_lower(table_name: str) -> Set[str]:
+        """
+        Robust table column lookup for hallucination checks.
+        Uses both request-scoped ALLOWED IDENTIFIERS and full schema metadata.
+        This prevents false positives when ALLOWED cards are sparse.
+        """
+        t = str(table_name or "").strip("`").lower()
+        if not t:
+            return set()
+
+        cols = set(allowed_cols_by_table_lower.get(t, set()))
+        if schema_analyzer is not None:
+            try:
+                cols.update(c.lower() for c in schema_analyzer.get_table_columns(t))
+            except Exception:
+                pass
+        return cols
     for tbl in allowed_ids.keys():
         sql_for_tokenizing = re.sub(
             rf"\b{re.escape(tbl)}\b",
@@ -1336,7 +1416,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # Fix: For subqueries, FROM (SELECT...) matches "SELECT" - skip that
     # Look for real table name or subquery alias
-    primary_match = re.search(r"FROM\s+([A-Za-z0-9_]+)", sql_up)
+    primary_match = re.search(r"FROM\s+`?([A-Za-z0-9_]+)`?", sql_up)
     primary_tbl = ""
     if primary_match:
         candidate = primary_match.group(1).lower()
@@ -1346,7 +1426,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     
     if primary_tbl: reserved.add(primary_tbl)
 
-    primary_cols = {c.lower() for c in allowed_ids.get(primary_tbl, [])}
+    primary_cols = _table_cols_lower(primary_tbl)
     alien_cols = [t for t in sql_tokens if t not in reserved and t not in primary_cols and not t.isdigit()]
     
     # --- FLATTEN VALID COLS FOR KASUS J ---
@@ -1391,7 +1471,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     potential_table = ""
                     for tbl in detected_tables:
                         if tbl == primary_tbl: continue
-                        tbl_cols = {c.lower() for c in allowed_ids.get(tbl, [])}
+                        tbl_cols = _table_cols_lower(tbl)
                         if set(aliens_in_main).intersection(tbl_cols):
                             can_be_solved_by_join = True
                             potential_table = tbl
@@ -1432,7 +1512,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             potential_table = ""
             for tbl in detected_tables:
                 if tbl == primary_tbl: continue
-                tbl_cols = {c.lower() for c in allowed_ids.get(tbl, [])}
+                tbl_cols = _table_cols_lower(tbl)
                 if set(alien_cols).intersection(tbl_cols):
                     can_be_solved_by_join = True
                     potential_table = tbl

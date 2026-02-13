@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Set
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .schema_analyzer import get_name_column, get_id_column
+from .schema_analyzer import get_name_column, get_id_column, get_all_tables
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
@@ -140,6 +140,56 @@ def _parse_allowed_identifiers(ctx: str) -> Dict[str, Set[str]]:
             tables.setdefault(table, set()).update(cols)
     return tables
 
+def _to_singular(term: str) -> str:
+    t = (term or "").lower().strip()
+    if t.endswith("ies") and len(t) > 3:
+        return t[:-3] + "y"
+    if t.endswith("s") and not t.endswith("ss") and len(t) > 1:
+        return t[:-1]
+    return t
+
+def _entity_terms_from_ctx(ctx: str = "") -> Set[str]:
+    """
+    Build dynamic entity lexicon from schema context.
+    Priority:
+    1) ALLOWED IDENTIFIERS block (request-scoped schema)
+    2) Global schema analyzer tables (fallback)
+    """
+    terms: Set[str] = set()
+
+    allowed = _parse_allowed_identifiers(ctx)
+    source_tables = list(allowed.keys()) if allowed else list(get_all_tables())
+
+    for table in source_tables:
+        t = (table or "").lower().strip().strip("`")
+        if not t:
+            continue
+
+        singular = _to_singular(t)
+        variants = {t, singular}
+
+        # Support table names with underscores in natural-language questions
+        if "_" in t:
+            variants.add(t.replace("_", " "))
+        if "_" in singular:
+            variants.add(singular.replace("_", " "))
+
+        terms.update(v for v in variants if v)
+
+    return terms
+
+def _build_entity_kw(ctx: str = "") -> str:
+    """
+    Return regex alternation for entity nouns (schema-driven).
+    Keeps a conservative fallback if schema context is unavailable.
+    """
+    terms = _entity_terms_from_ctx(ctx)
+    if not terms:
+        terms = {"customer", "product", "employee", "order", "office", "payment"}
+
+    escaped = sorted((re.escape(t) for t in terms), key=len, reverse=True)
+    return f"(?:{'|'.join(escaped)})"
+
 def _canonicalize_table_names(sql: str, ctx: str) -> str:
     """
     Rewrite nama table di FROM/JOIN agar sesuai persis dengan ALLOWED IDENTIFIERS (termasuk casing).
@@ -252,35 +302,36 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
     if not q:
         return False
 
+    entity_kw = _build_entity_kw(ctx)
+    entity_terms = _entity_terms_from_ctx(ctx)
+
     # include-zero intent should win over inner-join filtering
     include_zero_overrides = [
-        "including customers with no", "customers with no", "with no payments",
-        "never paid", "all customers", "even if no", "include those without",
+        "including", "with no", "without any", "without",
+        "never paid", "even if no", "include those without",
         "termasuk", "meskipun tidak", "walaupun tidak", "yang tidak punya",
-        "tanpa pembayaran", "pelanggan yang belum", "customer yang belum",
+        "tanpa", "belum",
     ]
     if any(s in q for s in include_zero_overrides):
-        return False
+        if re.search(rf"\b{entity_kw}\b", q, flags=re.I):
+            return False
+
+    for ent in entity_terms:
+        if (
+            f"including {ent} with no" in q
+            or f"{ent} with no" in q
+            or f"all {ent}" in q
+            or f"every {ent}" in q
+            or f"for each {ent}" in q
+        ):
+            return False
 
     if not re.search(r"\bonly\b", q):
         return False
 
-    # Dynamic entity list from context
-    allowed_tables = _parse_allowed_identifiers(ctx).keys()
-    if allowed_tables:
-        entities = []
-        for t in allowed_tables:
-            t_low = t.lower()
-            entities.append(re.escape(t_low))
-            if t_low.endswith("s"):
-                entities.append(re.escape(t_low[:-1]))
-        entity_kw = f"(?:{'|'.join(entities)})"
-    else:
-        entity_kw = r"(?:customer|product|employee|order|office|payment)"
-
     # "only products that have been ordered", "only customers who have placed orders"
     pat_relative_clause = rf"""
-        \bonly\s+{entity_kw}s?\b
+        \bonly\s+{entity_kw}\b
         .*?
         \b(?:who|that|which)\b
         .*?
@@ -294,7 +345,7 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
 
     # "only customers with orders", "only products having transactions"
     pat_with_having = rf"""
-        \bonly\s+{entity_kw}s?\b
+        \bonly\s+{entity_kw}\b
         .*?
         \b(?:with|having)\b
         (?:\s+\w+){{0,4}}
@@ -308,29 +359,34 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
 def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
     q = (question or "").lower()
 
-    # --- DINAMIS: Ambil daftar tabel dari context ---
-    allowed_tables = _parse_allowed_identifiers(ctx).keys()
-    if allowed_tables:
-        entities = []
-        for t in allowed_tables:
-            entities.append(re.escape(t.lower()))
-            # Handle singular (customers -> customer)
-            if t.lower().endswith('s'):
-                entities.append(re.escape(t.lower()[:-1]))
-        entity_kw = f"(?:{'|'.join(entities)})"
-    else:
-        # Fallback jika ctx tidak tersedia
-        entity_kw = r"(?:customer|product|employee|order|office|payment)"
+    entity_kw = _build_entity_kw(ctx)
+    entity_terms = _entity_terms_from_ctx(ctx)
 
     # --- LOGIKA SIGNALS (Tetap sama) ---
     explicit_signals = [
-        "including customers with no", "customers with no", "with no payments",
-        "never paid", "all customers", "even if no", "include those without",
+        "including", "with no", "without any", "without",
+        "never paid", "even if no", "include those without",
         "termasuk", "meskipun tidak", "walaupun tidak", "yang tidak punya",
-        "tanpa pembayaran", "pelanggan yang belum", "customer yang belum",
+        "tanpa", "belum",
     ]
 
     if any(s in q for s in explicit_signals):
+        # Require at least one entity mention for generic terms
+        if re.search(rf"\b{entity_kw}\b", q, flags=re.I):
+            return True
+
+    # Dynamic "all/for each/every <entity>" and "<entity> with no ..."
+    for ent in entity_terms:
+        if (
+            f"including {ent} with no" in q
+            or f"{ent} with no" in q
+            or f"all {ent}" in q
+            or f"every {ent}" in q
+            or f"for each {ent}" in q
+        ):
+            return True
+
+    if re.search(rf"\b{entity_kw}\b.*\b(without|with\s+no|no)\b", q, flags=re.I):
         return True
 
     # Pattern 0: explicit existence filtering (NOT include-zero)
@@ -339,12 +395,12 @@ def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
         return False  # Explicitly NOT include-zero, trigger INNER JOIN preference
 
     # Pattern 1: "for each X"
-    if re.search(rf"\b(for\s+each|per|setiap|tiap)\s+{entity_kw}", q, flags=re.I):
+    if re.search(rf"\b(for\s+each|per|setiap|tiap)\s+{entity_kw}\b", q, flags=re.I):
         return True
 
     # Pattern 2: "X with <aggregate condition>"
     if re.search(
-        rf"\b{entity_kw}s?\s+with\s+(total|sum|count|average|avg|jumlah)\s+.*?\b(exceed|over|greater|more\s+than|above|>|melebihi|lebih\s+dari)",
+        rf"\b{entity_kw}\s+with\s+(total|sum|count|average|avg|jumlah)\s+.*?\b(exceed|over|greater|more\s+than|above|>|melebihi|lebih\s+dari)",
         q, flags=re.I
     ):
         return True
@@ -463,26 +519,16 @@ def _question_wants_all_entities(question: str, ctx: str = "") -> bool:
     """
     q = (question or "").lower()
     
-    # Build entity keywords from context
-    allowed_tables = _parse_allowed_identifiers(ctx).keys()
-    if allowed_tables:
-        entities = []
-        for t in allowed_tables:
-            entities.append(re.escape(t.lower()))
-            if t.lower().endswith('s'):
-                entities.append(re.escape(t.lower()[:-1]))
-        entity_kw = f"(?:{'|'.join(entities)})"
-    else:
-        entity_kw = r"(?:customer|product|employee|order|office|payment)"
+    entity_kw = _build_entity_kw(ctx)
     
     # Pattern: "all/every/each <entity>"
     # E.g., "all customers", "every customer", "each customer"
     all_patterns = [
-        rf"\ball\s+{entity_kw}s?\b",           # "all customers"
+        rf"\ball\s+{entity_kw}\b",             # "all customers"
         rf"\bevery\s+{entity_kw}\b",           # "every customer"
         rf"\beach\s+{entity_kw}\b",            # "each customer"
         rf"\bfor\s+each\s+{entity_kw}\b",      # "for each customer"
-        rf"\bsemua\s+{entity_kw}s?\b",         # "semua customers" (Indonesian)
+        rf"\bsemua\s+{entity_kw}\b",           # "semua customers" (Indonesian)
         rf"\bsetiap\s+{entity_kw}\b",          # "setiap customer" (Indonesian)
     ]
     
@@ -867,17 +913,28 @@ def _rewrite_inner_join_filter_to_exists(sql: str) -> str:
 
     return f"{prefix_select}FROM {t1} {a1}{new_where}{(' ' + rest_after_where.strip()) if rest_after_where.strip() else ''}"
 
-def _question_wants_anti_existence(question: str) -> bool:
+def _question_wants_anti_existence(question: str, ctx: str = "") -> bool:
     q = (question or "").lower()
+    entity_kw = _build_entity_kw(ctx)
 
     eng = [
         "with no", "without any", "who have no", "who has no",
         "that have no", "that has no",
         "never", "have never", "has never",
-        "no orders", "no payments",
+        "without", "tanpa",
     ]
 
-    return any(p in q for p in eng)
+    if any(p in q for p in eng):
+        return True
+
+    if re.search(rf"\bno\s+{entity_kw}\b", q, flags=re.I):
+        return True
+    if re.search(rf"\bwithout\s+(?:any\s+)?{entity_kw}\b", q, flags=re.I):
+        return True
+    if re.search(rf"\btanpa\s+{entity_kw}\b", q, flags=re.I):
+        return True
+
+    return False
 
 def _question_wants_existence(question: str) -> bool:
     q = (question or "").lower()
@@ -891,14 +948,14 @@ def _question_wants_existence(question: str) -> bool:
 
     return any(p in q for p in eng)
 
-def _rewrite_inner_join_existence_to_exists(sql: str, question: str) -> str:
+def _rewrite_inner_join_existence_to_exists(sql: str, question: str, ctx: str = "") -> str:
     if not sql:
         return sql
     if join_count(sql) != 1:
         return sql
     if re.search(r"\b(left|right|full)\s+join\b", sql, flags=re.I):
         return sql
-    if _question_wants_anti_existence(question):
+    if _question_wants_anti_existence(question, ctx):
         return sql
     if not _question_wants_existence(question):
         return sql
