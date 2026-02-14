@@ -145,6 +145,66 @@ def _question_mentions_schema_entity(question_lower: str) -> bool:
 
     return False
 
+
+def _schema_entities_for_examples(max_items: int = 3) -> List[str]:
+    """
+    Build user-facing entity examples from schema tables (fallback-safe).
+    """
+    entities: List[str] = []
+    try:
+        for table in get_all_tables():
+            variants = sorted(_table_name_variants(table), key=len)
+            # Prefer simple natural form (usually singular/plural table name).
+            if variants:
+                entities.append(variants[0])
+    except Exception:
+        entities = []
+
+    # Deduplicate while preserving order.
+    seen = set()
+    out = []
+    for e in entities:
+        k = (e or "").strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(e)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _example_data_queries() -> List[str]:
+    entities = _schema_entities_for_examples(max_items=3)
+    if len(entities) >= 3:
+        return [
+            f"Show all {entities[0]}",
+            f"How many {entities[1]} in 2023?",
+            f"List {entities[2]} with value above 100",
+        ]
+    if len(entities) == 2:
+        return [
+            f"Show all {entities[0]}",
+            f"How many {entities[1]} in 2023?",
+            f"List {entities[0]} with value above 100",
+        ]
+    if len(entities) == 1:
+        return [
+            f"Show all {entities[0]}",
+            f"How many {entities[0]} in 2023?",
+            f"List {entities[0]} with value above 100",
+        ]
+    return [
+        "Show all records",
+        "How many records in 2023?",
+        "List records with value above 100",
+    ]
+
+
+def _format_example_block() -> str:
+    examples = _example_data_queries()
+    return "\n".join([f"  - '{ex}'" for ex in examples])
+
 def _check_instant_reject(question: str) -> Tuple[bool, str]:
     """
     Layer 1: Regex-based instant rejection for obvious garbage.
@@ -159,7 +219,10 @@ def _check_instant_reject(question: str) -> Tuple[bool, str]:
     # --- Check 1: Pattern-based rejection (greetings, etc) ---
     for pattern in _INSTANT_REJECT_PATTERNS:
         if re.match(pattern, q_lower, re.IGNORECASE):
-            return True, "This doesn't look like a data query. Please ask about your data (e.g., 'Show all customers', 'How many orders in 2023?')."
+            return True, (
+                "This doesn't look like a data query. Please ask about your data, for example:\n"
+                + _format_example_block()
+            )
     
     # --- Check 2: Gibberish detection ---
     is_gibberish, gibberish_reason = _detect_gibberish(q)
@@ -280,11 +343,14 @@ def _llm_judge_sql_intent(question: str) -> Tuple[bool, str]:
         num_predict=64,  # Short response
     )
     
+    schema_entities = _schema_entities_for_examples(max_items=6)
+    schema_entities_txt = ", ".join(schema_entities) if schema_entities else "schema entities"
+
     prompt = f"""You are a query intent classifier for a SQL database system.
 Determine if the user's question is asking about DATA or DATABASE QUERIES.
 
 VALID questions (answer "yes"):
-- Questions about customers, orders, products, employees, payments, offices
+- Questions about schema entities such as: {schema_entities_txt}
 - Questions asking for lists, counts, totals, averages
 - Questions with filters (by date, by country, by status)
 - Questions asking for rankings (highest, lowest, top, most)
@@ -307,7 +373,11 @@ Return JSON: {{"is_data_query": true/false, "reason": "brief explanation"}}"""
         reason = result.get("reason", "")
         
         if not is_valid:
-            return False, f"This doesn't appear to be a data query. {reason}\n\nPlease ask about your data, for example:\n  - 'Show all customers from USA'\n  - 'How many orders in 2023?'\n  - 'List products with price above 100'"
+            return False, (
+                f"This doesn't appear to be a data query. {reason}\n\n"
+                "Please ask about your data, for example:\n"
+                + _format_example_block()
+            )
         
         return True, ""
         
@@ -1831,32 +1901,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         if missing_cols:
             # TIERING LOGIC - Smart escalation based on complexity
             if complexity == "simple" and qtype == "lookup":
-                # SOFT ERROR: Auto-fix tanpa regenerate
-                _dbg_print_two("[Agent3] SOFT FIX - Missing Columns", f"Auto-appending {missing_cols}")
-                
-                # STEP 3: Safe Injection (Menangani DISTINCT)
-                is_distinct = re.search(r"^SELECT\s+DISTINCT\s+", final_sql, re.IGNORECASE)
-                
-                if is_distinct:
-                    # Pola: SELECT DISTINCT col1 -> SELECT DISTINCT missing, col1
-                    final_sql = re.sub(
-                        r"^(SELECT\s+DISTINCT\s+)(.*?)(\s+FROM)", 
-                        f"\\1{', '.join(missing_cols)}, \\2\\3", 
-                        final_sql, 
-                        count=1, 
-                        flags=re.IGNORECASE | re.DOTALL
-                    )
-                else:
-                    # Pola: SELECT col1 -> SELECT missing, col1
-                    final_sql = re.sub(
-                        r"^(SELECT\s+)(.*?)(\s+FROM)", 
-                        f"\\1{', '.join(missing_cols)}, \\2\\3", 
-                        final_sql, 
-                        count=1, 
-                        flags=re.IGNORECASE | re.DOTALL
-                    )
-                
-                corrections.append(f"Auto-added missing columns: {', '.join(missing_cols)}")
+                # Avoid SQL string surgery. Regenerate so final SQL naturally includes requested columns.
+                _dbg_print_two("[Agent3] MEDIUM ERROR - Missing Columns", f"Retry (no auto-append): {missing_cols}")
+                extra_instruction = (
+                    f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
+                    f"But they are MISSING from the SELECT clause. "
+                    f"You MUST include: {', '.join(missing_cols)} in the SELECT output."
+                )
+                needs_regeneration = True
+                regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
             
             elif draft_model == SMALL_MODEL and complexity == "simple":
                 # MEDIUM ERROR: Regenerate dengan 3B (simple query dari 3B yang salah)
@@ -1928,14 +1981,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         )
 
         if has_month_name_group and not has_safe_sort:
-             _dbg_print_two("[Agent3] HARD ERROR - Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
-             extra_instruction = (
+            _dbg_print_two("[Agent3] HARD ERROR - Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
+            extra_instruction = (
                 "STRICT REQUIREMENT: You are grouping by Month Name, which sorts Alphabetically (Apr, Aug...). "
                 "FIX: You MUST Group and Sort by the Month Number as well. "
-                "Example: `GROUP BY MONTH(orderDate), month_name ORDER BY MONTH(orderDate) DESC`."
-             )
-             needs_regeneration = True
-             regeneration_model = LARGE_MODEL  # Force 7B
+                "Example: `GROUP BY MONTH(date_col), month_name ORDER BY MONTH(date_col) DESC`."
+            )
+            needs_regeneration = True
+            regeneration_model = LARGE_MODEL  # Force 7B
 
     # --- KASUS K: AGGREGATION VIOLATION (ERROR 1055) (HARD ERROR) ---
     # Menangkap kasus SELECT raw_col FROM... GROUP BY derived_col (Error 1055)

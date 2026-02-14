@@ -14,6 +14,7 @@ import asyncio
 import argparse
 import csv
 import os
+import re
 import time
 from pathlib import Path
 from datetime import datetime
@@ -105,13 +106,113 @@ def normalize_value(val, tolerance: float = 0.0001) -> str:
     
     return str(val).strip()
 
-def values_match(val1, val2, tolerance: float = 0.01) -> bool:
+def _is_null_token(val) -> bool:
+    """Return True if value represents SQL NULL in comparison layer."""
+    if val is None:
+        return True
+    if isinstance(val, str) and val.strip().upper() == "NULL":
+        return True
+    return False
+
+
+def _question_requires_null_to_zero(question: str) -> bool:
+    """
+    Return True when question explicitly asks NULL->0 style behavior.
+
+    This is used to avoid forgiving NULL vs 0 mismatches when the prompt
+    explicitly requires null handling to be shown in SQL.
+    """
+    q = (question or "").lower()
+    patterns = (
+        r"\bcoalesce\b",
+        r"\bifnull\b",
+        r"\bnvl\b",
+        r"\bnull\s+as\s+(?:0|zero)\b",
+        r"\b(?:0|zero)\s+instead\s+of\s+null\b",
+        r"\breplace\s+null\s+(?:with|by)\s+(?:0|zero)\b",
+        r"\bconvert\s+null\s+(?:to|into)\s+(?:0|zero)\b",
+        r"\btreat\s+null\s+as\s+(?:0|zero)\b",
+        r"\bdefault(?:ing)?\s+(?:null\s+)?(?:to|as)\s+(?:0|zero)\b",
+    )
+    return any(re.search(p, q) for p in patterns)
+
+
+def _sql_has_null_to_zero_handling(sql: str) -> bool:
+    """
+    Detect explicit NULL->0 handling in SQL text.
+    """
+    s = (sql or "")
+
+    # Direct function-based null handling
+    if re.search(r"\b(coalesce|ifnull|nvl)\s*\(", s, flags=re.IGNORECASE):
+        return True
+
+    # CASE WHEN ... IS NULL THEN 0 ...
+    if re.search(
+        r"\bcase\b[\s\S]*?\bwhen\b[\s\S]*?\bis\s+null\b[\s\S]*?\bthen\s+0(?:\.0+)?\b",
+        s,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def _resolve_null_zero_equivalent(
+    question: str,
+    null_zero_mode: str,
+) -> tuple[bool, bool, str]:
+    """
+    Resolve comparison behavior for NULL vs 0.
+
+    Returns:
+      - allow_null_zero_equivalent: enable tolerant value comparison
+      - explicit_null_to_zero_required: whether question explicitly asks it
+      - reason: short mode label for logging
+    """
+    mode = (null_zero_mode or "auto").strip().lower()
+    if mode not in {"off", "on", "auto"}:
+        mode = "auto"
+
+    explicit_required = _question_requires_null_to_zero(question)
+
+    if mode == "off":
+        return False, explicit_required, "off"
+    if mode == "on":
+        return True, explicit_required, "on"
+
+    # auto: allow NULL~0 only when question did NOT explicitly ask for null handling
+    if explicit_required:
+        return False, True, "auto(explicit-null-handling)"
+    return True, False, "auto(default)"
+
+
+def values_match(
+    val1,
+    val2,
+    tolerance: float = 0.01,
+    null_zero_equivalent: bool = False,
+) -> bool:
     """
     Compare two values with numeric tolerance.
     
     For numeric values: match if within tolerance (default 1%)
     For strings: exact match (case-insensitive)
     """
+    # Optional mode: treat NULL and numeric zero as equivalent.
+    # Useful when gold SQL may use SUM(...) while prediction uses COALESCE(SUM(...), 0).
+    if null_zero_equivalent:
+        v1_null = _is_null_token(val1)
+        v2_null = _is_null_token(val2)
+        if v1_null and v2_null:
+            return True
+        if v1_null ^ v2_null:
+            other = val2 if v1_null else val1
+            try:
+                return abs(float(other)) < 1e-9
+            except (ValueError, TypeError):
+                return False
+
     # Handle None
     if val1 is None and val2 is None:
         return True
@@ -139,7 +240,13 @@ def values_match(val1, val2, tolerance: float = 0.01) -> bool:
         # Fall back to string comparison
         return str(val1).strip().lower() == str(val2).strip().lower()
 
-def compare_results(predicted_rows: list, groundtruth_rows: list, order_sensitive: bool = False, numeric_tolerance: float = 0.01) -> tuple[bool, str]:
+def compare_results(
+    predicted_rows: list,
+    groundtruth_rows: list,
+    order_sensitive: bool = False,
+    numeric_tolerance: float = 0.01,
+    null_zero_equivalent: bool = False,
+) -> tuple[bool, str]:
     """
     Compare execution results (Execution Accuracy).
     Returns (is_match, reason).
@@ -171,63 +278,97 @@ def compare_results(predicted_rows: list, groundtruth_rows: list, order_sensitiv
             return False, f"Column count mismatch: pred={pred_col_count}, gt={gt_col_count}"
     
     try:
-        # Normalize rows - convert each row to tuple of SORTED VALUES (within the row)
-        def row_to_tuple(row: dict) -> tuple:
-            return tuple(sorted(normalize_value(v) for v in row.values()))
+        from collections import Counter
 
-        pred_tuples = [row_to_tuple(r) for r in predicted_rows]
-        gt_tuples = [row_to_tuple(r) for r in groundtruth_rows]
+        # Normalize row values and ignore column ORDER.
+        pred_rows_norm = [tuple(normalize_value(v) for v in row.values()) for row in predicted_rows]
+        gt_rows_norm = [tuple(normalize_value(v) for v in row.values()) for row in groundtruth_rows]
 
-        # ORDER SENSITIVE: Compare row by row in order (for ORDER BY queries)
-        if order_sensitive:
-            for i, (p_row, g_row) in enumerate(zip(pred_tuples, gt_tuples)):
-                if len(p_row) != len(g_row):
-                    return False, f"Column count mismatch at row {i+1}"
-                for j, (p_val, g_val) in enumerate(zip(p_row, g_row)):
-                    if not values_match(p_val, g_val, numeric_tolerance):
-                        return False, f"Row {i+1}, column {j+1} mismatch: {p_val} vs {g_val}"
-            return True, "Exact match (ordered)"
-
-        # ORDER INSENSITIVE: Treat as SET comparison (row order doesn't matter)
-        # First try exact match (fast path)
-        pred_set = set(pred_tuples)
-        gt_set = set(gt_tuples)
-
-        if pred_set == gt_set:
-            return True, "Exact match (unordered)"
-
-        # If no exact match, try with numeric tolerance
-        # Compare row by row with tolerance
-        def rows_match_with_tolerance(pred_list, gt_list) -> bool:
-            """Check if all rows match with numeric tolerance."""
-            if len(pred_list) != len(gt_list):
+        def rows_match_ignore_col_order(pred_row: tuple, gt_row: tuple) -> bool:
+            """Compare one row while ignoring column order."""
+            if len(pred_row) != len(gt_row):
                 return False
 
-            # Sort both lists for comparison
-            pred_sorted = sorted(pred_list)
-            gt_sorted = sorted(gt_list)
+            # Fast exact path (column order already ignored)
+            if Counter(pred_row) == Counter(gt_row):
+                return True
 
-            for p_row, g_row in zip(pred_sorted, gt_sorted):
-                if len(p_row) != len(g_row):
-                    return False
-                for p_val, g_val in zip(p_row, g_row):
-                    if not values_match(p_val, g_val, numeric_tolerance):
-                        return False
-            return True
+            used = [False] * len(gt_row)
 
-        if rows_match_with_tolerance(pred_tuples, gt_tuples):
-            return True, f"Match with tolerance ({numeric_tolerance*100:.1f}%)"
+            def backtrack(i: int) -> bool:
+                if i == len(pred_row):
+                    return True
+                p_val = pred_row[i]
+                for j, g_val in enumerate(gt_row):
+                    if used[j]:
+                        continue
+                    if values_match(
+                        p_val,
+                        g_val,
+                        numeric_tolerance,
+                        null_zero_equivalent=null_zero_equivalent,
+                    ):
+                        used[j] = True
+                        if backtrack(i + 1):
+                            return True
+                        used[j] = False
+                return False
 
-        # No match - find differences for debugging
-        missing = gt_set - pred_set
-        extra = pred_set - gt_set
+            return backtrack(0)
 
+        # ORDER SENSITIVE: row order must match exactly, but column order can differ.
+        if order_sensitive:
+            for i, (p_row, g_row) in enumerate(zip(pred_rows_norm, gt_rows_norm)):
+                if not rows_match_ignore_col_order(p_row, g_row):
+                    return False, f"Row order/content mismatch at row {i+1}"
+            return True, "Exact match (ordered rows, unordered columns)"
+
+        # ORDER INSENSITIVE: row order and column order can differ.
+        pred_counter = Counter(tuple(sorted(r)) for r in pred_rows_norm)
+        gt_counter = Counter(tuple(sorted(r)) for r in gt_rows_norm)
+        if pred_counter == gt_counter:
+            return True, "Exact match (unordered rows/columns)"
+
+        # Build bipartite matching between predicted and groundtruth rows.
+        n = len(pred_rows_norm)
+        edges = [[] for _ in range(n)]
+        for i, p_row in enumerate(pred_rows_norm):
+            for j, g_row in enumerate(gt_rows_norm):
+                if rows_match_ignore_col_order(p_row, g_row):
+                    edges[i].append(j)
+
+        # DFS-based maximum bipartite matching
+        match_to_pred = [-1] * n
+
+        def dfs(i: int, seen: list[bool]) -> bool:
+            for j in edges[i]:
+                if seen[j]:
+                    continue
+                seen[j] = True
+                if match_to_pred[j] == -1 or dfs(match_to_pred[j], seen):
+                    match_to_pred[j] = i
+                    return True
+            return False
+
+        fully_matched = True
+        for i in range(n):
+            seen = [False] * n
+            if not dfs(i, seen):
+                fully_matched = False
+                break
+
+        if fully_matched:
+            mode_suffix = " + NULL~0" if null_zero_equivalent else ""
+            return True, f"Match with tolerance ({numeric_tolerance*100:.1f}%){mode_suffix}"
+
+        # No match - count unmatched rows (column-order-insensitive exact signatures)
+        missing_count = sum((gt_counter - pred_counter).values())
+        extra_count = sum((pred_counter - gt_counter).values())
         reason = []
-        if missing:
-            reason.append(f"missing {len(missing)} rows")
-        if extra:
-            reason.append(f"extra {len(extra)} rows")
-
+        if missing_count:
+            reason.append(f"missing {missing_count} rows")
+        if extra_count:
+            reason.append(f"extra {extra_count} rows")
         return False, "; ".join(reason) if reason else "Content mismatch"
             
     except Exception as e:
@@ -424,6 +565,7 @@ async def run_single_case(
     paths: list[str],
     case: dict,
     execute_groundtruth: bool = True,
+    null_zero_mode: str = "auto",
 ) -> dict:
     """
     Run a single test case and return evaluation result.
@@ -432,6 +574,9 @@ async def run_single_case(
     question = case.get("question", "")
     groundtruth_sql = case.get("groundtruth_sql", "").strip()
     difficulty = case.get("difficulty", "unknown")
+    allow_null_zero_equivalent, explicit_null_to_zero_required, null_zero_reason = (
+        _resolve_null_zero_equivalent(question, null_zero_mode)
+    )
     
     print(f"\n{'='*60}")
     print(f"[{case_id}] ({difficulty}) {question[:80]}...")
@@ -543,14 +688,35 @@ async def run_single_case(
             # Debug: show ORDER BY detection
             order_mode = "ORDERED" if has_order_by else "UNORDERED"
             print(f"[EVALUATION] Comparison mode: {order_mode} (ORDER BY detected: {has_order_by})")
+            print(
+                f"[EVALUATION] NULL~0 mode: {null_zero_reason} "
+                f"(enabled: {allow_null_zero_equivalent})"
+            )
+
+            explicit_null_violation = False
+            explicit_null_reason = ""
+            if explicit_null_to_zero_required and not _sql_has_null_to_zero_handling(predicted_sql):
+                explicit_null_violation = True
+                explicit_null_reason = (
+                    "Question explicitly requires NULL->0 handling, "
+                    "but predicted SQL has no COALESCE/IFNULL/NVL/CASE null handling"
+                )
 
             # Compare results
-            is_match, reason = compare_results(pred_rows, gt_rows, order_sensitive=has_order_by)
-            result["result_match"] = is_match
-            result["match_reason"] = reason
+            is_match, reason = compare_results(
+                pred_rows,
+                gt_rows,
+                order_sensitive=has_order_by,
+                null_zero_equivalent=allow_null_zero_equivalent,
+            )
+            result["result_match"] = is_match and not explicit_null_violation
+            if explicit_null_violation:
+                result["match_reason"] = f"{reason}; {explicit_null_reason}" if reason else explicit_null_reason
+            else:
+                result["match_reason"] = reason
             
-            status = "MATCH" if is_match else "MISMATCH"
-            print(f"[EVALUATION] {status} - {reason}")
+            status = "MATCH" if result["result_match"] else "MISMATCH"
+            print(f"[EVALUATION] {status} - {result['match_reason']}")
             print(f"       (pred: {result['pred_row_count']} rows, gt: {result['gt_row_count']} rows)")
         else:
             result["match_reason"] = f"Groundtruth SQL failed: {gt_error}"
@@ -622,6 +788,7 @@ async def run_batch_eval(
     execute_groundtruth: bool = True,
     skip_warmup: bool = False,
     difficulty_filters: dict[str, set[int] | None] | None = None,
+    null_zero_mode: str = "auto",
 ):
     """
     Main batch evaluation function.
@@ -720,7 +887,8 @@ async def run_batch_eval(
             print(f"\n[Progress: {i+1}/{len(cases)}]")
             result = await run_single_case(
                 app, mcp, paths, case, 
-                execute_groundtruth=execute_groundtruth
+                execute_groundtruth=execute_groundtruth,
+                null_zero_mode=null_zero_mode,
             )
             results.append(result)
     
@@ -867,6 +1035,20 @@ Examples:
         action="store_true",
         help="Skip warmup phase (not recommended - will cause cold start bias)"
     )
+    parser.add_argument(
+        "--null-zero-equivalent",
+        action="store_true",
+        help="Backward-compatible alias for --null-zero-mode on"
+    )
+    parser.add_argument(
+        "--null-zero-mode",
+        choices=["off", "on", "auto"],
+        default="auto",
+        help=(
+            "NULL vs 0 comparison mode: off=strict, on=always treat NULL~0 as equal, "
+            "auto=allow NULL~0 unless question explicitly asks NULL->0 handling"
+        )
+    )
     # Difficulty filter arguments (supports: --easy, --easy4, --easy4-7, etc.)
     parser.add_argument(
         "--easy",
@@ -888,6 +1070,8 @@ Examples:
     )
 
     args = parser.parse_args()
+    # Backward compatibility for existing commands
+    null_zero_mode = "on" if args.null_zero_equivalent else args.null_zero_mode
 
     # Build difficulty filter dict with optional ID ranges
     difficulty_filters = {}
@@ -924,6 +1108,7 @@ Examples:
         execute_groundtruth=not args.no_groundtruth_exec,
         skip_warmup=args.skip_warmup,
         difficulty_filters=difficulty_filters if difficulty_filters else None,
+        null_zero_mode=null_zero_mode,
     ))
 
 if __name__ == "__main__":

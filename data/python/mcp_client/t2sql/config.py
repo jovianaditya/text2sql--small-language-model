@@ -43,6 +43,8 @@ TABLE_SCORE_DESC_TOKEN = float(os.getenv("TABLE_SCORE_DESC_TOKEN", "0.3"))
 TABLE_SCORE_MENTION_DIM = float(os.getenv("TABLE_SCORE_MENTION_DIM", "0.9"))
 TABLE_SCORE_MENTION_TXN = float(os.getenv("TABLE_SCORE_MENTION_TXN", "0.7"))
 TABLE_SCORE_MENTION_OTHER = float(os.getenv("TABLE_SCORE_MENTION_OTHER", "0.8"))
+TABLE_SCORE_BRIDGE_PENALTY = float(os.getenv("TABLE_SCORE_BRIDGE_PENALTY", "-0.4"))
+TABLE_SCORE_BRIDGE_NUMERIC_BOOST = float(os.getenv("TABLE_SCORE_BRIDGE_NUMERIC_BOOST", "0.6"))
 MAX_TOP_TABLES = int(os.getenv("MAX_TOP_TABLES", "3"))
 # >>> Batasi berapa banyak dokumen yang masuk ke context LLM
 MAX_CTX_DOCS = int(os.getenv("MAX_CTX_DOCS", "12"))

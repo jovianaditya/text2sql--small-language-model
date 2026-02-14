@@ -37,6 +37,8 @@ from .config import (
     TABLE_SCORE_MENTION_DIM,
     TABLE_SCORE_MENTION_TXN,
     TABLE_SCORE_MENTION_OTHER,
+    TABLE_SCORE_BRIDGE_PENALTY,
+    TABLE_SCORE_BRIDGE_NUMERIC_BOOST,
     MAX_TOP_TABLES,
     MAX_CTX_DOCS,
     SPARSE_MAX_HITS,
@@ -46,12 +48,11 @@ from .config import (
 from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
-from .helpers_main import _is_productline_lookup, _is_simple_orders_lookup, _wants_customer_name_only, _get_qtype, build_dynamic_probe
+from .helpers_main import _get_qtype, build_dynamic_probe
 from .schema_analyzer import (
     get_all_tables,
     get_table_synonyms,
     get_singular_form,
-    find_table_by_keyword,
     get_table_type,
     is_transaction_table,
     get_column_synonyms,
@@ -476,7 +477,21 @@ def _tokenize_bm25_query(q: str) -> List[str]:
     raw_tokens = s.split()
     toks: List[str] = []
 
-    STEM_EXCEPTIONS = {"status", "address", "business", "orders", "sales"} 
+    schema_tokens = set()
+    try:
+        for tbl in get_all_tables():
+            t = str(tbl or "").strip().lower()
+            if not t:
+                continue
+            schema_tokens.add(t)
+            singular = get_singular_form(t)
+            if singular:
+                schema_tokens.add(str(singular).lower())
+    except Exception:
+        pass
+
+    # Prevent over-stemming for generic nouns and schema entity words.
+    STEM_EXCEPTIONS = {"status", "address", "business", "sales"} | schema_tokens
 
     for t in raw_tokens:
         if not t:
@@ -801,6 +816,11 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
 
     # Get all tables from schema (dynamic)
     all_tables = get_all_tables()
+    bridge_tables = {
+        str(t).strip().lower()
+        for t in all_tables
+        if str(t).strip() and get_table_type(str(t).strip().lower()) == "bridge"
+    }
 
     # Build mentions map dynamically using schema metadata
     # Uses _is_mentioned() which checks table name + synonyms from JSONL (schema-agnostic)
@@ -815,11 +835,17 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
     # Check if any retrieved column has numeric/aggregate characteristics
     needs_numeric_data = _check_needs_numeric_data_from_retrieved(reranked)
 
-    # Only penalize orderdetails if NOT in aggregate context AND NOT needing numeric data
-    # Use mentions_map directly (dynamic, schema-agnostic)
-    penalize_orderdetails_default = (
-        mentions_map.get("orders", False) and
-        not mentions_map.get("orderdetails", False) and
+    # Penalize bridge tables by default in non-aggregate/no-numeric contexts,
+    # unless bridge tables are explicitly mentioned.
+    transaction_table_mentioned = any(
+        mentions_map.get(tbl, False) for tbl in all_tables if is_transaction_table(tbl)
+    )
+    bridge_table_mentioned = any(
+        mentions_map.get(tbl, False) for tbl in bridge_tables
+    )
+    penalize_bridge_default = (
+        transaction_table_mentioned and
+        not bridge_table_mentioned and
         not has_aggregation and
         not needs_numeric_data
     )
@@ -850,12 +876,12 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
             else:
                 base += TABLE_SCORE_MENTION_OTHER
 
-        # Special handling for orderdetails (bridge table with numeric columns)
-        # Don't penalize orderdetails in aggregate/numeric contexts
-        if penalize_orderdetails_default and tl == "orderdetails": base -= 0.4
+        # Generic bridge-table handling (schema-agnostic).
+        if penalize_bridge_default and tl in bridge_tables:
+            base += TABLE_SCORE_BRIDGE_PENALTY
 
-        # Boost orderdetails when numeric data is needed (even if not explicitly mentioned)
-        if needs_numeric_data and tl == "orderdetails": base += 0.6
+        if needs_numeric_data and tl in bridge_tables:
+            base += TABLE_SCORE_BRIDGE_NUMERIC_BOOST
 
         scores[tbl] += base
     return scores
@@ -1087,15 +1113,37 @@ def _has_join_intent(question: str) -> bool:
         "and their", "with their", "beserta", "bersama", "dengan",
         "for each", "per ", "setiap",
     ]
-    multi_entity = [
-        ("customer", "order"), ("customer", "payment"), ("order", "product"),
-        ("order", "order detail"), ("order", "orderdetails"), ("employee", "office"),
-        ("employee", "customer"), ("office", "employee"),
+    if any(s in q for s in join_signals):
+        return True
+
+    # Generic multi-entity signal: 2+ explicit table mentions.
+    mentioned_tables = [
+        t for t in get_all_tables()
+        if _text_mentions_table(q, t, include_synonyms=False)
     ]
-    if any(s in q for s in join_signals): return True
-    for a, b in multi_entity:
-        if a in q and b in q: return True
+    if len(mentioned_tables) >= 2:
+        return True
+
     return False
+
+
+def _wants_name_only_for_table(question: str, table: str) -> bool:
+    """
+    Generic replacement for table-specific name-only heuristics.
+    """
+    q = (question or "").lower()
+    t = (table or "").strip().lower()
+    if not q or not t:
+        return False
+
+    if not _text_mentions_table(q, t, include_synonyms=True):
+        return False
+
+    # Avoid treating "number of" as ID intent.
+    q_clean = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
+    asks_id_like = bool(re.search(r"\b(ids?|numbers?|codes?|identifier|nomor|kode|no)\b", q_clean))
+    asks_name_like = bool(re.search(r"\b(name|names|nama)\b", q_clean))
+    return (asks_name_like or not asks_id_like) and not asks_id_like
 
 def _detect_primary_entity_table(question: str) -> Optional[str]:
     """
@@ -1158,9 +1206,12 @@ def retrieve_node(state: RAGState) -> RAGState:
     q_l = q.lower()
     qtype = _get_qtype(state)
 
-    wants_customer_no_id = _wants_customer_name_only(q)
-    productline_lookup = _is_productline_lookup(q)
-    orders_simple_lookup = _is_simple_orders_lookup(q)
+    primary_lookup_table = _detect_primary_entity_table(q) if qtype == "lookup" else None
+    prefer_name_table = (
+        primary_lookup_table
+        if _wants_name_only_for_table(q, primary_lookup_table or "")
+        else ""
+    )
 
     # --- [MODIFIED 2] Filter Paths: Hanya ambil file yang namanya mengandung "_sparse" ---
     all_paths = state.get("jsonl_paths", [])
@@ -1206,18 +1257,18 @@ def retrieve_node(state: RAGState) -> RAGState:
             sparse_metas = []
             if RETRIEVE_DEBUG: print(f"[WARN] Sparse meta fetch failed: {e!r}")
 
-    # Get customer name column dynamically (schema-agnostic)
-    customer_name_col = get_name_column("customers")
-    customer_name_col_lower = (customer_name_col or "").lower()
+    # Get preferred display-name column for lookup contexts (schema-agnostic).
+    preferred_name_col = get_name_column(prefer_name_table) if prefer_name_table else None
+    preferred_name_col_lower = (preferred_name_col or "").lower()
 
-    sparse_has_customername = any(
-        ((_meta_table(m) or "").lower() == "customers") and ((_meta_column(m) or "").lower() == customer_name_col_lower)
+    sparse_has_preferred_name = any(
+        ((_meta_table(m) or "").lower() == prefer_name_table) and ((_meta_column(m) or "").lower() == preferred_name_col_lower)
         for m in sparse_metas if isinstance(m, dict)
-    ) if customer_name_col else False
+    ) if preferred_name_col else False
 
     base_k = max(12, TOP_K)
     dense_k = base_k
-    if wants_customer_no_id and not sparse_has_customername:
+    if prefer_name_table and preferred_name_col and not sparse_has_preferred_name:
         dense_k = max(28, base_k)
 
     # -----------------------------
@@ -1248,10 +1299,10 @@ def retrieve_node(state: RAGState) -> RAGState:
     dense_dists = (dense_dists or [0.0] * n)[:n]
     dense_ids = (dense_ids or [""] * n)[:n]
 
-    dense_has_customername = any(
-        ((_meta_table(md) or "").lower() == "customers") and ((_meta_column(md) or "").lower() in (customer_name_col_lower, customer_name_col_lower.replace("n", "_n")))
+    dense_has_preferred_name = any(
+        ((_meta_table(md) or "").lower() == prefer_name_table) and ((_meta_column(md) or "").lower() in (preferred_name_col_lower, preferred_name_col_lower.replace("n", "_n")))
         for md in dense_metas
-    ) if customer_name_col else False
+    ) if preferred_name_col else False
 
     # -----------------------------
     # 4) Scoring + rerank (dense + sparse bonus + priority boost)
@@ -1275,19 +1326,19 @@ def retrieve_node(state: RAGState) -> RAGState:
         })
 
     # -----------------------------
-    # 5) Auto-inject sangat terbatas (customerName) - now schema-agnostic
+    # 5) Auto-inject sangat terbatas (preferred display-name column)
     # -----------------------------
-    if wants_customer_no_id and sparse_has_customername and not dense_has_customername and customer_name_col:
-        sparse_customername_urn = None
-        urn_suffix = f"::{customer_name_col_lower}"
+    if prefer_name_table and preferred_name_col and sparse_has_preferred_name and not dense_has_preferred_name:
+        sparse_preferred_name_urn = None
+        urn_suffix = f"::{preferred_name_col_lower}"
         for u in sparse_field_urns:
             if u.lower().endswith(urn_suffix):
-                sparse_customername_urn = u
+                sparse_preferred_name_urn = u
                 break
-        if sparse_customername_urn:
+        if sparse_preferred_name_urn:
             present_ids = {item["id"] for item in scored if item.get("id")}
-            if sparse_customername_urn not in present_ids:
-                got = col.get(ids=[sparse_customername_urn])
+            if sparse_preferred_name_urn not in present_ids:
+                got = col.get(ids=[sparse_preferred_name_urn])
                 if got and got.get("ids"):
                     md = (got.get("metadatas") or [{}])[0]
                     doc = (got.get("documents") or [""])[0]
@@ -1299,7 +1350,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                     boosted = max_boost + 0.05
                     boosted += apply_column_priority_boost(q_l=q_l, table=table_name, col_name=col_name, roles=roles, aliases=aliases)
                     scored.append({
-                        "rank": len(scored), "id": sparse_customername_urn, "doc": doc, "meta": md or {},
+                        "rank": len(scored), "id": sparse_preferred_name_urn, "doc": doc, "meta": md or {},
                         "dist": 0.0, "base": 0.0, "sparse": True, "boosted": boosted,
                     })
 
@@ -1435,14 +1486,9 @@ def retrieve_node(state: RAGState) -> RAGState:
     token_for_score = _tokenize_bm25_query(sparse_query_clean)
     table_scores = score_tables_from_reranked(reranked, token_for_score)
 
-    if qtype == "lookup" and wants_customer_no_id:
-        filtered_allowed = {t: cols for t, cols in allowed.items() if t.lower() == "customers"}
-    elif qtype == "lookup" and productline_lookup:
-        only_pl = {t: cols for t, cols in allowed.items() if t.lower() == "productlines"}
-        filtered_allowed = only_pl if only_pl else dict(allowed)
-    elif qtype == "lookup" and orders_simple_lookup:
-        only_orders = {t: cols for t, cols in allowed.items() if t.lower() == "orders"}
-        filtered_allowed = only_orders if only_orders else dict(allowed)
+    if qtype == "lookup" and prefer_name_table:
+        only_preferred = {t: cols for t, cols in allowed.items() if t.lower() == prefer_name_table}
+        filtered_allowed = only_preferred if only_preferred else dict(allowed)
     else:
         if lock_single:
             primary = primary_for_lock
@@ -1512,11 +1558,11 @@ def retrieve_node(state: RAGState) -> RAGState:
             else:
                 filtered_allowed = dict(allowed)
 
-    if wants_customer_no_id and customer_name_col:
+    if prefer_name_table and preferred_name_col:
         for t_key in list(filtered_allowed.keys()):
-            if t_key.lower() == "customers":
-                if customer_name_col not in filtered_allowed[t_key]:
-                    filtered_allowed[t_key].append(customer_name_col)
+            if t_key.lower() == prefer_name_table:
+                if preferred_name_col not in filtered_allowed[t_key]:
+                    filtered_allowed[t_key].append(preferred_name_col)
 
     # -----------------------------
     # 10) Context build
