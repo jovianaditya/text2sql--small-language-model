@@ -63,6 +63,13 @@ from .config import (
     RETRIEVAL_DENSE_K_FLOOR,
     RETRIEVAL_SPARSE_FILENAME_MARKER,
     RETRIEVAL_FK_PATH_MAX_DEPTH,
+    RETRIEVAL_ID_ROLE_TAGS,
+    RETRIEVAL_METRIC_ROLE_TAGS,
+    RETRIEVAL_NUMERIC_TYPE_HINTS,
+    RETRIEVAL_TABLE_SCORING_MATH_KEYWORDS,
+    RETRIEVAL_NAME_ONLY_ID_PATTERN,
+    RETRIEVAL_NAME_ONLY_NAME_PATTERN,
+    RETRIEVAL_DEBUG_FOCUS_COLUMNS,
 )
 from .state import RAGState
 from .chroma_embedding import build_vector_store
@@ -190,7 +197,7 @@ def _is_column_relevant_to_query(
 
     # === RULE 1: Always include primary keys and identifying columns ===
     roles = _parse_str_or_list_lower(metadata.get("tags_role") or metadata.get("roles") or [])
-    if any(r in ["id", "key", "primary", "identifier"] for r in roles):
+    if any(r in RETRIEVAL_ID_ROLE_TAGS for r in roles):
         return True
 
     # === RULE 2: Always include if explicitly mentioned in question ===
@@ -222,11 +229,11 @@ def _is_column_relevant_to_query(
     if qtype == "aggregate" and "count" in q_l:
         # Count queries only need: PK, name columns, and explicitly mentioned columns
         # Exclude: quantityInStock, buyPrice, etc. unless mentioned
-        is_metric = any(r in ["metric", "measure", "amount", "quantity"] for r in roles)
+        is_metric = any(r in RETRIEVAL_METRIC_ROLE_TAGS for r in roles)
 
         # Check if column is a numeric measure
         datatype = (metadata.get("datatype") or "").lower()
-        is_numeric = any(t in datatype for t in ["int", "decimal", "numeric", "float", "double"])
+        is_numeric = any(t in datatype for t in RETRIEVAL_NUMERIC_TYPE_HINTS)
 
         # Numeric column patterns (generic, not table-specific)
         numeric_patterns = RETRIEVAL_NUMERIC_PATTERN_KEYWORDS
@@ -247,12 +254,12 @@ def _is_column_relevant_to_query(
 
             if not mentioned_in_question:
                 # DEBUG: Show why column is being excluded
-                if RETRIEVE_DEBUG and col_lower in ["quantityinstock", "buyprice", "msrp"]:
+                if RETRIEVE_DEBUG and col_lower in RETRIEVAL_DEBUG_FOCUS_COLUMNS:
                     print(f"   [FILTER-RULE3] Excluding {table}.{column}: is_metric={is_metric}, is_numeric={is_numeric}, has_pattern={has_numeric_pattern}")
                 return False
             else:
                 # DEBUG: Show why column is being kept
-                if RETRIEVE_DEBUG and col_lower in ["quantityinstock", "buyprice", "msrp"]:
+                if RETRIEVE_DEBUG and col_lower in RETRIEVAL_DEBUG_FOCUS_COLUMNS:
                     print(f"   [FILTER-RULE3] KEPT {table}.{column}: column name explicitly mentioned")
 
     # === RULE 4: For aggregate queries (SUM/AVG), include relevant metric columns ===
@@ -877,8 +884,7 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
     mentions_map = {tbl: _is_mentioned(q_l, tbl) for tbl in all_tables}
 
     # Detect aggregate context - indicates we need detail tables
-    math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata',
-                     'percentage', 'percent', 'ratio', 'proportion', 'persentase', 'rasio']
+    math_keywords = RETRIEVAL_TABLE_SCORING_MATH_KEYWORDS
     has_aggregation = any(kw in q_l for kw in math_keywords)
 
     # Check if we need numeric columns - based on RETRIEVED columns metadata (not hardcoded keywords)
@@ -1174,8 +1180,8 @@ def _wants_name_only_for_table(question: str, table: str) -> bool:
 
     # Avoid treating "number of" as ID intent.
     q_clean = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
-    asks_id_like = bool(re.search(r"\b(ids?|numbers?|codes?|identifier|nomor|kode|no)\b", q_clean))
-    asks_name_like = bool(re.search(r"\b(name|names|nama)\b", q_clean))
+    asks_id_like = bool(re.search(RETRIEVAL_NAME_ONLY_ID_PATTERN, q_clean))
+    asks_name_like = bool(re.search(RETRIEVAL_NAME_ONLY_NAME_PATTERN, q_clean))
     return (asks_name_like or not asks_id_like) and not asks_id_like
 
 def _detect_primary_entity_table(question: str) -> Optional[str]:
@@ -1479,7 +1485,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                 if RETRIEVE_DEBUG:
                     print(f"   [FILTER-ALLOWED] Excluding {t}.{c} from allowed identifiers")
                 continue
-            elif RETRIEVE_DEBUG and c.lower() in ["quantityinstock", "buyprice", "msrp"]:
+            elif RETRIEVE_DEBUG and c.lower() in RETRIEVAL_DEBUG_FOCUS_COLUMNS:
                 # Debug: show why numeric columns passed the filter
                 print(f"   [FILTER-ALLOWED] KEPT {t}.{c} - passed relevance check")
 

@@ -40,6 +40,16 @@ from .config import (
     AGENT_ROUTER_EXPLICIT_SORT_TERMS,
     AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS,
     AGENT_SQL_RESERVED_EXTRA_TOKENS,
+    AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS,
+    AGENT_COLUMN_STOP_TOKENS,
+    AGENT_ROUTER_IGNORE_PATTERNS,
+    AGENT_ROUTER_WEAK_EVIDENCE_TAGS,
+    AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH,
+    AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE,
+    AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT,
+    AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS,
+    AGENT_ROUTER_TABLE_ATTRIBUTE_PATTERNS,
+    AGENT_ROUTER_AGGREGATE_CONTEXT_PATTERNS,
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -123,6 +133,21 @@ def _table_entity_pattern(table: str) -> str:
 
     escaped = [re.escape(v).replace(r"\ ", r"\s+") for v in variants]
     return "(?:" + "|".join(escaped) + ")"
+
+
+def _instantiate_entity_patterns(templates: List[str], entity_pattern: str) -> List[str]:
+    """
+    Replace entity placeholders in regex templates.
+    Supports both "__ENTITY__" and "{entity}" placeholders for env overrides.
+    """
+    patterns: List[str] = []
+    for tpl in templates or []:
+        raw = str(tpl or "").strip()
+        if not raw:
+            continue
+        pat = raw.replace("__ENTITY__", entity_pattern).replace("{entity}", entity_pattern)
+        patterns.append(pat)
+    return patterns
 
 def _question_mentions_schema_entity(question_lower: str) -> bool:
     """
@@ -480,13 +505,7 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
 
     # Guardrail: avoid false positives like customerName matching just "customer id".
     # For semantic suffix columns, require suffix intent in question unless full phrase matched.
-    semantic_suffix_keywords = {
-        "name": {"name", "names", "nama"},
-        "date": {"date", "dates", "tanggal", "tgl", "time", "waktu"},
-        "number": {"number", "numbers", "id", "ids", "code", "codes", "nomor", "kode", "no"},
-        "code": {"code", "codes", "id", "ids", "number", "numbers", "nomor", "kode", "no"},
-        "id": {"id", "ids", "number", "numbers", "code", "codes", "nomor", "kode", "no"},
-    }
+    semantic_suffix_keywords = AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS
     col_tokens = re.findall(r"[a-z0-9]+", spaced)
     if len(col_tokens) >= 2:
         suffix = col_tokens[-1]
@@ -500,12 +519,7 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
                 return False
 
     # Token-level fallback (skip weak generic tokens)
-    stop_tokens = {
-        "id", "ids", "code", "codes", "number", "numbers",
-        "name", "names", "date", "dates", "line", "lines",
-        "type", "types", "status", "each", "table", "order",
-        "quantity", "price", "amount", "total", "average", "value"
-    }
+    stop_tokens = AGENT_COLUMN_STOP_TOKENS
     for token in re.findall(r"[a-z0-9]+", spaced):
         if len(token) < 4 or token in stop_tokens:
             continue
@@ -566,16 +580,7 @@ def router_agent(state: RAGState) -> RAGState:
         return cols
     
     # [FIX] Definisi Pattern yang HARUS DIBUANG sebelum deteksi tabel
-    ignore_patterns = {
-        'order': [
-            r"\border(ed|s)?\s+by\b",
-            r"\b(descending|ascending)\s+order\b",
-            r"\bin\s+order\b"
-        ],
-        'group': [r"\bgroup\s+by\b"],
-        'sort':  [r"\bsort(ed)?\s+by\b"],
-        'rank':  [r"\brank\s+over\b"]
-    }
+    ignore_patterns = AGENT_ROUTER_IGNORE_PATTERNS
     
     relevant_tables = []
     for tbl in whitelisted_tables:
@@ -865,37 +870,31 @@ def router_agent(state: RAGState) -> RAGState:
 
         # Check 2: "For each X" patterns
         # Handle both plural and singular, with optional words in between (e.g., "for each such customer")
-        for_each_patterns = [
-            rf"\bfor\s+each\s+(?:\w+\s+)?{table_entity_pattern}\b",
-            rf"\bper\s+(?:\w+\s+)?{table_entity_pattern}\b",
-            rf"\beach\s+(?:\w+\s+)?{table_entity_pattern}\b",
-        ]
+        for_each_patterns = _instantiate_entity_patterns(
+            AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS,
+            table_entity_pattern,
+        )
         if any(re.search(p, question_lower) for p in for_each_patterns):
-            evidence.append("'for each' pattern")
+            evidence.append(AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH)
 
         # Check 3: Table name + attribute patterns
-        table_patterns = [
-            rf"\b{table_entity_pattern}\b\s+(name|number|id|code)\b",
-        ]
+        table_patterns = _instantiate_entity_patterns(
+            AGENT_ROUTER_TABLE_ATTRIBUTE_PATTERNS,
+            table_entity_pattern,
+        )
         if any(re.search(p, question_lower) for p in table_patterns):
-            evidence.append("table+attribute pattern")
+            evidence.append(AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE)
 
         # Check 4: Aggregate keywords with table mention
         if has_math or has_group_word:
             # Patterns like "total orders", "count of customers", "number of orders", etc.
             # More flexible: allows extra words after table name (e.g., "orders placed")
-            aggregate_patterns = [
-                # "count of orders", "total of orders", "avg customers"
-                rf"\b(total|sum|count|average|avg)\s+(of\s+)?{table_entity_pattern}\b",
-                # "count of orders placed" (with extra words)
-                rf"\b(total|sum|count|average|avg)\s+(of\s+)?{table_entity_pattern}\s+\w+",
-                # "number of orders" (explicit aggregate phrase only)
-                rf"\bnumber\s+of\s+{table_entity_pattern}\b",
-                # "orders total", "customers count"
-                rf"\b{table_entity_pattern}\b\s+(total|sum|count|average)\b",
-            ]
+            aggregate_patterns = _instantiate_entity_patterns(
+                AGENT_ROUTER_AGGREGATE_CONTEXT_PATTERNS,
+                table_entity_pattern,
+            )
             if any(re.search(p, question_lower) for p in aggregate_patterns):
-                evidence.append("aggregate context")
+                evidence.append(AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT)
 
         if evidence:
             evidence_tables.add(tbl_lower)
@@ -914,7 +913,7 @@ def router_agent(state: RAGState) -> RAGState:
         # Check if evidence is ONLY weak patterns
         # Strong evidence: non-FK column mentions, aggregate context
         # Weak evidence: 'for each' pattern, table+attribute pattern, FK column mentions
-        weak_evidence = {"'for each' pattern", "table+attribute pattern"}
+        weak_evidence = AGENT_ROUTER_WEAK_EVIDENCE_TAGS
         # Also check for FK column evidence (format: "FK column 'X'")
         is_only_weak = all(e in weak_evidence or e.startswith("FK column") for e in evidence_list)
 
@@ -1195,14 +1194,13 @@ def router_agent(state: RAGState) -> RAGState:
         for tbl in relevant_tables:
             tbl_lower = tbl.lower()
             table_entity_pattern = _table_entity_pattern(tbl_lower)
-            for_each_patterns = [
-                rf"\bfor\s+each\s+(?:\w+\s+)?{table_entity_pattern}\b",
-                rf"\bper\s+(?:\w+\s+)?{table_entity_pattern}\b",
-                rf"\beach\s+(?:\w+\s+)?{table_entity_pattern}\b",
-            ]
+            for_each_patterns = _instantiate_entity_patterns(
+                AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS,
+                table_entity_pattern,
+            )
             if any(re.search(p, question_lower) for p in for_each_patterns):
                 primary_table = tbl
-                primary_reason = "'for each' pattern"
+                primary_reason = AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH
                 break
 
         # Rule 2: Not yet found, check "show X from Y" / "X in Y" patterns

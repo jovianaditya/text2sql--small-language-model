@@ -386,3 +386,138 @@ AGENT_SQL_RESERVED_EXTRA_TOKENS = set(
         ],
     )
 )
+
+# Additional retrieval heuristics (low-risk literal centralization)
+RETRIEVAL_ID_ROLE_TAGS = set(
+    _env_json_list(
+        "RETRIEVAL_ID_ROLE_TAGS",
+        ["id", "key", "primary", "identifier"],
+    )
+)
+
+RETRIEVAL_METRIC_ROLE_TAGS = set(
+    _env_json_list(
+        "RETRIEVAL_METRIC_ROLE_TAGS",
+        ["metric", "measure", "amount", "quantity"],
+    )
+)
+
+RETRIEVAL_NUMERIC_TYPE_HINTS = set(
+    _env_json_list(
+        "RETRIEVAL_NUMERIC_TYPE_HINTS",
+        ["int", "decimal", "numeric", "float", "double"],
+    )
+)
+
+RETRIEVAL_TABLE_SCORING_MATH_KEYWORDS = _env_json_list(
+    "RETRIEVAL_TABLE_SCORING_MATH_KEYWORDS",
+    [
+        "sum", "count", "total", "avg", "average", "number of", "jumlah", "rata-rata",
+        "percentage", "percent", "ratio", "proportion", "persentase", "rasio",
+    ],
+)
+
+RETRIEVAL_NAME_ONLY_ID_PATTERN = os.getenv(
+    "RETRIEVAL_NAME_ONLY_ID_PATTERN",
+    r"\b(ids?|numbers?|codes?|identifier|nomor|kode|no)\b",
+).strip()
+
+RETRIEVAL_NAME_ONLY_NAME_PATTERN = os.getenv(
+    "RETRIEVAL_NAME_ONLY_NAME_PATTERN",
+    r"\b(name|names|nama)\b",
+).strip()
+
+RETRIEVAL_DEBUG_FOCUS_COLUMNS = set(
+    _env_json_list(
+        "RETRIEVAL_DEBUG_FOCUS_COLUMNS",
+        ["quantityinstock", "buyprice", "msrp"],
+    )
+)
+
+# Additional agent heuristics (low-risk literal centralization)
+AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS = {
+    "name": set(_env_json_list("AGENT_COLUMN_SUFFIX_NAME_TERMS", ["name", "names", "nama"])),
+    "date": set(_env_json_list("AGENT_COLUMN_SUFFIX_DATE_TERMS", ["date", "dates", "tanggal", "tgl", "time", "waktu"])),
+    "number": set(_env_json_list("AGENT_COLUMN_SUFFIX_NUMBER_TERMS", ["number", "numbers", "id", "ids", "code", "codes", "nomor", "kode", "no"])),
+    "code": set(_env_json_list("AGENT_COLUMN_SUFFIX_CODE_TERMS", ["code", "codes", "id", "ids", "number", "numbers", "nomor", "kode", "no"])),
+    "id": set(_env_json_list("AGENT_COLUMN_SUFFIX_ID_TERMS", ["id", "ids", "number", "numbers", "code", "codes", "nomor", "kode", "no"])),
+}
+
+AGENT_COLUMN_STOP_TOKENS = set(
+    _env_json_list(
+        "AGENT_COLUMN_STOP_TOKENS",
+        [
+            "id", "ids", "code", "codes", "number", "numbers",
+            "name", "names", "date", "dates", "line", "lines",
+            "type", "types", "status", "each", "table", "order",
+            "quantity", "price", "amount", "total", "average", "value",
+        ],
+    )
+)
+
+AGENT_ROUTER_IGNORE_PATTERNS = {
+    "order": _env_json_list(
+        "AGENT_ROUTER_IGNORE_PATTERNS_ORDER",
+        [r"\border(ed|s)?\s+by\b", r"\b(descending|ascending)\s+order\b", r"\bin\s+order\b"],
+    ),
+    "group": _env_json_list(
+        "AGENT_ROUTER_IGNORE_PATTERNS_GROUP",
+        [r"\bgroup\s+by\b"],
+    ),
+    "sort": _env_json_list(
+        "AGENT_ROUTER_IGNORE_PATTERNS_SORT",
+        [r"\bsort(ed)?\s+by\b"],
+    ),
+    "rank": _env_json_list(
+        "AGENT_ROUTER_IGNORE_PATTERNS_RANK",
+        [r"\brank\s+over\b"],
+    ),
+}
+
+AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH = os.getenv(
+    "AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH",
+    "'for each' pattern",
+).strip()
+
+AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE = os.getenv(
+    "AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE",
+    "table+attribute pattern",
+).strip()
+
+AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT = os.getenv(
+    "AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT",
+    "aggregate context",
+).strip()
+
+AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS = _env_json_list(
+    "AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS",
+    [
+        r"\bfor\s+each\s+(?:\w+\s+)?__ENTITY__\b",
+        r"\bper\s+(?:\w+\s+)?__ENTITY__\b",
+        r"\beach\s+(?:\w+\s+)?__ENTITY__\b",
+    ],
+)
+
+AGENT_ROUTER_TABLE_ATTRIBUTE_PATTERNS = _env_json_list(
+    "AGENT_ROUTER_TABLE_ATTRIBUTE_PATTERNS",
+    [
+        r"\b__ENTITY__\b\s+(name|number|id|code)\b",
+    ],
+)
+
+AGENT_ROUTER_AGGREGATE_CONTEXT_PATTERNS = _env_json_list(
+    "AGENT_ROUTER_AGGREGATE_CONTEXT_PATTERNS",
+    [
+        r"\b(total|sum|count|average|avg)\s+(of\s+)?__ENTITY__\b",
+        r"\b(total|sum|count|average|avg)\s+(of\s+)?__ENTITY__\s+\w+",
+        r"\bnumber\s+of\s+__ENTITY__\b",
+        r"\b__ENTITY__\b\s+(total|sum|count|average)\b",
+    ],
+)
+
+AGENT_ROUTER_WEAK_EVIDENCE_TAGS = set(
+    _env_json_list(
+        "AGENT_ROUTER_WEAK_EVIDENCE_TAGS",
+        [AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH, AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE],
+    )
+)
