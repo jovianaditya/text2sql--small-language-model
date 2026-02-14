@@ -47,6 +47,22 @@ from .config import (
     RETRIEVAL_EXTRA_STOPWORDS,
     RETRIEVAL_GENERIC_MENTION_TERMS,
     RETRIEVAL_JOIN_SIGNALS,
+    RETRIEVAL_NUMERIC_SQL_TYPES,
+    RETRIEVAL_BM25_STEM_EXCEPTIONS_BASE,
+    RETRIEVAL_NAME_QUERY_TERMS,
+    RETRIEVAL_ID_LIKE_QUERY_TERMS,
+    RETRIEVAL_NAME_REQUEST_TERMS,
+    RETRIEVAL_CONTACT_NAME_TERMS,
+    RETRIEVAL_ID_BOOST_QUERY_TERMS,
+    RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS,
+    RETRIEVAL_NUMERIC_PATTERN_KEYWORDS,
+    RETRIEVAL_NUMERIC_EXCLUDE_COLUMN_KEYWORDS,
+    RETRIEVAL_DESC_GENERIC_TERMS,
+    RETRIEVAL_AGGREGATE_QUERY_TERMS,
+    RETRIEVAL_BASE_K_FLOOR,
+    RETRIEVAL_DENSE_K_FLOOR,
+    RETRIEVAL_SPARSE_FILENAME_MARKER,
+    RETRIEVAL_FK_PATH_MAX_DEPTH,
 )
 from .state import RAGState
 from .chroma_embedding import build_vector_store
@@ -196,7 +212,7 @@ def _is_column_relevant_to_query(
     # Only match if description words actually appear as whole words in question
     if desc_words.intersection(q_words):
         # But exclude generic terms that could cause false positives
-        generic_terms = {"number", "total", "each", "per", "for", "the", "a", "an"}
+        generic_terms = RETRIEVAL_DESC_GENERIC_TERMS
         # Only match if there's a specific term match (not just generic terms)
         specific_matches = desc_words.intersection(q_words) - generic_terms
         if specific_matches:
@@ -213,7 +229,7 @@ def _is_column_relevant_to_query(
         is_numeric = any(t in datatype for t in ["int", "decimal", "numeric", "float", "double"])
 
         # Numeric column patterns (generic, not table-specific)
-        numeric_patterns = ["quantity", "stock", "amount", "price", "cost", "value"]
+        numeric_patterns = RETRIEVAL_NUMERIC_PATTERN_KEYWORDS
 
         # Check if column name contains any numeric pattern
         has_numeric_pattern = any(p in col_lower for p in numeric_patterns)
@@ -240,7 +256,7 @@ def _is_column_relevant_to_query(
                     print(f"   [FILTER-RULE3] KEPT {table}.{column}: column name explicitly mentioned")
 
     # === RULE 4: For aggregate queries (SUM/AVG), include relevant metric columns ===
-    if qtype == "aggregate" and any(kw in q_l for kw in ["sum", "avg", "average", "total"]):
+    if qtype == "aggregate" and any(kw in q_l for kw in RETRIEVAL_AGGREGATE_QUERY_TERMS):
         # These queries need numeric columns, but only relevant ones
         # Default: include (will be filtered by relevance scoring)
         return True
@@ -388,11 +404,7 @@ def _build_cards(
 _BM25_CACHE: dict[str, Any] = {}
 _PHRASE_TO_COLUMN_CACHE: Optional[Dict[str, str]] = None
 
-_NUMERIC_SQL_TYPES = {
-    'int', 'integer', 'tinyint', 'smallint', 'mediumint', 'bigint',
-    'decimal', 'numeric', 'float', 'double', 'double precision',
-    'real', 'money', 'smallmoney', 'bit'
-}
+_NUMERIC_SQL_TYPES = set(RETRIEVAL_NUMERIC_SQL_TYPES)
 
 # Stopwords for BM25 tokenization
 _STOPWORDS = (set(ENGLISH_STOP_WORDS) - {"name", "names"}) | set(RETRIEVAL_EXTRA_STOPWORDS)
@@ -489,7 +501,7 @@ def _tokenize_bm25_query(q: str) -> List[str]:
         pass
 
     # Prevent over-stemming for generic nouns and schema entity words.
-    STEM_EXCEPTIONS = {"status", "address", "business", "sales"} | schema_tokens
+    STEM_EXCEPTIONS = set(RETRIEVAL_BM25_STEM_EXCEPTIONS_BASE) | schema_tokens
 
     for t in raw_tokens:
         if not t:
@@ -744,7 +756,7 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
     col_lower = col_name.lower()
 
     # Generic name boosting (table-agnostic)
-    if any(k in q_l for k in ["name"]):
+    if any(k in q_l for k in RETRIEVAL_NAME_QUERY_TERMS):
         if any(r == "name" or "name" in r for r in roles) or "name" in col_lower:
             bonus += NAME_QUERY_BONUS
 
@@ -753,14 +765,11 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
 
     if table_mentioned:
         # Detect query intent: ID vs Name
-        asks_id_like = any(k in q_l for k in [" id", "id ", " id,", "identifier", "code", "number"])
-        asks_for_names = any(k in q_l for k in ["name", "names", "nama"])
+        asks_id_like = any(k in q_l for k in RETRIEVAL_ID_LIKE_QUERY_TERMS)
+        asks_for_names = any(k in q_l for k in RETRIEVAL_NAME_REQUEST_TERMS)
 
         # Detect if asking for "contact" specifically (for tables with contact columns)
-        asks_contact_explicitly = any(k in q_l for k in [
-            "contact name", "contact first", "contact last",
-            "first name", "last name", "person name"
-        ])
+        asks_contact_explicitly = any(k in q_l for k in RETRIEVAL_CONTACT_NAME_TERMS)
 
         # Dynamic column name pattern: {table}name (e.g., customername, productname)
         # Handle both concatenated and underscored forms
@@ -815,7 +824,7 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
                     bonus += COL_BOOST_OTHER_ID_PENALTY
 
     # Generic ID boosting (table-agnostic, already dynamic)
-    if any(k in q_l for k in [" id ", "id ", " id,", "identifier", "code"]):
+    if any(k in q_l for k in RETRIEVAL_ID_BOOST_QUERY_TERMS):
         if (any(r == "id" or "id" in r for r in roles) or "number" in col_lower or col_lower.endswith("id")):
             bonus += ID_QUERY_BONUS
 
@@ -957,16 +966,16 @@ def _check_needs_numeric_data_from_retrieved(reranked: List[Dict[str, Any]]) -> 
                 col = _meta_column(md).lower()
                 # Exclude primary keys and foreign keys (IDs) as they're not used for calculations
                 desc = str(md.get("description") or "").lower()
-                if not any(kw in col for kw in ['id', 'code', 'key']):
+                if not any(kw in col for kw in RETRIEVAL_NUMERIC_EXCLUDE_COLUMN_KEYWORDS):
                     return True
                 # Check description for calculation-related terms
-                if any(kw in desc for kw in ['quantity', 'price', 'amount', 'total', 'cost', 'value', 'each', 'rate']):
+                if any(kw in desc for kw in RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS):
                     return True
 
         # Fallback: Check column name pattern for numeric-sounding columns
         # (only if datatype check above didn't trigger)
         col = _meta_column(md).lower()
-        if any(kw in col for kw in ['quantity', 'price', 'amount', 'total', 'value', 'cost', 'each', 'rate']):
+        if any(kw in col for kw in RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS):
             return True
 
     return False
@@ -1046,10 +1055,10 @@ def _infer_bridge_tables(
                 is_numeric = base_type in _NUMERIC_SQL_TYPES
             else:
                 # Fallback: Check column name pattern
-                is_numeric = any(kw in col_lower for kw in ['quantity', 'price', 'amount', 'value', 'total', 'cost', 'each', 'rate'])
+                is_numeric = any(kw in col_lower for kw in RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS)
 
             # Exclude ID columns from numeric consideration
-            if is_numeric and not any(kw in col_lower for kw in ['id', 'code', 'key']):
+            if is_numeric and not any(kw in col_lower for kw in RETRIEVAL_NUMERIC_EXCLUDE_COLUMN_KEYWORDS):
                 tables_with_numeric_cols.add(tbl.lower())
 
     # Expand selection to include tables with numeric columns
@@ -1078,7 +1087,7 @@ def _find_fk_path(
     end: str,
     fk_graph: Dict[str, Dict[str, str]],
     allowed: Dict[str, List[str]],
-    max_depth: int = 3,
+    max_depth: int = RETRIEVAL_FK_PATH_MAX_DEPTH,
 ) -> Optional[List[str]]:
     """
     Find FK path between two tables using BFS.
@@ -1239,7 +1248,7 @@ def retrieve_node(state: RAGState) -> RAGState:
 
     # --- [MODIFIED 2] Filter Paths: Hanya ambil file yang namanya mengandung "_sparse" ---
     all_paths = state.get("jsonl_paths", [])
-    sparse_target_paths = [p for p in all_paths if "_sparse" in str(p)]
+    sparse_target_paths = [p for p in all_paths if RETRIEVAL_SPARSE_FILENAME_MARKER in str(p)]
     
     # Fallback: Jika tidak ada file _sparse, pakai semua (backward compat)
     if not sparse_target_paths:
@@ -1290,10 +1299,10 @@ def retrieve_node(state: RAGState) -> RAGState:
         for m in sparse_metas if isinstance(m, dict)
     ) if preferred_name_col else False
 
-    base_k = max(12, TOP_K)
+    base_k = max(RETRIEVAL_BASE_K_FLOOR, TOP_K)
     dense_k = base_k
     if prefer_name_table and preferred_name_col and not sparse_has_preferred_name:
-        dense_k = max(28, base_k)
+        dense_k = max(RETRIEVAL_DENSE_K_FLOOR, base_k)
 
     # -----------------------------
     # 2) Dense query

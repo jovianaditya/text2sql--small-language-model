@@ -29,6 +29,17 @@ from .config import (
     AGENT_GIBBERISH_KEYBOARD_PATTERNS,
     AGENT_MISSING_COL_SUFFIX_SYNONYMS,
     AGENT_REGEX_TRIGGERS,
+    AGENT_ROUTER_MATH_KEYWORDS,
+    AGENT_ROUTER_GROUP_INDICATORS,
+    AGENT_ROUTER_VALUE_RANK_TERMS,
+    AGENT_ROUTER_TIME_RANK_TERMS,
+    AGENT_ROUTER_EXPLICIT_RANK_PATTERNS,
+    AGENT_ROUTER_ORDINAL_WORDS,
+    AGENT_ROUTER_ORDINAL_TARGET_TERMS,
+    AGENT_ROUTER_WITHIN_SAME_PATTERN,
+    AGENT_ROUTER_EXPLICIT_SORT_TERMS,
+    AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS,
+    AGENT_SQL_RESERVED_EXTRA_TOKENS,
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -677,11 +688,10 @@ def router_agent(state: RAGState) -> RAGState:
     question_lower = question.lower()
     
     # Detect aggregation context
-    math_keywords = ['sum', 'count', 'total', 'avg', 'average', 'number of', 'jumlah', 'rata-rata', 
-                     'percentage', 'percent', 'ratio', 'proportion', 'persentase', 'rasio']
+    math_keywords = AGENT_ROUTER_MATH_KEYWORDS
     has_math = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in math_keywords)
     
-    group_indicators = ["each", "per", "every", "masing-masing", "setiap", "for each", "classify"]
+    group_indicators = AGENT_ROUTER_GROUP_INDICATORS
     has_group_word = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in group_indicators)
     
     is_aggregation = has_math or has_group_word
@@ -1124,9 +1134,8 @@ def router_agent(state: RAGState) -> RAGState:
     # ═══════════════════════════════════════════════════════════════════
     # Note: "rank/ranking" NOT included here - explicit ranking with RANK() OVER 
     # is simpler than winner-row patterns (highest/lowest/top) which need subqueries
-    value_ranks = ["highest", "lowest", "top", "bottom", "most", "least", "largest", "smallest", 
-                   "terbesar", "terkecil", "paling", "tertinggi", "terendah"]
-    time_ranks = ["latest", "earliest", "newest", "oldest", "terbaru", "terlama"]
+    value_ranks = AGENT_ROUTER_VALUE_RANK_TERMS
+    time_ranks = AGENT_ROUTER_TIME_RANK_TERMS
     is_ranking_value = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in value_ranks)
     is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in time_ranks)
     is_ranking = is_ranking_value or is_ranking_time
@@ -1134,33 +1143,25 @@ def router_agent(state: RAGState) -> RAGState:
     # EXPLICIT RANK FUNCTION DETECTION: "a rank of X" / "rank employees" / "ranking"
     # This means user explicitly wants RANK() OVER window function
     # E.g., "return a rank of employees within each job title"
-    explicit_rank_patterns = [
-        r"\ba\s+rank\s+of\b",           # "a rank of employees"
-        r"\brank\s+\w+\s+by\b",          # "rank products by"
-        r"\branking\s+of\b",             # "ranking of X"
-        r"\breturn.*\brank\b.*\bwithin\b",
-        r"\brank\s+.*\bbased\s+on\b",
-        r"\brank\s+the\s+\w+\b",         # "rank the products"
-        r"\branked\s+by\b",              # "ranked by sales"
-    ]
+    explicit_rank_patterns = AGENT_ROUTER_EXPLICIT_RANK_PATTERNS
     is_explicit_rank_function = any(re.search(pat, question_lower) for pat in explicit_rank_patterns)
     
     # ORDINAL RANKING DETECTION: "second highest", "third largest", "2nd lowest", etc.
     # These patterns ALWAYS need ROW_NUMBER() with rn = N, much more complex than simple MAX/MIN
-    ordinal_words = ["second", "third", "fourth", "fifth", "2nd", "3rd", "4th", "5th",
-                     "kedua", "ketiga", "keempat", "kelima"]
-    ordinal_pattern = rf"\b({'|'.join(ordinal_words)})\s+(highest|lowest|largest|smallest|biggest|top|bottom|best|worst|most|least|terbesar|terkecil|tertinggi|terendah)\b"
+    ordinal_words = AGENT_ROUTER_ORDINAL_WORDS
+    ordinal_targets = AGENT_ROUTER_ORDINAL_TARGET_TERMS
+    ordinal_pattern = rf"\b({'|'.join(re.escape(w) for w in ordinal_words)})\s+({'|'.join(re.escape(w) for w in ordinal_targets)})\b"
     is_ordinal_ranking = bool(re.search(ordinal_pattern, question_lower))
     
     # WINDOW AGGREGATE DETECTION: "within the same X" / "in the same X" pattern
     # This pattern requires COUNT(*) OVER (PARTITION BY X), NOT GROUP BY
     # E.g., "total employees within the same office" → PARTITION BY officeCode
-    within_same_pattern = r"\b(within|in)\s+the\s+same\s+(\w+)"
+    within_same_pattern = AGENT_ROUTER_WITHIN_SAME_PATTERN
     within_same_match = re.search(within_same_pattern, question_lower)
     is_window_aggregate = bool(within_same_match)
     partition_hint = within_same_match.group(2) if within_same_match else None
     
-    explicit_sort = ["sort by", "ordered by", "sorted by", "order by", "sorted from"]
+    explicit_sort = AGENT_ROUTER_EXPLICIT_SORT_TERMS
     is_sorting = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in explicit_sort) or is_ranking
     
     is_by_logic = ("by " in question_lower and not any(re.search(rf"\b{re.escape(s)}\b", question_lower) for s in explicit_sort) and (has_math or is_ranking))
@@ -1298,8 +1299,7 @@ def router_agent(state: RAGState) -> RAGState:
     has_exclusion = False
     
     # Pattern 1: Cross-table exclusion keywords (always need 7B)
-    cross_table_exclusion = ["never ordered", "never paid", "without any", "have no", "has no", 
-                             "tidak pernah", "belum pernah", "tidak ada", "yang tidak punya"]
+    cross_table_exclusion = AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS
     if any(kw in question_lower for kw in cross_table_exclusion):
         has_exclusion = True
     
@@ -1594,14 +1594,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # Remove placeholder tokens
     sql_tokens.discard("_tbl_")    
-    reserved = _SQL_KEYWORDS.union({
-        'year', 'month', 'day', 'date', 'date_format', 'now', 'curdate',
-        'concat', 'group_concat', 'coalesce', 'ifnull', 'sum', 'count', 'avg',
-        't', 'limit', 'offset', 'as', 'regexp_like', 'str_to_date',
-        'case', 'when', 'then', 'else', 'end',
-        'union', 'all', 'distinct', 'values', 'exists', 'having',
-        'substr',
-    })
+    reserved = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS))
     
     defined_aliases = set()
     defined_aliases.update(re.findall(r"\bAS\s+([a-zA-Z0-9_]+)\b", sql_up, re.IGNORECASE))

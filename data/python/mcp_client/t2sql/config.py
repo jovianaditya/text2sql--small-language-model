@@ -218,3 +218,171 @@ RETRIEVAL_JOIN_SIGNALS = _env_json_list(
         "for each", "per ", "setiap",
     ],
 )
+
+# Additional low-risk retrieval literals (externalized from retrieval.py)
+RETRIEVAL_NUMERIC_SQL_TYPES = set(
+    _env_json_list(
+        "RETRIEVAL_NUMERIC_SQL_TYPES",
+        [
+            "int", "integer", "tinyint", "smallint", "mediumint", "bigint",
+            "decimal", "numeric", "float", "double", "double precision",
+            "real", "money", "smallmoney", "bit",
+        ],
+    )
+)
+
+RETRIEVAL_BM25_STEM_EXCEPTIONS_BASE = set(
+    _env_json_list(
+        "RETRIEVAL_BM25_STEM_EXCEPTIONS_BASE",
+        ["status", "address", "business", "sales"],
+    )
+)
+
+RETRIEVAL_NAME_QUERY_TERMS = _env_json_list(
+    "RETRIEVAL_NAME_QUERY_TERMS",
+    ["name"],
+)
+
+RETRIEVAL_ID_LIKE_QUERY_TERMS = _env_json_list(
+    "RETRIEVAL_ID_LIKE_QUERY_TERMS",
+    [" id", "id ", " id,", "identifier", "code", "number"],
+)
+
+RETRIEVAL_NAME_REQUEST_TERMS = _env_json_list(
+    "RETRIEVAL_NAME_REQUEST_TERMS",
+    ["name", "names", "nama"],
+)
+
+RETRIEVAL_CONTACT_NAME_TERMS = _env_json_list(
+    "RETRIEVAL_CONTACT_NAME_TERMS",
+    [
+        "contact name", "contact first", "contact last",
+        "first name", "last name", "person name",
+    ],
+)
+
+RETRIEVAL_ID_BOOST_QUERY_TERMS = _env_json_list(
+    "RETRIEVAL_ID_BOOST_QUERY_TERMS",
+    [" id ", "id ", " id,", "identifier", "code"],
+)
+
+RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS = set(
+    _env_json_list(
+        "RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS",
+        ["quantity", "price", "amount", "total", "cost", "value", "each", "rate"],
+    )
+)
+
+RETRIEVAL_NUMERIC_PATTERN_KEYWORDS = set(
+    _env_json_list(
+        "RETRIEVAL_NUMERIC_PATTERN_KEYWORDS",
+        ["quantity", "stock", "amount", "price", "cost", "value"],
+    )
+)
+
+RETRIEVAL_NUMERIC_EXCLUDE_COLUMN_KEYWORDS = set(
+    _env_json_list(
+        "RETRIEVAL_NUMERIC_EXCLUDE_COLUMN_KEYWORDS",
+        ["id", "code", "key"],
+    )
+)
+
+RETRIEVAL_DESC_GENERIC_TERMS = set(
+    _env_json_list(
+        "RETRIEVAL_DESC_GENERIC_TERMS",
+        ["number", "total", "each", "per", "for", "the", "a", "an"],
+    )
+)
+
+RETRIEVAL_AGGREGATE_QUERY_TERMS = set(
+    _env_json_list(
+        "RETRIEVAL_AGGREGATE_QUERY_TERMS",
+        ["sum", "avg", "average", "total"],
+    )
+)
+
+RETRIEVAL_BASE_K_FLOOR = int(os.getenv("RETRIEVAL_BASE_K_FLOOR", "12"))
+RETRIEVAL_DENSE_K_FLOOR = int(os.getenv("RETRIEVAL_DENSE_K_FLOOR", "28"))
+RETRIEVAL_SPARSE_FILENAME_MARKER = os.getenv("RETRIEVAL_SPARSE_FILENAME_MARKER", "_sparse").strip()
+RETRIEVAL_FK_PATH_MAX_DEPTH = int(os.getenv("RETRIEVAL_FK_PATH_MAX_DEPTH", "3"))
+
+# Additional low-risk agent literals (externalized from agents.py)
+AGENT_ROUTER_MATH_KEYWORDS = _env_json_list(
+    "AGENT_ROUTER_MATH_KEYWORDS",
+    [
+        "sum", "count", "total", "avg", "average", "number of", "jumlah", "rata-rata",
+        "percentage", "percent", "ratio", "proportion", "persentase", "rasio",
+    ],
+)
+
+AGENT_ROUTER_GROUP_INDICATORS = _env_json_list(
+    "AGENT_ROUTER_GROUP_INDICATORS",
+    ["each", "per", "every", "masing-masing", "setiap", "for each", "classify"],
+)
+
+AGENT_ROUTER_VALUE_RANK_TERMS = _env_json_list(
+    "AGENT_ROUTER_VALUE_RANK_TERMS",
+    [
+        "highest", "lowest", "top", "bottom", "most", "least", "largest", "smallest",
+        "terbesar", "terkecil", "paling", "tertinggi", "terendah",
+    ],
+)
+
+AGENT_ROUTER_TIME_RANK_TERMS = _env_json_list(
+    "AGENT_ROUTER_TIME_RANK_TERMS",
+    ["latest", "earliest", "newest", "oldest", "terbaru", "terlama"],
+)
+
+AGENT_ROUTER_EXPLICIT_RANK_PATTERNS = _env_json_list(
+    "AGENT_ROUTER_EXPLICIT_RANK_PATTERNS",
+    [
+        r"\ba\s+rank\s+of\b",
+        r"\brank\s+\w+\s+by\b",
+        r"\branking\s+of\b",
+        r"\breturn.*\brank\b.*\bwithin\b",
+        r"\brank\s+.*\bbased\s+on\b",
+        r"\brank\s+the\s+\w+\b",
+        r"\branked\s+by\b",
+    ],
+)
+
+AGENT_ROUTER_ORDINAL_WORDS = _env_json_list(
+    "AGENT_ROUTER_ORDINAL_WORDS",
+    ["second", "third", "fourth", "fifth", "2nd", "3rd", "4th", "5th", "kedua", "ketiga", "keempat", "kelima"],
+)
+
+AGENT_ROUTER_ORDINAL_TARGET_TERMS = _env_json_list(
+    "AGENT_ROUTER_ORDINAL_TARGET_TERMS",
+    [
+        "highest", "lowest", "largest", "smallest", "biggest", "top", "bottom",
+        "best", "worst", "most", "least", "terbesar", "terkecil", "tertinggi", "terendah",
+    ],
+)
+
+AGENT_ROUTER_WITHIN_SAME_PATTERN = os.getenv(
+    "AGENT_ROUTER_WITHIN_SAME_PATTERN",
+    r"\b(within|in)\s+the\s+same\s+(\w+)",
+).strip()
+
+AGENT_ROUTER_EXPLICIT_SORT_TERMS = _env_json_list(
+    "AGENT_ROUTER_EXPLICIT_SORT_TERMS",
+    ["sort by", "ordered by", "sorted by", "order by", "sorted from"],
+)
+
+AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS = _env_json_list(
+    "AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS",
+    ["never ordered", "never paid", "without any", "have no", "has no", "tidak pernah", "belum pernah", "tidak ada", "yang tidak punya"],
+)
+
+AGENT_SQL_RESERVED_EXTRA_TOKENS = set(
+    _env_json_list(
+        "AGENT_SQL_RESERVED_EXTRA_TOKENS",
+        [
+            "year", "month", "day", "date", "date_format", "now", "curdate",
+            "concat", "group_concat", "coalesce", "ifnull", "sum", "count", "avg",
+            "t", "limit", "offset", "as", "regexp_like", "str_to_date",
+            "case", "when", "then", "else", "end", "union", "all", "distinct",
+            "values", "exists", "having", "substr",
+        ],
+    )
+)
