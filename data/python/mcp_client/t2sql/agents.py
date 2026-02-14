@@ -24,6 +24,11 @@ from .config import (
     RETRIEVE_DEBUG,
     OOM_WAIT_TIME,
     OOM_MAX_RETRIES,
+    AGENT_INSTANT_REJECT_PATTERNS,
+    AGENT_DEFINITE_SQL_PATTERNS,
+    AGENT_GIBBERISH_KEYBOARD_PATTERNS,
+    AGENT_MISSING_COL_SUFFIX_SYNONYMS,
+    AGENT_REGEX_TRIGGERS,
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -47,31 +52,10 @@ from .helpers_core import (has_join, _question_requires_word_boundary_regex, _pa
 # ======================================================================
 
 # --- Layer 1: Patterns to INSTANT REJECT (obvious garbage) ---
-_INSTANT_REJECT_PATTERNS = [
-    r"^\s*(hi|hello|hey|halo|hai|hallo)\s*[!.,]?\s*$",
-    r"^\s*(good\s*)?(morning|afternoon|evening|night)\s*[!.,]?\s*$",
-    r"^\s*(selamat\s+)?(pagi|siang|sore|malam)\s*[!.,]?\s*$",
-    r"^\s*(apa\s+kabar|how\s+are\s+you|what'?s\s+up)\s*[?!.,]?\s*$",
-    r"^\s*(thanks?|thank\s+you|terima\s*kasih|makasih)\s*[!.,]?\s*$",
-    r"^\s*(bye|goodbye|see\s+you|sampai\s+jumpa)\s*[!.,]?\s*$",
-    r"^\s*(yes|no|ya|tidak|ok|okay|oke|sip)\s*[!.,]?\s*$",
-    r"^\s*(test|testing|tes|coba)\s*[!.,]?\s*$",
-    r"^\s*[!?.,:;\-_=+*#@&]+\s*$",  # Just punctuation/symbols
-    r"^\s*\d+\s*$",  # Just numbers
-    r"^\s*.{0,2}\s*$",  # Too short (0-2 chars)
-]
+_INSTANT_REJECT_PATTERNS = AGENT_INSTANT_REJECT_PATTERNS
 
 # --- Patterns that BYPASS LLM check (definitely SQL-related) ---
-_DEFINITE_SQL_PATTERNS = [
-    # Explicit query verbs
-    r"\b(show|list|display|get|find|retrieve|fetch|count|total|sum|average)\b",
-    r"\b(tampilkan|tunjukkan|lihat|ambil|cari|hitung|berapa)\b",
-    # SQL keywords
-    r"\b(select|from|where|join|group by|order by)\b",
-    # Superlatives (ranking intent)
-    r"\b(highest|lowest|top|most|least|largest|smallest|latest|earliest)\b",
-    r"\b(tertinggi|terendah|terbesar|terkecil|terbaru|terlama)\b",
-]
+_DEFINITE_SQL_PATTERNS = AGENT_DEFINITE_SQL_PATTERNS
 
 try:
     _TABLE_SINGULAR_ROOTS = {
@@ -304,8 +288,7 @@ def _detect_gibberish(text: str) -> Tuple[bool, str]:
     # Common keyboard patterns: qwerty, asdf, zxcv
     # Only for inputs without spaces (single gibberish words)
     if not has_spaces:
-        keyboard_patterns = ['qwert', 'asdfg', 'zxcvb', 'qazwsx', 'yxcvbn', 'hjkl', 'yuiop']
-        for kp in keyboard_patterns:
+        for kp in AGENT_GIBBERISH_KEYBOARD_PATTERNS:
             if kp in alpha_only:
                 return True, "Input appears to be random text. Please enter a valid data query."
     
@@ -1856,15 +1839,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         if having_match:
             where_having_tokens.update(re.findall(r"\b([a-z][a-z0-9_]*)\b", having_match.group(1)))
 
-        suffix_synonyms = {
-            "number": r"(number|no|id|code|kode|nomor)",
-            "code":   r"(code|id|no|number|kode|nomor)",
-            "id":     r"(id|no|code|number|kode|nomor)",
-            "date":   r"(date|tanggal|tgl|waktu)",
-            "name":   r"(name|nama)",
-            "amount": r"(amount|total|jumlah|nilai|harga)",
-            "extension": r"(extension|ext)"
-        }
+        suffix_synonyms = AGENT_MISSING_COL_SUFFIX_SYNONYMS
         
         # all_valid_cols sudah disiapkan di atas
         for col_raw in all_valid_cols:
@@ -1945,14 +1920,9 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS H: REGEX PATTERN MISMATCH (HARD ERROR) ---
     if not needs_regeneration:
-        regex_triggers = [
-            r"exactly\s+\w+\s+digits",
-            r"followed\s+by\s+\w+\s+digits",
-            r"\d+\s+digits",
-            r"pattern",
-            r"format"
-        ]
-        requires_strict_pattern = any(re.search(p, question, re.IGNORECASE) for p in regex_triggers)
+        requires_strict_pattern = any(
+            re.search(p, question, re.IGNORECASE) for p in AGENT_REGEX_TRIGGERS
+        )
         uses_simple_like = "LIKE" in sql_up and "REGEXP" not in sql_up and "RLIKE" not in sql_up
         
         if requires_strict_pattern and uses_simple_like:

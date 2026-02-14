@@ -44,12 +44,16 @@ from .config import (
     SPARSE_MAX_HITS,
     SPARSE_DEBUG,
     RETRIEVE_DEBUG,
+    RETRIEVAL_EXTRA_STOPWORDS,
+    RETRIEVAL_GENERIC_MENTION_TERMS,
+    RETRIEVAL_JOIN_SIGNALS,
 )
 from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
 from .helpers_main import _get_qtype, build_dynamic_probe
 from .schema_analyzer import (
+    get_schema_analyzer,
     get_all_tables,
     get_table_synonyms,
     get_singular_form,
@@ -382,25 +386,19 @@ def _build_cards(
 # =========================== SPARSE (BM25) ============================
 # ======================================================================
 _BM25_CACHE: dict[str, Any] = {}
+_PHRASE_TO_COLUMN_CACHE: Optional[Dict[str, str]] = None
+
+_NUMERIC_SQL_TYPES = {
+    'int', 'integer', 'tinyint', 'smallint', 'mediumint', 'bigint',
+    'decimal', 'numeric', 'float', 'double', 'double precision',
+    'real', 'money', 'smallmoney', 'bit'
+}
 
 # Stopwords for BM25 tokenization
-_STOPWORDS = (set(ENGLISH_STOP_WORDS) - {"name", "names"}) | {"show", "all", "list", "their", "that", "have", "no",
-    "include", "includes", "including", "sort", "sorted", "sorting",
-    "result", "results", "record", "records", "row", "rows",
-    "display", "return", "get", "give", "find", "fetch", "please", "kindly",
-    "alphabetical", "alphabetically", "ascending", "descending", "distinct",
-    "yang", "dan", "atau", "ke", "dari", "di", "itu", "ini",
-    "tampilkan", "daftar",
-}
+_STOPWORDS = (set(ENGLISH_STOP_WORDS) - {"name", "names"}) | set(RETRIEVAL_EXTRA_STOPWORDS)
 
 # Generic alias/synonym words that are too broad for table mention detection.
-_GENERIC_MENTION_TERMS = {
-    "name", "names", "id", "ids", "code", "codes", "number", "numbers",
-    "date", "dates", "time", "status", "type", "types", "value", "values",
-    "amount", "amounts", "total", "totals", "count", "counts", "description",
-    "descriptions", "detail", "details", "record", "records", "row", "rows",
-    "address", "city", "country", "state", "phone", "email", "contact",
-}
+_GENERIC_MENTION_TERMS = set(RETRIEVAL_GENERIC_MENTION_TERMS)
 
 try:
     _TABLE_SINGULAR_ROOTS = {
@@ -512,11 +510,54 @@ def _tokenize_bm25_query(q: str) -> List[str]:
 
     return toks
 
+def _phrase_to_column_map() -> Dict[str, str]:
+    """
+    Build phrase->column token map from schema metadata synonyms.
+
+    Example:
+      "list price" -> "msrp"
+
+    This minimizes schema-specific hardcode by deriving aliases dynamically
+    from JSONL metadata.
+    """
+    global _PHRASE_TO_COLUMN_CACHE
+    if _PHRASE_TO_COLUMN_CACHE is not None:
+        return _PHRASE_TO_COLUMN_CACHE
+
+    mapping: Dict[str, str] = {}
+    try:
+        analyzer = get_schema_analyzer()
+        for table in get_all_tables():
+            for col in analyzer.get_table_columns(table):
+                col_lower = str(col or "").strip().lower()
+                if not col_lower:
+                    continue
+                for syn in get_column_synonyms(table, col):
+                    s = str(syn or "").strip().lower()
+                    if not s:
+                        continue
+                    tokens = [tok for tok in re.findall(r"[a-z0-9]+", s) if tok]
+                    # Keep only meaningful multi-word phrases to avoid noisy generic matches.
+                    if len(tokens) < 2:
+                        continue
+                    if all(tok in _GENERIC_MENTION_TERMS for tok in tokens):
+                        continue
+                    phrase = " ".join(tokens)
+                    mapping.setdefault(phrase, col_lower)
+    except Exception:
+        mapping = {}
+
+    _PHRASE_TO_COLUMN_CACHE = mapping
+    return mapping
+
 def build_sparse_query_from_question(q: str) -> str:
     toks = _tokenize_bm25_query(q)
     q_l = (q or "").lower()
-    if "list price" in q_l and "msrp" not in toks:
-        toks.append("msrp")
+    # Dynamic phrase alias expansion from schema metadata (e.g., "list price" -> "msrp")
+    for phrase, column_token in _phrase_to_column_map().items():
+        pattern = re.escape(phrase).replace(r"\ ", r"\s+")
+        if re.search(rf"\b{pattern}\b", q_l) and column_token not in toks:
+            toks.append(column_token)
     return " ".join(toks)
 
 def _doc_tokens_from_meta(meta: Dict[str, Any]) -> List[str]:
@@ -902,13 +943,6 @@ def _check_needs_numeric_data_from_retrieved(reranked: List[Dict[str, Any]]) -> 
     Returns:
         True if any retrieved column indicates numeric data is needed
     """
-    # Numeric SQL datatypes
-    numeric_datatypes = {
-        'int', 'integer', 'tinyint', 'smallint', 'mediumint', 'bigint',
-        'decimal', 'numeric', 'float', 'double', 'double precision',
-        'real', 'money', 'smallmoney', 'bit'
-    }
-
     for item in reranked[:MAX_CTX_DOCS]:
         md = item.get("meta") or {}
 
@@ -917,7 +951,7 @@ def _check_needs_numeric_data_from_retrieved(reranked: List[Dict[str, Any]]) -> 
         if datatype:
             # Remove any size specification (e.g., "decimal(10,2)" -> "decimal")
             base_type = datatype.split('(')[0].strip()
-            if base_type in numeric_datatypes:
+            if base_type in _NUMERIC_SQL_TYPES:
                 # Check if this numeric column is used for calculations
                 # (not just IDs or counts)
                 col = _meta_column(md).lower()
@@ -996,11 +1030,6 @@ def _infer_bridge_tables(
 
     # NEW: Also consider tables with numeric columns in reranked results
     # Uses metadata-driven approach: check datatype field + column patterns as fallback
-    numeric_datatypes = {
-        'int', 'integer', 'tinyint', 'smallint', 'mediumint', 'bigint',
-        'decimal', 'numeric', 'float', 'double', 'double precision', 'real'
-    }
-
     tables_with_numeric_cols = set()
     for item in reranked[:MAX_CTX_DOCS]:
         md = item.get("meta") or {}
@@ -1014,7 +1043,7 @@ def _infer_bridge_tables(
 
             if datatype:
                 base_type = datatype.split('(')[0].strip()
-                is_numeric = base_type in numeric_datatypes
+                is_numeric = base_type in _NUMERIC_SQL_TYPES
             else:
                 # Fallback: Check column name pattern
                 is_numeric = any(kw in col_lower for kw in ['quantity', 'price', 'amount', 'value', 'total', 'cost', 'each', 'rate'])
@@ -1108,12 +1137,7 @@ def _find_fk_path(
 # ======================================================================
 def _has_join_intent(question: str) -> bool:
     q = (question or "").lower()
-    join_signals = [
-        "join", "gabung", "combine", "combine with", "along with", "together with",
-        "and their", "with their", "beserta", "bersama", "dengan",
-        "for each", "per ", "setiap",
-    ]
-    if any(s in q for s in join_signals):
+    if any(s in q for s in RETRIEVAL_JOIN_SIGNALS):
         return True
 
     # Generic multi-entity signal: 2+ explicit table mentions.

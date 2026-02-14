@@ -12,6 +12,56 @@
 # ====================== STANDARD LIBRARY IMPORT =======================
 # ======================================================================
 import os
+import json
+
+
+def _env_json_list(name: str, default: list[str]) -> list[str]:
+    """
+    Read list config from env.
+
+    Priority:
+    1) JSON array string
+    2) Comma-separated string
+    3) default
+    """
+    raw = os.getenv(name)
+    if not raw:
+        return default
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            items = [str(x).strip() for x in parsed if str(x).strip()]
+            return items or default
+    except Exception:
+        pass
+
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return items or default
+
+
+def _env_json_dict(name: str, default: dict[str, str]) -> dict[str, str]:
+    """
+    Read dict config from env as JSON object; fallback to default.
+    """
+    raw = os.getenv(name)
+    if not raw:
+        return default
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            out: dict[str, str] = {}
+            for k, v in parsed.items():
+                key = str(k).strip()
+                val = str(v).strip()
+                if key and val:
+                    out[key] = val
+            return out or default
+    except Exception:
+        pass
+
+    return default
 # ======================================================================
 # ============================ APP/GENERAL =============================
 # ======================================================================
@@ -68,3 +118,103 @@ OOM_MAX_RETRIES = int(os.getenv("OOM_MAX_RETRIES", "3"))
 # ======================================================================
 SQL_DEBUG = bool(int(os.getenv("SQL_DEBUG", "1")))
 COMPARE_DEBUG = bool(int(os.getenv("COMPARE_DEBUG", "0")))
+
+# ======================================================================
+# ========================= AGENT HEURISTICS ============================
+# ======================================================================
+AGENT_INSTANT_REJECT_PATTERNS = _env_json_list(
+    "AGENT_INSTANT_REJECT_PATTERNS",
+    [
+        r"^\s*(hi|hello|hey|halo|hai|hallo)\s*[!.,]?\s*$",
+        r"^\s*(good\s*)?(morning|afternoon|evening|night)\s*[!.,]?\s*$",
+        r"^\s*(selamat\s+)?(pagi|siang|sore|malam)\s*[!.,]?\s*$",
+        r"^\s*(apa\s+kabar|how\s+are\s+you|what'?s\s+up)\s*[?!.,]?\s*$",
+        r"^\s*(thanks?|thank\s+you|terima\s*kasih|makasih)\s*[!.,]?\s*$",
+        r"^\s*(bye|goodbye|see\s+you|sampai\s+jumpa)\s*[!.,]?\s*$",
+        r"^\s*(yes|no|ya|tidak|ok|okay|oke|sip)\s*[!.,]?\s*$",
+        r"^\s*(test|testing|tes|coba)\s*[!.,]?\s*$",
+        r"^\s*[!?.,:;\-_=+*#@&]+\s*$",
+        r"^\s*\d+\s*$",
+        r"^\s*.{0,2}\s*$",
+    ],
+)
+
+AGENT_DEFINITE_SQL_PATTERNS = _env_json_list(
+    "AGENT_DEFINITE_SQL_PATTERNS",
+    [
+        r"\b(show|list|display|get|find|retrieve|fetch|count|total|sum|average)\b",
+        r"\b(tampilkan|tunjukkan|lihat|ambil|cari|hitung|berapa)\b",
+        r"\b(select|from|where|join|group by|order by)\b",
+        r"\b(highest|lowest|top|most|least|largest|smallest|latest|earliest)\b",
+        r"\b(tertinggi|terendah|terbesar|terkecil|terbaru|terlama)\b",
+    ],
+)
+
+AGENT_GIBBERISH_KEYBOARD_PATTERNS = _env_json_list(
+    "AGENT_GIBBERISH_KEYBOARD_PATTERNS",
+    ["qwert", "asdfg", "zxcvb", "qazwsx", "yxcvbn", "hjkl", "yuiop"],
+)
+
+AGENT_MISSING_COL_SUFFIX_SYNONYMS = _env_json_dict(
+    "AGENT_MISSING_COL_SUFFIX_SYNONYMS",
+    {
+        "number": r"(number|no|id|code|kode|nomor)",
+        "code": r"(code|id|no|number|kode|nomor)",
+        "id": r"(id|no|code|number|kode|nomor)",
+        "date": r"(date|tanggal|tgl|waktu)",
+        "name": r"(name|nama)",
+        "amount": r"(amount|total|jumlah|nilai|harga)",
+        "extension": r"(extension|ext)",
+    },
+)
+
+AGENT_REGEX_TRIGGERS = _env_json_list(
+    "AGENT_REGEX_TRIGGERS",
+    [
+        r"exactly\s+\w+\s+digits",
+        r"followed\s+by\s+\w+\s+digits",
+        r"\d+\s+digits",
+        r"pattern",
+        r"format",
+    ],
+)
+
+# ======================================================================
+# ======================== RETRIEVE HEURISTICS ==========================
+# ======================================================================
+RETRIEVAL_EXTRA_STOPWORDS = set(
+    _env_json_list(
+        "RETRIEVAL_EXTRA_STOPWORDS",
+        [
+            "show", "all", "list", "their", "that", "have", "no",
+            "include", "includes", "including", "sort", "sorted", "sorting",
+            "result", "results", "record", "records", "row", "rows",
+            "display", "return", "get", "give", "find", "fetch", "please", "kindly",
+            "alphabetical", "alphabetically", "ascending", "descending", "distinct",
+            "yang", "dan", "atau", "ke", "dari", "di", "itu", "ini",
+            "tampilkan", "daftar",
+        ],
+    )
+)
+
+RETRIEVAL_GENERIC_MENTION_TERMS = set(
+    _env_json_list(
+        "RETRIEVAL_GENERIC_MENTION_TERMS",
+        [
+            "name", "names", "id", "ids", "code", "codes", "number", "numbers",
+            "date", "dates", "time", "status", "type", "types", "value", "values",
+            "amount", "amounts", "total", "totals", "count", "counts", "description",
+            "descriptions", "detail", "details", "record", "records", "row", "rows",
+            "address", "city", "country", "state", "phone", "email", "contact",
+        ],
+    )
+)
+
+RETRIEVAL_JOIN_SIGNALS = _env_json_list(
+    "RETRIEVAL_JOIN_SIGNALS",
+    [
+        "join", "gabung", "combine", "combine with", "along with", "together with",
+        "and their", "with their", "beserta", "bersama", "dengan",
+        "for each", "per ", "setiap",
+    ],
+)
