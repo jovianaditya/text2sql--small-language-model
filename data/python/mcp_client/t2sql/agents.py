@@ -54,6 +54,12 @@ from .config import (
     AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN,
     AGENT_ROUTER_TIEBREAKER_PATTERN,
     AGENT_ROUTER_MISSING_EMPTY_PATTERN,
+    AGENT_ROUTER_PRIMARY_FROM_IN_PATTERNS,
+    AGENT_ROUTER_PRIMARY_ALL_ENTITY_PATTERN,
+    AGENT_ROUTER_PRIMARY_REASON_FROM_IN,
+    AGENT_ROUTER_PRIMARY_REASON_ALL,
+    AGENT_ROUTER_FK_EVIDENCE_EXTRACT_PATTERN,
+    AGENT_ROUTER_FK_EVIDENCE_PREFIX,
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -919,7 +925,7 @@ def router_agent(state: RAGState) -> RAGState:
         # Weak evidence: 'for each' pattern, table+attribute pattern, FK column mentions
         weak_evidence = AGENT_ROUTER_WEAK_EVIDENCE_TAGS
         # Also check for FK column evidence (format: "FK column 'X'")
-        is_only_weak = all(e in weak_evidence or e.startswith("FK column") for e in evidence_list)
+        is_only_weak = all(e in weak_evidence or e.startswith(AGENT_ROUTER_FK_EVIDENCE_PREFIX) for e in evidence_list)
 
         if is_only_weak and evidence_list:  # Has evidence, but all are weak
             table_singular = get_singular_form(tbl_lower)
@@ -976,7 +982,7 @@ def router_agent(state: RAGState) -> RAGState:
                 # products.productLine <-> productlines.productLine even without explicit FK cards.
                 weak_fk_cols = set()
                 for ev in evidence_list:
-                    m_fk = re.match(r"^FK column '([^']+)'$", ev)
+                    m_fk = re.match(AGENT_ROUTER_FK_EVIDENCE_EXTRACT_PATTERN, ev)
                     if m_fk:
                         weak_fk_cols.add(m_fk.group(1).lower())
 
@@ -987,7 +993,7 @@ def router_agent(state: RAGState) -> RAGState:
                         if other_lower == tbl_lower:
                             continue
                         other_evidence = evidence_details.get(other_lower, [])
-                        if any((e not in weak_evidence) and (not e.startswith("FK column")) for e in other_evidence):
+                        if any((e not in weak_evidence) and (not e.startswith(AGENT_ROUTER_FK_EVIDENCE_PREFIX)) for e in other_evidence):
                             has_strong_other = True
                             break
 
@@ -1213,23 +1219,25 @@ def router_agent(state: RAGState) -> RAGState:
                 tbl_lower = tbl.lower()
                 table_entity_pattern = _table_entity_pattern(tbl_lower)
                 # Patterns: "customers who placed", "offices in", "products from"
-                from_in_patterns = [
-                    rf"\b\w+\s+(from|in)\s+{table_entity_pattern}\b",
-                    rf"\b{table_entity_pattern}\b\s+who\s+",
-                    rf"\b{table_entity_pattern}\b\s+that\s+",
-                ]
+                from_in_patterns = _instantiate_entity_patterns(
+                    AGENT_ROUTER_PRIMARY_FROM_IN_PATTERNS,
+                    table_entity_pattern,
+                )
                 if any(re.search(p, question_lower) for p in from_in_patterns):
                     primary_table = tbl
-                    primary_reason = "from/in pattern"
+                    primary_reason = AGENT_ROUTER_PRIMARY_REASON_FROM_IN
                     break
 
         # Rule 3: Not yet found, check "all X that Y" pattern
         if not primary_table:
             for tbl in relevant_tables:
                 table_entity_pattern = _table_entity_pattern(tbl.lower())
-                if re.search(rf"\ball\s+{table_entity_pattern}\b", question_lower):
+                all_x_pattern = AGENT_ROUTER_PRIMARY_ALL_ENTITY_PATTERN.replace(
+                    "__ENTITY__", table_entity_pattern
+                ).replace("{entity}", table_entity_pattern)
+                if re.search(all_x_pattern, question_lower):
                     primary_table = tbl
-                    primary_reason = "'all X' pattern"
+                    primary_reason = AGENT_ROUTER_PRIMARY_REASON_ALL
                     break
 
         # Rule 4: Not yet found, use table with most evidence

@@ -515,6 +515,40 @@ AGENT_ROUTER_AGGREGATE_CONTEXT_PATTERNS = _env_json_list(
     ],
 )
 
+AGENT_ROUTER_PRIMARY_FROM_IN_PATTERNS = _env_json_list(
+    "AGENT_ROUTER_PRIMARY_FROM_IN_PATTERNS",
+    [
+        r"\b\w+\s+(from|in)\s+__ENTITY__\b",
+        r"\b__ENTITY__\b\s+who\s+",
+        r"\b__ENTITY__\b\s+that\s+",
+    ],
+)
+
+AGENT_ROUTER_PRIMARY_ALL_ENTITY_PATTERN = os.getenv(
+    "AGENT_ROUTER_PRIMARY_ALL_ENTITY_PATTERN",
+    r"\ball\s+__ENTITY__\b",
+).strip()
+
+AGENT_ROUTER_PRIMARY_REASON_FROM_IN = os.getenv(
+    "AGENT_ROUTER_PRIMARY_REASON_FROM_IN",
+    "from/in pattern",
+).strip()
+
+AGENT_ROUTER_PRIMARY_REASON_ALL = os.getenv(
+    "AGENT_ROUTER_PRIMARY_REASON_ALL",
+    "'all X' pattern",
+).strip()
+
+AGENT_ROUTER_FK_EVIDENCE_EXTRACT_PATTERN = os.getenv(
+    "AGENT_ROUTER_FK_EVIDENCE_EXTRACT_PATTERN",
+    r"^FK column '([^']+)'$",
+).strip()
+
+AGENT_ROUTER_FK_EVIDENCE_PREFIX = os.getenv(
+    "AGENT_ROUTER_FK_EVIDENCE_PREFIX",
+    "FK column",
+).strip()
+
 AGENT_ROUTER_WEAK_EVIDENCE_TAGS = set(
     _env_json_list(
         "AGENT_ROUTER_WEAK_EVIDENCE_TAGS",
