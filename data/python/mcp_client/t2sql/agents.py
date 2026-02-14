@@ -50,6 +50,10 @@ from .config import (
     AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS,
     AGENT_ROUTER_TABLE_ATTRIBUTE_PATTERNS,
     AGENT_ROUTER_AGGREGATE_CONTEXT_PATTERNS,
+    AGENT_ROUTER_WINNER_ROW_RECORD_PATTERN,
+    AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN,
+    AGENT_ROUTER_TIEBREAKER_PATTERN,
+    AGENT_ROUTER_MISSING_EMPTY_PATTERN,
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -1275,19 +1279,16 @@ def router_agent(state: RAGState) -> RAGState:
     # E.g., "payment record with the largest payment amount"
     if not is_winner_row and is_ranking_value:
         # "record/row with the largest/highest/lowest"
-        if re.search(r"\b(record|row|entry|item)\s+with\s+(the\s+)?(largest|highest|lowest|smallest|biggest)", question_lower):
+        if re.search(AGENT_ROUTER_WINNER_ROW_RECORD_PATTERN, question_lower):
             is_winner_row = True
         # "the largest X for each Y" / "largest X per Y"
-        if re.search(r"\b(largest|highest|lowest|smallest|biggest)\s+\w+\s+(for\s+each|per)\b", question_lower):
+        if re.search(AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN, question_lower):
             is_winner_row = True
     
     # Pattern C: Tiebreaker pattern (always complex, needs ROW_NUMBER with multiple ORDER BY)
     # "if multiple X have the same Y, choose the one with..."
     # "if there are ties, pick..."
-    has_tiebreaker = bool(re.search(
-        r"\bif\s+(multiple|several|there\s+are\s+ties?|same)\b.*\b(choose|pick|select|take)\s+(the\s+)?(one|latest|earliest|first|last)\b",
-        question_lower
-    ))
+    has_tiebreaker = bool(re.search(AGENT_ROUTER_TIEBREAKER_PATTERN, question_lower))
     if has_tiebreaker:
         is_winner_row = True
     
@@ -1317,7 +1318,7 @@ def router_agent(state: RAGState) -> RAGState:
     # Pattern 3: "missing" or "empty" ONLY if multi-table context
     # Single-table "missing" = just IS NULL (simple, 3B can handle)
     if not has_exclusion and is_multi_table:
-        if re.search(r"\b(missing|empty)\b", question_lower):
+        if re.search(AGENT_ROUTER_MISSING_EMPTY_PATTERN, question_lower):
             has_exclusion = True
     
     # ESCALATION LOGIC

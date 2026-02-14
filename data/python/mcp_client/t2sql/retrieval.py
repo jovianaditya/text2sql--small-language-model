@@ -70,6 +70,8 @@ from .config import (
     RETRIEVAL_NAME_ONLY_ID_PATTERN,
     RETRIEVAL_NAME_ONLY_NAME_PATTERN,
     RETRIEVAL_DEBUG_FOCUS_COLUMNS,
+    RETRIEVAL_TABLE_NAME_PREFIX_STRIP_CHARS,
+    RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS,
 )
 from .state import RAGState
 from .chroma_embedding import build_vector_store
@@ -245,10 +247,14 @@ def _is_column_relevant_to_query(
             # Only include if COLUMN NAME is explicitly mentioned in question
             # (not just generic numeric keywords like "total")
             # Check column name variants
+            normalized_compound = col_lower
+            for src, dst in RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS.items():
+                normalized_compound = normalized_compound.replace(src, dst)
+
             col_variants = [
                 col_lower,                    # quantityinstock
                 col_no_underscore,             # same for no underscore
-                col_lower.replace("quantity", "").replace("instock", "in stock"),  # handle compound words
+                normalized_compound,           # configurable compound normalization
             ]
             mentioned_in_question = any(v in q_l for v in col_variants if v)
 
@@ -780,7 +786,11 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
 
         # Dynamic column name pattern: {table}name (e.g., customername, productname)
         # Handle both concatenated and underscored forms
-        table_prefix = tl.rstrip('s')  # Remove trailing 's' to get base (customers -> customer)
+        table_prefix = (
+            tl.rstrip(RETRIEVAL_TABLE_NAME_PREFIX_STRIP_CHARS)
+            if RETRIEVAL_TABLE_NAME_PREFIX_STRIP_CHARS
+            else tl
+        )
         expected_name_cols = [
             f"{table_prefix}name",      # customername, productname
             f"{table_prefix}_name",     # customer_name, product_name

@@ -521,3 +521,37 @@ AGENT_ROUTER_WEAK_EVIDENCE_TAGS = set(
         [AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH, AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE],
     )
 )
+
+# Medium-risk heuristics (externalized with behavior-preserving defaults)
+RETRIEVAL_TABLE_NAME_PREFIX_STRIP_CHARS = os.getenv(
+    "RETRIEVAL_TABLE_NAME_PREFIX_STRIP_CHARS",
+    "s",
+)
+
+RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS = _env_json_dict(
+    "RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS",
+    {
+        "quantity": "",
+        "instock": "in stock",
+    },
+)
+
+AGENT_ROUTER_WINNER_ROW_RECORD_PATTERN = os.getenv(
+    "AGENT_ROUTER_WINNER_ROW_RECORD_PATTERN",
+    r"\b(record|row|entry|item)\s+with\s+(the\s+)?(largest|highest|lowest|smallest|biggest)",
+).strip()
+
+AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN = os.getenv(
+    "AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN",
+    r"\b(largest|highest|lowest|smallest|biggest)\s+\w+\s+(for\s+each|per)\b",
+).strip()
+
+AGENT_ROUTER_TIEBREAKER_PATTERN = os.getenv(
+    "AGENT_ROUTER_TIEBREAKER_PATTERN",
+    r"\bif\s+(multiple|several|there\s+are\s+ties?|same)\b.*\b(choose|pick|select|take)\s+(the\s+)?(one|latest|earliest|first|last)\b",
+).strip()
+
+AGENT_ROUTER_MISSING_EMPTY_PATTERN = os.getenv(
+    "AGENT_ROUTER_MISSING_EMPTY_PATTERN",
+    r"\b(missing|empty)\b",
+).strip()
