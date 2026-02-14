@@ -25,6 +25,19 @@ from .config import (
     SPARSE_BONUS,
     NAME_QUERY_BONUS,
     ID_QUERY_BONUS,
+    COL_BOOST_DIM_NAME_EXPLICIT,
+    COL_BOOST_DIM_CONTACT_PENALTY,
+    COL_BOOST_DIM_NAME_DEFAULT,
+    COL_BOOST_DIM_ID_PENALTY,
+    COL_BOOST_OTHER_NAME_DEFAULT,
+    COL_BOOST_OTHER_ID_PENALTY,
+    TABLE_SCORE_SPARSE_HIT,
+    TABLE_SCORE_TABLE_MENTION,
+    TABLE_SCORE_DESC_TOKEN,
+    TABLE_SCORE_MENTION_DIM,
+    TABLE_SCORE_MENTION_TXN,
+    TABLE_SCORE_MENTION_OTHER,
+    MAX_TOP_TABLES,
     MAX_CTX_DOCS,
     SPARSE_MAX_HITS,
     SPARSE_DEBUG,
@@ -723,27 +736,27 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
             if asks_for_names and not asks_contact_explicitly:
                 # Boost {table}name columns
                 if any(expected in col_lower for expected in expected_name_cols):
-                    bonus += 0.9
+                    bonus += COL_BOOST_DIM_NAME_EXPLICIT
                 # Penalize contact columns when asking for generic names
                 elif is_contact_column:
-                    bonus -= 0.8
+                    bonus += COL_BOOST_DIM_CONTACT_PENALTY
             elif not asks_id_like:
                 # Boost name columns when not asking for ID
                 if any(expected in col_lower for expected in expected_name_cols):
-                    bonus += 0.6
+                    bonus += COL_BOOST_DIM_NAME_DEFAULT
                 # Penalize ID columns when asking for names
                 if is_id_column:
-                    bonus -= 0.35
+                    bonus += COL_BOOST_DIM_ID_PENALTY
 
         # Medium boost for other table types (transaction, bridge, reference)
         else:
             if not asks_id_like:
                 # Boost name columns
                 if any(expected in col_lower for expected in expected_name_cols):
-                    bonus += 0.5
+                    bonus += COL_BOOST_OTHER_NAME_DEFAULT
                 # Penalize ID columns when asking for names
                 if is_id_column:
-                    bonus -= 0.3
+                    bonus += COL_BOOST_OTHER_ID_PENALTY
 
     # Generic ID boosting (table-agnostic, already dynamic)
     if any(k in q_l for k in [" id ", "id ", " id,", "identifier", "code"]):
@@ -819,23 +832,23 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
         base = 0.0
         tl = tbl.lower()
 
-        if it.get("sparse"): base += 0.5
-        if tl in q_l: base += 1.0
+        if it.get("sparse"): base += TABLE_SCORE_SPARSE_HIT
+        if tl in q_l: base += TABLE_SCORE_TABLE_MENTION
         for t in qt:
-            if t and t in desc: base += 0.3
+            if t and t in desc: base += TABLE_SCORE_DESC_TOKEN
 
         # Dynamic table mention boost (instead of hardcoded "customers", "products", etc.)
         # Uses mentions_map built from schema metadata
         if tl in mentions_map and mentions_map[tl]:
             # High boost for dimension/master tables (customers, products)
             if get_table_type(tl) in ("dimension", "unknown"):
-                base += 0.9
+                base += TABLE_SCORE_MENTION_DIM
             # Medium boost for transaction tables (orders, payments)
             elif is_transaction_table(tl):
-                base += 0.7
+                base += TABLE_SCORE_MENTION_TXN
             # High boost for bridge/lookup tables (offices, productlines, orderdetails, employees)
             else:
-                base += 0.8
+                base += TABLE_SCORE_MENTION_OTHER
 
         # Special handling for orderdetails (bridge table with numeric columns)
         # Don't penalize orderdetails in aggregate/numeric contexts
@@ -1460,7 +1473,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                         print(f"  {tbl}: {score:.2f}")
 
                 # Base: Top 3 tables by score (increased from 2)
-                max_top_tables = 3
+                max_top_tables = MAX_TOP_TABLES
                 top_tables = {name for name, score in sorted_tbls[:max_top_tables] if score > 0.0}
 
                 # Addition: Include tables with any column in reranked results

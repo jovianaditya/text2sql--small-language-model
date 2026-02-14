@@ -15,7 +15,16 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .config import ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_URL, OLLAMA_KEEP_ALIVE, RETRIEVE_DEBUG
+from .config import (
+    ROUTING_MODEL,
+    SMALL_MODEL,
+    LARGE_MODEL,
+    OLLAMA_URL,
+    OLLAMA_KEEP_ALIVE,
+    RETRIEVE_DEBUG,
+    OOM_WAIT_TIME,
+    OOM_MAX_RETRIES,
+)
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
 from .utils import _dbg_print_two, try_llm_json, build_router_schema
@@ -1074,7 +1083,7 @@ def router_agent(state: RAGState) -> RAGState:
     # E.g., "return a rank of employees within each job title"
     explicit_rank_patterns = [
         r"\ba\s+rank\s+of\b",           # "a rank of employees"
-        r"\brand\s+\w+\s+by\b",          # "rank products by"
+        r"\brank\s+\w+\s+by\b",          # "rank products by"
         r"\branking\s+of\b",             # "ranking of X"
         r"\breturn.*\brank\b.*\bwithin\b",
         r"\brank\s+.*\bbased\s+on\b",
@@ -1316,9 +1325,6 @@ def router_agent(state: RAGState) -> RAGState:
 import time as _time  # For inference timing
 # Track last warmup time per model
 _last_model_warmup = {}
-# OOM retry settings
-OOM_WAIT_TIME = 35  # Wait 35 seconds for model to unload (keep_alive=30s + buffer)
-OOM_MAX_RETRIES = 3  # Max retry attempts on OOM
 
 def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM_MAX_RETRIES) -> bool:
         global _last_model_warmup
