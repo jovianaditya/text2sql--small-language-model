@@ -107,6 +107,8 @@ from .config import (
     AGENT_DRAFT_LIMIT_REMOVE_PATTERN,
     AGENT_DRAFT_LIMIT_INTENT_TERMS,
     AGENT_KEEP_ALIVE_PARSE_PATTERN,
+    AGENT_KEEP_ALIVE_DEFAULT_SECONDS,
+    AGENT_KEEP_ALIVE_UNIT_SECONDS,
     AGENT_ROUTER_PRIMARY_FROM_IN_PATTERNS,
     AGENT_ROUTER_PRIMARY_ALL_ENTITY_PATTERN,
     AGENT_ROUTER_PRIMARY_REASON_FROM_IN,
@@ -122,6 +124,13 @@ from .config import (
     AGENT_REFINE_MONTH_NAME_GROUP_PATTERN,
     AGENT_REFINE_SAFE_MONTH_SORT_FUNC_PATTERN,
     AGENT_REFINE_SAFE_MONTH_SORT_DATE_PATTERN,
+    AGENT_REFINE_GROUP_BY_TOKEN,
+    AGENT_REFINE_LEFT_JOIN_TOKEN,
+    AGENT_REFINE_WILDCARD_TOKEN,
+    AGENT_REFINE_LIKE_TOKEN,
+    AGENT_REFINE_REGEX_TOKENS,
+    AGENT_REFINE_MONTH_TOKEN,
+    AGENT_REFINE_ORDER_TOKEN,
     AGENT_REFINE_GROUP_CLAUSE_PATTERN,
     AGENT_REFINE_WHERE_CLAUSE_PATTERN,
     AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN,
@@ -1506,16 +1515,13 @@ def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM
         m = re.match(AGENT_KEEP_ALIVE_PARSE_PATTERN, str(OLLAMA_KEEP_ALIVE).lower())
         if m:
             val, unit = int(m.group(1)), m.group(2)
-            if unit == "s":
-                keep_alive_sec = val
-            elif unit == "m":
-                keep_alive_sec = val * 60
-            elif unit == "h":
-                keep_alive_sec = val * 3600
+            scale = AGENT_KEEP_ALIVE_UNIT_SECONDS.get(unit)
+            if scale is not None:
+                keep_alive_sec = val * scale
             else:
-                keep_alive_sec = 60
+                keep_alive_sec = AGENT_KEEP_ALIVE_DEFAULT_SECONDS
         else:
-            keep_alive_sec = 60
+            keep_alive_sec = AGENT_KEEP_ALIVE_DEFAULT_SECONDS
 
         now = _time.time()
         last_warmup = _last_model_warmup.get(target_model, 0)
@@ -1910,8 +1916,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     regeneration_model = LARGE_MODEL  # Force 7B
 
     # --- KASUS E: INNER JOIN TRAP (HARD ERROR) ---
-    has_groupby = "GROUP BY" in sql_up
-    is_left_join = "LEFT JOIN" in sql_up
+    has_groupby = AGENT_REFINE_GROUP_BY_TOKEN in sql_up
+    is_left_join = AGENT_REFINE_LEFT_JOIN_TOKEN in sql_up
     if has_groupby and not is_left_join and not needs_regeneration:
         where_match = re.search(AGENT_REFINE_WHERE_CLAUSE_PATTERN, sql_up, re.DOTALL)
         group_match = re.search(AGENT_REFINE_GROUP_CLAUSE_PATTERN, sql_up, re.DOTALL)
@@ -1964,7 +1970,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             
             # STEP 2: Logic Check yang Lebih Akurat
             # Skip jika kolom sudah ada di SELECT tokens, atau jika ada wildcard (*)
-            if col_lower in select_tokens_chk or "*" in select_text_chk: 
+            if col_lower in select_tokens_chk or AGENT_REFINE_WILDCARD_TOKEN in select_text_chk:
                 continue
             
             # Skip jika kolom sudah dipakai di WHERE/HAVING (artinya dipakai sebagai filter, bukan output)
@@ -2040,7 +2046,9 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         requires_strict_pattern = any(
             re.search(p, question, re.IGNORECASE) for p in AGENT_REGEX_TRIGGERS
         )
-        uses_simple_like = "LIKE" in sql_up and "REGEXP" not in sql_up and "RLIKE" not in sql_up
+        uses_simple_like = AGENT_REFINE_LIKE_TOKEN in sql_up and not any(
+            tok in sql_up for tok in AGENT_REFINE_REGEX_TOKENS
+        )
         
         if requires_strict_pattern and uses_simple_like:
              _dbg_print_two("[Agent3] HARD ERROR - Pattern Mismatch", "Question asks for strict pattern (digits), but SQL uses simple LIKE.")
@@ -2055,7 +2063,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
              regeneration_model = LARGE_MODEL  # Force 7B
 
     # --- KASUS I: UNSAFE MONTH SORTING (HARD ERROR) ---
-    if "MONTH" in sql_up and "ORDER" in sql_up and not needs_regeneration:
+    if AGENT_REFINE_MONTH_TOKEN in sql_up and AGENT_REFINE_ORDER_TOKEN in sql_up and not needs_regeneration:
         has_month_name_group = re.search(AGENT_REFINE_MONTH_NAME_GROUP_PATTERN, sql_up, re.DOTALL)
         # FIX: Accept sorting by date columns (any alias) as safe - gives chronological order
         # Pattern matches: MONTH(date), YEAR(date), MIN(...), MAX(...), or any *Date column
@@ -2079,7 +2087,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS K: AGGREGATION VIOLATION (ERROR 1055) (HARD ERROR) ---
     # Menangkap kasus SELECT raw_col FROM... GROUP BY derived_col (Error 1055)
-    if "GROUP BY" in sql_up and not needs_regeneration:
+    if AGENT_REFINE_GROUP_BY_TOKEN in sql_up and not needs_regeneration:
         group_clause = re.search(AGENT_REFINE_GROUP_CLAUSE_PATTERN, sql_up, re.DOTALL)
         if group_clause:
             group_text = group_clause.group(1).lower()

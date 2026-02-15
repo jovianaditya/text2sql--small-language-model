@@ -111,6 +111,11 @@ RETRIEVAL_CARDS_MAX_INJECT = int(os.getenv("RETRIEVAL_CARDS_MAX_INJECT", "12"))
 RETRIEVAL_CARDS_DESC_MAX_LEN = int(os.getenv("RETRIEVAL_CARDS_DESC_MAX_LEN", "100"))
 RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT = int(os.getenv("RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT", "5"))
 RETRIEVAL_DENSE_DESC_FALLBACK_LEN = int(os.getenv("RETRIEVAL_DENSE_DESC_FALLBACK_LEN", "100"))
+RETRIEVAL_SPARSE_DEBUG_PREVIEW_LIMIT = int(os.getenv("RETRIEVAL_SPARSE_DEBUG_PREVIEW_LIMIT", "10"))
+RETRIEVAL_RETRIEVE_DEBUG_MAX_SHOW = int(os.getenv("RETRIEVAL_RETRIEVE_DEBUG_MAX_SHOW", "7"))
+RETRIEVAL_AUTO_INJECT_BONUS_DELTA = float(os.getenv("RETRIEVAL_AUTO_INJECT_BONUS_DELTA", "0.05"))
+RETRIEVAL_TOP_TABLE_MIN_SCORE = float(os.getenv("RETRIEVAL_TOP_TABLE_MIN_SCORE", "0.0"))
+RETRIEVAL_BRIDGE_MIN_TABLE_COUNT = int(os.getenv("RETRIEVAL_BRIDGE_MIN_TABLE_COUNT", "2"))
 # ======================================================================
 # =============================== MCP ==================================
 # ======================================================================
@@ -842,6 +847,15 @@ AGENT_KEEP_ALIVE_PARSE_PATTERN = os.getenv(
     "AGENT_KEEP_ALIVE_PARSE_PATTERN",
     r"(\d+)([smh])",
 ).strip()
+AGENT_KEEP_ALIVE_DEFAULT_SECONDS = int(os.getenv("AGENT_KEEP_ALIVE_DEFAULT_SECONDS", "60"))
+AGENT_KEEP_ALIVE_UNIT_SECONDS = {
+    k.lower().strip(): int(v)
+    for k, v in _env_json_dict(
+        "AGENT_KEEP_ALIVE_UNIT_SECONDS",
+        {"s": "1", "m": "60", "h": "3600"},
+    ).items()
+    if str(k).strip() and str(v).strip()
+}
 
 AGENT_REFINE_DEFINED_ALIAS_PATTERN = os.getenv(
     "AGENT_REFINE_DEFINED_ALIAS_PATTERN",
@@ -988,6 +1002,17 @@ AGENT_REFINE_SAFE_MONTH_SORT_DATE_PATTERN = os.getenv(
     "AGENT_REFINE_SAFE_MONTH_SORT_DATE_PATTERN",
     r"ORDER\s+BY\s+.*?\w*Date\b",
 ).strip()
+AGENT_REFINE_GROUP_BY_TOKEN = os.getenv("AGENT_REFINE_GROUP_BY_TOKEN", "GROUP BY").strip().upper()
+AGENT_REFINE_LEFT_JOIN_TOKEN = os.getenv("AGENT_REFINE_LEFT_JOIN_TOKEN", "LEFT JOIN").strip().upper()
+AGENT_REFINE_WILDCARD_TOKEN = os.getenv("AGENT_REFINE_WILDCARD_TOKEN", "*").strip()
+AGENT_REFINE_LIKE_TOKEN = os.getenv("AGENT_REFINE_LIKE_TOKEN", "LIKE").strip().upper()
+AGENT_REFINE_REGEX_TOKENS = set(
+    tok.strip().upper()
+    for tok in _env_json_list("AGENT_REFINE_REGEX_TOKENS", ["REGEXP", "RLIKE"])
+    if tok and tok.strip()
+)
+AGENT_REFINE_MONTH_TOKEN = os.getenv("AGENT_REFINE_MONTH_TOKEN", "MONTH").strip().upper()
+AGENT_REFINE_ORDER_TOKEN = os.getenv("AGENT_REFINE_ORDER_TOKEN", "ORDER").strip().upper()
 
 AGENT_REFINE_GROUP_CLAUSE_PATTERN = os.getenv(
     "AGENT_REFINE_GROUP_CLAUSE_PATTERN",

@@ -51,6 +51,11 @@ from .config import (
     RETRIEVAL_CARDS_DESC_MAX_LEN,
     RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT,
     RETRIEVAL_DENSE_DESC_FALLBACK_LEN,
+    RETRIEVAL_SPARSE_DEBUG_PREVIEW_LIMIT,
+    RETRIEVAL_RETRIEVE_DEBUG_MAX_SHOW,
+    RETRIEVAL_AUTO_INJECT_BONUS_DELTA,
+    RETRIEVAL_TOP_TABLE_MIN_SCORE,
+    RETRIEVAL_BRIDGE_MIN_TABLE_COUNT,
     RETRIEVAL_EXTRA_STOPWORDS,
     RETRIEVAL_GENERIC_MENTION_TERMS,
     RETRIEVAL_JOIN_SIGNALS,
@@ -659,7 +664,7 @@ def _doc_tokens_from_meta(meta: Dict[str, Any]) -> List[str]:
     bag = " ".join([table, column, desc] + aliases + roles + extra)
     return _tokenize_bm25_query(bag)
 
-def jsonl_sparse_search(q: str, jsonl_paths: List[str], max_hits: int = 20) -> List[str]:
+def jsonl_sparse_search(q: str, jsonl_paths: List[str], max_hits: int = SPARSE_MAX_HITS) -> List[str]:
     # cache key by files + mtime
     sig = []
     for p in jsonl_paths:
@@ -751,7 +756,7 @@ def jsonl_sparse_search(q: str, jsonl_paths: List[str], max_hits: int = 20) -> L
 
     if SPARSE_DEBUG:
         print("[SPARSE] top hits:")
-        for doc_id, sc in ranked[:min(max_hits, 10)]:
+        for doc_id, sc in ranked[:min(max_hits, RETRIEVAL_SPARSE_DEBUG_PREVIEW_LIMIT)]:
             print(f"  - {doc_id}  score={sc:.3f}")
 
     return out
@@ -1439,7 +1444,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                     col_raw = _meta_column(md) or ""
                     col_name = col_raw.lower()
                     max_boost = max((x["boosted"] for x in scored), default=0.0)
-                    boosted = max_boost + 0.05
+                    boosted = max_boost + RETRIEVAL_AUTO_INJECT_BONUS_DELTA
                     boosted += apply_column_priority_boost(q_l=q_l, table=table_name, col_name=col_name, roles=roles, aliases=aliases)
                     scored.append({
                         "rank": len(scored), "id": sparse_preferred_name_urn, "doc": doc, "meta": md or {},
@@ -1469,7 +1474,7 @@ def retrieve_node(state: RAGState) -> RAGState:
         print(f"QTYPE         : {qtype}\n")
 
         total_sparse = len(sparse_docs_pretty)
-        max_show = min(7, total_sparse)
+        max_show = min(RETRIEVAL_RETRIEVE_DEBUG_MAX_SHOW, total_sparse)
         print(f"SPARSE CANDIDATES (top {max_show} of {total_sparse}):")
         if total_sparse == 0: print("  <none>\n")
         else:
@@ -1488,7 +1493,7 @@ def retrieve_node(state: RAGState) -> RAGState:
             print()
 
         total_dense = len(dense_metas)
-        max_show = min(7, total_dense)
+        max_show = min(RETRIEVAL_RETRIEVE_DEBUG_MAX_SHOW, total_dense)
         print(f"DENSE CANDIDATES (top {max_show} of {total_dense}):")
         if total_dense == 0: print("  <none>\n")
         else:
@@ -1502,7 +1507,7 @@ def retrieve_node(state: RAGState) -> RAGState:
             print()
 
         total_rerank = len(reranked)
-        max_show = min(7, total_rerank)
+        max_show = min(RETRIEVAL_RETRIEVE_DEBUG_MAX_SHOW, total_rerank)
         print(f"RERANKED RESULT (top {max_show} of {total_rerank}):")
         if total_rerank == 0: print("  <no reranked candidates>")
         else:
@@ -1612,7 +1617,11 @@ def retrieve_node(state: RAGState) -> RAGState:
 
                 # Base: Top 3 tables by score (increased from 2)
                 max_top_tables = MAX_TOP_TABLES
-                top_tables = {name for name, score in sorted_tbls[:max_top_tables] if score > 0.0}
+                top_tables = {
+                    name
+                    for name, score in sorted_tbls[:max_top_tables]
+                    if score > RETRIEVAL_TOP_TABLE_MIN_SCORE
+                }
 
                 # Addition: Include tables with any column in reranked results
                 # This captures tables that may not be mentioned but have needed columns
@@ -1639,7 +1648,7 @@ def retrieve_node(state: RAGState) -> RAGState:
 
                 # Addition: Bridge table inference
                 # If we have multiple tables, check if we need bridge tables
-                if len(top_tables) >= 2:
+                if len(top_tables) >= RETRIEVAL_BRIDGE_MIN_TABLE_COUNT:
                     bridge_tables = _infer_bridge_tables(top_tables, allowed, reranked)
                     top_tables.update(bridge_tables)
 
