@@ -27,6 +27,25 @@ from .config import (
     AGENT_INSTANT_REJECT_PATTERNS,
     AGENT_DEFINITE_SQL_PATTERNS,
     AGENT_GIBBERISH_KEYBOARD_PATTERNS,
+    AGENT_GUARD_EXAMPLE_MAX_ITEMS,
+    AGENT_GUARD_EXAMPLE_YEAR,
+    AGENT_GUARD_EXAMPLE_VALUE_THRESHOLD,
+    AGENT_GUARD_BANNER_CHAR,
+    AGENT_GUARD_BANNER_WIDTH,
+    AGENT_GIBBERISH_MIN_TEXT_LENGTH,
+    AGENT_GIBBERISH_SENTENCE_WORD_BYPASS,
+    AGENT_GIBBERISH_MIN_ALPHA_LENGTH,
+    AGENT_GIBBERISH_VOWEL_RATIO_MIN,
+    AGENT_GIBBERISH_VOWEL_CHECK_MIN_LEN,
+    AGENT_GIBBERISH_CONSONANT_RUN_MIN,
+    AGENT_GIBBERISH_CONSONANT_CHECK_MIN_LEN,
+    AGENT_GIBBERISH_NO_SPACE_LEN,
+    AGENT_GIBBERISH_REPEAT_MIN_LEN,
+    AGENT_GIBBERISH_REPEAT_PATTERN_LENGTHS,
+    AGENT_GIBBERISH_VOWELS,
+    AGENT_TABLE_VARIANT_MIN_TAIL_LEN,
+    AGENT_COLUMN_ORDERED_TOKEN,
+    AGENT_COLUMN_ORDERED_BY_PATTERN,
     AGENT_MISSING_COL_SUFFIX_SYNONYMS,
     AGENT_REGEX_TRIGGERS,
     AGENT_ROUTER_MATH_KEYWORDS,
@@ -59,9 +78,18 @@ from .config import (
     AGENT_ROUTER_ESCALATE_ON_EXCLUSION,
     AGENT_ROUTER_COMPLEXITY_SIMPLE,
     AGENT_ROUTER_COMPLEXITY_COMPLEX,
+    AGENT_ROUTER_COMPLEXITY_REJECTED,
     AGENT_ROUTER_QTYPE_LOOKUP,
     AGENT_ROUTER_QTYPE_AGGREGATE,
     AGENT_ROUTER_QTYPE_RANK,
+    AGENT_ROUTER_QTYPE_INVALID,
+    AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_FROM_PATTERN,
+    AGENT_DRAFT_SELECT_FROM_PATTERN,
+    AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_COMMA_PATTERN,
+    AGENT_DRAFT_LIMIT_NULL_ZERO_PATTERN,
+    AGENT_DRAFT_LIMIT_CAPTURE_PATTERN,
+    AGENT_DRAFT_LIMIT_REMOVE_PATTERN,
+    AGENT_DRAFT_LIMIT_INTENT_TERMS,
     AGENT_ROUTER_PRIMARY_FROM_IN_PATTERNS,
     AGENT_ROUTER_PRIMARY_ALL_ENTITY_PATTERN,
     AGENT_ROUTER_PRIMARY_REASON_FROM_IN,
@@ -147,7 +175,7 @@ def _table_name_variants(table: str) -> Set[str]:
                 continue
             if compact.startswith(root):
                 tail = compact[len(root):]
-                if len(tail) >= 3 and tail.isalpha():
+                if len(tail) >= AGENT_TABLE_VARIANT_MIN_TAIL_LEN and tail.isalpha():
                     variants.add(f"{root} {tail}")
 
     return {v for v in variants if v}
@@ -196,7 +224,7 @@ def _question_mentions_schema_entity(question_lower: str) -> bool:
     return False
 
 
-def _schema_entities_for_examples(max_items: int = 3) -> List[str]:
+def _schema_entities_for_examples(max_items: int = AGENT_GUARD_EXAMPLE_MAX_ITEMS) -> List[str]:
     """
     Build user-facing entity examples from schema tables (fallback-safe).
     """
@@ -225,29 +253,29 @@ def _schema_entities_for_examples(max_items: int = 3) -> List[str]:
 
 
 def _example_data_queries() -> List[str]:
-    entities = _schema_entities_for_examples(max_items=3)
+    entities = _schema_entities_for_examples(max_items=AGENT_GUARD_EXAMPLE_MAX_ITEMS)
     if len(entities) >= 3:
         return [
             f"Show all {entities[0]}",
-            f"How many {entities[1]} in 2023?",
-            f"List {entities[2]} with value above 100",
+            f"How many {entities[1]} in {AGENT_GUARD_EXAMPLE_YEAR}?",
+            f"List {entities[2]} with value above {AGENT_GUARD_EXAMPLE_VALUE_THRESHOLD}",
         ]
     if len(entities) == 2:
         return [
             f"Show all {entities[0]}",
-            f"How many {entities[1]} in 2023?",
-            f"List {entities[0]} with value above 100",
+            f"How many {entities[1]} in {AGENT_GUARD_EXAMPLE_YEAR}?",
+            f"List {entities[0]} with value above {AGENT_GUARD_EXAMPLE_VALUE_THRESHOLD}",
         ]
     if len(entities) == 1:
         return [
             f"Show all {entities[0]}",
-            f"How many {entities[0]} in 2023?",
-            f"List {entities[0]} with value above 100",
+            f"How many {entities[0]} in {AGENT_GUARD_EXAMPLE_YEAR}?",
+            f"List {entities[0]} with value above {AGENT_GUARD_EXAMPLE_VALUE_THRESHOLD}",
         ]
     return [
         "Show all records",
-        "How many records in 2023?",
-        "List records with value above 100",
+        f"How many records in {AGENT_GUARD_EXAMPLE_YEAR}?",
+        f"List records with value above {AGENT_GUARD_EXAMPLE_VALUE_THRESHOLD}",
     ]
 
 
@@ -292,7 +320,7 @@ def _detect_gibberish(text: str) -> Tuple[bool, str]:
     3. No spaces in long text (>15 chars without space)
     4. Repeated character patterns
     """
-    if not text or len(text) < 3:
+    if not text or len(text) < AGENT_GIBBERISH_MIN_TEXT_LENGTH:
         return False, ""  # Too short to judge, let other checks handle
     
     t = text.lower().strip()
@@ -303,23 +331,23 @@ def _detect_gibberish(text: str) -> Tuple[bool, str]:
     word_count = len(t.split())
     
     # If it looks like a real sentence (3+ words), skip gibberish check
-    if has_spaces and word_count >= 3:
+    if has_spaces and word_count >= AGENT_GIBBERISH_SENTENCE_WORD_BYPASS:
         return False, ""
     
     alpha_only = re.sub(r'[^a-z]', '', t)
     
-    if len(alpha_only) < 3:
+    if len(alpha_only) < AGENT_GIBBERISH_MIN_ALPHA_LENGTH:
         return False, ""  # Not enough letters to analyze
     
     # --- Heuristic 1: Vowel ratio ---
-    vowels = set('aiueo')
+    vowels = set(AGENT_GIBBERISH_VOWELS or "aiueo")
     vowel_count = sum(1 for c in alpha_only if c in vowels)
     vowel_ratio = vowel_count / len(alpha_only)
     
     # Normal English/Indonesian text has ~35-50% vowels
     # "asdgasdgasd" has ratio ~0.18 (too low)
     # Only apply to single-word inputs (no spaces)
-    if vowel_ratio < 0.12 and len(alpha_only) > 5 and not has_spaces:
+    if vowel_ratio < AGENT_GIBBERISH_VOWEL_RATIO_MIN and len(alpha_only) > AGENT_GIBBERISH_VOWEL_CHECK_MIN_LEN and not has_spaces:
         return True, "Input appears to be random text. Please enter a valid data query."
     
     # --- Heuristic 2: Consecutive consonants ---
@@ -327,14 +355,15 @@ def _detect_gibberish(text: str) -> Tuple[bool, str]:
     # "qwrtypsdfgh" still caught (10 consonants)
     # Only apply to single-word inputs
     if not has_spaces:
-        consonant_run = re.search(r'[bcdfghjklmnpqrstvwxyz]{7,}', alpha_only)
-        if consonant_run and len(alpha_only) > 6:
+        consonant_run_min = max(1, AGENT_GIBBERISH_CONSONANT_RUN_MIN)
+        consonant_run = re.search(rf'[bcdfghjklmnpqrstvwxyz]{{{consonant_run_min},}}', alpha_only)
+        if consonant_run and len(alpha_only) > AGENT_GIBBERISH_CONSONANT_CHECK_MIN_LEN:
             return True, "Input appears to be random text. Please enter a valid data query."
     
     # --- Heuristic 3: No spaces in long text ---
     # Normal questions have spaces: "show all customers"
     # Gibberish often doesn't: "asdgasdgasdgasd"
-    if len(t) > 15 and ' ' not in t:
+    if len(t) > AGENT_GIBBERISH_NO_SPACE_LEN and ' ' not in t:
         # Exception: could be a single long word like "customerNumber"
         # Check if it looks like camelCase or has some structure
         if not re.search(r'[A-Z]', text) and not re.search(r'[_\-]', text):
@@ -343,9 +372,11 @@ def _detect_gibberish(text: str) -> Tuple[bool, str]:
     # --- Heuristic 4: Repeated patterns ---
     # "abcabcabc" or "xyxyxyxy"
     # Only for short inputs without spaces
-    if len(t) >= 6 and not has_spaces:
+    if len(t) >= AGENT_GIBBERISH_REPEAT_MIN_LEN and not has_spaces:
         # Check for 2-3 char patterns repeated 3+ times
-        for pattern_len in [2, 3]:
+        for pattern_len in AGENT_GIBBERISH_REPEAT_PATTERN_LENGTHS:
+            if pattern_len <= 0:
+                continue
             pattern = t[:pattern_len]
             if pattern * 3 in t and len(set(pattern)) < pattern_len:
                 return True, "Input appears to be random text. Please enter a valid data query."
@@ -478,9 +509,9 @@ def question_guard_node(state: RAGState) -> RAGState:
     Standalone guard node - runs BEFORE retrieve to save resources.
     If rejected, pipeline ends early without calling retrieve/router/draft/refine.
     """
-    line_sep = "─" * 150
+    line_sep = AGENT_GUARD_BANNER_CHAR * AGENT_GUARD_BANNER_WIDTH
     print(f"\n{line_sep}")
-    print(f"{'QUESTION GUARD':^150}")
+    print(f"{'QUESTION GUARD':^{AGENT_GUARD_BANNER_WIDTH}}")
     print(f"{line_sep}")
     
     question = state.get("question", "")
@@ -494,8 +525,8 @@ def question_guard_node(state: RAGState) -> RAGState:
         return {
             **state,
             "router_decision": {
-                "complexity": "rejected",
-                "qtype": "invalid", 
+                "complexity": AGENT_ROUTER_COMPLEXITY_REJECTED,
+                "qtype": AGENT_ROUTER_QTYPE_INVALID,
                 "rejection_reason": rejection_reason,
                 "is_valid_question": False,
             },
@@ -554,7 +585,11 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
         if len(token) < 4 or token in stop_tokens:
             continue
         # "ordered by ..." usually indicates sorting intent, not orderdetails semantics
-        if token == "ordered" and re.search(r"\bordered\s+by\b", question_lower):
+        if (
+            AGENT_COLUMN_ORDERED_TOKEN
+            and token == AGENT_COLUMN_ORDERED_TOKEN
+            and re.search(AGENT_COLUMN_ORDERED_BY_PATTERN, question_lower)
+        ):
             continue
         token_forms = {token}
         if token.endswith("y") and len(token) > 3:
@@ -1461,7 +1496,7 @@ def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM
 def draft_sql_agent(state: RAGState) -> RAGState:
     # --- Guard: Skip if question was rejected by router ---
     decision = state.get("router_decision", {})
-    if decision.get("complexity") == "rejected" or decision.get("is_valid_question") == False:
+    if decision.get("complexity") == AGENT_ROUTER_COMPLEXITY_REJECTED or decision.get("is_valid_question") is False:
         print("[DRAFT] Skipped: Question was rejected by router guard")
         return state  # Pass through unchanged
     
@@ -1511,7 +1546,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # 2. [NEW] Hapus syntax error: SELECT col DESC FROM ...
     # Regex ini mencari DESC/ASC sebelum FROM (hanya di SELECT clause, bukan di ORDER BY)
     # Hanya strip DESC/ASC yang langsung sebelum FROM (dalam SELECT list)
-    draft_sql = re.sub(r"\s+(DESC|ASC)\s*(?=FROM)", " ", draft_sql, flags=re.IGNORECASE)
+    draft_sql = re.sub(AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_FROM_PATTERN, " ", draft_sql, flags=re.IGNORECASE)
     # FIX: Jangan strip DESC/ASC sebelum koma jika ada di dalam ORDER BY atau OVER clause
     # Pattern lama: r"\s+(DESC|ASC)\s*(?=,)" - ini salah strip "ORDER BY amount DESC, date"
     # Pattern baru: hanya strip jika di SELECT clause (sebelum FROM)
@@ -1519,23 +1554,28 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     def _strip_desc_in_select_only(sql: str) -> str:
         """Strip DESC/ASC before comma only in SELECT clause, not in ORDER BY."""
         # Find SELECT ... FROM boundary
-        match = re.search(r"\bSELECT\b(.*?)\bFROM\b", sql, re.IGNORECASE | re.DOTALL)
+        match = re.search(AGENT_DRAFT_SELECT_FROM_PATTERN, sql, re.IGNORECASE | re.DOTALL)
         if not match:
             return sql
         select_part = match.group(1)
         # Strip DESC/ASC before comma only in SELECT part
-        fixed_select = re.sub(r"\s+(DESC|ASC)\s*(?=,)", " ", select_part, flags=re.IGNORECASE)
+        fixed_select = re.sub(AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_COMMA_PATTERN, " ", select_part, flags=re.IGNORECASE)
         if fixed_select != select_part:
             sql = sql[:match.start(1)] + fixed_select + sql[match.end(1):]
         return sql
     draft_sql = _strip_desc_in_select_only(draft_sql)
     # Basic Cleanup (Limit Halusinasi)
-    draft_sql = re.sub(r"LIMIT\s+(NULL|0)", "", draft_sql, flags=re.IGNORECASE).strip()
-    match = re.search(r"LIMIT\s+(\d+)", draft_sql, re.IGNORECASE)
+    draft_sql = re.sub(AGENT_DRAFT_LIMIT_NULL_ZERO_PATTERN, "", draft_sql, flags=re.IGNORECASE).strip()
+    match = re.search(AGENT_DRAFT_LIMIT_CAPTURE_PATTERN, draft_sql, re.IGNORECASE)
     if match:
         limit_n = match.group(1)
-        if not re.search(rf"\b{limit_n}\b|top|best|highest|lowest|limit", question.lower()):
-            draft_sql = re.sub(r"LIMIT\s+\d+\s*;?", "", draft_sql, flags=re.IGNORECASE).strip()
+        limit_terms_pattern = "|".join(re.escape(term) for term in AGENT_DRAFT_LIMIT_INTENT_TERMS if term)
+        has_limit_intent = bool(
+            re.search(rf"\b{re.escape(limit_n)}\b", question.lower()) or
+            (limit_terms_pattern and re.search(rf"\b(?:{limit_terms_pattern})\b", question.lower()))
+        )
+        if not has_limit_intent:
+            draft_sql = re.sub(AGENT_DRAFT_LIMIT_REMOVE_PATTERN, "", draft_sql, flags=re.IGNORECASE).strip()
     
     if not draft_sql.endswith(";"): draft_sql += ";"
     print(f"[DRAFT] After cleanup: {draft_sql}")
@@ -1546,7 +1586,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 def refine_sql_agent(state: RAGState) -> RAGState:
     # --- Guard: Skip if question was rejected by router ---
     decision = state.get("router_decision", {})
-    if decision.get("complexity") == "rejected" or decision.get("is_valid_question") == False:
+    if decision.get("complexity") == AGENT_ROUTER_COMPLEXITY_REJECTED or decision.get("is_valid_question") is False:
         print("[REFINE] Skipped: Question was rejected by router guard")
         return state  # Pass through unchanged
     

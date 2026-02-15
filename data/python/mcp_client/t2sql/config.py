@@ -103,6 +103,14 @@ SPARSE_MAX_HITS  = int(os.getenv("SPARSE_MAX_HITS", "20"))
 SPARSE_DEBUG   = bool(int(os.getenv("SPARSE_DEBUG", "0")))
 RETRIEVE_DEBUG = bool(int(os.getenv("RETRIEVE_DEBUG", "1")))
 EXPORT_JSONL_OUTPUT = os.getenv("EXPORT_JSONL_OUTPUT", "classicmodels_dense.jsonl").strip()
+
+RETRIEVAL_STATS_MAX_SAMPLES = int(os.getenv("RETRIEVAL_STATS_MAX_SAMPLES", "5"))
+RETRIEVAL_DESC_KEYWORD_HEAD_WORDS = int(os.getenv("RETRIEVAL_DESC_KEYWORD_HEAD_WORDS", "5"))
+RETRIEVAL_CARDS_MAX_DOCS = int(os.getenv("RETRIEVAL_CARDS_MAX_DOCS", "15"))
+RETRIEVAL_CARDS_MAX_INJECT = int(os.getenv("RETRIEVAL_CARDS_MAX_INJECT", "12"))
+RETRIEVAL_CARDS_DESC_MAX_LEN = int(os.getenv("RETRIEVAL_CARDS_DESC_MAX_LEN", "100"))
+RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT = int(os.getenv("RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT", "5"))
+RETRIEVAL_DENSE_DESC_FALLBACK_LEN = int(os.getenv("RETRIEVAL_DENSE_DESC_FALLBACK_LEN", "100"))
 # ======================================================================
 # =============================== MCP ==================================
 # ======================================================================
@@ -154,6 +162,33 @@ AGENT_GIBBERISH_KEYBOARD_PATTERNS = _env_json_list(
     "AGENT_GIBBERISH_KEYBOARD_PATTERNS",
     ["qwert", "asdfg", "zxcvb", "qazwsx", "yxcvbn", "hjkl", "yuiop"],
 )
+
+AGENT_GUARD_EXAMPLE_MAX_ITEMS = int(os.getenv("AGENT_GUARD_EXAMPLE_MAX_ITEMS", "3"))
+AGENT_GUARD_EXAMPLE_YEAR = int(os.getenv("AGENT_GUARD_EXAMPLE_YEAR", "2023"))
+AGENT_GUARD_EXAMPLE_VALUE_THRESHOLD = int(os.getenv("AGENT_GUARD_EXAMPLE_VALUE_THRESHOLD", "100"))
+AGENT_GUARD_BANNER_CHAR = os.getenv("AGENT_GUARD_BANNER_CHAR", "\u2500")
+AGENT_GUARD_BANNER_WIDTH = int(os.getenv("AGENT_GUARD_BANNER_WIDTH", "150"))
+
+AGENT_GIBBERISH_MIN_TEXT_LENGTH = int(os.getenv("AGENT_GIBBERISH_MIN_TEXT_LENGTH", "3"))
+AGENT_GIBBERISH_SENTENCE_WORD_BYPASS = int(os.getenv("AGENT_GIBBERISH_SENTENCE_WORD_BYPASS", "3"))
+AGENT_GIBBERISH_MIN_ALPHA_LENGTH = int(os.getenv("AGENT_GIBBERISH_MIN_ALPHA_LENGTH", "3"))
+AGENT_GIBBERISH_VOWEL_RATIO_MIN = float(os.getenv("AGENT_GIBBERISH_VOWEL_RATIO_MIN", "0.12"))
+AGENT_GIBBERISH_VOWEL_CHECK_MIN_LEN = int(os.getenv("AGENT_GIBBERISH_VOWEL_CHECK_MIN_LEN", "5"))
+AGENT_GIBBERISH_CONSONANT_RUN_MIN = int(os.getenv("AGENT_GIBBERISH_CONSONANT_RUN_MIN", "7"))
+AGENT_GIBBERISH_CONSONANT_CHECK_MIN_LEN = int(os.getenv("AGENT_GIBBERISH_CONSONANT_CHECK_MIN_LEN", "6"))
+AGENT_GIBBERISH_NO_SPACE_LEN = int(os.getenv("AGENT_GIBBERISH_NO_SPACE_LEN", "15"))
+AGENT_GIBBERISH_REPEAT_MIN_LEN = int(os.getenv("AGENT_GIBBERISH_REPEAT_MIN_LEN", "6"))
+AGENT_GIBBERISH_REPEAT_PATTERN_LENGTHS = [
+    int(x) for x in _env_json_list("AGENT_GIBBERISH_REPEAT_PATTERN_LENGTHS", ["2", "3"])
+    if str(x).strip().isdigit()
+] or [2, 3]
+AGENT_GIBBERISH_VOWELS = os.getenv("AGENT_GIBBERISH_VOWELS", "aiueo").strip().lower()
+AGENT_TABLE_VARIANT_MIN_TAIL_LEN = int(os.getenv("AGENT_TABLE_VARIANT_MIN_TAIL_LEN", "3"))
+AGENT_COLUMN_ORDERED_TOKEN = os.getenv("AGENT_COLUMN_ORDERED_TOKEN", "ordered").strip().lower()
+AGENT_COLUMN_ORDERED_BY_PATTERN = os.getenv(
+    "AGENT_COLUMN_ORDERED_BY_PATTERN",
+    r"\bordered\s+by\b",
+).strip()
 
 AGENT_MISSING_COL_SUFFIX_SYNONYMS = _env_json_dict(
     "AGENT_MISSING_COL_SUFFIX_SYNONYMS",
@@ -259,6 +294,65 @@ RETRIEVAL_CONTACT_NAME_TERMS = _env_json_list(
         "contact name", "contact first", "contact last",
         "first name", "last name", "person name",
     ],
+)
+
+RETRIEVAL_NAME_ROLE_HINT_TERMS = set(
+    _env_json_list(
+        "RETRIEVAL_NAME_ROLE_HINT_TERMS",
+        ["name"],
+    )
+)
+
+RETRIEVAL_NAME_COLUMN_HINT_TERMS = set(
+    _env_json_list(
+        "RETRIEVAL_NAME_COLUMN_HINT_TERMS",
+        ["name"],
+    )
+)
+
+RETRIEVAL_ID_ROLE_HINT_TERMS = set(
+    _env_json_list(
+        "RETRIEVAL_ID_ROLE_HINT_TERMS",
+        ["id"],
+    )
+)
+
+RETRIEVAL_ID_COLUMN_SUFFIX_TERMS = _env_json_list(
+    "RETRIEVAL_ID_COLUMN_SUFFIX_TERMS",
+    ["id", "code", "number"],
+)
+
+RETRIEVAL_ID_COLUMN_SUBSTRING_TERMS = set(
+    _env_json_list(
+        "RETRIEVAL_ID_COLUMN_SUBSTRING_TERMS",
+        ["number"],
+    )
+)
+
+RETRIEVAL_ID_BOOST_COLUMN_SUFFIX_TERMS = _env_json_list(
+    "RETRIEVAL_ID_BOOST_COLUMN_SUFFIX_TERMS",
+    ["id"],
+)
+
+RETRIEVAL_ID_BOOST_COLUMN_SUBSTRING_TERMS = set(
+    _env_json_list(
+        "RETRIEVAL_ID_BOOST_COLUMN_SUBSTRING_TERMS",
+        ["number"],
+    )
+)
+
+RETRIEVAL_CONTACT_COLUMN_HINT_TERMS = set(
+    _env_json_list(
+        "RETRIEVAL_CONTACT_COLUMN_HINT_TERMS",
+        ["contact"],
+    )
+)
+
+RETRIEVAL_DIMENSION_LIKE_TABLE_TYPES = set(
+    _env_json_list(
+        "RETRIEVAL_DIMENSION_LIKE_TABLE_TYPES",
+        ["dimension", "unknown"],
+    )
 )
 
 RETRIEVAL_ID_BOOST_QUERY_TERMS = _env_json_list(
@@ -427,6 +521,11 @@ RETRIEVAL_NAME_ONLY_NAME_PATTERN = os.getenv(
     r"\b(name|names|nama)\b",
 ).strip()
 
+RETRIEVAL_NAME_ONLY_NUMBER_OF_PATTERN = os.getenv(
+    "RETRIEVAL_NAME_ONLY_NUMBER_OF_PATTERN",
+    r"\b(total\s+)?number\s+of\b",
+).strip()
+
 RETRIEVAL_DEBUG_FOCUS_COLUMNS = set(
     _env_json_list(
         "RETRIEVAL_DEBUG_FOCUS_COLUMNS",
@@ -562,6 +661,10 @@ RETRIEVAL_TABLE_NAME_PREFIX_STRIP_CHARS = os.getenv(
     "s",
 )
 
+RETRIEVAL_TABLE_VARIANT_MIN_TAIL_LEN = int(
+    os.getenv("RETRIEVAL_TABLE_VARIANT_MIN_TAIL_LEN", "3")
+)
+
 RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS = _env_json_dict(
     "RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS",
     {
@@ -596,9 +699,46 @@ AGENT_ROUTER_ESCALATE_ON_EXCLUSION = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_O
 
 AGENT_ROUTER_COMPLEXITY_SIMPLE = os.getenv("AGENT_ROUTER_COMPLEXITY_SIMPLE", "simple").strip()
 AGENT_ROUTER_COMPLEXITY_COMPLEX = os.getenv("AGENT_ROUTER_COMPLEXITY_COMPLEX", "complex").strip()
+AGENT_ROUTER_COMPLEXITY_REJECTED = os.getenv("AGENT_ROUTER_COMPLEXITY_REJECTED", "rejected").strip()
 AGENT_ROUTER_QTYPE_LOOKUP = os.getenv("AGENT_ROUTER_QTYPE_LOOKUP", "lookup").strip()
 AGENT_ROUTER_QTYPE_AGGREGATE = os.getenv("AGENT_ROUTER_QTYPE_AGGREGATE", "aggregate").strip()
 AGENT_ROUTER_QTYPE_RANK = os.getenv("AGENT_ROUTER_QTYPE_RANK", "rank").strip()
+AGENT_ROUTER_QTYPE_INVALID = os.getenv("AGENT_ROUTER_QTYPE_INVALID", "invalid").strip()
+
+AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_FROM_PATTERN = os.getenv(
+    "AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_FROM_PATTERN",
+    r"\s+(DESC|ASC)\s*(?=FROM)",
+).strip()
+
+AGENT_DRAFT_SELECT_FROM_PATTERN = os.getenv(
+    "AGENT_DRAFT_SELECT_FROM_PATTERN",
+    r"\bSELECT\b(.*?)\bFROM\b",
+).strip()
+
+AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_COMMA_PATTERN = os.getenv(
+    "AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_COMMA_PATTERN",
+    r"\s+(DESC|ASC)\s*(?=,)",
+).strip()
+
+AGENT_DRAFT_LIMIT_NULL_ZERO_PATTERN = os.getenv(
+    "AGENT_DRAFT_LIMIT_NULL_ZERO_PATTERN",
+    r"LIMIT\s+(NULL|0)",
+).strip()
+
+AGENT_DRAFT_LIMIT_CAPTURE_PATTERN = os.getenv(
+    "AGENT_DRAFT_LIMIT_CAPTURE_PATTERN",
+    r"LIMIT\s+(\d+)",
+).strip()
+
+AGENT_DRAFT_LIMIT_REMOVE_PATTERN = os.getenv(
+    "AGENT_DRAFT_LIMIT_REMOVE_PATTERN",
+    r"LIMIT\s+\d+\s*;?",
+).strip()
+
+AGENT_DRAFT_LIMIT_INTENT_TERMS = _env_json_list(
+    "AGENT_DRAFT_LIMIT_INTENT_TERMS",
+    ["top", "best", "highest", "lowest", "limit"],
+)
 
 AGENT_REFINE_WINNER_ROW_LEAK_PATTERN = os.getenv(
     "AGENT_REFINE_WINNER_ROW_LEAK_PATTERN",

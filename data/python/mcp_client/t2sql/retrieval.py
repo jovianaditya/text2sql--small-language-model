@@ -44,6 +44,13 @@ from .config import (
     SPARSE_MAX_HITS,
     SPARSE_DEBUG,
     RETRIEVE_DEBUG,
+    RETRIEVAL_STATS_MAX_SAMPLES,
+    RETRIEVAL_DESC_KEYWORD_HEAD_WORDS,
+    RETRIEVAL_CARDS_MAX_DOCS,
+    RETRIEVAL_CARDS_MAX_INJECT,
+    RETRIEVAL_CARDS_DESC_MAX_LEN,
+    RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT,
+    RETRIEVAL_DENSE_DESC_FALLBACK_LEN,
     RETRIEVAL_EXTRA_STOPWORDS,
     RETRIEVAL_GENERIC_MENTION_TERMS,
     RETRIEVAL_JOIN_SIGNALS,
@@ -53,6 +60,15 @@ from .config import (
     RETRIEVAL_ID_LIKE_QUERY_TERMS,
     RETRIEVAL_NAME_REQUEST_TERMS,
     RETRIEVAL_CONTACT_NAME_TERMS,
+    RETRIEVAL_NAME_ROLE_HINT_TERMS,
+    RETRIEVAL_NAME_COLUMN_HINT_TERMS,
+    RETRIEVAL_ID_ROLE_HINT_TERMS,
+    RETRIEVAL_ID_COLUMN_SUFFIX_TERMS,
+    RETRIEVAL_ID_COLUMN_SUBSTRING_TERMS,
+    RETRIEVAL_ID_BOOST_COLUMN_SUFFIX_TERMS,
+    RETRIEVAL_ID_BOOST_COLUMN_SUBSTRING_TERMS,
+    RETRIEVAL_CONTACT_COLUMN_HINT_TERMS,
+    RETRIEVAL_DIMENSION_LIKE_TABLE_TYPES,
     RETRIEVAL_ID_BOOST_QUERY_TERMS,
     RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS,
     RETRIEVAL_NUMERIC_PATTERN_KEYWORDS,
@@ -69,9 +85,14 @@ from .config import (
     RETRIEVAL_TABLE_SCORING_MATH_KEYWORDS,
     RETRIEVAL_NAME_ONLY_ID_PATTERN,
     RETRIEVAL_NAME_ONLY_NAME_PATTERN,
+    RETRIEVAL_NAME_ONLY_NUMBER_OF_PATTERN,
     RETRIEVAL_DEBUG_FOCUS_COLUMNS,
     RETRIEVAL_TABLE_NAME_PREFIX_STRIP_CHARS,
+    RETRIEVAL_TABLE_VARIANT_MIN_TAIL_LEN,
     RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS,
+    AGENT_ROUTER_QTYPE_LOOKUP,
+    AGENT_ROUTER_QTYPE_AGGREGATE,
+    AGENT_ROUTER_QTYPE_RANK,
 )
 from .state import RAGState
 from .chroma_embedding import build_vector_store
@@ -134,7 +155,7 @@ def _format_stats_for_llm(stats_raw: Any) -> str:
 
     if val_list and isinstance(val_list, list):
         # Ambil max 5 sample agar hemat token
-        clean_vals = [str(v) for v in val_list[:5] if v is not None]
+        clean_vals = [str(v) for v in val_list[:RETRIEVAL_STATS_MAX_SAMPLES] if v is not None]
         if clean_vals:
             parts.append(f"Samples={str(clean_vals)}")
     elif val_single:
@@ -217,7 +238,7 @@ def _is_column_relevant_to_query(
     # Check column description (with word boundary matching)
     desc = str(metadata.get("description") or "").lower()
     # Extract key terms from description (first few words)
-    desc_words = set(desc.split()[:5])
+    desc_words = set(desc.split()[:RETRIEVAL_DESC_KEYWORD_HEAD_WORDS])
     # Only match if description words actually appear as whole words in question
     if desc_words.intersection(q_words):
         # But exclude generic terms that could cause false positives
@@ -228,7 +249,7 @@ def _is_column_relevant_to_query(
             return True
 
     # === RULE 3: For COUNT queries, exclude metric columns not mentioned ===
-    if qtype == "aggregate" and "count" in q_l:
+    if qtype == AGENT_ROUTER_QTYPE_AGGREGATE and "count" in q_l:
         # Count queries only need: PK, name columns, and explicitly mentioned columns
         # Exclude: quantityInStock, buyPrice, etc. unless mentioned
         is_metric = any(r in RETRIEVAL_METRIC_ROLE_TAGS for r in roles)
@@ -269,15 +290,15 @@ def _is_column_relevant_to_query(
                     print(f"   [FILTER-RULE3] KEPT {table}.{column}: column name explicitly mentioned")
 
     # === RULE 4: For aggregate queries (SUM/AVG), include relevant metric columns ===
-    if qtype == "aggregate" and any(kw in q_l for kw in RETRIEVAL_AGGREGATE_QUERY_TERMS):
+    if qtype == AGENT_ROUTER_QTYPE_AGGREGATE and any(kw in q_l for kw in RETRIEVAL_AGGREGATE_QUERY_TERMS):
         # These queries need numeric columns, but only relevant ones
         # Default: include (will be filtered by relevance scoring)
         return True
 
     # === RULE 5: For lookup queries, include filterable and display columns ===
-    if qtype == "lookup":
+    if qtype == AGENT_ROUTER_QTYPE_LOOKUP:
         # Name columns are always relevant
-        if "name" in col_lower:
+        if any(term in col_lower for term in RETRIEVAL_NAME_COLUMN_HINT_TERMS):
             return True
         # Include if table is mentioned
         if table_lower in q_l or get_singular_form(table_lower) in q_l:
@@ -293,20 +314,19 @@ def _is_column_relevant_to_query(
 def _build_cards(
     filtered_allowed: Dict[str, List[str]],
     reranked: List[Dict[str, Any]],
-    max_cards: int = 15,
-    max_inject: int = 12,
-    desc_max_len: int = 100,
+    max_cards: int = RETRIEVAL_CARDS_MAX_DOCS,
+    max_inject: int = RETRIEVAL_CARDS_MAX_INJECT,
+    desc_max_len: int = RETRIEVAL_CARDS_DESC_MAX_LEN,
     question: str = "",  # Add question parameter
     qtype: str = "",     # Add qtype parameter
 ) -> str:
     cards: List[str] = []
     present = set()
     
-    # debug_count = 0 
-    # print(f"\n[DEBUG CARD PREVIEW] Menampilkan Top 5 Kartu untuk LLM:")
+    # debug_count = 0
     if RETRIEVE_DEBUG:
         debug_count = 0 
-        print(f"\n[DEBUG CARD PREVIEW] Menampilkan Top 5 Kartu untuk LLM:")
+        print(f"\n[DEBUG CARD PREVIEW] Menampilkan Top {RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT} Kartu untuk LLM:")
 
     for it in (reranked or [])[:max_cards]:
         md = it.get("meta") or {}
@@ -358,8 +378,8 @@ def _build_cards(
                     if end != -1:
                         desc = doc_text[start:end].strip()
                     else:
-                        # Ambil max 100 char kalau tidak nemu batas
-                        desc = doc_text[start:start+100].strip()
+                        # Fallback truncation length is configurable.
+                        desc = doc_text[start:start + RETRIEVAL_DENSE_DESC_FALLBACK_LEN].strip()
                 except:
                     pass
 
@@ -387,9 +407,8 @@ def _build_cards(
         cards.append(card_str)
         present.add((table.lower(), column.lower()))
 
-        # Print debug 5 baris pertama
-        # if debug_count < 5:
-        if RETRIEVE_DEBUG and debug_count < 5:
+        # Print debug preview rows.
+        if RETRIEVE_DEBUG and debug_count < RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT:
             print(f"   [{debug_count+1}] {card_str}")
             debug_count += 1
 
@@ -458,7 +477,7 @@ def _table_mention_candidates(table: str, include_synonyms: bool = True) -> List
                 continue
             if compact.startswith(root):
                 tail = compact[len(root):]
-                if len(tail) >= 3 and tail.isalpha():
+                if len(tail) >= RETRIEVAL_TABLE_VARIANT_MIN_TAIL_LEN and tail.isalpha():
                     candidates.add(f"{root} {tail}")
 
     if include_synonyms:
@@ -770,7 +789,10 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
 
     # Generic name boosting (table-agnostic)
     if any(k in q_l for k in RETRIEVAL_NAME_QUERY_TERMS):
-        if any(r == "name" or "name" in r for r in roles) or "name" in col_lower:
+        if (
+            any(any(term in r for term in RETRIEVAL_NAME_ROLE_HINT_TERMS) for r in roles)
+            or any(term in col_lower for term in RETRIEVAL_NAME_COLUMN_HINT_TERMS)
+        ):
             bonus += NAME_QUERY_BONUS
 
     # Check if table is mentioned (dynamic - uses schema metadata)
@@ -800,21 +822,19 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
 
         # Dynamic ID column patterns
         is_id_column = (
-            any(r == "id" or "id" in r for r in roles) or
-            col_lower.endswith("id") or
-            col_lower.endswith("code") or
-            col_lower.endswith("number") or
-            "number" in col_lower
+            any(any(term in r for term in RETRIEVAL_ID_ROLE_HINT_TERMS) for r in roles) or
+            any(col_lower.endswith(suffix) for suffix in RETRIEVAL_ID_COLUMN_SUFFIX_TERMS) or
+            any(term in col_lower for term in RETRIEVAL_ID_COLUMN_SUBSTRING_TERMS)
         )
 
         # Dynamic contact column detection (for tables with contact info)
-        is_contact_column = "contact" in col_lower
+        is_contact_column = any(term in col_lower for term in RETRIEVAL_CONTACT_COLUMN_HINT_TERMS)
 
         # Apply table-type-based boosts (dynamic based on table type, not hardcoded names)
         table_type = get_table_type(tl)
 
         # High boost for dimension tables (customers, products, employees)
-        if table_type in ("dimension", "unknown"):
+        if table_type in RETRIEVAL_DIMENSION_LIKE_TABLE_TYPES:
             if asks_for_names and not asks_contact_explicitly:
                 # Boost {table}name columns
                 if any(expected in col_lower for expected in expected_name_cols):
@@ -842,7 +862,11 @@ def apply_column_priority_boost(q_l: str, table: str, col_name: str, roles: List
 
     # Generic ID boosting (table-agnostic, already dynamic)
     if any(k in q_l for k in RETRIEVAL_ID_BOOST_QUERY_TERMS):
-        if (any(r == "id" or "id" in r for r in roles) or "number" in col_lower or col_lower.endswith("id")):
+        if (
+            any(any(term in r for term in RETRIEVAL_ID_ROLE_HINT_TERMS) for r in roles)
+            or any(term in col_lower for term in RETRIEVAL_ID_BOOST_COLUMN_SUBSTRING_TERMS)
+            or any(col_lower.endswith(suffix) for suffix in RETRIEVAL_ID_BOOST_COLUMN_SUFFIX_TERMS)
+        ):
             bonus += ID_QUERY_BONUS
 
     return bonus
@@ -1189,7 +1213,7 @@ def _wants_name_only_for_table(question: str, table: str) -> bool:
         return False
 
     # Avoid treating "number of" as ID intent.
-    q_clean = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
+    q_clean = re.sub(RETRIEVAL_NAME_ONLY_NUMBER_OF_PATTERN, "", q)
     asks_id_like = bool(re.search(RETRIEVAL_NAME_ONLY_ID_PATTERN, q_clean))
     asks_name_like = bool(re.search(RETRIEVAL_NAME_ONLY_NAME_PATTERN, q_clean))
     return (asks_name_like or not asks_id_like) and not asks_id_like
@@ -1240,7 +1264,7 @@ def _is_table_mentioned(question: str, table: str) -> bool:
 
 
 def _should_lock_single_table_ctx(question: str, qtype: str) -> bool:
-    if qtype not in {"lookup", "aggregate", "rank"}: return False
+    if qtype not in {AGENT_ROUTER_QTYPE_LOOKUP, AGENT_ROUTER_QTYPE_AGGREGATE, AGENT_ROUTER_QTYPE_RANK}: return False
     if _has_join_intent(question): return False
     return _detect_primary_entity_table(question) is not None
 
@@ -1255,7 +1279,7 @@ def retrieve_node(state: RAGState) -> RAGState:
     q_l = q.lower()
     qtype = _get_qtype(state)
 
-    primary_lookup_table = _detect_primary_entity_table(q) if qtype == "lookup" else None
+    primary_lookup_table = _detect_primary_entity_table(q) if qtype == AGENT_ROUTER_QTYPE_LOOKUP else None
     prefer_name_table = (
         primary_lookup_table
         if _wants_name_only_for_table(q, primary_lookup_table or "")
@@ -1524,7 +1548,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                     allowed[primary_for_lock].append(c)
 
         # For lookup-style prompts, keep the entity's ID/name columns if available.
-        if qtype == "lookup":
+        if qtype == AGENT_ROUTER_QTYPE_LOOKUP:
             for c in [get_id_column(primary_for_lock), get_name_column(primary_for_lock)]:
                 if c and c not in allowed[primary_for_lock]:
                     allowed[primary_for_lock].append(c)
@@ -1535,7 +1559,7 @@ def retrieve_node(state: RAGState) -> RAGState:
     token_for_score = _tokenize_bm25_query(sparse_query_clean)
     table_scores = score_tables_from_reranked(reranked, token_for_score)
 
-    if qtype == "lookup" and prefer_name_table:
+    if qtype == AGENT_ROUTER_QTYPE_LOOKUP and prefer_name_table:
         only_preferred = {t: cols for t, cols in allowed.items() if t.lower() == prefer_name_table}
         filtered_allowed = only_preferred if only_preferred else dict(allowed)
     else:
@@ -1620,9 +1644,9 @@ def retrieve_node(state: RAGState) -> RAGState:
     cards_text = _build_cards(
         filtered_allowed,
         reranked,
-        max_cards=15,
-        max_inject=12,
-        desc_max_len=100,
+        max_cards=RETRIEVAL_CARDS_MAX_DOCS,
+        max_inject=RETRIEVAL_CARDS_MAX_INJECT,
+        desc_max_len=RETRIEVAL_CARDS_DESC_MAX_LEN,
         question=q,      # Pass question for column filtering
         qtype=qtype,     # Pass qtype for column filtering
     )
