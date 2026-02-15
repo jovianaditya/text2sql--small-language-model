@@ -54,12 +54,32 @@ from .config import (
     AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN,
     AGENT_ROUTER_TIEBREAKER_PATTERN,
     AGENT_ROUTER_MISSING_EMPTY_PATTERN,
+    AGENT_ROUTER_ESCALATE_ON_MULTI_TABLE,
+    AGENT_ROUTER_ESCALATE_ON_WINNER_ROW,
+    AGENT_ROUTER_ESCALATE_ON_EXCLUSION,
+    AGENT_ROUTER_COMPLEXITY_SIMPLE,
+    AGENT_ROUTER_COMPLEXITY_COMPLEX,
+    AGENT_ROUTER_QTYPE_LOOKUP,
+    AGENT_ROUTER_QTYPE_AGGREGATE,
+    AGENT_ROUTER_QTYPE_RANK,
     AGENT_ROUTER_PRIMARY_FROM_IN_PATTERNS,
     AGENT_ROUTER_PRIMARY_ALL_ENTITY_PATTERN,
     AGENT_ROUTER_PRIMARY_REASON_FROM_IN,
     AGENT_ROUTER_PRIMARY_REASON_ALL,
     AGENT_ROUTER_FK_EVIDENCE_EXTRACT_PATTERN,
     AGENT_ROUTER_FK_EVIDENCE_PREFIX,
+    AGENT_REFINE_WINNER_ROW_LEAK_PATTERN,
+    AGENT_REFINE_TUPLE_IN_PATTERN,
+    AGENT_REFINE_PARTITION_BY_PATTERN,
+    AGENT_REFINE_BROKEN_ALIAS_PATTERN,
+    AGENT_REFINE_MONTH_NAME_GROUP_PATTERN,
+    AGENT_REFINE_SAFE_MONTH_SORT_FUNC_PATTERN,
+    AGENT_REFINE_SAFE_MONTH_SORT_DATE_PATTERN,
+    AGENT_REFINE_GROUP_CLAUSE_PATTERN,
+    AGENT_REFINE_WHERE_CLAUSE_PATTERN,
+    AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN,
+    AGENT_REFINE_LOWER_WHERE_PATTERN,
+    AGENT_REFINE_LOWER_HAVING_PATTERN,
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -1335,9 +1355,9 @@ def router_agent(state: RAGState) -> RAGState:
     # - Winner-row patterns (requires ROW_NUMBER/RANK subquery)
     # - Cross-table exclusion patterns (NOT IN, NOT EXISTS)
     should_escalate = (
-        is_multi_table or   # JOINs need 7B
-        is_winner_row or    # ROW_NUMBER subquery patterns need 7B
-        has_exclusion       # Cross-table exclusion needs 7B
+        (AGENT_ROUTER_ESCALATE_ON_MULTI_TABLE and is_multi_table) or
+        (AGENT_ROUTER_ESCALATE_ON_WINNER_ROW and is_winner_row) or
+        (AGENT_ROUTER_ESCALATE_ON_EXCLUSION and has_exclusion)
     )
     
     if is_multi_table:
@@ -1346,15 +1366,15 @@ def router_agent(state: RAGState) -> RAGState:
         print(f"[Router] Winner-row pattern detected (tiebreaker/subquery needed) -> escalating to 7B")
     
     chosen_model = LARGE_MODEL if should_escalate else SMALL_MODEL
-    complexity = "complex" if should_escalate else "simple"
+    complexity = AGENT_ROUTER_COMPLEXITY_COMPLEX if should_escalate else AGENT_ROUTER_COMPLEXITY_SIMPLE
     
     # Tentukan QTYPE
-    if is_winner_row: 
-        qtype = "rank"
-    elif has_math or has_grouping: 
-        qtype = "aggregate"
+    if is_winner_row:
+        qtype = AGENT_ROUTER_QTYPE_RANK
+    elif has_math or has_grouping:
+        qtype = AGENT_ROUTER_QTYPE_AGGREGATE
     else: 
-        qtype = "lookup"
+        qtype = AGENT_ROUTER_QTYPE_LOOKUP
     
     print(f"[Router] Detected Tables: {relevant_tables}")
     print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, OrdinalRank:{is_ordinal_ranking}, Exclusion:{has_exclusion}, WindowAgg:{is_window_aggregate}, ExplicitRank:{is_explicit_rank_function}")
@@ -1541,8 +1561,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     
     decision = state.get("router_decision", {})
     detected_tables = state.get("router_tables") or []
-    complexity = decision.get("complexity", "complex")
-    qtype = decision.get("qtype", "lookup")
+    complexity = decision.get("complexity", AGENT_ROUTER_COMPLEXITY_COMPLEX)
+    qtype = decision.get("qtype", AGENT_ROUTER_QTYPE_LOOKUP)
     
     # 1. HEURISTIC PIPELINE (Versi Bersih/Safe Mode)
     final_sql = normalize_sql_pipeline(draft_sql, question, ctx)
@@ -1753,7 +1773,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # --- KASUS B: Winner-Row Leak Check (HARD ERROR) ---
     is_winner_row = decision.get("is_winner_row", False)
     if is_winner_row and not needs_regeneration:
-        if re.search(r"SELECT\s+.*?\brn\b.*?FROM", sql_up):
+        if re.search(AGENT_REFINE_WINNER_ROW_LEAK_PATTERN, sql_up):
              _dbg_print_two("[Agent3] HARD ERROR - Winner-Row Leak", "rn column found in outer select.")
              extra_instruction = (
                 "STRICT REQUIREMENT: Use standard Winner-Row pattern. "
@@ -1763,7 +1783,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
              regeneration_model = LARGE_MODEL  # Force 7B
 
     # --- KASUS C: ANTI-PATTERN (WHERE IN Subquery) (HARD ERROR) ---
-    tuple_in_pattern = re.search(r"WHERE\s*\([^)]+,[^)]+\)\s*IN\s*\(SELECT", sql_up)
+    tuple_in_pattern = re.search(AGENT_REFINE_TUPLE_IN_PATTERN, sql_up)
     if tuple_in_pattern and not needs_regeneration:
         _dbg_print_two("[Agent3] HARD ERROR - Anti-Pattern", "Tuple comparison inside WHERE IN (...)")
         extra_instruction = (
@@ -1776,10 +1796,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS D: MISSING PARTITION KEY IN OUTPUT (HARD ERROR) ---
     if is_winner_row and not needs_regeneration:
-        part_match = re.search(r"PARTITION\s+BY\s+([A-Za-z0-9_]+)", sql_up)
+        part_match = re.search(AGENT_REFINE_PARTITION_BY_PATTERN, sql_up)
         if part_match:
             part_col = part_match.group(1)
-            select_clause_match = re.search(r"^SELECT\s+(.*?)\s+FROM", sql_up, re.DOTALL)
+            select_clause_match = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, sql_up, re.DOTALL)
             if select_clause_match:
                 select_clause = select_clause_match.group(1)
                 if part_col not in select_clause.upper():
@@ -1796,8 +1816,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     has_groupby = "GROUP BY" in sql_up
     is_left_join = "LEFT JOIN" in sql_up
     if has_groupby and not is_left_join and not needs_regeneration:
-        where_match = re.search(r"WHERE\s+(.*?)($|GROUP|ORDER|LIMIT)", sql_up, re.DOTALL)
-        group_match = re.search(r"GROUP\s+BY\s+(.*?)($|ORDER|LIMIT|HAVING)", sql_up, re.DOTALL)
+        where_match = re.search(AGENT_REFINE_WHERE_CLAUSE_PATTERN, sql_up, re.DOTALL)
+        group_match = re.search(AGENT_REFINE_GROUP_CLAUSE_PATTERN, sql_up, re.DOTALL)
         if where_match and group_match:
             where_clause = where_match.group(1).lower()
             group_clause = group_match.group(1).lower()
@@ -1821,7 +1841,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         
         # STEP 1: Ambil tokens HANYA dari klausa SELECT (Bukan seluruh SQL)
         # Tujuannya agar kolom yang hanya ada di WHERE/ORDER BY tetap terdeteksi sebagai "missing" di output
-        select_match_chk = re.search(r"^SELECT\s+(.*?)\s+FROM", final_sql, re.IGNORECASE | re.DOTALL)
+        select_match_chk = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, final_sql, re.IGNORECASE | re.DOTALL)
         select_text_chk = select_match_chk.group(1).lower() if select_match_chk else ""
         # Tokenize hanya bagian SELECT
         select_tokens_chk = set(re.findall(r"\b([a-z][a-z0-9_]*)\b", select_text_chk))
@@ -1831,11 +1851,11 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         sql_lower = final_sql.lower()
         where_having_tokens = set()
         # Extract WHERE clause
-        where_match = re.search(r"\bwhere\s+(.*?)(?:\bgroup\b|\border\b|\blimit\b|\bhaving\b|;|$)", sql_lower, re.DOTALL)
+        where_match = re.search(AGENT_REFINE_LOWER_WHERE_PATTERN, sql_lower, re.DOTALL)
         if where_match:
             where_having_tokens.update(re.findall(r"\b([a-z][a-z0-9_]*)\b", where_match.group(1)))
         # Extract HAVING clause
-        having_match = re.search(r"\bhaving\s+(.*?)(?:\border\b|\blimit\b|;|$)", sql_lower, re.DOTALL)
+        having_match = re.search(AGENT_REFINE_LOWER_HAVING_PATTERN, sql_lower, re.DOTALL)
         if having_match:
             where_having_tokens.update(re.findall(r"\b([a-z][a-z0-9_]*)\b", having_match.group(1)))
 
@@ -1875,7 +1895,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
         if missing_cols:
             # TIERING LOGIC - Smart escalation based on complexity
-            if complexity == "simple" and qtype == "lookup":
+            if complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE and qtype == AGENT_ROUTER_QTYPE_LOOKUP:
                 # Avoid SQL string surgery. Regenerate so final SQL naturally includes requested columns.
                 _dbg_print_two("[Agent3] MEDIUM ERROR - Missing Columns", f"Retry (no auto-append): {missing_cols}")
                 extra_instruction = (
@@ -1886,7 +1906,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 needs_regeneration = True
                 regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
             
-            elif draft_model == SMALL_MODEL and complexity == "simple":
+            elif draft_model == SMALL_MODEL and complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE:
                 # MEDIUM ERROR: Regenerate dengan 3B (simple query dari 3B yang salah)
                 _dbg_print_two("[Agent3] MEDIUM ERROR - Missing Columns", f"Retry with 3B: {missing_cols}")
                 extra_instruction = (
@@ -1909,7 +1929,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS G: BROKEN ALIAS SYNTAX (HARD ERROR) ---
     if not needs_regeneration:
-        if re.search(r"\b[a-z0-9_]+\.\(", sql_up.lower()):
+        if re.search(AGENT_REFINE_BROKEN_ALIAS_PATTERN, sql_up.lower()):
              _dbg_print_two("[Agent3] HARD ERROR - Syntax Error", "Broken alias syntax `alias.(...)` detected.")
              extra_instruction = (
                 "SYNTAX ERROR: You generated invalid SQL syntax like `table_alias.(condition)`. "
@@ -1939,14 +1959,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS I: UNSAFE MONTH SORTING (HARD ERROR) ---
     if "MONTH" in sql_up and "ORDER" in sql_up and not needs_regeneration:
-        has_month_name_group = re.search(r"GROUP\s+BY\s+.*?DATE_FORMAT", sql_up, re.DOTALL)
+        has_month_name_group = re.search(AGENT_REFINE_MONTH_NAME_GROUP_PATTERN, sql_up, re.DOTALL)
         # FIX: Accept sorting by date columns (any alias) as safe - gives chronological order
         # Pattern matches: MONTH(date), YEAR(date), MIN(...), MAX(...), or any *Date column
         has_safe_sort = re.search(
-            r"ORDER\s+BY\s+(.*?\.)?(MONTH|YEAR|MIN|MAX|STR_TO_DATE)\(",
+            AGENT_REFINE_SAFE_MONTH_SORT_FUNC_PATTERN,
             sql_up, re.DOTALL | re.IGNORECASE
         ) or re.search(
-            r"ORDER\s+BY\s+.*?\w*Date\b",  # Matches: orderDate, o.orderDate, t.paymentDate, etc.
+            AGENT_REFINE_SAFE_MONTH_SORT_DATE_PATTERN,
             sql_up, re.IGNORECASE
         )
 
@@ -1963,7 +1983,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # --- KASUS K: AGGREGATION VIOLATION (ERROR 1055) (HARD ERROR) ---
     # Menangkap kasus SELECT raw_col FROM... GROUP BY derived_col (Error 1055)
     if "GROUP BY" in sql_up and not needs_regeneration:
-        group_clause = re.search(r"GROUP\s+BY\s+(.*?)($|ORDER|LIMIT|HAVING)", sql_up, re.DOTALL)
+        group_clause = re.search(AGENT_REFINE_GROUP_CLAUSE_PATTERN, sql_up, re.DOTALL)
         if group_clause:
             group_text = group_clause.group(1).lower()
             # Risky cols: kolom yang ada di dalam ekspresi Group By (e.g. CASE WHEN msrp < ...)
@@ -1971,7 +1991,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             risky_cols.update(re.findall(r"\((?:.*?\s)?([a-z0-9_]+)(?:\s.*?)?\)", group_text))
             risky_cols = {c for c in risky_cols if c in all_valid_cols}
             
-            select_clause = re.search(r"^SELECT\s+(.*?)\s+FROM", sql_up, re.DOTALL).group(1).lower()
+            select_clause = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, sql_up, re.DOTALL).group(1).lower()
             
             for col in risky_cols:
                 # Cek apakah 'col' muncul di SELECT tanpa fungsi agregasi
