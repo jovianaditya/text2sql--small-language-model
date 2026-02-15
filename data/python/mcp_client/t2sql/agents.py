@@ -61,6 +61,13 @@ from .config import (
     AGENT_SQL_RESERVED_EXTRA_TOKENS,
     AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS,
     AGENT_COLUMN_STOP_TOKENS,
+    AGENT_COLUMN_TOKEN_SUFFIX_Y,
+    AGENT_COLUMN_TOKEN_SUFFIX_IES,
+    AGENT_COLUMN_TOKEN_SUFFIX_S,
+    AGENT_COLUMN_TOKEN_SUFFIX_Y_MIN_LEN,
+    AGENT_COLUMN_TOKEN_SUFFIX_IES_MIN_LEN,
+    AGENT_COLUMN_TOKEN_SUFFIX_S_MIN_LEN,
+    AGENT_ROUTER_FK_SUFFIX_TERMS,
     AGENT_ROUTER_IGNORE_PATTERNS,
     AGENT_ROUTER_WEAK_EVIDENCE_TAGS,
     AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH,
@@ -603,19 +610,30 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
         ):
             continue
         token_forms = {token}
-        if token.endswith("y") and len(token) > 3:
-            token_forms.add(token[:-1] + "ies")
-        elif token.endswith("ies") and len(token) > 4:
-            token_forms.add(token[:-3] + "y")
-        elif token.endswith("s") and len(token) > 4:
+        if AGENT_COLUMN_TOKEN_SUFFIX_Y and token.endswith(AGENT_COLUMN_TOKEN_SUFFIX_Y) and len(token) >= AGENT_COLUMN_TOKEN_SUFFIX_Y_MIN_LEN:
+            token_forms.add(token[:-len(AGENT_COLUMN_TOKEN_SUFFIX_Y)] + AGENT_COLUMN_TOKEN_SUFFIX_IES)
+        elif AGENT_COLUMN_TOKEN_SUFFIX_IES and token.endswith(AGENT_COLUMN_TOKEN_SUFFIX_IES) and len(token) >= AGENT_COLUMN_TOKEN_SUFFIX_IES_MIN_LEN:
+            token_forms.add(token[:-len(AGENT_COLUMN_TOKEN_SUFFIX_IES)] + AGENT_COLUMN_TOKEN_SUFFIX_Y)
+        elif AGENT_COLUMN_TOKEN_SUFFIX_S and token.endswith(AGENT_COLUMN_TOKEN_SUFFIX_S) and len(token) >= AGENT_COLUMN_TOKEN_SUFFIX_S_MIN_LEN:
             token_forms.add(token[:-1])
         else:
-            token_forms.add(token + "s")
+            token_forms.add(token + AGENT_COLUMN_TOKEN_SUFFIX_S)
 
         if any(re.search(rf"\b{re.escape(tok)}\b", question_lower) for tok in token_forms if tok):
             return True
 
     return False
+
+
+def _is_conventional_fk_name(table_singular: str, column_name: str) -> bool:
+    singular = (table_singular or "").strip().lower()
+    col = (column_name or "").strip().lower()
+    suffixes = [str(s or "").strip().lower() for s in AGENT_ROUTER_FK_SUFFIX_TERMS if str(s or "").strip()]
+    if not singular or not col or not suffixes:
+        return False
+    suffix_pattern = "|".join(re.escape(s) for s in suffixes)
+    fk_pattern = rf'^{re.escape(singular)}(?:{suffix_pattern})$'
+    return bool(re.match(fk_pattern, col, re.IGNORECASE))
 
 # ======================================================================
 # ======================== AGENT 1 - ROUTER AGENT ======================
@@ -898,8 +916,7 @@ def router_agent(state: RAGState) -> RAGState:
             # 1) Conventional FK naming (<entity>Number/<entity>Code/<entity>Id)
             # 2) Explicit FK metadata from context (fk_columns_by_table)
             # 3) Parent key reused in child tables (e.g., productLine shared by products/productlines)
-            fk_pattern = rf'^{re.escape(table_singular)}(number|code|id)$'
-            is_fk_col = bool(re.match(fk_pattern, col_lower, re.IGNORECASE))
+            is_fk_col = _is_conventional_fk_name(table_singular, col_lower)
             if col_lower in fk_columns_by_table.get(tbl_lower, {}):
                 is_fk_col = True
             table_id_col = (get_id_column(tbl_lower) or "").lower()
@@ -1007,8 +1024,7 @@ def router_agent(state: RAGState) -> RAGState:
                     # Check if this is an FK column (e.g., customerNumber → customers)
                     col_lower = str(col).lower()
                     # Pattern: <table_singular>(Number|Code|Id|ID)
-                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id)$'
-                    if (table_id_col and col_lower == table_id_col) or re.match(fk_pattern, col_lower, re.IGNORECASE):
+                    if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(table_singular, col_lower):
                         fk_exists_in_other_table = True
                         break
                 if fk_exists_in_other_table:
@@ -1021,8 +1037,7 @@ def router_agent(state: RAGState) -> RAGState:
                 fk_cols = set()
                 for col in tbl_cols:
                     col_lower = str(col).lower()
-                    fk_pattern = rf'^{re.escape(table_singular)}(number|code|id)$'
-                    if (table_id_col and col_lower == table_id_col) or re.match(fk_pattern, col_lower, re.IGNORECASE):
+                    if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(table_singular, col_lower):
                         fk_cols.add(col_lower)
 
                 # Check if any non-FK column is mentioned in question

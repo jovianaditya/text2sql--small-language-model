@@ -56,6 +56,13 @@ from .config import (
     RETRIEVAL_JOIN_SIGNALS,
     RETRIEVAL_NUMERIC_SQL_TYPES,
     RETRIEVAL_BM25_STEM_EXCEPTIONS_BASE,
+    RETRIEVAL_BM25_STOPWORD_EXCEPTIONS,
+    RETRIEVAL_STEM_SUFFIX_IES,
+    RETRIEVAL_STEM_SUFFIX_IES_MIN_LEN,
+    RETRIEVAL_STEM_SUFFIX_IES_TO,
+    RETRIEVAL_STEM_SUFFIX_S,
+    RETRIEVAL_STEM_SUFFIX_S_MIN_LEN,
+    RETRIEVAL_STEM_SUFFIX_S_EXCLUDE,
     RETRIEVAL_NAME_QUERY_TERMS,
     RETRIEVAL_ID_LIKE_QUERY_TERMS,
     RETRIEVAL_NAME_REQUEST_TERMS,
@@ -440,7 +447,7 @@ _PHRASE_TO_COLUMN_CACHE: Optional[Dict[str, str]] = None
 _NUMERIC_SQL_TYPES = set(RETRIEVAL_NUMERIC_SQL_TYPES)
 
 # Stopwords for BM25 tokenization
-_STOPWORDS = (set(ENGLISH_STOP_WORDS) - {"name", "names"}) | set(RETRIEVAL_EXTRA_STOPWORDS)
+_STOPWORDS = (set(ENGLISH_STOP_WORDS) - set(RETRIEVAL_BM25_STOPWORD_EXCEPTIONS)) | set(RETRIEVAL_EXTRA_STOPWORDS)
 
 # Generic alias/synonym words that are too broad for table mention detection.
 _GENERIC_MENTION_TERMS = set(RETRIEVAL_GENERIC_MENTION_TERMS)
@@ -545,9 +552,14 @@ def _tokenize_bm25_query(q: str) -> List[str]:
                 toks.append(t)
             continue
 
-        if len(t) > 4 and t.endswith("ies"):
-            t = t[:-3] + "y"
-        elif len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        if RETRIEVAL_STEM_SUFFIX_IES and len(t) >= RETRIEVAL_STEM_SUFFIX_IES_MIN_LEN and t.endswith(RETRIEVAL_STEM_SUFFIX_IES):
+            t = t[:-len(RETRIEVAL_STEM_SUFFIX_IES)] + RETRIEVAL_STEM_SUFFIX_IES_TO
+        elif (
+            RETRIEVAL_STEM_SUFFIX_S
+            and len(t) >= RETRIEVAL_STEM_SUFFIX_S_MIN_LEN
+            and t.endswith(RETRIEVAL_STEM_SUFFIX_S)
+            and (not RETRIEVAL_STEM_SUFFIX_S_EXCLUDE or not t.endswith(RETRIEVAL_STEM_SUFFIX_S_EXCLUDE))
+        ):
             t = t[:-1]
 
         if t and t not in _STOPWORDS:

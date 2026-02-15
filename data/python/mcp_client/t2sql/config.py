@@ -273,6 +273,20 @@ RETRIEVAL_BM25_STEM_EXCEPTIONS_BASE = set(
     )
 )
 
+RETRIEVAL_BM25_STOPWORD_EXCEPTIONS = set(
+    _env_json_list(
+        "RETRIEVAL_BM25_STOPWORD_EXCEPTIONS",
+        ["name", "names"],
+    )
+)
+
+RETRIEVAL_STEM_SUFFIX_IES = os.getenv("RETRIEVAL_STEM_SUFFIX_IES", "ies").strip().lower()
+RETRIEVAL_STEM_SUFFIX_IES_MIN_LEN = int(os.getenv("RETRIEVAL_STEM_SUFFIX_IES_MIN_LEN", "5"))
+RETRIEVAL_STEM_SUFFIX_IES_TO = os.getenv("RETRIEVAL_STEM_SUFFIX_IES_TO", "y").strip().lower()
+RETRIEVAL_STEM_SUFFIX_S = os.getenv("RETRIEVAL_STEM_SUFFIX_S", "s").strip().lower()
+RETRIEVAL_STEM_SUFFIX_S_MIN_LEN = int(os.getenv("RETRIEVAL_STEM_SUFFIX_S_MIN_LEN", "4"))
+RETRIEVAL_STEM_SUFFIX_S_EXCLUDE = os.getenv("RETRIEVAL_STEM_SUFFIX_S_EXCLUDE", "ss").strip().lower()
+
 RETRIEVAL_NAME_QUERY_TERMS = _env_json_list(
     "RETRIEVAL_NAME_QUERY_TERMS",
     ["name"],
@@ -552,6 +566,18 @@ AGENT_COLUMN_STOP_TOKENS = set(
             "quantity", "price", "amount", "total", "average", "value",
         ],
     )
+)
+
+AGENT_COLUMN_TOKEN_SUFFIX_Y = os.getenv("AGENT_COLUMN_TOKEN_SUFFIX_Y", "y").strip().lower()
+AGENT_COLUMN_TOKEN_SUFFIX_IES = os.getenv("AGENT_COLUMN_TOKEN_SUFFIX_IES", "ies").strip().lower()
+AGENT_COLUMN_TOKEN_SUFFIX_S = os.getenv("AGENT_COLUMN_TOKEN_SUFFIX_S", "s").strip().lower()
+AGENT_COLUMN_TOKEN_SUFFIX_Y_MIN_LEN = int(os.getenv("AGENT_COLUMN_TOKEN_SUFFIX_Y_MIN_LEN", "4"))
+AGENT_COLUMN_TOKEN_SUFFIX_IES_MIN_LEN = int(os.getenv("AGENT_COLUMN_TOKEN_SUFFIX_IES_MIN_LEN", "5"))
+AGENT_COLUMN_TOKEN_SUFFIX_S_MIN_LEN = int(os.getenv("AGENT_COLUMN_TOKEN_SUFFIX_S_MIN_LEN", "5"))
+
+AGENT_ROUTER_FK_SUFFIX_TERMS = _env_json_list(
+    "AGENT_ROUTER_FK_SUFFIX_TERMS",
+    ["number", "code", "id"],
 )
 
 AGENT_ROUTER_IGNORE_PATTERNS = {
