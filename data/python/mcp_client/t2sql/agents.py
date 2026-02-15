@@ -96,6 +96,8 @@ from .config import (
     AGENT_ROUTER_PRIMARY_REASON_ALL,
     AGENT_ROUTER_FK_EVIDENCE_EXTRACT_PATTERN,
     AGENT_ROUTER_FK_EVIDENCE_PREFIX,
+    AGENT_ROUTER_FK_PATTERN_CARD,
+    AGENT_ROUTER_FK_PATTERN_DOT,
     AGENT_REFINE_WINNER_ROW_LEAK_PATTERN,
     AGENT_REFINE_TUPLE_IN_PATTERN,
     AGENT_REFINE_PARTITION_BY_PATTERN,
@@ -108,6 +110,15 @@ from .config import (
     AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN,
     AGENT_REFINE_LOWER_WHERE_PATTERN,
     AGENT_REFINE_LOWER_HAVING_PATTERN,
+    AGENT_REFINE_DEFINED_ALIAS_PATTERN,
+    AGENT_REFINE_QUOTED_ALIAS_PATTERN,
+    AGENT_REFINE_SUBQUERY_ALIAS_PATTERN,
+    AGENT_REFINE_TABLE_ALIAS_PATTERN,
+    AGENT_REFINE_SUBQUERY_ALIAS_RESERVED_TOKENS,
+    AGENT_REFINE_TABLE_ALIAS_RESERVED_TOKENS,
+    AGENT_REFINE_PRIMARY_FROM_PATTERN,
+    AGENT_REFINE_HAS_SUBQUERY_PATTERN,
+    AGENT_REFINE_MAIN_SELECT_FROM_PATTERN,
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -790,7 +801,7 @@ def router_agent(state: RAGState) -> RAGState:
     fk_columns_by_table = {}  # {source_table: {fk_column: target_table}}
 
     # Pattern 1: Card format "table: X | column: Y | ... FK to Z.W"
-    fk_pattern_card = re.compile(r'table:\s*(\w+)\s*\|\s*column:\s*(\w+).*?FK to (\w+)\.(\w+)', re.IGNORECASE)
+    fk_pattern_card = re.compile(AGENT_ROUTER_FK_PATTERN_CARD, re.IGNORECASE)
     for match in fk_pattern_card.finditer(ctx):
         source_table = match.group(1).lower()
         source_col = match.group(2).lower()
@@ -813,7 +824,7 @@ def router_agent(state: RAGState) -> RAGState:
         fk_graph[target_table][source_table] = (None, source_col)
 
     # Pattern 2: Dot notation "X.Y ... FK to Z.W"
-    fk_pattern_dot = re.compile(r'(\w+)\.(\w+).*?FK to (\w+)\.(\w+)', re.IGNORECASE)
+    fk_pattern_dot = re.compile(AGENT_ROUTER_FK_PATTERN_DOT, re.IGNORECASE)
     for match in fk_pattern_dot.finditer(ctx):
         source_table = match.group(1).lower()
         source_col = match.group(2).lower()
@@ -1664,30 +1675,30 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     reserved = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS))
     
     defined_aliases = set()
-    defined_aliases.update(re.findall(r"\bAS\s+([a-zA-Z0-9_]+)\b", sql_up, re.IGNORECASE))
-    quoted_aliases = re.findall(r"\bAS\s+['\"`]?([a-zA-Z0-9_]+)['\"`]?", sql_up, re.IGNORECASE)
+    defined_aliases.update(re.findall(AGENT_REFINE_DEFINED_ALIAS_PATTERN, sql_up, re.IGNORECASE))
+    quoted_aliases = re.findall(AGENT_REFINE_QUOTED_ALIAS_PATTERN, sql_up, re.IGNORECASE)
     defined_aliases.update(quoted_aliases)
     
     # Also capture subquery aliases: FROM (...) alias or FROM (...) AS alias
-    subquery_aliases = re.findall(r'\)\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b', sql_up, re.IGNORECASE)
+    subquery_aliases = re.findall(AGENT_REFINE_SUBQUERY_ALIAS_PATTERN, sql_up, re.IGNORECASE)
     for sa in subquery_aliases:
-        if sa.lower() not in ('where', 'group', 'order', 'having', 'limit', 'on', 'and', 'or'):
+        if sa.lower() not in AGENT_REFINE_SUBQUERY_ALIAS_RESERVED_TOKENS:
             defined_aliases.add(sa)
 
     # Also capture table aliases: FROM orders o, JOIN customers c
     # Pattern: FROM table alias or JOIN table alias (with or without AS)
-    table_alias_pattern = r'\b(?:FROM|JOIN)\s+[a-zA-Z_][a-zA-Z0-9_]*\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b'
+    table_alias_pattern = AGENT_REFINE_TABLE_ALIAS_PATTERN
     for m in re.finditer(table_alias_pattern, sql_up, re.IGNORECASE):
         alias = m.group(1).lower()
         # Skip SQL keywords that might be captured
-        if alias not in ('where', 'group', 'order', 'having', 'limit', 'on', 'and', 'or', 'select'):
+        if alias not in AGENT_REFINE_TABLE_ALIAS_RESERVED_TOKENS:
             defined_aliases.add(alias)
 
     reserved.update(a.lower() for a in defined_aliases)
 
     # Fix: For subqueries, FROM (SELECT...) matches "SELECT" - skip that
     # Look for real table name or subquery alias
-    primary_match = re.search(r"FROM\s+`?([A-Za-z0-9_]+)`?", sql_up)
+    primary_match = re.search(AGENT_REFINE_PRIMARY_FROM_PATTERN, sql_up)
     primary_tbl = ""
     if primary_match:
         candidate = primary_match.group(1).lower()
@@ -1714,12 +1725,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if alien_cols and "JOIN" not in sql_up:
         # SMART SUBQUERY HANDLING
         # Only skip validation if alien columns are INSIDE subquery (not in main SELECT)
-        has_subquery = re.search(r"\(\s*SELECT\b", sql_up, re.IGNORECASE)
+        has_subquery = re.search(AGENT_REFINE_HAS_SUBQUERY_PATTERN, sql_up, re.IGNORECASE)
         
         if has_subquery:
             # Extract main SELECT clause (before first subquery)
             # Pattern: SELECT ... FROM ... WHERE ... (SELECT ...)
-            main_select_match = re.search(r"^SELECT\s+(.*?)\s+FROM", sql_up, re.IGNORECASE | re.DOTALL)
+            main_select_match = re.search(AGENT_REFINE_MAIN_SELECT_FROM_PATTERN, sql_up, re.IGNORECASE | re.DOTALL)
             
             if main_select_match:
                 main_select = main_select_match.group(1)

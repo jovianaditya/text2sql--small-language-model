@@ -90,6 +90,7 @@ from .config import (
     RETRIEVAL_TABLE_NAME_PREFIX_STRIP_CHARS,
     RETRIEVAL_TABLE_VARIANT_MIN_TAIL_LEN,
     RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS,
+    RETRIEVAL_FK_REFERENCE_PATTERN,
     AGENT_ROUTER_QTYPE_LOOKUP,
     AGENT_ROUTER_QTYPE_AGGREGATE,
     AGENT_ROUTER_QTYPE_RANK,
@@ -1056,7 +1057,7 @@ def _infer_bridge_tables(
 
         # Parse FK references from description
         # Pattern: "FK to targetTable.targetColumn"
-        fk_match = re.search(r'FK to (\w+)\.(\w+)', desc, re.IGNORECASE)
+        fk_match = re.search(RETRIEVAL_FK_REFERENCE_PATTERN, desc, re.IGNORECASE)
         if fk_match:
             source_table = _meta_table(md)
             fk_column = _meta_column(md)

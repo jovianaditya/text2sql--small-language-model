@@ -648,6 +648,16 @@ AGENT_ROUTER_FK_EVIDENCE_PREFIX = os.getenv(
     "FK column",
 ).strip()
 
+AGENT_ROUTER_FK_PATTERN_CARD = os.getenv(
+    "AGENT_ROUTER_FK_PATTERN_CARD",
+    r"table:\s*(\w+)\s*\|\s*column:\s*(\w+).*?FK to (\w+)\.(\w+)",
+).strip()
+
+AGENT_ROUTER_FK_PATTERN_DOT = os.getenv(
+    "AGENT_ROUTER_FK_PATTERN_DOT",
+    r"(\w+)\.(\w+).*?FK to (\w+)\.(\w+)",
+).strip()
+
 AGENT_ROUTER_WEAK_EVIDENCE_TAGS = set(
     _env_json_list(
         "AGENT_ROUTER_WEAK_EVIDENCE_TAGS",
@@ -740,9 +750,63 @@ AGENT_DRAFT_LIMIT_INTENT_TERMS = _env_json_list(
     ["top", "best", "highest", "lowest", "limit"],
 )
 
+AGENT_REFINE_DEFINED_ALIAS_PATTERN = os.getenv(
+    "AGENT_REFINE_DEFINED_ALIAS_PATTERN",
+    r"\bAS\s+([a-zA-Z0-9_]+)\b",
+).strip()
+
+AGENT_REFINE_QUOTED_ALIAS_PATTERN = os.getenv(
+    "AGENT_REFINE_QUOTED_ALIAS_PATTERN",
+    r"\bAS\s+['\"`]?([a-zA-Z0-9_]+)['\"`]?",
+).strip()
+
+AGENT_REFINE_SUBQUERY_ALIAS_PATTERN = os.getenv(
+    "AGENT_REFINE_SUBQUERY_ALIAS_PATTERN",
+    r"\)\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b",
+).strip()
+
+AGENT_REFINE_TABLE_ALIAS_PATTERN = os.getenv(
+    "AGENT_REFINE_TABLE_ALIAS_PATTERN",
+    r"\b(?:FROM|JOIN)\s+[a-zA-Z_][a-zA-Z0-9_]*\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b",
+).strip()
+
+AGENT_REFINE_SUBQUERY_ALIAS_RESERVED_TOKENS = set(
+    _env_json_list(
+        "AGENT_REFINE_SUBQUERY_ALIAS_RESERVED_TOKENS",
+        ["where", "group", "order", "having", "limit", "on", "and", "or"],
+    )
+)
+
+AGENT_REFINE_TABLE_ALIAS_RESERVED_TOKENS = set(
+    _env_json_list(
+        "AGENT_REFINE_TABLE_ALIAS_RESERVED_TOKENS",
+        ["where", "group", "order", "having", "limit", "on", "and", "or", "select"],
+    )
+)
+
+AGENT_REFINE_PRIMARY_FROM_PATTERN = os.getenv(
+    "AGENT_REFINE_PRIMARY_FROM_PATTERN",
+    r"FROM\s+`?([A-Za-z0-9_]+)`?",
+).strip()
+
+AGENT_REFINE_HAS_SUBQUERY_PATTERN = os.getenv(
+    "AGENT_REFINE_HAS_SUBQUERY_PATTERN",
+    r"\(\s*SELECT\b",
+).strip()
+
+AGENT_REFINE_MAIN_SELECT_FROM_PATTERN = os.getenv(
+    "AGENT_REFINE_MAIN_SELECT_FROM_PATTERN",
+    r"^SELECT\s+(.*?)\s+FROM",
+).strip()
+
 AGENT_REFINE_WINNER_ROW_LEAK_PATTERN = os.getenv(
     "AGENT_REFINE_WINNER_ROW_LEAK_PATTERN",
     r"SELECT\s+.*?\brn\b.*?FROM",
+).strip()
+
+RETRIEVAL_FK_REFERENCE_PATTERN = os.getenv(
+    "RETRIEVAL_FK_REFERENCE_PATTERN",
+    r"FK to (\w+)\.(\w+)",
 ).strip()
 
 AGENT_REFINE_TUPLE_IN_PATTERN = os.getenv(
