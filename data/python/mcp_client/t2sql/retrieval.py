@@ -63,6 +63,12 @@ from .config import (
     RETRIEVAL_STEM_SUFFIX_S,
     RETRIEVAL_STEM_SUFFIX_S_MIN_LEN,
     RETRIEVAL_STEM_SUFFIX_S_EXCLUDE,
+    RETRIEVAL_TOKENIZE_ALNUM_PATTERN,
+    RETRIEVAL_NORMALIZE_THOUSANDS_PATTERN,
+    RETRIEVAL_NORMALIZE_POSSESSIVE_PATTERN,
+    RETRIEVAL_NORMALIZE_NON_ALNUM_PATTERN,
+    RETRIEVAL_DESC_CAMEL_SPLIT_PATTERN_1,
+    RETRIEVAL_DESC_CAMEL_SPLIT_PATTERN_2,
     RETRIEVAL_NAME_QUERY_TERMS,
     RETRIEVAL_ID_LIKE_QUERY_TERMS,
     RETRIEVAL_NAME_REQUEST_TERMS,
@@ -395,8 +401,8 @@ def _build_cards(
         # Jaga-jaga jika Priority 1 & 2 gagal total
         if not desc:
             # "productCode" -> "product Code" -> "product code"
-            s1 = re.sub('(.)([A-Z][a-z]+)', r'\1 \2', column)
-            s2 = re.sub('([a-z0-9])([A-Z])', r'\1 \2', s1).replace("_", " ")
+            s1 = re.sub(RETRIEVAL_DESC_CAMEL_SPLIT_PATTERN_1, r'\1 \2', column)
+            s2 = re.sub(RETRIEVAL_DESC_CAMEL_SPLIT_PATTERN_2, r'\1 \2', s1).replace("_", " ")
             desc = s2.lower()
 
         # Bersihkan & Potong Deskripsi
@@ -493,7 +499,7 @@ def _table_mention_candidates(table: str, include_synonyms: bool = True) -> List
             s = str(syn).strip().lower()
             if not s:
                 continue
-            tokens = [tok for tok in re.findall(r"[a-z0-9]+", s) if tok]
+            tokens = [tok for tok in re.findall(RETRIEVAL_TOKENIZE_ALNUM_PATTERN, s) if tok]
             if not tokens:
                 continue
             # Skip overly generic synonyms.
@@ -516,10 +522,10 @@ def _text_mentions_table(text: str, table: str, include_synonyms: bool = True) -
 
 def _normalize_text(txt: str) -> str:
     txt = txt.lower()
-    txt = re.sub(r"(\d)[,\.](\d{3})(\b|$)", r"\1\2", txt)
-    txt = re.sub(r"(\w)'s\b", r"\1", txt)
+    txt = re.sub(RETRIEVAL_NORMALIZE_THOUSANDS_PATTERN, r"\1\2", txt)
+    txt = re.sub(RETRIEVAL_NORMALIZE_POSSESSIVE_PATTERN, r"\1", txt)
     txt = txt.replace("'", "")
-    txt = re.sub(r"[^a-z0-9_]+", " ", txt)
+    txt = re.sub(RETRIEVAL_NORMALIZE_NON_ALNUM_PATTERN, " ", txt)
     return txt.strip()
 
 def _tokenize_bm25_query(q: str) -> List[str]:
@@ -593,7 +599,7 @@ def _phrase_to_column_map() -> Dict[str, str]:
                     s = str(syn or "").strip().lower()
                     if not s:
                         continue
-                    tokens = [tok for tok in re.findall(r"[a-z0-9]+", s) if tok]
+                    tokens = [tok for tok in re.findall(RETRIEVAL_TOKENIZE_ALNUM_PATTERN, s) if tok]
                     # Keep only meaningful multi-word phrases to avoid noisy generic matches.
                     if len(tokens) < 2:
                         continue

@@ -39,10 +39,14 @@ from .config import (
     AGENT_GIBBERISH_VOWEL_CHECK_MIN_LEN,
     AGENT_GIBBERISH_CONSONANT_RUN_MIN,
     AGENT_GIBBERISH_CONSONANT_CHECK_MIN_LEN,
+    AGENT_GIBBERISH_CONSONANT_CLASS,
     AGENT_GIBBERISH_NO_SPACE_LEN,
     AGENT_GIBBERISH_REPEAT_MIN_LEN,
     AGENT_GIBBERISH_REPEAT_PATTERN_LENGTHS,
     AGENT_GIBBERISH_VOWELS,
+    AGENT_GIBBERISH_ALPHA_ONLY_PATTERN,
+    AGENT_GIBBERISH_HAS_UPPER_PATTERN,
+    AGENT_GIBBERISH_HAS_SEPARATOR_PATTERN,
     AGENT_TABLE_VARIANT_MIN_TAIL_LEN,
     AGENT_COLUMN_ORDERED_TOKEN,
     AGENT_COLUMN_ORDERED_BY_PATTERN,
@@ -67,6 +71,9 @@ from .config import (
     AGENT_COLUMN_TOKEN_SUFFIX_Y_MIN_LEN,
     AGENT_COLUMN_TOKEN_SUFFIX_IES_MIN_LEN,
     AGENT_COLUMN_TOKEN_SUFFIX_S_MIN_LEN,
+    AGENT_COLUMN_CAMEL_SPLIT_PATTERN,
+    AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN,
+    AGENT_COLUMN_TOKEN_PATTERN,
     AGENT_ROUTER_FK_SUFFIX_TERMS,
     AGENT_ROUTER_IGNORE_PATTERNS,
     AGENT_ROUTER_WEAK_EVIDENCE_TAGS,
@@ -76,6 +83,8 @@ from .config import (
     AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS,
     AGENT_ROUTER_TABLE_ATTRIBUTE_PATTERNS,
     AGENT_ROUTER_AGGREGATE_CONTEXT_PATTERNS,
+    AGENT_ROUTER_ID_REFERENCE_TERMS,
+    AGENT_ROUTER_FK_VALUE_LIST_PATTERN,
     AGENT_ROUTER_WINNER_ROW_RECORD_PATTERN,
     AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN,
     AGENT_ROUTER_TIEBREAKER_PATTERN,
@@ -97,6 +106,7 @@ from .config import (
     AGENT_DRAFT_LIMIT_CAPTURE_PATTERN,
     AGENT_DRAFT_LIMIT_REMOVE_PATTERN,
     AGENT_DRAFT_LIMIT_INTENT_TERMS,
+    AGENT_KEEP_ALIVE_PARSE_PATTERN,
     AGENT_ROUTER_PRIMARY_FROM_IN_PATTERNS,
     AGENT_ROUTER_PRIMARY_ALL_ENTITY_PATTERN,
     AGENT_ROUTER_PRIMARY_REASON_FROM_IN,
@@ -126,6 +136,17 @@ from .config import (
     AGENT_REFINE_PRIMARY_FROM_PATTERN,
     AGENT_REFINE_HAS_SUBQUERY_PATTERN,
     AGENT_REFINE_MAIN_SELECT_FROM_PATTERN,
+    AGENT_REFINE_SINGLE_QUOTED_STRING_PATTERN,
+    AGENT_REFINE_DOUBLE_QUOTED_STRING_PATTERN,
+    AGENT_REFINE_FUNCTION_CALL_PATTERN,
+    AGENT_REFINE_SQL_TOKEN_PATTERN,
+    AGENT_REFINE_TABLE_PLACEHOLDER_TOKEN,
+    AGENT_REFINE_TABLE_PLACEHOLDER_DISCARD,
+    AGENT_REFINE_JOIN_KEYWORD,
+    AGENT_REFINE_PRIMARY_FROM_SKIP_TOKENS,
+    AGENT_REFINE_TABLE_REF_TOKEN_PATTERN,
+    AGENT_REFINE_GROUP_RISKY_COMPARE_PATTERN,
+    AGENT_REFINE_GROUP_RISKY_PAREN_PATTERN,
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -224,6 +245,13 @@ def _instantiate_entity_patterns(templates: List[str], entity_pattern: str) -> L
         pat = raw.replace("__ENTITY__", entity_pattern).replace("{entity}", entity_pattern)
         patterns.append(pat)
     return patterns
+
+
+def _router_id_terms_pattern() -> str:
+    terms = [str(t or "").strip().lower() for t in AGENT_ROUTER_ID_REFERENCE_TERMS if str(t or "").strip()]
+    if not terms:
+        return r"(?:id)"
+    return "|".join(re.escape(t) for t in sorted(set(terms), key=len, reverse=True))
 
 def _question_mentions_schema_entity(question_lower: str) -> bool:
     """
@@ -352,7 +380,7 @@ def _detect_gibberish(text: str) -> Tuple[bool, str]:
     if has_spaces and word_count >= AGENT_GIBBERISH_SENTENCE_WORD_BYPASS:
         return False, ""
     
-    alpha_only = re.sub(r'[^a-z]', '', t)
+    alpha_only = re.sub(AGENT_GIBBERISH_ALPHA_ONLY_PATTERN, '', t)
     
     if len(alpha_only) < AGENT_GIBBERISH_MIN_ALPHA_LENGTH:
         return False, ""  # Not enough letters to analyze
@@ -374,9 +402,11 @@ def _detect_gibberish(text: str) -> Tuple[bool, str]:
     # Only apply to single-word inputs
     if not has_spaces:
         consonant_run_min = max(1, AGENT_GIBBERISH_CONSONANT_RUN_MIN)
-        consonant_run = re.search(rf'[bcdfghjklmnpqrstvwxyz]{{{consonant_run_min},}}', alpha_only)
-        if consonant_run and len(alpha_only) > AGENT_GIBBERISH_CONSONANT_CHECK_MIN_LEN:
-            return True, "Input appears to be random text. Please enter a valid data query."
+        consonant_class = AGENT_GIBBERISH_CONSONANT_CLASS
+        if consonant_class:
+            consonant_run = re.search(rf'[{re.escape(consonant_class)}]{{{consonant_run_min},}}', alpha_only)
+            if consonant_run and len(alpha_only) > AGENT_GIBBERISH_CONSONANT_CHECK_MIN_LEN:
+                return True, "Input appears to be random text. Please enter a valid data query."
     
     # --- Heuristic 3: No spaces in long text ---
     # Normal questions have spaces: "show all customers"
@@ -384,7 +414,7 @@ def _detect_gibberish(text: str) -> Tuple[bool, str]:
     if len(t) > AGENT_GIBBERISH_NO_SPACE_LEN and ' ' not in t:
         # Exception: could be a single long word like "customerNumber"
         # Check if it looks like camelCase or has some structure
-        if not re.search(r'[A-Z]', text) and not re.search(r'[_\-]', text):
+        if not re.search(AGENT_GIBBERISH_HAS_UPPER_PATTERN, text) and not re.search(AGENT_GIBBERISH_HAS_SEPARATOR_PATTERN, text):
             return True, "Input appears to be random text. Please enter a valid data query."
     
     # --- Heuristic 4: Repeated patterns ---
@@ -574,7 +604,7 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
         return False
 
     col_lower = column.lower()
-    spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', column).replace("_", " ").lower()
+    spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_PATTERN, r'\1 \2', column).replace("_", " ").lower()
 
     # Full-form matches
     if col_lower in question_lower:
@@ -585,7 +615,7 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
     # Guardrail: avoid false positives like customerName matching just "customer id".
     # For semantic suffix columns, require suffix intent in question unless full phrase matched.
     semantic_suffix_keywords = AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS
-    col_tokens = re.findall(r"[a-z0-9]+", spaced)
+    col_tokens = re.findall(AGENT_COLUMN_TOKEN_PATTERN, spaced)
     if len(col_tokens) >= 2:
         suffix = col_tokens[-1]
         suffix_terms = semantic_suffix_keywords.get(suffix)
@@ -599,7 +629,7 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
 
     # Token-level fallback (skip weak generic tokens)
     stop_tokens = AGENT_COLUMN_STOP_TOKENS
-    for token in re.findall(r"[a-z0-9]+", spaced):
+    for token in re.findall(AGENT_COLUMN_TOKEN_PATTERN, spaced):
         if len(token) < 4 or token in stop_tokens:
             continue
         # "ordered by ..." usually indicates sorting intent, not orderdetails semantics
@@ -677,6 +707,7 @@ def router_agent(state: RAGState) -> RAGState:
     ignore_patterns = AGENT_ROUTER_IGNORE_PATTERNS
     
     relevant_tables = []
+    id_terms_pattern = _router_id_terms_pattern()
     for tbl in whitelisted_tables:
         if f"- {tbl}:" not in ctx and f"- `{tbl}`:" not in ctx:
             continue
@@ -697,13 +728,13 @@ def router_agent(state: RAGState) -> RAGState:
 
             # Deteksi referensi ID saja (FK)
             is_just_id_ref = re.search(
-                rf"\b{table_pattern}\b\s+(number|id|code|kode|nomor)\b",
+                rf"\b{table_pattern}\b\s+(?:{id_terms_pattern})\b",
                 search_scope
             )
 
             if is_just_id_ref:
                 if re.search(
-                    rf"\b{table_pattern}\b(?!\s+(number|id|code|kode|nomor))",
+                    rf"\b{table_pattern}\b(?!\s+(?:{id_terms_pattern}))",
                     search_scope
                 ):
                     relevant_tables.append(tbl)
@@ -727,13 +758,13 @@ def router_agent(state: RAGState) -> RAGState:
         table_pattern = _table_entity_pattern(tbl)
 
         # Pattern: "<table> with <code/id> <angka/list>"
-        fk_only_pattern = rf"\b{table_pattern}\b\s+with\s+(code|number|id|kode|nomor)s?\s+[\d,\sor]+"
+        fk_only_pattern = rf"\b{table_pattern}\b\s+with\s+(?:{id_terms_pattern})s?\s+{AGENT_ROUTER_FK_VALUE_LIST_PATTERN}"
 
         if re.search(fk_only_pattern, question):
             temp_scope = re.sub(fk_only_pattern, "", question)
 
             has_other_mention = re.search(
-                rf"\b{table_pattern}\b(?!\s+(code|number|id|kode|nomor))",
+                rf"\b{table_pattern}\b(?!\s+(?:{id_terms_pattern}))",
                 temp_scope
             )
 
@@ -1047,7 +1078,7 @@ def router_agent(state: RAGState) -> RAGState:
                     if col_low in fk_cols:
                         continue
                     # Check if column is mentioned (including spaced variant)
-                    spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', str(col)).lower()
+                    spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r'\1 \2', str(col)).lower()
                     if col_low in question_lower or spaced in question_lower:
                         non_fk_mentioned = True
                         break
@@ -1190,7 +1221,7 @@ def router_agent(state: RAGState) -> RAGState:
             needs_non_fk = False
             for col in non_fk_cols:
                 col_variants = [col.lower()]
-                spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', col).lower()
+                spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r'\1 \2', col).lower()
                 if spaced != col.lower():
                     col_variants.append(spaced)
                 if any(v in question_lower for v in col_variants):
@@ -1472,7 +1503,7 @@ def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM
         # Get keep_alive in seconds
         import re
         from .config import OLLAMA_KEEP_ALIVE
-        m = re.match(r"(\d+)([smh])", str(OLLAMA_KEEP_ALIVE).lower())
+        m = re.match(AGENT_KEEP_ALIVE_PARSE_PATTERN, str(OLLAMA_KEEP_ALIVE).lower())
         if m:
             val, unit = int(m.group(1)), m.group(2)
             if unit == "s":
@@ -1637,11 +1668,11 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # 2. PREPARE CHECKS (FULL PROTECTION)
     sql_for_tokenizing = final_sql
-    sql_for_tokenizing = re.sub(r"'(?:''|[^'])*'", " ", sql_for_tokenizing)
-    sql_for_tokenizing = re.sub(r'"(?:""|[^"])*"', " ", sql_for_tokenizing)
+    sql_for_tokenizing = re.sub(AGENT_REFINE_SINGLE_QUOTED_STRING_PATTERN, " ", sql_for_tokenizing)
+    sql_for_tokenizing = re.sub(AGENT_REFINE_DOUBLE_QUOTED_STRING_PATTERN, " ", sql_for_tokenizing)
     # FIX 1: Remove function calls (word followed by parenthesis)
     sql_for_tokenizing = re.sub(
-        r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(",
+        AGENT_REFINE_FUNCTION_CALL_PATTERN,
         "(",
         sql_for_tokenizing
     )
@@ -1678,15 +1709,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     for tbl in allowed_ids.keys():
         sql_for_tokenizing = re.sub(
             rf"\b{re.escape(tbl)}\b",
-            "_TBL_",
+            AGENT_REFINE_TABLE_PLACEHOLDER_TOKEN,
             sql_for_tokenizing,
             flags=re.IGNORECASE
         )
 
-    sql_tokens = set(re.findall(r"\b([a-z][a-z0-9_]*)\b", sql_for_tokenizing.lower()))
+    sql_tokens = set(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, sql_for_tokenizing.lower()))
 
     # Remove placeholder tokens
-    sql_tokens.discard("_tbl_")    
+    sql_tokens.discard(AGENT_REFINE_TABLE_PLACEHOLDER_DISCARD)
     reserved = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS))
     
     defined_aliases = set()
@@ -1718,7 +1749,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if primary_match:
         candidate = primary_match.group(1).lower()
         # Skip if it's a keyword (subquery case: FROM (SELECT...))
-        if candidate not in ('select', 'with'):
+        if candidate not in AGENT_REFINE_PRIMARY_FROM_SKIP_TOKENS:
             primary_tbl = candidate
     
     if primary_tbl: reserved.add(primary_tbl)
@@ -1737,7 +1768,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     extra_instruction = ""
 
     # --- KASUS A: Schema Validation & Hallucination Check (HARD ERROR) ---
-    if alien_cols and "JOIN" not in sql_up:
+    if alien_cols and AGENT_REFINE_JOIN_KEYWORD not in sql_up:
         # SMART SUBQUERY HANDLING
         # Only skip validation if alien columns are INSIDE subquery (not in main SELECT)
         has_subquery = re.search(AGENT_REFINE_HAS_SUBQUERY_PATTERN, sql_up, re.IGNORECASE)
@@ -1887,8 +1918,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         if where_match and group_match:
             where_clause = where_match.group(1).lower()
             group_clause = group_match.group(1).lower()
-            where_refs = set(re.findall(r"\b([a-z0-9_]+)\.", where_clause))
-            group_refs = set(re.findall(r"\b([a-z0-9_]+)\.", group_clause))
+            where_refs = set(re.findall(AGENT_REFINE_TABLE_REF_TOKEN_PATTERN, where_clause))
+            group_refs = set(re.findall(AGENT_REFINE_TABLE_REF_TOKEN_PATTERN, group_clause))
             risky_filters = where_refs - group_refs
             if risky_filters:
                  _dbg_print_two("[Agent3] HARD ERROR - INNER JOIN Trap", f"Filtering child table {risky_filters}")
@@ -1910,7 +1941,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         select_match_chk = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, final_sql, re.IGNORECASE | re.DOTALL)
         select_text_chk = select_match_chk.group(1).lower() if select_match_chk else ""
         # Tokenize hanya bagian SELECT
-        select_tokens_chk = set(re.findall(r"\b([a-z][a-z0-9_]*)\b", select_text_chk))
+        select_tokens_chk = set(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, select_text_chk))
         
         # STEP 1b: Ambil tokens dari WHERE/HAVING/subquery (kolom yang dipakai sebagai filter)
         # Kolom yang sudah dipakai di WHERE tidak perlu ada di SELECT (bukan "missing")
@@ -1919,11 +1950,11 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         # Extract WHERE clause
         where_match = re.search(AGENT_REFINE_LOWER_WHERE_PATTERN, sql_lower, re.DOTALL)
         if where_match:
-            where_having_tokens.update(re.findall(r"\b([a-z][a-z0-9_]*)\b", where_match.group(1)))
+            where_having_tokens.update(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, where_match.group(1)))
         # Extract HAVING clause
         having_match = re.search(AGENT_REFINE_LOWER_HAVING_PATTERN, sql_lower, re.DOTALL)
         if having_match:
-            where_having_tokens.update(re.findall(r"\b([a-z][a-z0-9_]*)\b", having_match.group(1)))
+            where_having_tokens.update(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, having_match.group(1)))
 
         suffix_synonyms = AGENT_MISSING_COL_SUFFIX_SYNONYMS
         
@@ -1940,7 +1971,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             if col_lower in where_having_tokens:
                 continue
             
-            clean_name = re.sub(r'([a-z])([A-Z])', r'\1 \2', col_raw)
+            clean_name = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r'\1 \2', col_raw)
             clean_name = clean_name.replace('_', ' ').lower()
             parts = clean_name.split()
             if not parts: continue
@@ -2053,8 +2084,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         if group_clause:
             group_text = group_clause.group(1).lower()
             # Risky cols: kolom yang ada di dalam ekspresi Group By (e.g. CASE WHEN msrp < ...)
-            risky_cols = set(re.findall(r"\b([a-z0-9_]+)\s*[<>=]", group_text))
-            risky_cols.update(re.findall(r"\((?:.*?\s)?([a-z0-9_]+)(?:\s.*?)?\)", group_text))
+            risky_cols = set(re.findall(AGENT_REFINE_GROUP_RISKY_COMPARE_PATTERN, group_text))
+            risky_cols.update(re.findall(AGENT_REFINE_GROUP_RISKY_PAREN_PATTERN, group_text))
             risky_cols = {c for c in risky_cols if c in all_valid_cols}
             
             select_clause = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, sql_up, re.DOTALL).group(1).lower()
