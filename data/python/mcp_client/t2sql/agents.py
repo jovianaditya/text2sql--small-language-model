@@ -32,6 +32,10 @@ from .config import (
     AGENT_GUARD_EXAMPLE_VALUE_THRESHOLD,
     AGENT_GUARD_BANNER_CHAR,
     AGENT_GUARD_BANNER_WIDTH,
+    AGENT_GUARD_LLM_TEMPERATURE,
+    AGENT_GUARD_LLM_NUM_CTX,
+    AGENT_GUARD_LLM_NUM_PREDICT,
+    AGENT_GUARD_SCHEMA_EXAMPLE_MAX_ITEMS,
     AGENT_GIBBERISH_MIN_TEXT_LENGTH,
     AGENT_GIBBERISH_SENTENCE_WORD_BYPASS,
     AGENT_GIBBERISH_MIN_ALPHA_LENGTH,
@@ -60,6 +64,7 @@ from .config import (
     AGENT_ROUTER_ORDINAL_WORDS,
     AGENT_ROUTER_ORDINAL_TARGET_TERMS,
     AGENT_ROUTER_WITHIN_SAME_PATTERN,
+    AGENT_ROUTER_BY_TOKEN,
     AGENT_ROUTER_EXPLICIT_SORT_TERMS,
     AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS,
     AGENT_SQL_RESERVED_EXTRA_TOKENS,
@@ -106,7 +111,9 @@ from .config import (
     AGENT_DRAFT_LIMIT_CAPTURE_PATTERN,
     AGENT_DRAFT_LIMIT_REMOVE_PATTERN,
     AGENT_DRAFT_LIMIT_INTENT_TERMS,
+    AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS,
     AGENT_KEEP_ALIVE_PARSE_PATTERN,
+    AGENT_PREWARM_MEMORY_ERROR_TOKEN,
     AGENT_KEEP_ALIVE_DEFAULT_SECONDS,
     AGENT_KEEP_ALIVE_UNIT_SECONDS,
     AGENT_ROUTER_PRIMARY_FROM_IN_PATTERNS,
@@ -131,6 +138,10 @@ from .config import (
     AGENT_REFINE_REGEX_TOKENS,
     AGENT_REFINE_MONTH_TOKEN,
     AGENT_REFINE_ORDER_TOKEN,
+    AGENT_REFINE_FUNC_LOOKAHEAD_LEN,
+    AGENT_REFINE_ALIAS_WINDOW_CHARS,
+    AGENT_REFINE_ALIAS_TOKEN_WITH_SPACE,
+    AGENT_REFINE_ALIAS_TOKEN,
     AGENT_REFINE_GROUP_CLAUSE_PATTERN,
     AGENT_REFINE_WHERE_CLAUSE_PATTERN,
     AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN,
@@ -473,14 +484,14 @@ def _llm_judge_sql_intent(question: str) -> Tuple[bool, str]:
     llm = ChatOllama(
         model=ROUTING_MODEL,  # qwen2.5:1.5b-instruct
         base_url=OLLAMA_URL,
-        temperature=0.0,
+        temperature=AGENT_GUARD_LLM_TEMPERATURE,
         format="json",
         keep_alive=OLLAMA_KEEP_ALIVE,
-        num_ctx=512,  # Small context for fast inference
-        num_predict=64,  # Short response
+        num_ctx=AGENT_GUARD_LLM_NUM_CTX,  # Small context for fast inference
+        num_predict=AGENT_GUARD_LLM_NUM_PREDICT,  # Short response
     )
     
-    schema_entities = _schema_entities_for_examples(max_items=6)
+    schema_entities = _schema_entities_for_examples(max_items=AGENT_GUARD_SCHEMA_EXAMPLE_MAX_ITEMS)
     schema_entities_txt = ", ".join(schema_entities) if schema_entities else "schema entities"
 
     prompt = f"""You are a query intent classifier for a SQL database system.
@@ -1294,7 +1305,11 @@ def router_agent(state: RAGState) -> RAGState:
     explicit_sort = AGENT_ROUTER_EXPLICIT_SORT_TERMS
     is_sorting = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in explicit_sort) or is_ranking
     
-    is_by_logic = ("by " in question_lower and not any(re.search(rf"\b{re.escape(s)}\b", question_lower) for s in explicit_sort) and (has_math or is_ranking))
+    is_by_logic = (
+        AGENT_ROUTER_BY_TOKEN in question_lower
+        and not any(re.search(rf"\b{re.escape(s)}\b", question_lower) for s in explicit_sort)
+        and (has_math or is_ranking)
+    )
     has_grouping = has_group_word or is_by_logic
 
     # ═══════════════════════════════════════════════════════════════════
@@ -1544,7 +1559,7 @@ def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM
                 return True
             except Exception as e:
                 error_msg = str(e).lower()
-                if "memory" in error_msg:
+                if AGENT_PREWARM_MEMORY_ERROR_TOKEN in error_msg:
                     print(f"[DRAFT OOM] Memory issue detected. Waiting {OOM_WAIT_TIME}s for previous model to unload...")
                     _time.sleep(OOM_WAIT_TIME)
                     print(f"[DRAFT OOM] Retrying model load...")
@@ -1592,7 +1607,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     
     # ===== TIMED INFERENCE (model already loaded) =====
     _t0 = _time.perf_counter()
-    obj = try_llm_json(llm, prompt, max_attempts=2, oom_retry_wait=OOM_WAIT_TIME)
+    obj = try_llm_json(llm, prompt, max_attempts=AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS, oom_retry_wait=OOM_WAIT_TIME)
     _inference_time = _time.perf_counter() - _t0
 
     # Store inference time in state for debugging (not logged to reduce noise)
@@ -2103,9 +2118,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 matches = re.finditer(rf"\b{col}\b", select_clause)
                 for m in matches:
                     start, end = m.span()
-                    is_func = select_clause[end:end+5].strip().startswith('(')
-                    prev_text = select_clause[max(0, start-10):start].upper()
-                    is_alias = "AS " in prev_text or "AS" in prev_text
+                    is_func = select_clause[end:end + AGENT_REFINE_FUNC_LOOKAHEAD_LEN].strip().startswith("(")
+                    prev_text = select_clause[max(0, start - AGENT_REFINE_ALIAS_WINDOW_CHARS):start].upper()
+                    is_alias = (
+                        AGENT_REFINE_ALIAS_TOKEN_WITH_SPACE in prev_text
+                        or AGENT_REFINE_ALIAS_TOKEN in prev_text
+                    )
                     
                     if not is_func and not is_alias:
                          _dbg_print_two("[Agent3] HARD ERROR - Aggregation Violation", f"Raw column '{col}' selected but grouped by derived value.")

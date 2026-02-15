@@ -45,6 +45,16 @@ from .config import (
     SPARSE_DEBUG,
     RETRIEVE_DEBUG,
     RETRIEVAL_STATS_MAX_SAMPLES,
+    RETRIEVAL_STATS_KEY_MIN,
+    RETRIEVAL_STATS_KEY_MAX,
+    RETRIEVAL_STATS_KEY_MEAN,
+    RETRIEVAL_STATS_KEY_DISTINCT_COUNT,
+    RETRIEVAL_META_DESCRIPTION_KEY,
+    RETRIEVAL_META_KEYWORDS_KEY,
+    RETRIEVAL_DOC_DESCRIPTION_MARKER,
+    RETRIEVAL_DOC_DESC_END_MARKER,
+    RETRIEVAL_DOC_SYNONYMS_MARKER,
+    RETRIEVAL_DOC_PRIMARY_KEY_MARKER,
     RETRIEVAL_DESC_KEYWORD_HEAD_WORDS,
     RETRIEVAL_CARDS_MAX_DOCS,
     RETRIEVAL_CARDS_MAX_INJECT,
@@ -93,6 +103,8 @@ from .config import (
     RETRIEVAL_NUMERIC_EXCLUDE_COLUMN_KEYWORDS,
     RETRIEVAL_DESC_GENERIC_TERMS,
     RETRIEVAL_AGGREGATE_QUERY_TERMS,
+    RETRIEVAL_COUNT_QUERY_TERMS,
+    RETRIEVAL_MULTI_ENTITY_MIN_TABLES,
     RETRIEVAL_BASE_K_FLOOR,
     RETRIEVAL_DENSE_K_FLOOR,
     RETRIEVAL_SPARSE_FILENAME_MARKER,
@@ -182,19 +194,19 @@ def _format_stats_for_llm(stats_raw: Any) -> str:
         parts.append(f"Sample='{val_single}'")
 
     # B. NUMERIC STATS
-    if "min" in stats and "max" in stats:
+    if RETRIEVAL_STATS_KEY_MIN in stats and RETRIEVAL_STATS_KEY_MAX in stats:
         try:
-            parts.append(f"Range=[{stats['min']}..{stats['max']}]")
+            parts.append(f"Range=[{stats[RETRIEVAL_STATS_KEY_MIN]}..{stats[RETRIEVAL_STATS_KEY_MAX]}]")
         except: pass
     
-    if "mean" in stats:
+    if RETRIEVAL_STATS_KEY_MEAN in stats:
         try:
-            parts.append(f"Mean={float(stats['mean']):.2f}")
+            parts.append(f"Mean={float(stats[RETRIEVAL_STATS_KEY_MEAN]):.2f}")
         except: pass
 
     # C. DISTINCT COUNT (Cardinality)
-    if "distinct_count" in stats:
-        parts.append(f"Distinct={stats['distinct_count']}")
+    if RETRIEVAL_STATS_KEY_DISTINCT_COUNT in stats:
+        parts.append(f"Distinct={stats[RETRIEVAL_STATS_KEY_DISTINCT_COUNT]}")
 
     if not parts:
         return ""
@@ -255,7 +267,7 @@ def _is_column_relevant_to_query(
         return True
 
     # Check column description (with word boundary matching)
-    desc = str(metadata.get("description") or "").lower()
+    desc = str(metadata.get(RETRIEVAL_META_DESCRIPTION_KEY) or "").lower()
     # Extract key terms from description (first few words)
     desc_words = set(desc.split()[:RETRIEVAL_DESC_KEYWORD_HEAD_WORDS])
     # Only match if description words actually appear as whole words in question
@@ -268,7 +280,7 @@ def _is_column_relevant_to_query(
             return True
 
     # === RULE 3: For COUNT queries, exclude metric columns not mentioned ===
-    if qtype == AGENT_ROUTER_QTYPE_AGGREGATE and "count" in q_l:
+    if qtype == AGENT_ROUTER_QTYPE_AGGREGATE and any(k in q_l for k in RETRIEVAL_COUNT_QUERY_TERMS):
         # Count queries only need: PK, name columns, and explicitly mentioned columns
         # Exclude: quantityInStock, buyPrice, etc. unless mentioned
         is_metric = any(r in RETRIEVAL_METRIC_ROLE_TAGS for r in roles)
@@ -372,8 +384,8 @@ def _build_cards(
 
         # 1. PRIORITY 1: Metadata Explicit (Hasil Sparse JSONL Anda)
         # JSONL Sparse Anda sekarang punya key "description" di dalam metadata.
-        if md.get("description"):
-            desc = md.get("description").strip()
+        if md.get(RETRIEVAL_META_DESCRIPTION_KEY):
+            desc = md.get(RETRIEVAL_META_DESCRIPTION_KEY).strip()
 
         # 2. PRIORITY 2: Parsing Teks Dokumen (Hasil Dense JSONL Anda)
         # JSONL Dense Anda formatnya: "Table: ... Description: <ISI>.. Primary Key..."
@@ -381,17 +393,17 @@ def _build_cards(
             # Di retrieve_node, teks dokumen disimpan di key "doc" atau "text"
             doc_text = it.get("doc") or it.get("text") or it.get("document") or ""
             
-            if "Description:" in doc_text:
+            if RETRIEVAL_DOC_DESCRIPTION_MARKER in doc_text:
                 try:
-                    # Ambil teks setelah "Description:"
-                    start = doc_text.find("Description:") + len("Description:")
+                    # Ambil teks setelah marker description.
+                    start = doc_text.find(RETRIEVAL_DOC_DESCRIPTION_MARKER) + len(RETRIEVAL_DOC_DESCRIPTION_MARKER)
                     
                     # Cari batas akhir. Di data Dense Anda, batasnya adalah ".. " (titik dua kali)
-                    end = doc_text.find("..", start)
+                    end = doc_text.find(RETRIEVAL_DOC_DESC_END_MARKER, start)
                     
                     # Backup boundaries jika ".. " tidak ketemu
-                    if end == -1: end = doc_text.find("Synonyms:", start)
-                    if end == -1: end = doc_text.find("Primary Key", start)
+                    if end == -1: end = doc_text.find(RETRIEVAL_DOC_SYNONYMS_MARKER, start)
+                    if end == -1: end = doc_text.find(RETRIEVAL_DOC_PRIMARY_KEY_MARKER, start)
                     
                     # Jika ketemu batas, potong stringnya
                     if end != -1:
@@ -633,14 +645,14 @@ def _doc_tokens_from_meta(meta: Dict[str, Any]) -> List[str]:
     Mengambil token untuk BM25.
     """
     # --- [MODIFIED 1] Use 'keywords' field if available (from sparse.jsonl) ---
-    if "keywords" in meta:
+    if RETRIEVAL_META_KEYWORDS_KEY in meta:
         # Langsung pakai field 'keywords' yang sudah kaya nutrisi (sample values, aliases, dll)
-        return _tokenize_bm25_query(str(meta["keywords"]))
+        return _tokenize_bm25_query(str(meta[RETRIEVAL_META_KEYWORDS_KEY]))
     
     # --- Fallback: Legacy Logic (jika jsonl belum di-update) ---
     table = (_meta_table(meta) or "").lower()
     column = (_meta_column(meta) or "").lower()
-    desc = str(meta.get("description") or "").lower()
+    desc = str(meta.get(RETRIEVAL_META_DESCRIPTION_KEY) or "").lower()
 
     aliases = _parse_str_or_list_lower(meta.get("tags_alias") or meta.get("aliases") or [])
     roles   = _parse_str_or_list_lower(meta.get("tags_role")  or meta.get("roles")   or [])
@@ -968,7 +980,7 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
         md = it.get("meta") or {}
         tbl = _meta_table(md)
         if not tbl: continue
-        desc = (md.get("description") or "").lower()
+        desc = (md.get(RETRIEVAL_META_DESCRIPTION_KEY) or "").lower()
         base = 0.0
         tl = tbl.lower()
 
@@ -1029,7 +1041,7 @@ def _check_needs_numeric_data_from_retrieved(reranked: List[Dict[str, Any]]) -> 
                 # (not just IDs or counts)
                 col = _meta_column(md).lower()
                 # Exclude primary keys and foreign keys (IDs) as they're not used for calculations
-                desc = str(md.get("description") or "").lower()
+                desc = str(md.get(RETRIEVAL_META_DESCRIPTION_KEY) or "").lower()
                 if not any(kw in col for kw in RETRIEVAL_NUMERIC_EXCLUDE_COLUMN_KEYWORDS):
                     return True
                 # Check description for calculation-related terms
@@ -1076,7 +1088,7 @@ def _infer_bridge_tables(
 
     for item in reranked:
         md = item.get("meta") or {}
-        desc = str(md.get("description") or "")
+        desc = str(md.get(RETRIEVAL_META_DESCRIPTION_KEY) or "")
 
         # Parse FK references from description
         # Pattern: "FK to targetTable.targetColumn"
@@ -1218,7 +1230,7 @@ def _has_join_intent(question: str) -> bool:
         t for t in get_all_tables()
         if _text_mentions_table(q, t, include_synonyms=False)
     ]
-    if len(mentioned_tables) >= 2:
+    if len(mentioned_tables) >= RETRIEVAL_MULTI_ENTITY_MIN_TABLES:
         return True
 
     return False
