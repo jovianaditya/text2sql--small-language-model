@@ -142,6 +142,9 @@ OOM_MAX_RETRIES = int(os.getenv("OOM_MAX_RETRIES", "3"))
 SQL_DEBUG = bool(int(os.getenv("SQL_DEBUG", "1")))
 COMPARE_DEBUG = bool(int(os.getenv("COMPARE_DEBUG", "0")))
 
+# Alias output style
+ALIAS_MAX_LEN = int(os.getenv("ALIAS_MAX_LEN", "36"))
+
 # ======================================================================
 # ========================= AGENT HEURISTICS ============================
 # ======================================================================
@@ -556,6 +559,9 @@ AGENT_SQL_RESERVED_EXTRA_TOKENS = set(
             "t", "limit", "offset", "as", "regexp_like", "str_to_date",
             "case", "when", "then", "else", "end", "union", "all", "distinct",
             "values", "exists", "having", "substr",
+            # Window function grammar (not schema columns)
+            "over", "partition", "range", "rows", "row", "between",
+            "unbounded", "preceding", "following", "current",
         ],
     )
 )

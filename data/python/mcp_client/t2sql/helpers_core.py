@@ -17,9 +17,11 @@ from .schema_analyzer import (
     get_name_column,
     get_id_column,
     get_all_tables,
+    get_transaction_tables,
     get_table_synonyms,
     get_singular_form,
 )
+from .config import ALIAS_MAX_LEN
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
@@ -334,9 +336,72 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
             or f"{ent} with no" in q
             or f"all {ent}" in q
             or f"every {ent}" in q
-            or f"for each {ent}" in q
         ):
             return False
+
+    # Explicit existence filters (without requiring "only"), schema-driven:
+    # - "customers with payments"
+    # - "authors with books"
+    # - "users who have sessions"
+    #
+    # Build candidate "existence object" terms from transaction-like tables
+    # in schema metadata, narrowed by ALLOWED IDENTIFIERS when available.
+    allowed = _parse_allowed_identifiers(ctx)
+    scoped_tables = {t.lower() for t in allowed.keys()} if allowed else set()
+    try:
+        tx_tables = {t.lower() for t in get_transaction_tables()}
+    except Exception:
+        tx_tables = set()
+
+    if scoped_tables and tx_tables:
+        obj_tables = scoped_tables.intersection(tx_tables)
+    elif tx_tables:
+        obj_tables = tx_tables
+    else:
+        obj_tables = set()
+
+    obj_terms: Set[str] = set()
+    for t in obj_tables:
+        t0 = (t or "").strip().strip("`")
+        if not t0:
+            continue
+        singular = _to_singular(t0)
+        variants = {t0, singular}
+        if "_" in t0:
+            variants.add(t0.replace("_", " "))
+        if "_" in singular:
+            variants.add(singular.replace("_", " "))
+        obj_terms.update(v for v in variants if v)
+        try:
+            for syn in get_table_synonyms(t0):
+                s = (syn or "").lower().strip()
+                if not s:
+                    continue
+                obj_terms.add(s)
+                obj_terms.add(_to_singular(s))
+        except Exception:
+            pass
+
+    # Conservative lexical fallback if metadata is unavailable.
+    if not obj_terms:
+        obj_terms = {"order", "orders", "payment", "payments", "transaction", "transactions", "purchase", "purchases"}
+
+    # Generic row-record words are useful for prompts like:
+    # "have at least one row in the payments table"
+    generic_obj_terms = {"record", "records", "row", "rows", "entry", "entries"}
+    obj_terms.update(generic_obj_terms)
+
+    escaped_obj = sorted((re.escape(t) for t in obj_terms if t), key=len, reverse=True)
+    existence_object = f"(?:{'|'.join(escaped_obj)})" if escaped_obj else r"(?:records?|rows?)"
+    has_entity_mention = re.search(rf"\b{entity_kw}\b", q, flags=re.I) is not None
+    has_existence_object = re.search(rf"\b{existence_object}\b", q, flags=re.I) is not None
+    has_existence_connector = (
+        re.search(r"\b(?:with|having)\b", q, flags=re.I) is not None
+        or re.search(r"\b(?:who|that|which)\b.{0,80}\b(?:have|has|had)\b", q, flags=re.I) is not None
+        or re.search(r"\b(?:have|has|had)\b.{0,80}\b(?:at\s+least\s+one|any)\b", q, flags=re.I) is not None
+    )
+    if has_entity_mention and has_existence_object and has_existence_connector:
+        return True
 
     if not re.search(r"\bonly\b", q):
         return False
@@ -374,6 +439,11 @@ def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
     entity_kw = _build_entity_kw(ctx)
     entity_terms = _entity_terms_from_ctx(ctx)
 
+    # Existence-filter intent must take precedence over broad "for each" wording.
+    # Example: "customers with payments, and for each customer ..."
+    if _question_requires_inner_join(question, ctx):
+        return False
+
     # --- LOGIKA SIGNALS (Tetap sama) ---
     explicit_signals = [
         "including", "with no", "without any", "without",
@@ -400,11 +470,6 @@ def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
 
     if re.search(rf"\b{entity_kw}\b.*\b(without|with\s+no|no)\b", q, flags=re.I):
         return True
-
-    # Pattern 0: explicit existence filtering (NOT include-zero)
-    # "only products that have been ordered", "only customers with orders", etc.
-    if _question_requires_inner_join(question, ctx):
-        return False  # Explicitly NOT include-zero, trigger INNER JOIN preference
 
     # Pattern 1: "for each X"
     if re.search(rf"\b(for\s+each|per|setiap|tiap)\s+{entity_kw}\b", q, flags=re.I):
@@ -843,6 +908,9 @@ def _rewrite_inner_join_filter_to_exists(sql: str) -> str:
         return sql
     if re.search(r"\b(left|right|full)\s+join\b", sql, flags=re.I):
         return sql
+    # Derived-table joins are too risky for this regex rewrite.
+    if re.search(r"\b(?:from|join)\s*\(", sql, flags=re.I):
+        return sql
 
     s0 = sql.strip()
 
@@ -967,6 +1035,9 @@ def _rewrite_inner_join_existence_to_exists(sql: str, question: str, ctx: str = 
         return sql
     if re.search(r"\b(left|right|full)\s+join\b", sql, flags=re.I):
         return sql
+    # Derived-table joins are too risky for this regex rewrite.
+    if re.search(r"\b(?:from|join)\s*\(", sql, flags=re.I):
+        return sql
     if _question_wants_anti_existence(question, ctx):
         return sql
     if not _question_wants_existence(question):
@@ -1032,6 +1103,9 @@ def _remove_redundant_and_ornamental_joins(sql: str) -> str:
     if "GROUP BY" in sql.upper():
         return sql
     if re.search(r"\b(SUM|COUNT|AVG|MIN|MAX|GROUP_CONCAT)\s*\(", sql, flags=re.I):
+        return sql
+    # Skip derived-table joins to avoid accidental cross-subquery rewrites.
+    if re.search(r"\b(?:from|join)\s*\(", sql, flags=re.I):
         return sql
 
     out = sql
@@ -1478,6 +1552,511 @@ def _prefer_friendly_names(sql: str, question: str) -> str:
 
     return sql
 
+def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
+    """
+    If question explicitly asks for both entity identifier and entity name,
+    ensure both columns are present in SELECT (and GROUP BY for grouped queries).
+
+    Dynamic and schema-driven:
+    - entity detection from table synonyms / singular names
+    - id/name columns from metadata (get_id_column/get_name_column)
+    """
+    if not sql or not question:
+        return sql
+
+    q = (question or "").lower()
+    q_norm = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
+
+    wants_name = re.search(r"\bnames?\b", q_norm) is not None
+    wants_id_like = re.search(r"\b(ids?|numbers?|nomors?|nos?|codes?|kodes?)\b", q_norm) is not None
+    if not (wants_name and wants_id_like):
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        # Relaxed fallback parser for GROUP BY queries with HAVING.
+        s = (sql or "").strip().rstrip(";").strip()
+        m_sel = re.match(r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<after>.+)$", s)
+        if not m_sel:
+            return sql
+        select_part = (m_sel.group("select") or "").strip()
+        after_from = (m_sel.group("after") or "").strip()
+
+        gb_matches = list(re.finditer(r"\bGROUP\s+BY\b", after_from, flags=re.I))
+        if not gb_matches:
+            return sql
+        gb_m = gb_matches[-1]
+        from_and_maybe_where = after_from[:gb_m.start()].strip()
+        after_gb = after_from[gb_m.end():].strip()
+        if not from_and_maybe_where or not after_gb:
+            return sql
+
+        next_kw = re.search(r"\b(HAVING|ORDER\s+BY|LIMIT)\b", after_gb, flags=re.I)
+        if next_kw:
+            groupby_part = after_gb[:next_kw.start()].strip()
+            rem = after_gb[next_kw.start():].strip()
+        else:
+            groupby_part = after_gb.strip()
+            rem = ""
+        if not groupby_part:
+            return sql
+
+        having_part = ""
+        tail_part = ""
+        if rem:
+            if re.match(r"(?is)^HAVING\b", rem):
+                h_body = re.sub(r"(?is)^HAVING\s+", "", rem).strip()
+                h_next = re.search(r"\b(ORDER\s+BY|LIMIT)\b", h_body, flags=re.I)
+                if h_next:
+                    having_part = h_body[:h_next.start()].strip()
+                    tail_part = h_body[h_next.start():].strip()
+                else:
+                    having_part = h_body
+            else:
+                tail_part = rem
+
+        where_match = re.search(r"\bWHERE\b", from_and_maybe_where, flags=re.I)
+        if where_match:
+            from_core = from_and_maybe_where[:where_match.start()].strip()
+            where_part = from_and_maybe_where[where_match.start():].strip()
+        else:
+            from_core = from_and_maybe_where
+            where_part = ""
+
+        parsed = {
+            "select": select_part,
+            "from_core": from_core,
+            "where": where_part,
+            "groupby": groupby_part,
+            "having": having_part,
+            "tail": tail_part,
+        }
+
+    if not parsed:
+        return sql
+
+    from_core = (parsed.get("from_core") or "").strip()
+    if not from_core:
+        return sql
+
+    # Build alias -> table map, plus table self-qualifier fallback.
+    alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    if not alias_to_table:
+        # fallback for no-alias FROM base table
+        m_base = re.match(r"(?is)^`?([A-Za-z_][A-Za-z0-9_]*)`?", from_core)
+        if m_base:
+            t = m_base.group(1)
+            alias_to_table = {t: t, t.lower(): t}
+
+    if not alias_to_table:
+        return sql
+
+    table_to_aliases: Dict[str, List[str]] = {}
+    for a, t in alias_to_table.items():
+        if not a or not t:
+            continue
+        # skip convenience lower duplicates
+        if a.lower() != a and a.lower() in alias_to_table:
+            pass
+        table_to_aliases.setdefault(t.lower(), [])
+        if a not in table_to_aliases[t.lower()]:
+            table_to_aliases[t.lower()].append(a)
+
+    def _phrase_mentioned(text: str, phrase: str) -> bool:
+        p = str(phrase or "").strip().lower()
+        if not p:
+            return False
+        pattern = re.escape(p).replace(r"\ ", r"\s+")
+        return re.search(rf"\b{pattern}\b", text) is not None
+
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m:
+            return item.strip(), None
+        return m.group(1).strip(), m.group(2).strip()
+
+    def _parse_simple_col(expr: str) -> Optional[tuple]:
+        m = re.match(
+            r"(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            expr.strip(),
+        )
+        if not m:
+            return None
+        return m.group(1), m.group(2)
+
+    select_items = _split_top_level_commas(parsed["select"])
+    group_items = _split_top_level_commas(parsed.get("groupby", ""))
+
+    # Gather simple selected columns by (qualifier?, column).
+    selected_cols: List[tuple] = []
+    for it in select_items:
+        expr, _a = _split_expr_alias(it)
+        pcol = _parse_simple_col(expr)
+        if pcol:
+            qf, col = pcol
+            selected_cols.append((qf.lower() if qf else None, col.lower()))
+
+    grouped_cols: Set[tuple] = set()
+    for g in group_items:
+        pcol = _parse_simple_col(g)
+        if pcol:
+            qf, col = pcol
+            grouped_cols.add((qf.lower() if qf else None, col.lower()))
+
+    changed = False
+    prepended_cols: List[str] = []
+
+    for table in get_all_tables():
+        t = (table or "").strip().lower()
+        if t not in table_to_aliases:
+            continue
+
+        # only enforce when the question actually mentions this entity
+        entity_words = _entity_words_for_table(table)
+        if not any(_phrase_mentioned(q_norm, w) for w in entity_words):
+            continue
+
+        id_col = get_id_column(table)
+        name_col = get_name_column(table)
+        if not id_col or not name_col:
+            continue
+        id_col_l = id_col.lower()
+        name_col_l = name_col.lower()
+
+        aliases = table_to_aliases.get(t) or [table]
+        # Prefer first non-lowercase convenience alias
+        qual = aliases[0]
+        qual_l = qual.lower()
+
+        has_id = any(
+            c == id_col_l and (qf is None or qf == qual_l or qf == t)
+            for qf, c in selected_cols
+        )
+        has_name = any(
+            c == name_col_l and (qf is None or qf == qual_l or qf == t)
+            for qf, c in selected_cols
+        )
+
+        if not has_id:
+            prepended_cols.append(f"{qual}.{id_col}")
+            selected_cols.append((qual_l, id_col_l))
+            changed = True
+
+        if not has_name:
+            prepended_cols.append(f"{qual}.{name_col}")
+            selected_cols.append((qual_l, name_col_l))
+            changed = True
+
+        # For grouped queries, ensure GROUP BY contains missing non-aggregate cols.
+        if group_items:
+            need_g_id = not any(
+                c == id_col_l and (qf is None or qf == qual_l or qf == t)
+                for qf, c in grouped_cols
+            )
+            need_g_name = not any(
+                c == name_col_l and (qf is None or qf == qual_l or qf == t)
+                for qf, c in grouped_cols
+            )
+            if need_g_id:
+                group_items.append(f"{qual}.{id_col}")
+                grouped_cols.add((qual_l, id_col_l))
+                changed = True
+            if need_g_name:
+                group_items.append(f"{qual}.{name_col}")
+                grouped_cols.add((qual_l, name_col_l))
+                changed = True
+
+    if not changed:
+        return sql
+
+    # Preserve existing SELECT order; prepend only truly missing columns.
+    new_select_items = prepended_cols + select_items
+    # Deduplicate simple duplicates while preserving order.
+    dedup_select: List[str] = []
+    seen_sel = set()
+    for it in new_select_items:
+        k = it.strip().lower()
+        if k in seen_sel:
+            continue
+        seen_sel.add(k)
+        dedup_select.append(it.strip())
+
+    # Deduplicate GROUP BY too.
+    dedup_group: List[str] = []
+    seen_grp = set()
+    for g in group_items:
+        k = g.strip().lower()
+        if k in seen_grp:
+            continue
+        seen_grp.add(k)
+        dedup_group.append(g.strip())
+
+    out_lines = []
+    out_lines.append("SELECT " + ", ".join(dedup_select))
+    out_lines.append("FROM " + from_core)
+    if parsed.get("where"):
+        out_lines.append(parsed["where"].strip())
+    out_lines.append("GROUP BY " + ", ".join(dedup_group))
+    if parsed.get("having"):
+        out_lines.append("HAVING " + parsed["having"].strip())
+    if parsed.get("tail"):
+        out_lines.append(parsed["tail"].strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+def _prune_non_primary_dimensions_for_primary_aggregate(sql: str, question: str, ctx: str = "") -> str:
+    """
+    For include-zero "for each <primary entity>" aggregate questions, keep one row per
+    primary entity by removing non-primary simple dimensions from SELECT/GROUP BY.
+
+    Example fixed:
+      For each employee ... total payment from their customers ...
+      DROP: customerNumber/customerName from SELECT/GROUP BY.
+    """
+    if not sql or not question:
+        return sql
+
+    q = (question or "").lower()
+    # Only activate on conservative signals to avoid over-pruning.
+    has_for_each = bool(re.search(r"\b(for\s+each|each|per|every)\b", q))
+    has_agg = bool(re.search(r"\b(sum|count|avg|average|min|max|total|jumlah)\b", q))
+    include_zero = _question_wants_include_zero(question, ctx)
+    if not (has_for_each and has_agg and include_zero):
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+    from_core = (parsed.get("from_core") or "").strip()
+    if not from_core or not re.search(r"\bjoin\b", from_core, flags=re.I):
+        return sql
+    if not parsed.get("groupby"):
+        return sql
+
+    alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    if not alias_to_table:
+        return sql
+
+    # Build term->table mapping dynamically from schema metadata.
+    term_to_table: Dict[str, str] = {}
+    for t in get_all_tables():
+        tt = (t or "").strip().lower()
+        if not tt:
+            continue
+        terms: Set[str] = {tt}
+        sg = get_singular_form(tt) if tt else tt
+        if sg:
+            terms.add(str(sg).lower())
+        if "_" in tt:
+            terms.add(tt.replace("_", " "))
+        if sg and "_" in str(sg):
+            terms.add(str(sg).replace("_", " ").lower())
+        try:
+            for syn in get_table_synonyms(tt):
+                s = (syn or "").strip().lower()
+                if s:
+                    terms.add(s)
+        except Exception:
+            pass
+        for term in terms:
+            if not term:
+                continue
+            term_to_table[term] = tt
+
+    # Infer primary table from "for each <entity>" phrase.
+    primary_table: Optional[str] = None
+    # Sort longer terms first to avoid partial matches.
+    for term in sorted(term_to_table.keys(), key=len, reverse=True):
+        pat = rf"\b(?:for\s+each|each|per|every)\s+{re.escape(term)}\b"
+        if re.search(pat, q, flags=re.I):
+            primary_table = term_to_table[term]
+            break
+    if not primary_table:
+        return sql
+
+    primary_aliases: Set[str] = set()
+    for a, t in alias_to_table.items():
+        if not a or not t:
+            continue
+        if t.lower() == primary_table:
+            primary_aliases.add(a.lower())
+    # fallback without explicit alias
+    primary_aliases.add(primary_table)
+    primary_aliases.add(get_singular_form(primary_table).lower())
+
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m:
+            return item.strip(), None
+        return m.group(1).strip(), m.group(2).strip()
+
+    def _alias_refs(expr: str) -> Set[str]:
+        refs = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", expr or "", flags=re.I)
+        return {r.lower() for r in refs}
+
+    def _is_agg_or_window(expr: str) -> bool:
+        e = (expr or "")
+        if re.search(r"\b(SUM|COUNT|AVG|MIN|MAX|GROUP_CONCAT|STDDEV|VARIANCE)\s*\(", e, flags=re.I):
+            return True
+        if re.search(r"\bOVER\s*\(", e, flags=re.I):
+            return True
+        return False
+
+    select_items = _split_top_level_commas(parsed["select"])
+    group_items = _split_top_level_commas(parsed["groupby"])
+
+    new_select: List[str] = []
+    for it in select_items:
+        expr, _alias = _split_expr_alias(it)
+        refs = _alias_refs(expr)
+        if _is_agg_or_window(expr):
+            new_select.append(it.strip())
+            continue
+        if not refs:
+            new_select.append(it.strip())
+            continue
+        # Keep non-aggregate expression only when it depends exclusively on primary alias/table.
+        if refs.issubset(primary_aliases):
+            new_select.append(it.strip())
+            continue
+        # else: drop non-primary dimension
+
+    if not new_select:
+        return sql
+
+    new_group: List[str] = []
+    for g in group_items:
+        refs = _alias_refs(g)
+        if not refs or refs.issubset(primary_aliases):
+            new_group.append(g.strip())
+
+    if not new_group:
+        # do not produce invalid aggregate query
+        return sql
+
+    # Rebuild query with same tail/having.
+    out_lines = []
+    out_lines.append("SELECT " + ", ".join(new_select))
+    out_lines.append("FROM " + from_core)
+    if parsed.get("where"):
+        out_lines.append(parsed["where"].strip())
+    out_lines.append("GROUP BY " + ", ".join(new_group))
+    if parsed.get("having"):
+        out_lines.append("HAVING " + parsed["having"].strip())
+    if parsed.get("tail"):
+        out_lines.append(parsed["tail"].strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str) -> str:
+    """
+    If SELECT already contains CONCAT(alias.firstName, ' ', alias.lastName),
+    drop redundant raw alias.firstName / alias.lastName columns (and their GROUP BY entries)
+    unless the question explicitly asks for first/last name.
+    """
+    if not sql or not question:
+        return sql
+
+    q = (question or "").lower()
+    if "first name" in q or "last name" in q:
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+    if not parsed.get("groupby"):
+        return sql
+
+    select_items = _split_top_level_commas(parsed["select"])
+    group_items = _split_top_level_commas(parsed["groupby"])
+    if not select_items:
+        return sql
+
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m:
+            return item.strip(), None
+        return m.group(1).strip(), m.group(2).strip()
+
+    def _parse_simple_col(expr: str) -> Optional[tuple]:
+        m = re.match(
+            r"(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            expr.strip(),
+        )
+        if not m:
+            return None
+        return (m.group(1) or "").lower(), m.group(2).lower()
+
+    # Detect aliases that already project full-name via CONCAT(first,last).
+    concat_aliases: Set[str] = set()
+    for it in select_items:
+        expr, _a = _split_expr_alias(it)
+        m1 = re.match(
+            r"""(?is)^CONCAT\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(firstName|first_name)`?\s*,\s*'[^']*'\s*,\s*`?\1`?\s*\.\s*`?(lastName|last_name)`?\s*\)\s*$""",
+            expr,
+        )
+        m2 = re.match(
+            r"""(?is)^CONCAT\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(lastName|last_name)`?\s*,\s*'[^']*'\s*,\s*`?\1`?\s*\.\s*`?(firstName|first_name)`?\s*\)\s*$""",
+            expr,
+        )
+        if m1:
+            concat_aliases.add(m1.group(1).lower())
+        elif m2:
+            concat_aliases.add(m2.group(1).lower())
+
+    if not concat_aliases:
+        return sql
+
+    def _is_raw_name_col(item: str) -> bool:
+        expr, _a = _split_expr_alias(item)
+        p = _parse_simple_col(expr)
+        if not p:
+            return False
+        a, c = p
+        if not a:
+            return False
+        if a not in concat_aliases:
+            return False
+        return c in {"firstname", "first_name", "lastname", "last_name"}
+
+    new_select = [it.strip() for it in select_items if not _is_raw_name_col(it)]
+    if len(new_select) == len(select_items):
+        return sql
+
+    # Keep original GROUP BY as-is for safety (prevents 1055 regressions).
+    new_group = [g.strip() for g in group_items]
+
+    out_lines = []
+    out_lines.append("SELECT " + ", ".join(new_select))
+    out_lines.append("FROM " + (parsed.get("from_core") or "").strip())
+    if parsed.get("where"):
+        out_lines.append(parsed["where"].strip())
+    out_lines.append("GROUP BY " + ", ".join(new_group))
+    if parsed.get("having"):
+        out_lines.append("HAVING " + parsed["having"].strip())
+    if parsed.get("tail"):
+        out_lines.append(parsed["tail"].strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
 def _expand_group_by_aliases_regex(sql: str) -> str:
     """
     Regex-based GROUP BY alias expansion (simpler but less robust).
@@ -1730,14 +2309,12 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
 
 def _normalize_alias_lengths(sql: str) -> str:
     """
-    Normalize overly long aliases by removing common filler words.
+    Soft alias guard:
+    - Preserve LLM-defined aliases by default.
+    - Only shorten aliases that are excessively long.
 
-    Examples:
-    - 'earliest_order_date_associated_with_that_status' → 'earliest_order_date'
-    - 'total_number_of_orders' → 'total_orders'
-    - 'shipped_percentage_of_orders' → 'shipped_percentage'
-
-    Preserves technical meaning while removing non-descriptive filler words.
+    This keeps model creativity for normal aliases while preventing unwieldy
+    output names that hurt readability.
     """
     if not sql:
         return sql
@@ -1746,46 +2323,10 @@ def _normalize_alias_lengths(sql: str) -> str:
     if " AS " not in sql.upper():
         return sql
 
-    # Common filler word patterns in snake_case aliases
-    # These are words that appear in questions but shouldn't be in aliases
-    filler_patterns = [
-        r'_associated_with_(?:this|that|the)_',  # "associated_with_this/that"
-        r'_for_(?:this|that|the)_',             # "for_this/that"
-        r'_of_(?:the|this|that)_',              # "of_the/this/that"
-        r'_in_(?:the|this|that)_',              # "in_the/this/that"
-        r'_number_of_',                         # "number_of"
-        r'_count_of_',                          # "count_of"
-        r'_of_(?:orders?|customers?|items?)_',  # "of_orders/customers/items"
-        r'_(?:of|for|by|with|per)_each_',       # "of/for/by/with/per_each"
-    ]
-
-    # Function to shorten a single alias
-    def shorten_alias(alias: str) -> str:
-        """Shorten a single alias by removing filler words."""
-        if not alias:
-            return alias
-
-        # Skip if already short (<= 3 words or <= 20 chars)
-        word_count = len([w for w in re.split(r'_', alias) if w])
-        if word_count <= 3 and len(alias) <= 20:
-            return alias
-
-        shortened = alias
-        for pattern in filler_patterns:
-            shortened = re.sub(pattern, '_', shortened, flags=re.IGNORECASE)
-            # Clean up multiple underscores
-            shortened = re.sub(r'_+', '_', shortened).strip('_')
-
-        # If still long, truncate to first 2-3 key words
-        word_count = len([w for w in re.split(r'_', shortened) if w])
-        if word_count > 3:
-            parts = [p for p in shortened.split('_') if p]
-            shortened = '_'.join(parts[:2]) if len(parts) >= 2 else parts[0]
-
-        return shortened
+    max_alias_len = ALIAS_MAX_LEN if ALIAS_MAX_LEN >= 8 else 8
 
     def replace_alias(match):
-        """Replace a long alias with a shortened version."""
+        """Shorten only if alias is too long; otherwise keep original."""
         # Extract the alias from whichever group matched
         # groups[0] = content inside single quotes
         # groups[1] = content inside double quotes
@@ -1814,13 +2355,20 @@ def _normalize_alias_lengths(sql: str) -> str:
             # No match, return original
             return match.group(0)
 
-        # For quoted aliases with spaces, convert to snake_case first
-        if quote_char and ' ' in alias:
-            alias = alias.lower().replace(' ', '_').replace('-', '_')
-            # Remove special characters except underscore
-            alias = re.sub(r'[^\w]', '', alias)
+        # Keep exactly what LLM produced if alias is already reasonable.
+        if len(alias) <= max_alias_len:
+            return match.group(0)
 
-        shortened = shorten_alias(alias)
+        # If too long, compact to snake_case + max length.
+        shortened = alias.lower().replace(" ", "_").replace("-", "_")
+        shortened = re.sub(r"[^\w]", "_", shortened)
+        shortened = re.sub(r"_+", "_", shortened).strip("_")
+        if not shortened:
+            shortened = "alias"
+        if len(shortened) > max_alias_len:
+            shortened = shortened[:max_alias_len].rstrip("_")
+        if not shortened:
+            shortened = "alias"
 
         if quote_char:
             return f" AS {quote_char}{shortened}{quote_char}"
@@ -3546,6 +4094,1150 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str) -> str:
     ).where(exp.EQ(this=exp.column("rn", table="t"), expression=exp.Literal.number(1)))
 
     return outer.sql(dialect="mysql")
+
+def _question_wants_latest_year_scope_with_aggregate(question: str) -> bool:
+    """
+    Dynamic intent detector for:
+      - latest/most-recent year
+      - plus aggregate amount/total intent
+
+    Intentionally avoids exact phrase dependency like "in that year" so
+    paraphrases still trigger the same rewrite path.
+    """
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    has_latest = bool(
+        re.search(r"\b(?:latest|most\s+recent|newest|terbaru|terakhir)\b", q)
+    )
+    has_year = bool(re.search(r"\b(?:year|tahun)\b", q))
+    has_aggregate_amount = bool(
+        re.search(r"\b(?:sum|total|jumlah|amount|paid|payment)\b", q)
+    )
+
+    return has_latest and has_year and has_aggregate_amount
+
+
+def _rewrite_latest_year_same_year_aggregate(sql: str, question: str) -> str:
+    """
+    Fix aggregate anti-pattern for questions like:
+      - "latest/most recent payment year"
+      - "sum amount in that same year"
+
+    Wrong pattern:
+      SELECT key_cols, MAX(paymentDate), SUM(amount)
+      FROM entity JOIN metric_table ...
+      GROUP BY key_cols
+
+    This sums across all years. Correct strategy:
+      1) derive latest_year per entity from the metric table
+      2) join/filter metric rows to that latest_year
+      3) aggregate MAX(paymentDate) and SUM(amount) on filtered rows
+    """
+    if not sql:
+        return sql
+
+    # Keep trigger conservative but phrasing-agnostic.
+    if not _question_wants_latest_year_scope_with_aggregate(question):
+        return sql
+
+    low_sql = sql.lower()
+
+    # Already handled pattern (alias-agnostic): keep as-is.
+    # Accept any derived-table alias, not only a specific one.
+    already_has_latest_year_pattern = (
+        bool(re.search(r"\bmax\s*\(\s*year\s*\(", low_sql))
+        and "latest_year" in low_sql
+        and bool(re.search(r"=\s*[a-z_][a-z0-9_]*\.latest_year\b", low_sql))
+    )
+    if already_has_latest_year_pattern:
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+
+    from_core = parsed["from_core"].strip()
+    if not from_core:
+        return sql
+
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m:
+            return item.strip(), None
+        return m.group(1).strip(), m.group(2).strip()
+
+    def _parse_qualified_col(expr: str) -> Optional[tuple]:
+        """
+        Parse simple column reference:
+          p.paymentDate  -> ("p", "paymentDate")
+          paymentDate    -> (None, "paymentDate")
+        """
+        m = re.match(
+            r"(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            expr.strip(),
+        )
+        if not m:
+            return None
+        return m.group(1), m.group(2)
+
+    def _extract_alias_refs(expr: str) -> List[str]:
+        refs = re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.", expr or "", flags=re.I)
+        # keep order, dedup case-insensitively
+        out: List[str] = []
+        seen = set()
+        for r in refs:
+            k = r.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(r)
+        return out
+
+    def _pick_best_key(candidates: List[str], avoid_cols: Set[str]) -> Optional[str]:
+        if not candidates:
+            return None
+        uniq = []
+        seen = set()
+        for c in candidates:
+            k = c.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(c)
+
+        def score(col: str) -> int:
+            c = col.lower()
+            s = 0
+            if c in avoid_cols:
+                s -= 10
+            if c.endswith("id") or c.endswith("number") or c.endswith("code"):
+                s += 5
+            if "id" in c or "number" in c or "code" in c:
+                s += 2
+            return s
+
+        return sorted(uniq, key=score, reverse=True)[0]
+
+    select_items = _split_top_level_commas(parsed["select"])
+    if len(select_items) < 3:
+        return sql
+
+    date_expr_raw: Optional[str] = None
+    sum_expr_raw: Optional[str] = None
+
+    for it in select_items:
+        expr, _alias = _split_expr_alias(it)
+
+        m_max = re.match(r"(?is)^MAX\s*\(\s*(.+?)\s*\)$", expr)
+        if m_max and date_expr_raw is None:
+            max_inner = m_max.group(1).strip()
+            parsed_col = _parse_qualified_col(max_inner)
+            if parsed_col:
+                _, col_name = parsed_col
+                if ("date" in col_name.lower()) or ("time" in col_name.lower()):
+                    date_expr_raw = max_inner
+                    continue
+
+        m_sum = re.match(r"(?is)^SUM\s*\(\s*(.+?)\s*\)$", expr)
+        if m_sum and sum_expr_raw is None:
+            sum_expr_raw = m_sum.group(1).strip()
+            continue
+
+    if not date_expr_raw or not sum_expr_raw:
+        return sql
+
+    date_col = _parse_qualified_col(date_expr_raw)
+    if not date_col:
+        return sql
+    date_alias, date_col_name = date_col
+
+    sum_alias_refs = _extract_alias_refs(sum_expr_raw)
+    measure_alias: Optional[str] = None
+    if date_alias:
+        if sum_alias_refs and all(a.lower() != date_alias.lower() for a in sum_alias_refs):
+            return sql
+        measure_alias = date_alias
+    else:
+        if len(sum_alias_refs) == 1:
+            measure_alias = sum_alias_refs[0]
+        else:
+            return sql
+
+    if not measure_alias:
+        return sql
+
+    alias_map = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    measure_table = alias_map.get(measure_alias) or alias_map.get(measure_alias.lower())
+    if not measure_table:
+        # allow table name to be used directly as qualifier
+        measure_table = measure_alias
+
+    existing_aliases = {k.lower() for k in alias_map.keys() if k and not k.startswith("__")}
+
+    # Find join keys connected to metric alias via ON predicates.
+    eq_pat = re.compile(
+        r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*"
+        r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+        flags=re.I,
+    )
+    key_candidates: List[str] = []
+    for m in eq_pat.finditer(from_core):
+        a1, c1, a2, c2 = m.group(1), m.group(2), m.group(3), m.group(4)
+        if a1.lower() == measure_alias.lower():
+            key_candidates.append(c1)
+        if a2.lower() == measure_alias.lower():
+            key_candidates.append(c2)
+
+    # Fallback: metric alias appears in GROUP BY.
+    if not key_candidates:
+        for g in _split_top_level_commas(parsed["groupby"]):
+            gm = _parse_qualified_col(g)
+            if not gm:
+                continue
+            g_alias, g_col = gm
+            if g_alias and g_alias.lower() == measure_alias.lower():
+                key_candidates.append(g_col)
+
+    measure_key_col = _pick_best_key(key_candidates, avoid_cols={date_col_name.lower()})
+    if not measure_key_col:
+        return sql
+
+    # If query already has this year filter, do nothing (alias-agnostic).
+    date_ref = f"{measure_alias}.{date_col_name}"
+    year_filter_pat = re.compile(
+        rf"\bYEAR\s*\(\s*`?{re.escape(measure_alias)}`?\s*\.\s*`?{re.escape(date_col_name)}`?\s*\)\s*=\s*[A-Za-z_][A-Za-z0-9_]*\.latest_year",
+        flags=re.I,
+    )
+    if year_filter_pat.search(sql):
+        return sql
+
+    def _pick_subquery_alias(preferred: str = "latest_years") -> str:
+        base = re.sub(r"[^A-Za-z0-9_]", "", preferred) or "latest_years"
+        if not re.match(r"[A-Za-z_]", base[0]):
+            base = f"y_{base}"
+        cand = base
+        i = 2
+        while cand.lower() in existing_aliases:
+            cand = f"{base}_{i}"
+            i += 1
+        return cand
+
+    year_alias = _pick_subquery_alias(f"{measure_alias}_latest_years")
+
+    ly_join = (
+        "JOIN (\n"
+        "  SELECT\n"
+        f"    {measure_key_col},\n"
+        f"    MAX(YEAR({date_col_name})) AS latest_year\n"
+        f"  FROM {measure_table}\n"
+        f"  GROUP BY {measure_key_col}\n"
+        f") AS {year_alias}\n"
+        f"  ON {year_alias}.{measure_key_col} = {measure_alias}.{measure_key_col}"
+    )
+
+    from_with_ly = f"{from_core}\n{ly_join}"
+    year_cond = f"YEAR({date_ref}) = {year_alias}.latest_year"
+
+    where_clause = parsed["where"].strip()
+    if where_clause:
+        # Preserve original boolean precedence (especially OR chains).
+        existing_pred = re.sub(r"^\s*WHERE\s+", "", where_clause, flags=re.I).strip()
+        where_clause = f"WHERE ({existing_pred}) AND {year_cond}"
+    else:
+        where_clause = f"WHERE {year_cond}"
+
+    tail_clause = f"\n{parsed['tail'].strip()}" if parsed["tail"].strip() else ""
+    fixed = (
+        f"SELECT {parsed['select'].strip()}\n"
+        f"FROM {from_with_ly}\n"
+        f"{where_clause}\n"
+        f"GROUP BY {parsed['groupby'].strip()}"
+        f"{tail_clause};"
+    )
+    return fixed
+
+def _rewrite_latest_year_correlated_maxdate_misuse(sql: str, question: str) -> str:
+    """
+    Fix correlated-subquery anti-pattern such as:
+
+      WHERE p.paymentDate IN (
+        SELECT MAX(paymentDate)
+        FROM payments p2
+        WHERE YEAR(p2.paymentDate) = YEAR(p.paymentDate)
+          AND p2.customerNumber = p.customerNumber
+      )
+
+    combined with SUM(amount) + GROUP BY customer/year.
+
+    Strategy:
+      1) Canonicalize into: SELECT entity_cols, MAX(date), SUM(amount) ... GROUP BY entity_cols
+      2) Reuse latest-year rewrite to enforce "sum in the most recent year".
+    """
+    if not sql:
+        return sql
+
+    if not _question_wants_latest_year_scope_with_aggregate(question):
+        return sql
+
+    s = sql.strip().rstrip(";").strip()
+    if not s:
+        return sql
+
+    # Already-correct latest-year shape: skip.
+    low = s.lower()
+    if "latest_year" in low and re.search(r"=\s*[a-z_][a-z0-9_]*\.latest_year\b", low):
+        return sql
+
+    parsed = _parse_select_from_groupby(s)
+    if not parsed:
+        return sql
+    if not parsed.get("where"):
+        return sql
+
+    where_raw = re.sub(r"^\s*WHERE\s+", "", parsed["where"].strip(), flags=re.I).strip()
+    if not where_raw:
+        return sql
+    # Target only correlated max-date subquery shape.
+    if not re.search(r"\b(?:IN|=)\s*\(\s*SELECT\s+MAX\s*\(", where_raw, flags=re.I):
+        return sql
+    if "year(" not in where_raw.lower():
+        return sql
+
+    # Keep rewrite conservative on OR expressions.
+    if _has_top_level_or(where_raw):
+        return sql
+
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m:
+            return item.strip(), None
+        return m.group(1).strip(), m.group(2).strip()
+
+    def _parse_qualified_col(expr: str) -> Optional[tuple]:
+        m = re.match(
+            r"(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            expr.strip(),
+        )
+        if not m:
+            return None
+        return m.group(1), m.group(2)
+
+    def _strip_as(item: str) -> str:
+        return re.sub(
+            r"""(?is)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            "",
+            item.strip(),
+        ).strip()
+
+    def _safe_alias(a: Optional[str], default_name: str) -> str:
+        if not a:
+            return default_name
+        x = a.strip()
+        if (x.startswith("`") and x.endswith("`")) or (x.startswith("'") and x.endswith("'")) or (x.startswith('"') and x.endswith('"')):
+            x = x[1:-1]
+        x = re.sub(r"\s+", "_", x)
+        x = re.sub(r"[^A-Za-z0-9_]", "", x)
+        if not x:
+            return default_name
+        if not re.match(r"[A-Za-z_]", x[0]):
+            return default_name
+        return x
+
+    select_items = _split_top_level_commas(parsed["select"])
+    if not select_items:
+        return sql
+
+    entity_items: List[str] = []
+    date_expr_raw: Optional[str] = None
+    date_alias_raw: Optional[str] = None
+    sum_expr_inner: Optional[str] = None
+    sum_alias_raw: Optional[str] = None
+    measure_alias: Optional[str] = None
+    date_col_name: Optional[str] = None
+
+    for it in select_items:
+        expr, alias = _split_expr_alias(it)
+
+        m_sum = re.match(r"(?is)^SUM\s*\(\s*(.+?)\s*\)$", expr)
+        if m_sum and sum_expr_inner is None:
+            sum_expr_inner = m_sum.group(1).strip()
+            sum_alias_raw = alias
+            refs = re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.", sum_expr_inner, flags=re.I)
+            if len(refs) == 1:
+                measure_alias = refs[0]
+            continue
+
+        # Date may be raw (p.paymentDate) or already aggregated.
+        m_max = re.match(r"(?is)^MAX\s*\(\s*(.+?)\s*\)$", expr)
+        candidate = m_max.group(1).strip() if m_max else expr
+        parsed_col = _parse_qualified_col(candidate)
+        if parsed_col:
+            a, c = parsed_col
+            if ("date" in c.lower()) or ("time" in c.lower()):
+                if date_expr_raw is None:
+                    date_expr_raw = candidate
+                    date_alias_raw = alias
+                    date_col_name = c
+                    if a:
+                        measure_alias = a
+                    continue
+
+        # Keep non-aggregate entity columns.
+        if not re.search(r"\b(SUM|COUNT|AVG|MIN|MAX)\s*\(", expr, flags=re.I):
+            entity_items.append(it.strip())
+
+    if not date_expr_raw or not sum_expr_inner:
+        return sql
+
+    if not measure_alias:
+        refs = re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.", date_expr_raw, flags=re.I)
+        if len(refs) == 1:
+            measure_alias = refs[0]
+    if not measure_alias or not date_col_name:
+        return sql
+
+    # Remove correlated MAX(date) predicate from WHERE, keep unrelated filters.
+    conjuncts = _split_top_level_and(where_raw)
+    keep_conj: List[str] = []
+    for c in conjuncts:
+        c0 = c.strip()
+        low_c0 = c0.lower()
+        if ("select" in low_c0) and ("max(" in low_c0) and ("year(" in low_c0):
+            continue
+        keep_conj.append(c0)
+
+    # Build canonical GROUP BY from non-aggregate entity columns.
+    group_items: List[str] = []
+    seen_g = set()
+    for it in entity_items:
+        g = _strip_as(it)
+        k = g.lower()
+        if k in seen_g:
+            continue
+        seen_g.add(k)
+        group_items.append(g)
+
+    if not group_items:
+        # fallback from original GROUP BY: drop YEAR(...) and aggregates
+        for g in _split_top_level_commas(parsed.get("groupby", "")):
+            g0 = g.strip()
+            if not g0:
+                continue
+            low_g = g0.lower()
+            if ("year(" in low_g) or re.search(r"\b(SUM|COUNT|AVG|MIN|MAX)\s*\(", low_g, flags=re.I):
+                continue
+            k = g0.lower()
+            if k in seen_g:
+                continue
+            seen_g.add(k)
+            group_items.append(g0)
+
+    if not group_items:
+        return sql
+
+    # Qualify SUM expression to metric alias if expression is bare column.
+    sum_expr_final = sum_expr_inner.strip()
+    if re.fullmatch(r"`?[A-Za-z_][A-Za-z0-9_]*`?", sum_expr_final):
+        sum_expr_final = f"{measure_alias}.{sum_expr_final.strip('`')}"
+
+    date_alias_out = _safe_alias(date_alias_raw, f"latest_{date_col_name}")
+    sum_alias_out = _safe_alias(sum_alias_raw, "total_amount")
+
+    # Preserve requested ORDER BY direction, but make it aggregate-safe.
+    order_clause = ""
+    limit_clause = ""
+    tail = (parsed.get("tail") or "").strip()
+    if tail:
+        m_limit = re.search(r"\bLIMIT\b.+$", tail, flags=re.I)
+        if m_limit:
+            limit_clause = " " + m_limit.group(0).strip()
+        if re.search(r"\bORDER\s+BY\b", tail, flags=re.I):
+            if re.search(r"\bDESC\b", tail, flags=re.I):
+                direction = "DESC"
+            elif re.search(r"\bASC\b", tail, flags=re.I):
+                direction = "ASC"
+            else:
+                direction = "DESC"
+            order_clause = f"ORDER BY MAX({date_expr_raw}) {direction}"
+
+    canonical_lines = []
+    canonical_lines.append("SELECT")
+    select_out = []
+    select_out.extend(entity_items)
+    select_out.append(f"MAX({date_expr_raw}) AS {date_alias_out}")
+    select_out.append(f"SUM({sum_expr_final}) AS {sum_alias_out}")
+    canonical_lines.append("  " + ",\n  ".join(select_out))
+    canonical_lines.append(f"FROM {parsed['from_core'].strip()}")
+    if keep_conj:
+        canonical_lines.append("WHERE " + " AND ".join(keep_conj))
+    canonical_lines.append("GROUP BY " + ", ".join(group_items))
+    if order_clause:
+        canonical_lines.append(order_clause + limit_clause)
+    elif limit_clause:
+        canonical_lines.append(limit_clause.strip())
+    canonical_sql = "\n".join(canonical_lines).strip() + ";"
+
+    # Reuse the existing latest-year rewrite.
+    fixed = _rewrite_latest_year_same_year_aggregate(canonical_sql, question)
+    return fixed if fixed else canonical_sql
+
+def _move_latest_year_filter_where_to_inner_on(sql: str) -> str:
+    """
+    Canonicalize style:
+      WHERE YEAR(p.paymentDate) = ly.latest_year
+    ->
+      JOIN payments p ON ... AND YEAR(p.paymentDate) = ly.latest_year
+
+    Safety rules:
+    - only for queries parseable as SELECT...FROM...GROUP BY...
+    - only when all joins are INNER/JOIN (no LEFT/RIGHT/FULL)
+    - only top-level AND predicates (skip OR)
+    - only predicates matching YEAR(<alias>.<col>) = <alias>.latest_year (or reversed)
+    """
+    if not sql:
+        return sql
+    if "latest_year" not in (sql or "").lower():
+        return sql
+
+    def _is_word_boundary(text: str, i: int, n: int) -> bool:
+        left_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        right_ok = (i + n) >= len(text) or not (text[i + n].isalnum() or text[i + n] == "_")
+        return left_ok and right_ok
+
+    def _scan_top_level_word_positions(text: str, word: str) -> List[int]:
+        out: List[int] = []
+        w = word.lower()
+        n = len(w)
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and i + n <= len(text) and text[i:i + n].lower() == w and _is_word_boundary(text, i, n):
+                out.append(i)
+            i += 1
+        return out
+
+    def _first_top_level_word_pos(text: str, word: str, start: int = 0) -> int:
+        for p in _scan_top_level_word_positions(text, word):
+            if p >= start:
+                return p
+        return -1
+
+    def _first_top_level_group_by_pos(text: str, start: int = 0) -> int:
+        for p in _scan_top_level_word_positions(text, "group"):
+            if p < start:
+                continue
+            j = p + len("group")
+            while j < len(text) and text[j].isspace():
+                j += 1
+            if j + 2 <= len(text) and text[j:j + 2].lower() == "by" and _is_word_boundary(text, j, 2):
+                return p
+        return -1
+
+    def _first_top_level_order_by_pos(text: str, start: int = 0) -> int:
+        for p in _scan_top_level_word_positions(text, "order"):
+            if p < start:
+                continue
+            j = p + len("order")
+            while j < len(text) and text[j].isspace():
+                j += 1
+            if j + 2 <= len(text) and text[j:j + 2].lower() == "by" and _is_word_boundary(text, j, 2):
+                return p
+        return -1
+
+    s0 = sql.strip().rstrip(";").strip()
+    if not s0:
+        return sql
+
+    from_pos = _first_top_level_word_pos(s0, "from", start=0)
+    if from_pos < 0:
+        return sql
+
+    where_pos = _first_top_level_word_pos(s0, "where", start=from_pos + 4)
+    group_pos = _first_top_level_group_by_pos(s0, start=from_pos + 4)
+    having_pos = _first_top_level_word_pos(s0, "having", start=from_pos + 4)
+    order_pos = _first_top_level_order_by_pos(s0, start=from_pos + 4)
+    limit_pos = _first_top_level_word_pos(s0, "limit", start=from_pos + 4)
+
+    def _next_pos_after(start_pos: int, candidates: List[int]) -> int:
+        vals = [p for p in candidates if p >= 0 and p > start_pos]
+        return min(vals) if vals else -1
+
+    # FROM core ends at first top-level clause after FROM.
+    from_end = _next_pos_after(
+        from_pos,
+        [p for p in [where_pos, group_pos, having_pos, order_pos, limit_pos] if p >= 0],
+    )
+    if from_end < 0:
+        from_end = len(s0)
+
+    from_core = s0[from_pos + 4:from_end].strip()
+    if not from_core:
+        return sql
+    if not re.search(r"\bjoin\b", from_core, flags=re.I):
+        return sql
+    if re.search(r"\b(left|right|full)\s+join\b", from_core, flags=re.I):
+        return sql
+
+    if where_pos < 0:
+        return sql
+    where_end = _next_pos_after(
+        where_pos,
+        [p for p in [group_pos, having_pos, order_pos, limit_pos] if p >= 0],
+    )
+    if where_end < 0:
+        where_end = len(s0)
+    where_body = s0[where_pos + 5:where_end].strip()
+    if not where_body:
+        return sql
+    if _has_top_level_or(where_body):
+        return sql
+
+    select_prefix = s0[:from_pos].strip()
+    rest_after_where = s0[where_end:].strip() if where_end < len(s0) else ""
+
+    def _strip_wrapping_parens(expr: str) -> str:
+        s = (expr or "").strip()
+        changed = True
+        while changed and s.startswith("(") and s.endswith(")"):
+            changed = False
+            depth = 0
+            ok = True
+            for i, ch in enumerate(s):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth < 0:
+                        ok = False
+                        break
+                    if depth == 0 and i != len(s) - 1:
+                        ok = False
+                        break
+            if ok and depth == 0:
+                s = s[1:-1].strip()
+                changed = True
+        return s
+
+    def _extract_latest_year_alias_pair(cond: str) -> Optional[tuple]:
+        c = _strip_wrapping_parens(cond)
+        p1 = re.match(
+            r"""(?is)^\s*YEAR\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?latest_year`?\s*$""",
+            c,
+        )
+        if p1:
+            return p1.group(1), p1.group(3)
+        p2 = re.match(
+            r"""(?is)^\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?latest_year`?\s*=\s*YEAR\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*$""",
+            c,
+        )
+        if p2:
+            return p2.group(2), p2.group(1)
+        return None
+
+    def _rhs_alias_from_join_pre(pre: str) -> Optional[str]:
+        p = pre.strip()
+        # Derived table join: JOIN ( ... ) AS alias
+        m_sub = re.search(r"\)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*$", p, flags=re.I)
+        if m_sub:
+            return m_sub.group(1)
+        # Regular table join: JOIN table [AS] alias?
+        m_tbl = re.search(
+            r"""\b(?:INNER\s+JOIN|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?\s*$""",
+            p,
+            flags=re.I,
+        )
+        if not m_tbl:
+            return None
+        alias = (m_tbl.group(2) or "").strip()
+        if alias:
+            return alias
+        tbl = (m_tbl.group(1) or "").replace("`", "").split(".")[-1]
+        return tbl or None
+
+    def _base_aliases_from_from_core_base(base: str) -> Set[str]:
+        """
+        Parse base FROM part before first JOIN.
+        Examples:
+          customers AS c  -> {"c", "customers"}
+          `db`.`customers` c -> {"c", "customers"}
+          customers -> {"customers"}
+        """
+        b = (base or "").strip()
+        out: Set[str] = set()
+        m = re.match(
+            r"""(?is)^(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?\s*$""",
+            b,
+        )
+        if not m:
+            return out
+        tbl = (m.group(1) or "").replace("`", "").split(".")[-1].strip()
+        alias = (m.group(2) or "").strip()
+        if tbl:
+            out.add(tbl.lower())
+        if alias:
+            out.add(alias.lower())
+        return out
+
+    # Build join segments at top level.
+    raw_join_positions = _scan_top_level_word_positions(from_core, "join")
+    if not raw_join_positions:
+        return sql
+    join_positions: List[int] = []
+    for p in raw_join_positions:
+        start = p
+        prefix = from_core[:p]
+        m_inner = re.search(r"\bINNER\s*$", prefix, flags=re.I)
+        if m_inner:
+            start = m_inner.start()
+        if not join_positions or join_positions[-1] != start:
+            join_positions.append(start)
+
+    segments = []
+    for i, start in enumerate(join_positions):
+        end = join_positions[i + 1] if i + 1 < len(join_positions) else len(from_core)
+        seg = from_core[start:end]
+        on_rel = _first_top_level_word_pos(seg, "on", start=0)
+        if on_rel < 0:
+            continue
+        pre = seg[:on_rel].rstrip()
+        on_expr = seg[on_rel + 2:].strip()
+        rhs_alias = _rhs_alias_from_join_pre(pre)
+        segments.append(
+            {
+                "start": start,
+                "end": end,
+                "pre": pre,
+                "on": on_expr,
+                "rhs_alias": (rhs_alias or "").strip(),
+                "moved": [],
+                "avail": set(),
+            }
+        )
+
+    if not segments:
+        return sql
+
+    # Compute alias scope available at each JOIN ON clause.
+    base_aliases = _base_aliases_from_from_core_base(from_core[:join_positions[0]])
+    running_aliases: Set[str] = set(base_aliases)
+    for seg in segments:
+        rhs = (seg.get("rhs_alias") or "").lower()
+        if rhs:
+            running_aliases.add(rhs)
+        seg["avail"] = set(running_aliases)
+
+    # Extract movable predicates from WHERE.
+    conjuncts = _split_top_level_and(where_body)
+    keep_conj: List[str] = []
+    moved_any = False
+
+    for cond in conjuncts:
+        c0 = cond.strip()
+        pair = _extract_latest_year_alias_pair(c0)
+        if not pair:
+            keep_conj.append(c0)
+            continue
+
+        date_alias, year_alias = pair[0], pair[1]
+        date_alias_l = date_alias.lower()
+        year_alias_l = year_alias.lower()
+
+        # Prefer the rightmost JOIN where BOTH aliases are already in scope.
+        # This guarantees the ON clause can legally reference both sides.
+        target_idx = -1
+        for j in range(len(segments) - 1, -1, -1):
+            avail = {a.lower() for a in (segments[j].get("avail") or set())}
+            if date_alias_l in avail and year_alias_l in avail:
+                target_idx = j
+                break
+        # Fallback: attach to a JOIN introducing one of the aliases.
+        if target_idx < 0:
+            for j in range(len(segments) - 1, -1, -1):
+                rhs = (segments[j]["rhs_alias"] or "").lower()
+                if rhs in {date_alias_l, year_alias_l}:
+                    target_idx = j
+                    break
+
+        if target_idx < 0:
+            keep_conj.append(c0)
+            continue
+
+        segments[target_idx]["moved"].append(c0)
+        moved_any = True
+
+    if not moved_any:
+        return sql
+
+    # Reconstruct FROM/JOIN with predicates moved into target ON clauses.
+    base = from_core[:join_positions[0]].strip()
+    rebuilt_parts: List[str] = [base] if base else []
+    for seg in segments:
+        on_new = seg["on"]
+        for p in seg["moved"]:
+            on_new = f"({on_new}) AND ({p})"
+        rebuilt_parts.append(f"{seg['pre']} ON {on_new}")
+    from_new = "\n".join(p for p in rebuilt_parts if p and p.strip())
+
+    out_lines = []
+    out_lines.append(select_prefix)
+    out_lines.append(f"FROM {from_new}")
+    if keep_conj:
+        out_lines.append("WHERE " + " AND ".join(keep_conj))
+    if rest_after_where:
+        out_lines.append(rest_after_where)
+
+    fixed = "\n".join(x for x in out_lines if x and x.strip()).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str) -> str:
+    """
+    Handle malformed pattern:
+
+      SELECT entity_cols, sub.paymentDate, sub.amount
+      FROM entity e
+      JOIN (
+        SELECT key, MAX(date) AS latest_date, SUM(amount) AS total_amount
+        FROM metric
+        GROUP BY key
+      ) sub ON e.key = sub.key
+      [WHERE ...]
+
+    This pattern is both semantically wrong for "same year sum" and can reference
+    non-existent columns from derived subquery aliases.
+    """
+    if not sql:
+        return sql
+
+    if not _question_wants_latest_year_scope_with_aggregate(question):
+        return sql
+
+    s = sql.strip().rstrip(";").strip()
+    if not s:
+        return sql
+
+    # If already using latest_year pattern, skip.
+    low = s.lower()
+    if "latest_year" in low and re.search(r"=\s*[a-z_][a-z0-9_]*\.latest_year\b", low):
+        return sql
+
+    m_join_sub = re.search(r"\bJOIN\s*\(\s*SELECT\b", s, flags=re.I)
+    if not m_join_sub:
+        return sql
+
+    open_idx = s.find("(", m_join_sub.start())
+    if open_idx == -1:
+        return sql
+
+    # Find matching ')' for JOIN ( ... )
+    depth = 0
+    close_idx = -1
+    in_sq = False
+    in_dq = False
+    i = open_idx
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_dq:
+            if in_sq and i + 1 < len(s) and s[i + 1] == "'":
+                i += 2
+                continue
+            in_sq = not in_sq
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            i += 1
+            continue
+        if in_sq or in_dq:
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_idx = i
+                break
+        i += 1
+
+    if close_idx == -1:
+        return sql
+
+    before = s[:m_join_sub.start()].strip()
+    inner_sql = s[open_idx + 1:close_idx].strip()
+    after = s[close_idx + 1:].strip()
+
+    # before ends with join type token (e.g., "... FROM customers AS cust INNER")
+    before = re.sub(r"\b(?:INNER|LEFT|RIGHT|FULL|CROSS)\s*$", "", before, flags=re.I).strip()
+
+    m_after = re.match(
+        r"(?is)^(?:AS\s+)?(?P<sub>[A-Za-z_][A-Za-z0-9_]*)\s+ON\s+(?P<on>.+?)(?:\s+WHERE\s+(?P<where>.+))?$",
+        after,
+    )
+    if not m_after:
+        return sql
+
+    sub_alias = m_after.group("sub").strip()
+    on_clause = (m_after.group("on") or "").strip()
+
+    m_before = re.match(
+        r"(?is)^SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<t>`?[A-Za-z_][A-Za-z0-9_]*`?)(?:\s+(?:AS\s+)?(?P<a>[A-Za-z_][A-Za-z0-9_]*))?\s*$",
+        before,
+    )
+    if not m_before:
+        return sql
+
+    outer_select = m_before.group("select").strip()
+    entity_table = m_before.group("t").strip()
+    entity_alias = (m_before.group("a") or "").strip()
+    if not entity_alias:
+        # Recover dropped base-table alias from SELECT qualifiers.
+        outer_alias_refs = [
+            a for a in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", outer_select, flags=re.I)
+            if a.lower() != sub_alias.lower()
+        ]
+        uniq_refs = []
+        seen_refs = set()
+        for a in outer_alias_refs:
+            k = a.lower()
+            if k in seen_refs:
+                continue
+            seen_refs.add(k)
+            uniq_refs.append(a)
+        if len(uniq_refs) == 1:
+            entity_alias = uniq_refs[0]
+        else:
+            # Fallback deterministic alias from table name.
+            entity_alias = entity_table.strip("`")
+
+    inner_parsed = _parse_select_from_groupby(inner_sql)
+    if not inner_parsed:
+        return sql
+    if inner_parsed.get("where"):
+        # Conservative: skip if inner query already has filters.
+        return sql
+
+    m_inner_from = re.match(
+        r"(?is)^(`?[A-Za-z_][A-Za-z0-9_]*`?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?$",
+        inner_parsed["from_core"].strip(),
+    )
+    if not m_inner_from:
+        return sql
+
+    metric_table = m_inner_from.group(1).strip()
+    metric_table_plain = metric_table.strip("`")
+    metric_inner_alias = (m_inner_from.group(2) or metric_table_plain).strip()
+
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m:
+            return item.strip(), None
+        return m.group(1).strip(), m.group(2).strip()
+
+    def _parse_simple_col(expr: str) -> Optional[tuple]:
+        m = re.match(
+            r"(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            expr.strip(),
+        )
+        if not m:
+            return None
+        return m.group(1), m.group(2)
+
+    def _safe_alias(a: Optional[str], default_name: str) -> str:
+        if not a:
+            return default_name
+        x = a.strip()
+        if (x.startswith("`") and x.endswith("`")) or (x.startswith("'") and x.endswith("'")) or (x.startswith('"') and x.endswith('"')):
+            x = x[1:-1]
+        x = re.sub(r"\s+", "_", x)
+        x = re.sub(r"[^A-Za-z0-9_]", "", x)
+        if not x:
+            return default_name
+        if not re.match(r"[A-Za-z_]", x[0]):
+            return default_name
+        return x
+
+    inner_select_items = _split_top_level_commas(inner_parsed["select"])
+    inner_group_items = _split_top_level_commas(inner_parsed["groupby"])
+    if not inner_group_items:
+        return sql
+
+    key_col = None
+    first_group = _parse_simple_col(inner_group_items[0])
+    if first_group:
+        key_col = first_group[1]
+    if not key_col:
+        return sql
+
+    date_col = None
+    date_alias = None
+    sum_expr = None
+    sum_alias = None
+
+    for item in inner_select_items:
+        expr, alias = _split_expr_alias(item)
+        m_max = re.match(r"(?is)^MAX\s*\(\s*(.+?)\s*\)$", expr)
+        if m_max and date_col is None:
+            parsed_col = _parse_simple_col(m_max.group(1).strip())
+            if parsed_col:
+                _qa, c = parsed_col
+                if ("date" in c.lower()) or ("time" in c.lower()):
+                    date_col = c
+                    date_alias = alias
+                    continue
+
+        m_sum = re.match(r"(?is)^SUM\s*\(\s*(.+?)\s*\)$", expr)
+        if m_sum and sum_expr is None:
+            sum_expr = m_sum.group(1).strip()
+            sum_alias = alias
+            continue
+
+    if not date_col or not sum_expr:
+        return sql
+
+    # Parse entity/sub key mapping from ON
+    eq1 = re.search(
+        rf"`?{re.escape(entity_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?{re.escape(sub_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+        on_clause,
+        flags=re.I,
+    )
+    eq2 = re.search(
+        rf"`?{re.escape(sub_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?{re.escape(entity_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+        on_clause,
+        flags=re.I,
+    )
+    entity_key_col = None
+    sub_key_col = None
+    if eq1:
+        entity_key_col = eq1.group(1)
+        sub_key_col = eq1.group(2)
+    elif eq2:
+        sub_key_col = eq2.group(1)
+        entity_key_col = eq2.group(2)
+    if not entity_key_col:
+        return sql
+    if sub_key_col and sub_key_col.lower() != key_col.lower():
+        # Conservative: inconsistent key naming in derived table projection.
+        return sql
+
+    outer_items = _split_top_level_commas(outer_select)
+    entity_items = []
+    for it in outer_items:
+        if re.search(rf"\b{re.escape(sub_alias)}\s*\.", it, flags=re.I):
+            continue
+        entity_items.append(it.strip())
+    if not entity_items:
+        entity_items = [f"{entity_alias}.{entity_key_col}"]
+
+    def _strip_as(item: str) -> str:
+        return re.sub(
+            r"""(?is)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            "",
+            item.strip(),
+        ).strip()
+
+    group_items = []
+    seen = set()
+    for it in entity_items:
+        base = _strip_as(it)
+        k = base.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        group_items.append(base)
+
+    existing_aliases = {entity_alias.lower(), sub_alias.lower(), metric_inner_alias.lower()}
+
+    def _pick_alias(base: str) -> str:
+        b = re.sub(r"[^A-Za-z0-9_]", "", base) or "t"
+        if not re.match(r"[A-Za-z_]", b[0]):
+            b = f"t_{b}"
+        cand = b
+        n = 2
+        while cand.lower() in existing_aliases:
+            cand = f"{b}_{n}"
+            n += 1
+        existing_aliases.add(cand.lower())
+        return cand
+
+    year_alias = _pick_alias(f"{sub_alias}_latest_years")
+    metric_alias = _pick_alias(f"{metric_table_plain}_rows")
+
+    # Qualify SUM expression against metric alias.
+    sum_metric_expr = re.sub(
+        rf"\b(?:{re.escape(metric_inner_alias)}|{re.escape(metric_table_plain)})\s*\.",
+        f"{metric_alias}.",
+        sum_expr,
+        flags=re.I,
+    ).strip()
+    if re.fullmatch(r"`?[A-Za-z_][A-Za-z0-9_]*`?", sum_metric_expr):
+        sum_metric_expr = f"{metric_alias}.{sum_metric_expr.strip('`')}"
+
+    date_alias_out = _safe_alias(date_alias, f"latest_{date_col}")
+    sum_alias_out = _safe_alias(sum_alias, "total_amount")
+
+    select_lines = []
+    for it in entity_items:
+        select_lines.append(it)
+    select_lines.append(f"MAX({metric_alias}.{date_col}) AS {date_alias_out}")
+    select_lines.append(f"SUM({sum_metric_expr}) AS {sum_alias_out}")
+    select_block = ",\n  ".join(select_lines)
+
+    fixed = (
+        "SELECT\n"
+        f"  {select_block}\n"
+        f"FROM {entity_table} {entity_alias}\n"
+        "JOIN (\n"
+        "  SELECT\n"
+        f"    {key_col},\n"
+        f"    MAX(YEAR({date_col})) AS latest_year\n"
+        f"  FROM {metric_table}\n"
+        f"  GROUP BY {key_col}\n"
+        f") AS {year_alias}\n"
+        f"  ON {year_alias}.{key_col} = {entity_alias}.{entity_key_col}\n"
+        f"JOIN {metric_table} AS {metric_alias}\n"
+        f"  ON {metric_alias}.{key_col} = {entity_alias}.{entity_key_col}\n"
+        f" AND YEAR({metric_alias}.{date_col}) = {year_alias}.latest_year\n"
+        f"GROUP BY {', '.join(group_items)};"
+    )
+    return fixed
 # =======================================================================
 # ========= Phase 5 — Pattern, REGEXP, and Predicate Normalization ======
 # ========================= Guardrail for Regex =========================
@@ -4043,6 +5735,34 @@ def _question_requests_ordering(question: str) -> bool:
     
     return False
 
+def _simplify_default_window_frame(sql: str, question: str = "") -> str:
+    """
+    Style normalization for cumulative/running window queries:
+    Collapse explicit default frame into compact form.
+
+    Example:
+      SUM(x) OVER (PARTITION BY k ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    ->
+      SUM(x) OVER (PARTITION BY k ORDER BY d)
+
+    We only apply this for cumulative/running intent to avoid changing unrelated
+    window queries where explicit frame text may be intentionally kept.
+    """
+    if not sql:
+        return sql
+
+    q = (question or "").lower()
+    has_running_intent = any(t in q for t in ["cumulative", "running", "kumulatif", "akumulatif"])
+    if not has_running_intent:
+        return sql
+
+    frame_pat = re.compile(
+        r"\s+\b(?:ROWS|RANGE)\s+BETWEEN\s+UNBOUNDED\s+PRECEDING\s+AND\s+CURRENT\s+ROW\b",
+        flags=re.IGNORECASE,
+    )
+    out = frame_pat.sub("", sql)
+    return out
+
 def _remove_top_level_order_by_if_not_requested(sql: str, question: str) -> str:
     """
     Versi Regex Barbar: Memangkas ORDER BY jika user tidak meminta.
@@ -4173,6 +5893,11 @@ def _fix_aggregate_in_where(sql: str) -> str:
         return sql
     
     where_body = where_match.group(1).strip()
+
+    # Conservative safety: do not rewrite WHERE that contains subqueries.
+    # Naive AND-splitting below is unsafe for correlated subqueries and can corrupt SQL.
+    if re.search(r"\bSELECT\b", where_body, flags=re.IGNORECASE):
+        return sql
     
     # Cari semua aggregate conditions di WHERE
     agg_conditions = []

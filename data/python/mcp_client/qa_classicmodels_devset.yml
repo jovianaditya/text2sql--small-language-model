@@ -328,3 +328,26 @@ cases:
         JOIN orderdetails AS od
           ON p.productCode = od.productCode
         GROUP BY p.productCode, p.productName;
+    - id: H7
+      difficulty: hard
+      question: "Show customers with payments, and for each customer return customer id, customer name, latest payment date in their most recent payment year, and total amount paid in that year. Order by latest payment date descending"
+      groundtruth_sql: |
+        SELECT
+          c.customerNumber,
+          c.customerName,
+          MAX(p.paymentDate) AS latest_payment_date_in_latest_year,
+          SUM(p.amount) AS total_payment_in_latest_year
+        FROM customers AS c
+        JOIN (
+          SELECT
+            customerNumber,
+            MAX(YEAR(paymentDate)) AS latest_year
+          FROM payments
+          GROUP BY customerNumber
+        ) AS ly
+          ON ly.customerNumber = c.customerNumber
+        JOIN payments AS p
+          ON p.customerNumber = c.customerNumber
+         AND YEAR(p.paymentDate) = ly.latest_year
+        GROUP BY c.customerNumber, c.customerName
+        ORDER BY MAX(p.paymentDate) DESC;

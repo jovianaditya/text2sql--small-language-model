@@ -1739,7 +1739,13 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # Remove placeholder tokens
     sql_tokens.discard(AGENT_REFINE_TABLE_PLACEHOLDER_DISCARD)
-    reserved = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS))
+    # Window-frame syntax tokens are SQL grammar, not schema columns.
+    # Keep this local guard (in addition to config defaults) so env overrides
+    # cannot accidentally re-enable hallucination false positives.
+    window_grammar_tokens = {
+        "rows", "row", "range", "unbounded", "preceding", "following", "current",
+    }
+    reserved = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS)).union(window_grammar_tokens)
     
     defined_aliases = set()
     defined_aliases.update(re.findall(AGENT_REFINE_DEFINED_ALIAS_PATTERN, sql_up, re.IGNORECASE))

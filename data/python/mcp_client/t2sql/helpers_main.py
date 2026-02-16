@@ -47,7 +47,7 @@ from .helpers_core import (
     # phase 2
     _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table,
     # phase 3
-    _wants_customer_name_only, _wants_product_name_only, _prefer_friendly_names, _wants_name_only,
+    _wants_customer_name_only, _wants_product_name_only, _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
     _normalize_alias_lengths,
@@ -55,7 +55,8 @@ from .helpers_core import (
     _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _fix_redundant_groupby_with_rn_filter, _fix_inconsistent_subquery_alias, _looks_like_max_date_tiebreaker,
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
-    _rewrite_winner_row_aggregate_misuse, _winner_row_final_sanity,
+    _rewrite_winner_row_aggregate_misuse, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _question_wants_latest_year_scope_with_aggregate,
     # phase 4b - Aggregate in WHERE fix
     _fix_aggregate_in_where,
     _fix_raw_column_where_to_having,
@@ -65,7 +66,7 @@ from .helpers_core import (
     # phase 6
     _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _strip_unneeded_count_distinct, _parse_from_join_aliases,
     # phase 7
-    _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
+    _simplify_default_window_frame, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -1923,6 +1924,15 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "   - For range filtering: Use `date_column BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`."
     )
 
+    # [F.1] LATEST-YEAR + SAME-YEAR SUM RULE
+    if _question_wants_latest_year_scope_with_aggregate(question):
+        constraints.append(
+            "LATEST-YEAR AGGREGATION RULE (CRITICAL): If the question asks for latest/most-recent year and "
+            "sum in that same year, do NOT use `MAX(date)` + `SUM(amount)` on all rows in one GROUP BY. "
+            "Use 2-step pattern: (1) subquery to get latest year per entity, "
+            "(2) join/filter rows to that year, then compute `MAX(date)` and `SUM(amount)`."
+        )
+
     # [G] COLUMN INTEGRITY RULES (BENCHMARK MODE)
     # Extract explicitly mentioned columns from question for stricter enforcement
     import re as _re
@@ -1993,6 +2003,9 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "ALIAS CONSISTENCY: If you use a table alias (e.g. `t`, `p`, `cust`), "
         "you MUST prefix ALL columns in the SELECT clause with that alias. "
         "Bad: `SELECT p.id, name FROM ...` | Good: `SELECT p.id, p.name FROM ...`"
+    )
+    constraints.append(
+        "ALIAS STYLE: Let aliases be concise and readable. Prefer short snake_case names (roughly <= 30-36 chars)."
     )
     # [G] ANTI-HALLUCINATION & LOGIC EFFICIENCY
     # 1. Month Sorting
@@ -2212,7 +2225,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Plain columns: columnName AS alias → columnName (remove ALL aliases)
     # Computed expressions: COUNT(*) AS alias → KEEP (functions need aliases)
     # ---------------------------------------------------------------------------
-    # List of SQL functions that indicate computed expressions
+    # List of SQL functions that indicate computed expressions.
     computed_func_patterns = [
         r'COUNT\s*\(', r'SUM\s*\(', r'AVG\s*\(', r'MIN\s*\(', r'MAX\s*\(',
         r'CASE\s+WHEN', r'IF\s*\(', r'COALESCE\s*\(', r'NULLIF\s*\(',
@@ -2222,56 +2235,117 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         r'CONCAT\s*\(', r'GROUP_CONCAT\s*\(', r'SUBSTRING\s*\(', r'SUBSTR\s*\(',
         r'UPPER\s*\(', r'LOWER\s*\(', r'TRIM\s*\(', r'LENGTH\s*\('
     ]
-    # Pattern to match: plain_column AS alias or table.column AS alias
-    # Only match if NOT preceded by a function call
+
+    def _find_top_level_from_idx(text: str) -> int:
+        depth = 0
+        in_sq = False
+        in_dq = False
+        in_bt = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq and not in_bt:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq and not in_bt:
+                if in_dq and i + 1 < len(text) and text[i + 1] == '"':
+                    i += 2
+                    continue
+                in_dq = not in_dq
+                i += 1
+                continue
+            if ch == "`" and not in_sq and not in_dq:
+                in_bt = not in_bt
+                i += 1
+                continue
+            if in_sq or in_dq or in_bt:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if (
+                depth == 0
+                and i + 4 <= len(text)
+                and text[i:i + 4].lower() == "from"
+                and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))
+                and (i + 4 == len(text) or not (text[i + 4].isalnum() or text[i + 4] == "_"))
+            ):
+                return i
+            i += 1
+        return -1
+
+    # Apply this rule ONLY to top-level SELECT list to avoid stripping table aliases
+    # from FROM/JOIN clauses (e.g., "FROM customers AS cust").
+    from_idx = _find_top_level_from_idx(s)
+    select_segment = s if from_idx < 0 else s[:from_idx]
+    remainder_segment = "" if from_idx < 0 else s[from_idx:]
+
+    # Pattern to match: plain_column AS alias or table.column AS alias.
+    # Only match if NOT a computed expression.
     def remove_plain_column_alias(match):
-        column_ref = match.group(1)  # e.g., 'status' or 't.status'
-        alias_name = match.group(2) if len(match.groups()) > 1 else match.group(0).split(' AS ')[-1]
-        # Strip quotes from alias name for checking
+        column_ref = match.group(1)
+        alias_name = match.group(2)
         alias_clean = alias_name.strip('\'"`')
-        # Check if this is a computed expression by looking for function patterns
         combined = column_ref + ' ' + alias_clean
         for func_pattern in computed_func_patterns:
             if re.search(func_pattern, combined, re.IGNORECASE):
-                # This is a computed expression, keep the AS alias
                 return match.group(0)
-        # This is a plain column, remove the AS alias
         return column_ref
 
-    # FIX: First, protect CASE WHEN...END AS alias patterns by temporarily replacing them
-    # This prevents the regex from incorrectly matching "END AS alias"
+    def remove_plain_column_alias_quoted(match):
+        column_ref = match.group(1)
+        alias_name = match.group(3)
+        alias_clean = alias_name.strip('\'"`')
+        combined = column_ref + ' ' + alias_clean
+        for func_pattern in computed_func_patterns:
+            if re.search(func_pattern, combined, re.IGNORECASE):
+                return match.group(0)
+        return column_ref
+
+    # Protect CASE ... END AS alias in SELECT segment.
     case_aliases = {}
     def protect_case_aliases(match):
         alias = f"__CASE_ALIAS_{len(case_aliases)}__"
         case_aliases[alias] = match.group(0)
         return alias
-    s = re.sub(
+
+    select_segment = re.sub(
         r'\bCASE\s+WHEN\b.+?\bEND\b\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)',
         protect_case_aliases,
-        s,
+        select_segment,
         flags=re.IGNORECASE | re.DOTALL
     )
 
-    # Pattern 1: Quoted aliases (single or double quotes)
-    # Matches: status AS 'total orders', status AS "total", t.status AS "alias"
-    s = re.sub(
+    # Pattern 1: quoted aliases in SELECT list.
+    select_segment = re.sub(
         r"([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+AS\s+(['\"])([^'\"]+)\2",
-        lambda m: remove_plain_column_alias(type('obj', (object,), {'group': lambda self, i: m.group(1) if i == 1 else m.group(3), 'groups': lambda self: (m.group(1), m.group(3))})()),
-        s,
-        flags=re.IGNORECASE
-    )
-    # Pattern 2: Unquoted aliases
-    # Matches: status AS total_orders, t.status AS total
-    s = re.sub(
-        r"([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-        remove_plain_column_alias,
-        s,
+        remove_plain_column_alias_quoted,
+        select_segment,
         flags=re.IGNORECASE
     )
 
-    # FIX: Restore protected CASE WHEN aliases
+    # Pattern 2: unquoted aliases in SELECT list.
+    select_segment = re.sub(
+        r"([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+        remove_plain_column_alias,
+        select_segment,
+        flags=re.IGNORECASE
+    )
+
+    # Restore protected CASE aliases and recombine SQL.
     for alias, original in case_aliases.items():
-        s = s.replace(alias, original)
+        select_segment = select_segment.replace(alias, original)
+    s = select_segment + remainder_segment
 
     # NEW: Normalize overly long aliases by removing filler words
     s = _normalize_alias_lengths(s)
@@ -2280,15 +2354,28 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Operate on final column identities
     # ---------------------------------------------------------------------------
     s = _prefer_friendly_names(s, question)
+    s = _ensure_entity_id_and_name_if_requested(s, question)
+    s = _prune_non_primary_dimensions_for_primary_aggregate(s, question, ctx)
+    s = _drop_redundant_raw_name_columns_when_concat_present(s, question)
     s = _expand_group_by_aliases_regex(s)
+    latest_year_sum_intent = _question_wants_latest_year_scope_with_aggregate(question)
+    has_correlated_max_subquery = bool(
+        re.search(
+            r"\bWHERE\b[\s\S]*?\b(?:IN|=)\s*\(\s*SELECT\s+MAX\s*\(",
+            s,
+            flags=re.IGNORECASE,
+        )
+    )
+    skip_phase3_groupby_cleanup = latest_year_sum_intent and has_correlated_max_subquery
     if not _is_potential_winner_row(s, question, force=True):
         # REMOVE invalid columns FIRST, then enforce GROUP BY consistency
         # This prevents columns from being added to GROUP BY unnecessarily
-        s = _remove_invalid_select_columns_with_group_by(s)
-        s = _enforce_explicit_group_by(s)
-        # Fix ORDER BY to use GROUP BY expressions instead of raw columns
-        # e.g., ORDER BY o.orderDate → ORDER BY MONTH(o.orderDate)
-        s = _fix_order_by_group_by_consistency(s)
+        if not skip_phase3_groupby_cleanup:
+            s = _remove_invalid_select_columns_with_group_by(s)
+            s = _enforce_explicit_group_by(s)
+            # Fix ORDER BY to use GROUP BY expressions instead of raw columns
+            # e.g., ORDER BY o.orderDate → ORDER BY MONTH(o.orderDate)
+            s = _fix_order_by_group_by_consistency(s)
     # ---------------------------------------------------------------------------
     # Phase 3b — Fix invalid GROUP BY syntax (strip DESC/ASC)
     # DESC/ASC is only valid in ORDER BY, not GROUP BY
@@ -2376,11 +2463,13 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     before_phase4 = s
 
     if DEBUG_WR: print("\n[PH4] start ----")
+    s = _fix_missing_space_before_clauses(s)
     # FIX: NO re.I flag - creditLimit won't match (lowercase 'imit'), but HAVING will match (uppercase)
     s = re.sub(
     r"(\b[A-Za-z_][A-Za-z0-9_]*)(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b",
     r"\1 \2",
     s)
+    s = _fix_missing_space_before_clauses(s)
     if DEBUG_WR: print(f"[PH4] after re-spacing: {s[:200]}")
 
     # pre-sanity only (no rewrite)
@@ -2453,6 +2542,18 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _rewrite_winner_row_aggregate_misuse(s, question)
         if DEBUG_WR: print("[PH4] after agg-misuse:", s)
+
+        s = _rewrite_latest_year_same_year_aggregate(s, question)
+        if DEBUG_WR: print("[PH4] after latest-year-sum fix:", s)
+
+        s = _rewrite_latest_year_correlated_maxdate_misuse(s, question)
+        if DEBUG_WR: print("[PH4] after latest-year correlated-max fix:", s)
+
+        s = _rewrite_latest_year_derived_subquery_misuse(s, question)
+        if DEBUG_WR: print("[PH4] after latest-year derived-subquery fix:", s)
+
+        s = _move_latest_year_filter_where_to_inner_on(s)
+        if DEBUG_WR: print("[PH4] after latest-year WHERE->ON style fix:", s)
         
         s = _fix_aggregate_in_where(s)
         if DEBUG_WR: print(f"[PH4] after agg-in-where fix: {s}")
@@ -2597,6 +2698,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Phase 7 — Ordering, Limits, and Output Formatting
     # Cosmetic and execution-safety adjustments only
     # ---------------------------------------------------------------------------
+    s = _simplify_default_window_frame(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
     s = _maybe_add_limit(question, s)    
     # s = _collapse_spaces_outside_quotes(s)
