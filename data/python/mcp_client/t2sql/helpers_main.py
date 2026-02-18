@@ -45,7 +45,7 @@ from .helpers_core import (
     _rewrite_inner_join_filter_to_exists, _rewrite_inner_join_existence_to_exists,
     _remove_redundant_and_ornamental_joins, has_non_inner_join, join_count,
     # phase 2
-    _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table,
+    _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns,
     # phase 3
     _wants_customer_name_only, _wants_product_name_only, _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
@@ -56,6 +56,7 @@ from .helpers_core import (
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _rewrite_winner_row_aggregate_misuse, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _rewrite_latest_year_projection_to_year,
     _question_wants_latest_year_scope_with_aggregate,
     # phase 4b - Aggregate in WHERE fix
     _fix_aggregate_in_where,
@@ -2199,6 +2200,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     s = _fix_bad_backticks(s)
     s = _canonicalize_table_names(s, ctx)
+    s = _repair_invalid_qualified_columns(s, ctx)
     # s = ensure_join_aliases(s)  # DISABLED: Let LLM handle its own alias consistency
     s = _escape_reserved_column_aliases(s)  # Escape reserved words used as column aliases (e.g., AS rank -> AS `rank`)
     # ---------------------------------------------------------------------------
@@ -2543,17 +2545,20 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_winner_row_aggregate_misuse(s, question)
         if DEBUG_WR: print("[PH4] after agg-misuse:", s)
 
-        s = _rewrite_latest_year_same_year_aggregate(s, question)
+        s = _rewrite_latest_year_same_year_aggregate(s, question, ctx)
         if DEBUG_WR: print("[PH4] after latest-year-sum fix:", s)
 
-        s = _rewrite_latest_year_correlated_maxdate_misuse(s, question)
+        s = _rewrite_latest_year_correlated_maxdate_misuse(s, question, ctx)
         if DEBUG_WR: print("[PH4] after latest-year correlated-max fix:", s)
 
-        s = _rewrite_latest_year_derived_subquery_misuse(s, question)
+        s = _rewrite_latest_year_derived_subquery_misuse(s, question, ctx)
         if DEBUG_WR: print("[PH4] after latest-year derived-subquery fix:", s)
 
         s = _move_latest_year_filter_where_to_inner_on(s)
         if DEBUG_WR: print("[PH4] after latest-year WHERE->ON style fix:", s)
+
+        s = _rewrite_latest_year_projection_to_year(s, question)
+        if DEBUG_WR: print("[PH4] after latest-year projection->year fix:", s)
         
         s = _fix_aggregate_in_where(s)
         if DEBUG_WR: print(f"[PH4] after agg-in-where fix: {s}")

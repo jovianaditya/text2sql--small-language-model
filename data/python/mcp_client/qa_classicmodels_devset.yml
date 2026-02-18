@@ -351,3 +351,35 @@ cases:
          AND YEAR(p.paymentDate) = ly.latest_year
         GROUP BY c.customerNumber, c.customerName
         ORDER BY MAX(p.paymentDate) DESC;
+    - id: H8
+      difficulty: hard
+      question: "For each product that has been ordered at least once, find the year of its most recent order. Return the product code, product name, that latest order year, and the total quantity ordered for the product in that same year. Order the results by total quantity (in the latest year) descending, then by product code ascending."
+      groundtruth_sql: |
+        SELECT
+          p.productCode,
+          p.productName,
+          ly.latest_year AS latest_order_year,
+          SUM(od.quantityOrdered) AS total_quantity_in_latest_year
+        FROM products AS p
+        JOIN (
+          SELECT
+            od2.productCode,
+            MAX(YEAR(o2.orderDate)) AS latest_year
+          FROM orderdetails AS od2
+          JOIN orders AS o2
+            ON o2.orderNumber = od2.orderNumber
+          GROUP BY od2.productCode
+        ) AS ly
+          ON ly.productCode = p.productCode
+        JOIN orderdetails AS od
+          ON od.productCode = p.productCode
+        JOIN orders AS o
+          ON o.orderNumber = od.orderNumber
+        AND YEAR(o.orderDate) = ly.latest_year
+        GROUP BY
+          p.productCode,
+          p.productName,
+          ly.latest_year
+        ORDER BY
+          total_quantity_in_latest_year DESC,
+          p.productCode ASC;

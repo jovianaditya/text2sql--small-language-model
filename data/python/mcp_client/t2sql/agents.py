@@ -176,7 +176,15 @@ from .schema_analyzer import get_all_tables, get_singular_form, get_schema_analy
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
     _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline,
     _find_tables_with_implicit_columns, _extract_fk_from_context)
-from .helpers_core import (has_join, _question_requires_word_boundary_regex, _parse_allowed_identifiers, _remove_top_level_order_by_if_not_requested, _SQL_KEYWORDS)
+from .helpers_core import (
+    has_join,
+    _question_requires_word_boundary_regex,
+    _question_requires_inner_join,
+    _question_wants_include_zero,
+    _parse_allowed_identifiers,
+    _remove_top_level_order_by_if_not_requested,
+    _SQL_KEYWORDS,
+)
 # ======================================================================
 # ======================= AGENT 0 - QUESTION GUARD =====================
 # ======================================================================
@@ -1208,6 +1216,84 @@ def router_agent(state: RAGState) -> RAGState:
     # 2. In the minimal connecting subgraph (needed for joins)
     # 3. NOT in the subgraph but might be needed for aggregation (edge case)
 
+    # Temporal intent guardrail (schema-driven + config-driven):
+    # keep date-bearing tables when question expresses temporal ranking/filtering.
+    def _is_temporal_col_name(col_name: str) -> bool:
+        c = str(col_name or "").lower()
+        return any(k in c for k in ("date", "time", "timestamp", "year", "month", "day"))
+
+    # Derive temporal unit hints from schema columns (agnostic across domains).
+    # Generic temporal units are domain-agnostic and common in NL prompts.
+    temporal_unit_terms = {"year", "month", "day", "date", "time"}
+    temporal_cols_by_table = {}
+    for _tbl in whitelisted_tables:
+        t_cols = []
+        for c in _get_table_cols(_tbl):
+            if _is_temporal_col_name(c):
+                t_cols.append(str(c))
+        if t_cols:
+            temporal_cols_by_table[_tbl.lower()] = t_cols
+            for c in t_cols:
+                cl = c.lower()
+                if "date" in cl:
+                    temporal_unit_terms.add("date")
+                if "time" in cl:
+                    temporal_unit_terms.add("time")
+                if "timestamp" in cl:
+                    temporal_unit_terms.add("timestamp")
+                if "year" in cl:
+                    temporal_unit_terms.add("year")
+                if "month" in cl:
+                    temporal_unit_terms.add("month")
+                if "day" in cl:
+                    temporal_unit_terms.add("day")
+
+    # Config-driven temporal ranking terms (latest/newest/earliest, etc.).
+    has_temporal_rank_intent = any(
+        re.search(rf"\b{re.escape(str(t).lower())}\b", question_lower)
+        for t in AGENT_ROUTER_TIME_RANK_TERMS
+        if str(t or "").strip()
+    )
+    has_temporal_unit_mention = any(
+        re.search(rf"\b{re.escape(t)}\b", question_lower)
+        for t in temporal_unit_terms
+    )
+    has_temporal_col_mention = False
+    for _tbl, cols in temporal_cols_by_table.items():
+        if any(_question_mentions_column(question_lower, c) for c in cols):
+            has_temporal_col_mention = True
+            break
+    has_four_digit_year = bool(re.search(r"\b(?:19|20)\d{2}\b", question_lower))
+
+    has_temporal_intent = (
+        has_temporal_rank_intent
+        or has_temporal_unit_mention
+        or has_temporal_col_mention
+        or has_four_digit_year
+    )
+
+    def _table_has_temporal_column(tbl_name: str) -> bool:
+        tbl_l = (tbl_name or "").lower()
+        if tbl_l in temporal_cols_by_table:
+            return True
+        cols = _get_table_cols(tbl_name)
+        return any(_is_temporal_col_name(c) for c in cols)
+
+    def _question_mentions_table_entity(question_text: str, tbl_name: str) -> bool:
+        pat = _table_entity_pattern(tbl_name.lower())
+        if not pat:
+            return False
+        return bool(re.search(rf"\b{pat}\b", question_text))
+
+    def _question_mentions_table_temporal_column(question_text: str, tbl_name: str) -> bool:
+        tbl_l = (tbl_name or "").lower()
+        for c in temporal_cols_by_table.get(tbl_l, _get_table_cols(tbl_name)):
+            if not _is_temporal_col_name(c):
+                continue
+            if _question_mentions_column(question_text, str(c)):
+                return True
+        return False
+
     tables_to_remove = []
     for tbl in relevant_tables:
         tbl_lower = tbl.lower()
@@ -1253,6 +1339,17 @@ def router_agent(state: RAGState) -> RAGState:
                     print(f"[Router] Keeping {tbl}: has FK to evidence table + needs non-FK columns")
                 continue
 
+        # Temporal recency/year/date questions may need a date-bearing table
+        # that is not part of the minimal FK connector among seed tables.
+        if has_temporal_intent and _table_has_temporal_column(tbl):
+            if (
+                _question_mentions_table_entity(question_lower, tbl)
+                or _question_mentions_table_temporal_column(question_lower, tbl)
+            ):
+                if RETRIEVE_DEBUG:
+                    print(f"[Router] Keeping {tbl}: temporal intent + date-bearing table")
+                continue
+
         # Mark for removal
         tables_to_remove.append(tbl)
         if RETRIEVE_DEBUG:
@@ -1269,6 +1366,32 @@ def router_agent(state: RAGState) -> RAGState:
         relevant_tables.append(fallback_table)
         if RETRIEVE_DEBUG:
             print(f"[Router] All tables removed, falling back to: {fallback_table}")
+
+    # --- STEP 3.45: Ensure JOIN Connectivity via FK Bridge Tables ---
+    # If multiple kept tables are not directly connected, include minimal bridge
+    # tables from FK shortest paths so SQL generation has a valid join chain.
+    # Kept conservative: only for aggregation/temporal-intent workloads.
+    if len(relevant_tables) >= 2 and (is_aggregation or has_temporal_intent):
+        relevant_lower_now = [t.lower() for t in relevant_tables]
+        bridge_lowers = set()
+
+        for i, start in enumerate(relevant_lower_now):
+            for end in relevant_lower_now[i + 1:]:
+                path = bfs_shortest_path(start, end, fk_graph)
+                if not path:
+                    continue
+                for node in path:
+                    if node not in relevant_lower_now:
+                        bridge_lowers.add(node)
+
+        if bridge_lowers:
+            lower_to_original = {t.lower(): t for t in allowed_identifiers.keys()}
+            for node in sorted(bridge_lowers):
+                original = lower_to_original.get(node, node)
+                if original not in relevant_tables:
+                    relevant_tables.append(original)
+                    if RETRIEVE_DEBUG:
+                        print(f"[Router] Keeping {original}: bridge table for FK connectivity")
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 4: DETEKSI SINYAL (Complete Detection)
@@ -1937,9 +2060,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     regeneration_model = LARGE_MODEL  # Force 7B
 
     # --- KASUS E: INNER JOIN TRAP (HARD ERROR) ---
+    # Apply this guard ONLY when question intent expects inclusive parent rows
+    # (include-zero semantics). For existence-filter intent (e.g. "has at least one"),
+    # INNER JOIN is correct and this trap must be skipped.
     has_groupby = AGENT_REFINE_GROUP_BY_TOKEN in sql_up
     is_left_join = AGENT_REFINE_LEFT_JOIN_TOKEN in sql_up
-    if has_groupby and not is_left_join and not needs_regeneration:
+    wants_inner_join = _question_requires_inner_join(question, ctx)
+    wants_include_zero = _question_wants_include_zero(question, ctx)
+    if has_groupby and not is_left_join and not needs_regeneration and wants_include_zero and not wants_inner_join:
         where_match = re.search(AGENT_REFINE_WHERE_CLAUSE_PATTERN, sql_up, re.DOTALL)
         group_match = re.search(AGENT_REFINE_GROUP_CLAUSE_PATTERN, sql_up, re.DOTALL)
         if where_match and group_match:

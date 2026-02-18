@@ -18,6 +18,7 @@ from .schema_analyzer import (
     get_id_column,
     get_all_tables,
     get_transaction_tables,
+    get_schema_analyzer,
     get_table_synonyms,
     get_singular_form,
 )
@@ -1194,6 +1195,193 @@ def _remove_redundant_and_ornamental_joins(sql: str) -> str:
 # - drop_redundant_column_aliases
 # - drop_unused_from_table_aliases
 # - strip_alias_if_single_table
+# - repair_invalid_qualified_columns
+
+def _repair_invalid_qualified_columns(sql: str, ctx: str = "") -> str:
+    """
+    Schema-aware repair for malformed qualified references (alias.column).
+
+    Example fixed:
+      MAX(od.orderDate)  -> MAX(o.orderDate)
+    when `od` maps to a table that has no `orderDate`, and exactly one
+    other visible alias maps to a table that has `orderDate`.
+
+    Safety constraints:
+    - No hardcoded table/column names.
+    - Only rewrite when target alias is unique.
+    - Skip ambiguous alias scopes (same alias used for different tables).
+    - Ignore quoted string/backtick literal segments.
+    """
+    if not sql:
+        return sql
+
+    analyzer = None
+    allowed_cols: Dict[str, Set[str]] = {}
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    # Fallback source for columns if global analyzer is unavailable.
+    if not analyzer and ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            allowed_cols = {
+                t.lower(): {c.lower() for c in cols}
+                for t, cols in allowed.items()
+            }
+        except Exception:
+            allowed_cols = {}
+
+    # Build symbol -> table map from FROM/JOIN (alias optional).
+    # Keep alias and bare table symbol, but drop ambiguous symbols.
+    # Derived-table aliases are intentionally excluded (unknown columns).
+    tbl_pat = re.compile(
+        r"""
+        \b(?:from|join)\s+
+        (?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+        (?:\s+(?:as\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?
+        """,
+        flags=re.I | re.X,
+    )
+
+    symbol_map: Dict[str, tuple] = {}  # symbol(lower) -> (table_lower, is_alias_symbol)
+    ambiguous: Set[str] = set()
+
+    def _add_symbol(sym: str, table_l: str, is_alias_symbol: bool) -> None:
+        if not sym:
+            return
+        k = sym.lower()
+        if k in ambiguous:
+            return
+        prev = symbol_map.get(k)
+        if prev is None:
+            symbol_map[k] = (table_l, is_alias_symbol)
+            return
+        if prev[0] != table_l:
+            ambiguous.add(k)
+            symbol_map.pop(k, None)
+
+    for m in tbl_pat.finditer(sql):
+        table_raw = (m.group("table") or "").replace("`", "")
+        table_l = table_raw.split(".")[-1].strip().lower()
+        if not table_l:
+            continue
+        alias = (m.group("alias") or "").strip()
+        if alias and alias.lower() in _RESERVED_ALIASES:
+            alias = ""
+        _add_symbol(table_l, table_l, False)
+        if alias:
+            _add_symbol(alias, table_l, True)
+
+    if not symbol_map:
+        return sql
+
+    # Cache table columns once.
+    table_cols: Dict[str, Set[str]] = {}
+    for _sym, (tbl_l, _is_alias) in symbol_map.items():
+        if tbl_l in table_cols:
+            continue
+        cols: Set[str] = set()
+        if analyzer:
+            try:
+                cols = {c.lower() for c in analyzer.get_table_columns(tbl_l)}
+            except Exception:
+                cols = set()
+        if not cols and allowed_cols:
+            cols = set(allowed_cols.get(tbl_l, set()))
+        table_cols[tbl_l] = cols
+
+    if not table_cols:
+        return sql
+
+    # Qualified ref pattern that also supports optional backticks.
+    qcol_pat = re.compile(
+        r"""
+        (?P<aq>`?)
+        (?P<alias>[A-Za-z_][A-Za-z0-9_]*)
+        (?P=aq)\s*\.\s*
+        (?P<cq>`?)
+        (?P<col>[A-Za-z_][A-Za-z0-9_]*)
+        (?P=cq)
+        """,
+        flags=re.X,
+    )
+
+    # Alias symbols grouped by table, for unique-candidate resolution.
+    alias_syms_by_table: Dict[str, List[str]] = {}
+    table_syms_by_table: Dict[str, List[str]] = {}
+    for sym, (tbl_l, is_alias_symbol) in symbol_map.items():
+        if is_alias_symbol:
+            alias_syms_by_table.setdefault(tbl_l, []).append(sym)
+        else:
+            table_syms_by_table.setdefault(tbl_l, []).append(sym)
+
+    def _pick_replacement_symbol(src_alias_l: str, col_l: str) -> Optional[str]:
+        # 1) Prefer real aliases.
+        alias_candidates: List[str] = []
+        seen_tbl = set()
+        for tbl_l, syms in alias_syms_by_table.items():
+            if col_l not in table_cols.get(tbl_l, set()):
+                continue
+            if tbl_l in seen_tbl:
+                continue
+            seen_tbl.add(tbl_l)
+            alias_candidates.append(sorted(syms, key=len)[0])
+
+        alias_candidates = [a for a in alias_candidates if a.lower() != src_alias_l]
+        if len(alias_candidates) == 1:
+            return alias_candidates[0]
+        if len(alias_candidates) > 1:
+            return None
+
+        # 2) Fallback to bare table symbols if no alias candidate exists.
+        table_candidates: List[str] = []
+        seen_tbl = set()
+        for tbl_l, syms in table_syms_by_table.items():
+            if col_l not in table_cols.get(tbl_l, set()):
+                continue
+            if tbl_l in seen_tbl:
+                continue
+            seen_tbl.add(tbl_l)
+            table_candidates.append(sorted(syms, key=len)[0])
+
+        table_candidates = [t for t in table_candidates if t.lower() != src_alias_l]
+        if len(table_candidates) == 1:
+            return table_candidates[0]
+        return None
+
+    parts = _split_outside_quotes(sql)
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+
+        def _repl(m: re.Match) -> str:
+            alias = m.group("alias")
+            col = m.group("col")
+            aq = m.group("aq") or ""
+            cq = m.group("cq") or ""
+
+            alias_l = alias.lower()
+            col_l = col.lower()
+
+            entry = symbol_map.get(alias_l)
+            if not entry:
+                return m.group(0)
+
+            src_tbl = entry[0]
+            src_cols = table_cols.get(src_tbl, set())
+            if col_l in src_cols:
+                return m.group(0)
+
+            replacement = _pick_replacement_symbol(alias_l, col_l)
+            if not replacement:
+                return m.group(0)
+
+            return f"{aq}{replacement}{aq}.{cq}{col}{cq}"
+
+        parts[i] = qcol_pat.sub(_repl, seg)
+
+    return "".join(parts)
 
 def _is_simple_column_expr(x: str) -> bool:
     """
@@ -4119,7 +4307,7 @@ def _question_wants_latest_year_scope_with_aggregate(question: str) -> bool:
     return has_latest and has_year and has_aggregate_amount
 
 
-def _rewrite_latest_year_same_year_aggregate(sql: str, question: str) -> str:
+def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str = "") -> str:
     """
     Fix aggregate anti-pattern for questions like:
       - "latest/most recent payment year"
@@ -4277,6 +4465,24 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str) -> str:
         # allow table name to be used directly as qualifier
         measure_table = measure_alias
 
+    # Safety: date column must exist on the inferred metric table.
+    # If not, skip rewrite to avoid inventing invalid subqueries like:
+    #   FROM orderdetails ... MAX(YEAR(orderDate))
+    measure_cols: Set[str] = set()
+    try:
+        analyzer = get_schema_analyzer()
+        measure_cols = {c.lower() for c in analyzer.get_table_columns(measure_table)}
+    except Exception:
+        measure_cols = set()
+    if not measure_cols and ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            measure_cols = {c.lower() for c in allowed.get(measure_table, set())}
+        except Exception:
+            measure_cols = set()
+    if measure_cols and date_col_name.lower() not in measure_cols:
+        return sql
+
     existing_aliases = {k.lower() for k in alias_map.keys() if k and not k.startswith("__")}
 
     # Find join keys connected to metric alias via ON predicates.
@@ -4361,7 +4567,7 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str) -> str:
     )
     return fixed
 
-def _rewrite_latest_year_correlated_maxdate_misuse(sql: str, question: str) -> str:
+def _rewrite_latest_year_correlated_maxdate_misuse(sql: str, question: str, ctx: str = "") -> str:
     """
     Fix correlated-subquery anti-pattern such as:
 
@@ -4398,6 +4604,22 @@ def _rewrite_latest_year_correlated_maxdate_misuse(sql: str, question: str) -> s
         return sql
     if not parsed.get("where"):
         return sql
+
+    alias_map = _parse_from_join_aliases(f"SELECT 1 FROM {parsed['from_core'].strip()}")
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+    allowed_cols: Dict[str, Set[str]] = {}
+    if not analyzer and ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            allowed_cols = {
+                t.lower(): {c.lower() for c in cols}
+                for t, cols in allowed.items()
+            }
+        except Exception:
+            allowed_cols = {}
 
     where_raw = re.sub(r"^\s*WHERE\s+", "", parsed["where"].strip(), flags=re.I).strip()
     if not where_raw:
@@ -4451,6 +4673,63 @@ def _rewrite_latest_year_correlated_maxdate_misuse(sql: str, question: str) -> s
             return default_name
         return x
 
+    def _table_cols(tbl: str) -> Set[str]:
+        if not tbl:
+            return set()
+        t_l = tbl.lower()
+        if analyzer:
+            try:
+                return {x.lower() for x in analyzer.get_table_columns(t_l)}
+            except Exception:
+                return set()
+        return set(allowed_cols.get(t_l, set()))
+
+    def _repair_date_expr_if_needed(expr_raw: str) -> str:
+        """
+        If <alias>.<date_col> points to a table that does not own <date_col>,
+        and exactly one other visible alias owns it, rewrite to that alias.
+        """
+        parsed_col = _parse_qualified_col(expr_raw)
+        if not parsed_col:
+            return expr_raw
+        a, c = parsed_col
+        if not a:
+            return expr_raw
+
+        src_table = alias_map.get(a) or alias_map.get(a.lower())
+        if not src_table:
+            return expr_raw
+        src_cols = _table_cols(src_table)
+        if not src_cols:
+            return expr_raw
+        if c.lower() in src_cols:
+            return expr_raw
+
+        candidates = []
+        seen_tables = set()
+        for al, tbl in alias_map.items():
+            al_l = (al or "").lower()
+            if not al_l or al_l in seen_tables:
+                continue
+            # skip duplicate convenience key entries from alias parser
+            seen_tables.add(al_l)
+            cols = _table_cols(tbl)
+            if c.lower() in cols and al_l != a.lower():
+                candidates.append(al)
+
+        # unique repair only
+        uniq = []
+        seen = set()
+        for x in candidates:
+            xl = x.lower()
+            if xl in seen:
+                continue
+            seen.add(xl)
+            uniq.append(x)
+        if len(uniq) != 1:
+            return expr_raw
+        return f"{uniq[0]}.{c}"
+
     select_items = _split_top_level_commas(parsed["select"])
     if not select_items:
         return sql
@@ -4483,11 +4762,18 @@ def _rewrite_latest_year_correlated_maxdate_misuse(sql: str, question: str) -> s
             a, c = parsed_col
             if ("date" in c.lower()) or ("time" in c.lower()):
                 if date_expr_raw is None:
-                    date_expr_raw = candidate
+                    date_expr_raw = _repair_date_expr_if_needed(candidate)
                     date_alias_raw = alias
-                    date_col_name = c
-                    if a:
-                        measure_alias = a
+                    repaired_col = _parse_qualified_col(date_expr_raw)
+                    if repaired_col:
+                        ra, rc = repaired_col
+                        date_col_name = rc
+                        if ra:
+                            measure_alias = ra
+                    else:
+                        date_col_name = c
+                        if a:
+                            measure_alias = a
                     continue
 
         # Keep non-aggregate entity columns.
@@ -4586,7 +4872,7 @@ def _rewrite_latest_year_correlated_maxdate_misuse(sql: str, question: str) -> s
     canonical_sql = "\n".join(canonical_lines).strip() + ";"
 
     # Reuse the existing latest-year rewrite.
-    fixed = _rewrite_latest_year_same_year_aggregate(canonical_sql, question)
+    fixed = _rewrite_latest_year_same_year_aggregate(canonical_sql, question, ctx)
     return fixed if fixed else canonical_sql
 
 def _move_latest_year_filter_where_to_inner_on(sql: str) -> str:
@@ -4924,7 +5210,7 @@ def _move_latest_year_filter_where_to_inner_on(sql: str) -> str:
         fixed += ";"
     return fixed
 
-def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str) -> str:
+def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str, ctx: str = "") -> str:
     """
     Handle malformed pattern:
 
@@ -5132,6 +5418,22 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str) -> str
     if not date_col or not sum_expr:
         return sql
 
+    # Safety: derived metric table must actually own the date column.
+    metric_cols: Set[str] = set()
+    try:
+        analyzer = get_schema_analyzer()
+        metric_cols = {c.lower() for c in analyzer.get_table_columns(metric_table_plain)}
+    except Exception:
+        metric_cols = set()
+    if not metric_cols and ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            metric_cols = {c.lower() for c in allowed.get(metric_table_plain, set())}
+        except Exception:
+            metric_cols = set()
+    if metric_cols and date_col.lower() not in metric_cols:
+        return sql
+
     # Parse entity/sub key mapping from ON
     eq1 = re.search(
         rf"`?{re.escape(entity_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?{re.escape(sub_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
@@ -5236,6 +5538,119 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str) -> str
         f"  ON {metric_alias}.{key_col} = {entity_alias}.{entity_key_col}\n"
         f" AND YEAR({metric_alias}.{date_col}) = {year_alias}.latest_year\n"
         f"GROUP BY {', '.join(group_items)};"
+    )
+    return fixed
+
+
+def _rewrite_latest_year_projection_to_year(sql: str, question: str) -> str:
+    """
+    Convert date aggregate projection to year projection when output alias
+    explicitly asks for year-like value.
+
+    Example:
+      MAX(o.orderDate) AS latest_order_year
+    -> MAX(YEAR(o.orderDate)) AS latest_order_year
+
+    Safety:
+    - Trigger only when question mentions year/tahun.
+    - Trigger only for aliases containing year/tahun.
+    - Trigger only for MAX(date/time-like column), skip if already YEAR(...).
+    """
+    if not sql:
+        return sql
+
+    q = (question or "").lower()
+    if not re.search(r"\b(?:year|tahun)\b", q):
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+
+    select_items = _split_top_level_commas(parsed["select"])
+    if not select_items:
+        return sql
+
+    changed = False
+    rebuilt: List[str] = []
+
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m:
+            return item.strip(), None
+        return m.group(1).strip(), m.group(2).strip()
+
+    def _parse_qualified_col(expr: str) -> Optional[tuple]:
+        m = re.match(
+            r"(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            expr.strip(),
+        )
+        if not m:
+            return None
+        return m.group(1), m.group(2)
+
+    for item in select_items:
+        expr, alias = _split_expr_alias(item)
+        if not alias:
+            rebuilt.append(item.strip())
+            continue
+
+        alias_clean = alias.strip()
+        if (
+            (alias_clean.startswith("`") and alias_clean.endswith("`"))
+            or (alias_clean.startswith("'") and alias_clean.endswith("'"))
+            or (alias_clean.startswith('"') and alias_clean.endswith('"'))
+        ):
+            alias_clean = alias_clean[1:-1]
+        alias_l = alias_clean.lower()
+
+        # Only rewrite explicit year-like output alias.
+        if ("year" not in alias_l) and ("tahun" not in alias_l):
+            rebuilt.append(item.strip())
+            continue
+        # If alias explicitly asks for date/time too, keep date projection.
+        # Example: latest_payment_date_in_latest_year should remain MAX(date).
+        if ("date" in alias_l) or ("time" in alias_l) or ("tanggal" in alias_l):
+            rebuilt.append(item.strip())
+            continue
+
+        m_max = re.match(r"(?is)^MAX\s*\(\s*(.+?)\s*\)$", expr)
+        if not m_max:
+            rebuilt.append(item.strip())
+            continue
+
+        inner = m_max.group(1).strip()
+        if re.search(r"(?is)^\s*YEAR\s*\(", inner):
+            rebuilt.append(item.strip())
+            continue
+
+        parsed_col = _parse_qualified_col(inner)
+        if not parsed_col:
+            rebuilt.append(item.strip())
+            continue
+        _a, c = parsed_col
+        c_l = (c or "").lower()
+        if ("date" not in c_l) and ("time" not in c_l):
+            rebuilt.append(item.strip())
+            continue
+
+        rebuilt.append(f"MAX(YEAR({inner})) AS {alias}")
+        changed = True
+
+    if not changed:
+        return sql
+
+    where_block = f"\n{parsed['where'].strip()}" if parsed["where"].strip() else ""
+    tail_block = f"\n{parsed['tail'].strip()}" if parsed["tail"].strip() else ""
+    fixed = (
+        f"SELECT {', '.join(rebuilt)}\n"
+        f"FROM {parsed['from_core'].strip()}"
+        f"{where_block}\n"
+        f"GROUP BY {parsed['groupby'].strip()}"
+        f"{tail_block};"
     )
     return fixed
 # =======================================================================

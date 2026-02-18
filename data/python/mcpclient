@@ -29,4 +29,4 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir notebook ipykernel
 EXPOSE 8888
 
-CMD ["jupyter", "notebook", "--ip=*", "--port=8888", "--no-browser", "--allow-root", "--NotebookApp.token=''", "--NotebookApp.password=''"]
+CMD ["jupyter", "notebook", "--ip=*", "--port=8888", "--no-browser", "--allow-root"]
