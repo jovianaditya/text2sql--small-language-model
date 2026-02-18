@@ -1036,10 +1036,14 @@ def router_agent(state: RAGState) -> RAGState:
                 if col_exists_elsewhere:
                     break
 
-            is_shared_key_like = col_exists_elsewhere and (is_fk_col or is_parent_key)
+            # FK-like columns should be weak evidence even when unique in schema
+            # (e.g., customers.salesRepEmployeeNumber), because they often indicate
+            # relational linkage rather than requested output attributes.
+            is_weak_key_like = is_fk_col or (col_exists_elsewhere and is_parent_key)
 
-            if is_shared_key_like:
-                # Keep first weak match, but continue scanning for stronger column evidence.
+            if is_weak_key_like:
+                # Keep first weak match, but continue scanning for stronger
+                # non-FK/non-key column evidence.
                 if weak_col is None:
                     weak_col = col
             else:

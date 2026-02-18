@@ -402,3 +402,75 @@ cases:
         ORDER BY
           product_count DESC,
           pl.productLine ASC;
+    - id: H10
+      difficulty: hard
+      question: "For each office, show the office code, city, total number of employees, and how many of them are Sales Reps (jobTitle = 'Sales Rep'). Only include offices that have at least one Sales Rep, and where at least one employee in that office reports to someone (reportsTo is not NULL). Sort by Sales Rep count (highest first), then by office code."
+      groundtruth_sql: |
+        SELECT
+          o.officeCode,
+          o.city,
+          COUNT(e.employeeNumber) AS total_employees,
+          SUM(CASE WHEN e.jobTitle = 'Sales Rep' THEN 1 ELSE 0 END) AS sales_rep_count
+        FROM offices AS o
+        JOIN employees AS e
+          ON e.officeCode = o.officeCode
+        GROUP BY
+          o.officeCode,
+          o.city
+        HAVING
+          SUM(CASE WHEN e.jobTitle = 'Sales Rep' THEN 1 ELSE 0 END) > 0
+          AND EXISTS (
+            SELECT 1
+            FROM employees AS e2
+            WHERE e2.officeCode = o.officeCode
+              AND e2.reportsTo IS NOT NULL
+          )
+        ORDER BY
+          sales_rep_count DESC,
+          o.officeCode ASC;
+    - id: H11
+      difficulty: hard
+      question: "Show customers who have made at least one payment but have never placed any orders (i.e., they appear in payments but not in orders). Return customerNumber, customerName, and total payment amount. Sort by total payment amount descending, then customerNumber ascending."
+      groundtruth_sql: |
+        SELECT
+          c.customerNumber,
+          c.customerName,
+          SUM(p.amount) AS total_payment_amount
+        FROM customers AS c
+        JOIN payments AS p
+          ON p.customerNumber = c.customerNumber
+        LEFT JOIN orders AS o
+          ON o.customerNumber = c.customerNumber
+        GROUP BY
+          c.customerNumber,
+          c.customerName
+        HAVING
+          COUNT(o.orderNumber) = 0
+        ORDER BY
+          total_payment_amount DESC,
+          c.customerNumber ASC;
+    - id: H12
+      difficulty: hard
+      question: "Show offices where the average creditLimit of customers assigned to employees in that office is higher than the overall average creditLimit across all customers (ignore NULL creditLimit). Return officeCode, city, and avg_credit_limit. Sort by avg_credit_limit descending, then officeCode ascending."
+      groundtruth_sql: |
+        SELECT
+          o.officeCode,
+          o.city,
+          AVG(c.creditLimit) AS avg_credit_limit
+        FROM offices AS o
+        JOIN employees AS e
+          ON e.officeCode = o.officeCode
+        JOIN customers AS c
+          ON c.salesRepEmployeeNumber = e.employeeNumber
+        GROUP BY
+          o.officeCode,
+          o.city
+        HAVING
+          AVG(c.creditLimit) > (
+            SELECT AVG(c2.creditLimit)
+            FROM customers AS c2
+            WHERE c2.creditLimit IS NOT NULL
+          )
+        ORDER BY
+          avg_credit_limit DESC,
+          o.officeCode ASC;

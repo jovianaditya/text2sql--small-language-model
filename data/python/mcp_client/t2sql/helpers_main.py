@@ -58,6 +58,8 @@ from .helpers_core import (
     _rewrite_winner_row_aggregate_misuse, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
+    _rewrite_row_level_nonnull_to_group_existence,
+    _drop_unrequested_exists_filters,
     _question_wants_latest_year_scope_with_aggregate,
     # phase 4b - Aggregate in WHERE fix
     _fix_aggregate_in_where,
@@ -1449,23 +1451,51 @@ def _find_tables_with_implicit_columns(
 
     q_lower = question.lower()
     relevant_lower = {t.lower() for t in relevant_tables}
+    fk_map = _extract_fk_from_context(ctx)
 
-    def _question_mentions_column(q_text: str, column: str) -> bool:
+    def _is_key_or_fk_like_column(tbl_lower: str, col_name: str) -> bool:
         """
-        Robust mention detector for implicit table discovery.
-        Handles camelCase/snake_case + token-level semantic matches.
+        Conservative detector for bridge/key-like columns in implicit-table discovery.
+        We avoid adding new tables solely from these columns unless the table itself
+        is explicitly mentioned in the question.
+        """
+        c = (col_name or "").lower().strip()
+        if not c:
+            return False
+
+        # Explicit FK metadata from context.
+        if c in {str(k).lower() for k in fk_map.get(tbl_lower, {}).keys()}:
+            return True
+
+        # Table primary identifier is also key-like.
+        id_col = (get_id_column(tbl_lower) or "").lower().strip()
+        if id_col and c == id_col:
+            return True
+
+        # Generic identifier suffixes (schema-agnostic).
+        if re.search(r"(id|code|number)$", c, flags=re.I):
+            return True
+
+        return False
+
+    def _column_match_type(q_text: str, column: str) -> str:
+        """
+        Return match confidence for implicit table discovery:
+        - "exact": direct full/spaced column phrase found
+        - "token": token-level semantic fallback match
+        - "none" : no match
         """
         if not column:
-            return False
+            return "none"
 
         col_lower = column.lower()
         spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', column).replace("_", " ").lower()
 
         # Direct / phrase match
         if col_lower in q_text:
-            return True
+            return "exact"
         if spaced != col_lower and spaced in q_text:
-            return True
+            return "exact"
 
         # Guardrail: avoid false positives like customerName matching only "customer id".
         semantic_suffix_keywords = {
@@ -1485,7 +1515,7 @@ def _find_tables_with_implicit_columns(
                     for term in suffix_terms
                 )
                 if not has_suffix_intent:
-                    return False
+                    return "none"
 
         # Token boundary match for informative tokens only
         stop_tokens = {
@@ -1501,9 +1531,9 @@ def _find_tables_with_implicit_columns(
             if token == "ordered" and re.search(r"\bordered\s+by\b", q_text):
                 continue
             if re.search(rf"\b{re.escape(token)}\b", q_text):
-                return True
+                return "token"
 
-        return False
+        return "none"
 
     # Find tables whose columns are mentioned in question
     mentioned_tables = defaultdict(set)  # {table: {matched_columns}}
@@ -1515,7 +1545,16 @@ def _find_tables_with_implicit_columns(
         if tbl_lower in relevant_lower:
             continue
 
-        if _question_mentions_column(q_lower, col):
+        match_type = _column_match_type(q_lower, col)
+        if match_type != "none":
+            # Guardrail: do not expand tables from implicit FK/key-like columns only
+            # unless table entity is explicitly mentioned in the question.
+            if _is_key_or_fk_like_column(tbl_lower, col):
+                table_explicitly_mentioned = _table_mentioned(q_lower, tbl_lower, include_synonyms=True)
+                # For key-like columns, token-level fuzzy matches are too noisy
+                # unless the table itself is explicitly mentioned.
+                if (match_type != "exact") and (not table_explicitly_mentioned):
+                    continue
             mentioned_tables[tbl_lower].add(col)
 
     if not mentioned_tables:
@@ -1579,9 +1618,6 @@ def _find_tables_with_implicit_columns(
     mentioned_tables = filtered_mentioned_tables
     if not mentioned_tables:
         return set()
-
-    # Extract FK relationships from context
-    fk_map = _extract_fk_from_context(ctx)
 
     # Only include tables that have FK relationship with relevant tables
     tables_to_add = set()
@@ -2574,6 +2610,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         # Add missing COUNT(*) for GROUP BY aggregates
         s = _add_missing_count_for_group_by(s, question)
         if DEBUG_WR: print(f"[PH4] after add-count fix: {s}")
+
+        s = _rewrite_row_level_nonnull_to_group_existence(s, question)
+        if DEBUG_WR: print(f"[PH4] after nonnull row-filter->group existence fix: {s}")
+
+        s = _drop_unrequested_exists_filters(s, question, ctx)
+        if DEBUG_WR: print(f"[PH4] after unrequested EXISTS-drop fix: {s}")
 
         s = _rewrite_having_alias_to_expr(s)
         s = _winner_row_final_sanity(s, question)

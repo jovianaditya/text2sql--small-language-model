@@ -5988,6 +5988,209 @@ def _rewrite_latest_year_projection_to_year(sql: str, question: str) -> str:
         f"{tail_block};"
     )
     return fixed
+
+
+def _rewrite_row_level_nonnull_to_group_existence(sql: str, question: str) -> str:
+    """
+    For grouped aggregate queries where question asks existence semantics
+    ("at least one ... NOT NULL"), avoid row-level WHERE filtering that
+    shrinks aggregate totals.
+
+    Example rewrite:
+      ... WHERE e.reportsTo IS NOT NULL GROUP BY ...
+    ->
+      ... GROUP BY ... HAVING SUM(CASE WHEN e.reportsTo IS NOT NULL THEN 1 ELSE 0 END) > 0
+    """
+    if not sql:
+        return sql
+
+    q = (question or "").lower()
+    has_exist_intent = bool(re.search(r"\b(?:at\s+least\s+one|any|one\s+or\s+more)\b", q))
+    has_nonnull_intent = bool(re.search(r"\b(?:not\s+null|non[-\s]?null)\b", q))
+    if not (has_exist_intent and has_nonnull_intent):
+        return sql
+
+    s = sql.strip().rstrip(";").strip()
+    if not s:
+        return sql
+    if not re.search(r"\bGROUP\s+BY\b", s, flags=re.I):
+        return sql
+
+    m = re.match(
+        r"(?is)^(?P<head>.*?\bFROM\b.*?)(?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*)$",
+        s,
+    )
+    if not m:
+        return sql
+
+    head = (m.group("head") or "").strip()
+    tail = (m.group("tail") or "").strip()
+    where_body, rest_after_where = _split_where_and_rest(" " + tail)
+    if not where_body:
+        return sql
+    if _has_top_level_or(where_body):
+        return sql
+
+    conds = _split_top_level_and(where_body)
+    if not conds:
+        return sql
+
+    nonnull_conds: List[str] = []
+    keep_conds: List[str] = []
+    nonnull_pat = re.compile(
+        r"""(?is)^\s*\(?\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s+IS\s+NOT\s+NULL\s*\)?\s*$"""
+    )
+    for c in conds:
+        c0 = c.strip()
+        if not c0:
+            continue
+        if nonnull_pat.match(c0):
+            nonnull_conds.append(c0.strip("() ").strip())
+        else:
+            keep_conds.append(c0)
+
+    if not nonnull_conds:
+        return sql
+
+    existence_parts = [
+        f"SUM(CASE WHEN {c} THEN 1 ELSE 0 END) > 0" for c in nonnull_conds
+    ]
+    existence_expr = " AND ".join(existence_parts)
+
+    rest = (rest_after_where or "").strip()
+    if not rest:
+        return sql
+    if not re.search(r"\bGROUP\s+BY\b", rest, flags=re.I):
+        return sql
+
+    if re.search(r"\bHAVING\b", rest, flags=re.I):
+        rest = re.sub(
+            r"(?is)\bHAVING\b\s*(?P<h>.*?)(?=(\bORDER\s+BY\b|\bLIMIT\b|$))",
+            lambda m_h: f"HAVING ({m_h.group('h').strip()}) AND ({existence_expr})",
+            rest,
+            count=1,
+        )
+    else:
+        m_tail = re.search(r"\b(ORDER\s+BY|LIMIT)\b", rest, flags=re.I)
+        if m_tail:
+            rest = (
+                rest[:m_tail.start()].rstrip()
+                + f" HAVING {existence_expr} "
+                + rest[m_tail.start():].lstrip()
+            )
+        else:
+            rest = rest.rstrip() + f" HAVING {existence_expr}"
+
+    where_part = f" WHERE {' AND '.join(keep_conds)}" if keep_conds else ""
+    fixed = f"{head}{where_part} {rest}".strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _drop_unrequested_exists_filters(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Drop EXISTS predicates that reference tables not mentioned in the question.
+
+    This is a conservative guardrail against hallucinated relationship filters such as:
+      WHERE EXISTS (SELECT 1 FROM customers c WHERE ...)
+    when the prompt never asks about customers.
+    """
+    if not sql:
+        return sql
+
+    q = (question or "").lower().strip()
+    if not q:
+        return sql
+    if "exists" not in sql.lower():
+        return sql
+
+    s = sql.strip().rstrip(";").strip()
+    if not s:
+        return sql
+
+    m = re.match(
+        r"(?is)^(?P<head>.*?\bFROM\b.*?)(?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*)$",
+        s,
+    )
+    if not m:
+        return sql
+
+    head = (m.group("head") or "").strip()
+    tail = (m.group("tail") or "").strip()
+    where_body, rest_after_where = _split_where_and_rest(" " + tail)
+    if not where_body:
+        return sql
+    if _has_top_level_or(where_body):
+        return sql
+
+    def _table_mentioned_in_question(tbl: str) -> bool:
+        t = (tbl or "").lower().strip()
+        if not t:
+            return False
+        variants = {t}
+        singular = get_singular_form(t)
+        if singular:
+            variants.add(singular.lower())
+        if "_" in t:
+            variants.add(t.replace("_", " "))
+        if singular and "_" in singular:
+            variants.add(singular.replace("_", " "))
+        try:
+            for syn in get_table_synonyms(t):
+                s0 = (syn or "").lower().strip()
+                if s0:
+                    variants.add(s0)
+        except Exception:
+            pass
+        for v in variants:
+            if not v:
+                continue
+            pat = re.escape(v).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pat}\b", q, flags=re.I):
+                return True
+        return False
+
+    exists_table_pat = re.compile(
+        r"""(?is)^\s*EXISTS\s*\(\s*SELECT\b.*?\bFROM\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\b.*\)\s*$"""
+    )
+
+    conds = _split_top_level_and(where_body)
+    if not conds:
+        return sql
+
+    keep: List[str] = []
+    removed_any = False
+    for c in conds:
+        c0 = c.strip()
+        if not c0:
+            continue
+        m_exists = exists_table_pat.match(c0)
+        if not m_exists:
+            keep.append(c0)
+            continue
+
+        tbl_expr = (m_exists.group(1) or "").replace("`", "")
+        tbl = tbl_expr.split(".")[-1].lower().strip()
+        if _table_mentioned_in_question(tbl):
+            keep.append(c0)
+            continue
+
+        removed_any = True
+
+    if not removed_any:
+        return sql
+
+    if keep:
+        where_part = f" WHERE {' AND '.join(keep)}"
+    else:
+        where_part = ""
+
+    rest = (rest_after_where or "").strip()
+    fixed = f"{head}{where_part} {rest}".strip() if rest else f"{head}{where_part}".strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
 # =======================================================================
 # ========= Phase 5 — Pattern, REGEXP, and Predicate Normalization ======
 # ========================= Guardrail for Regex =========================
