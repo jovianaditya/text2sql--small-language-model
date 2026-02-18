@@ -120,6 +120,8 @@ from .config import (
     AGENT_ROUTER_PRIMARY_ALL_ENTITY_PATTERN,
     AGENT_ROUTER_PRIMARY_REASON_FROM_IN,
     AGENT_ROUTER_PRIMARY_REASON_ALL,
+    AGENT_ROUTER_PRIMARY_REASON_EXPLICIT_SUBJECT,
+    AGENT_ROUTER_EXPLICIT_SUBJECT_ENTITY_PATTERNS,
     AGENT_ROUTER_FK_EVIDENCE_EXTRACT_PATTERN,
     AGENT_ROUTER_FK_EVIDENCE_PREFIX,
     AGENT_ROUTER_FK_PATTERN_CARD,
@@ -273,6 +275,36 @@ def _instantiate_entity_patterns(templates: List[str], entity_pattern: str) -> L
         pat = raw.replace("__ENTITY__", entity_pattern).replace("{entity}", entity_pattern)
         patterns.append(pat)
     return patterns
+
+
+def _explicit_subject_match_score(question_lower: str, entity_pattern: str) -> int:
+    """
+    Score explicit-subject match specificity using config-driven templates.
+    Higher score means a longer concrete entity phrase was matched
+    (e.g., "product lines" > "product").
+    """
+    if not question_lower or not entity_pattern:
+        return 0
+
+    best = 0
+    ent_group = f"(?P<ent>{entity_pattern})"
+    for tpl in AGENT_ROUTER_EXPLICIT_SUBJECT_ENTITY_PATTERNS or []:
+        raw = str(tpl or "").strip()
+        if not raw:
+            continue
+        pat = raw.replace("__ENTITY__", ent_group).replace("{entity}", ent_group)
+        try:
+            m = re.search(pat, question_lower, flags=re.I)
+        except re.error:
+            continue
+        if not m:
+            continue
+        ent = (m.groupdict().get("ent") or "").strip()
+        if ent:
+            best = max(best, len(ent))
+        else:
+            best = max(best, 1)
+    return best
 
 
 def _router_id_terms_pattern() -> str:
@@ -1062,6 +1094,18 @@ def router_agent(state: RAGState) -> RAGState:
     for tbl_lower in list(evidence_tables):
         evidence_list = evidence_details.get(tbl_lower, [])
 
+        # Preserve weak-evidence parent table when it is explicitly the
+        # output subject in the question (e.g., "Show product lines ...")
+        # and has table+attribute evidence.
+        table_entity_pattern = _table_entity_pattern(tbl_lower)
+        has_table_attr_evidence = AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE in evidence_list
+        explicit_subject_score = _explicit_subject_match_score(question_lower, table_entity_pattern)
+        is_explicit_subject = has_table_attr_evidence and (explicit_subject_score > 0)
+        if is_explicit_subject:
+            if RETRIEVE_DEBUG:
+                print(f"[Router] Keeping {tbl_lower}: explicit subject entity in question")
+            continue
+
         # Check if evidence is ONLY weak patterns
         # Strong evidence: non-FK column mentions, aggregate context
         # Weak evidence: 'for each' pattern, table+attribute pattern, FK column mentions
@@ -1442,6 +1486,7 @@ def router_agent(state: RAGState) -> RAGState:
     # This provides guidance to LLM for SQL generation
     #
     # Priority rules:
+    # 0. Explicit lead subject ("Show/List/Return X ..."), most specific match wins
     # 1. "For each X" → X is primary table (GROUP BY context)
     # 2. "Show X from Y" / "X in Y" → Y is primary table
     # 3. "All X that Y" → X is primary table (filtering on X)
@@ -1458,19 +1503,52 @@ def router_agent(state: RAGState) -> RAGState:
     else:
         # Multiple tables - apply priority rules
 
-        # Rule 1: "For each X" pattern (highest priority)
-        # Handle both plural and singular, with optional words in between
+        # Rule 0: explicit subject entity at question lead (config-driven).
+        # This reduces false anchors like "products" when prompt starts with
+        # a more specific entity such as "product lines".
+        explicit_candidates = []
         for tbl in relevant_tables:
             tbl_lower = tbl.lower()
-            table_entity_pattern = _table_entity_pattern(tbl_lower)
-            for_each_patterns = _instantiate_entity_patterns(
-                AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS,
-                table_entity_pattern,
+            evidence_list = evidence_details.get(tbl_lower, [])
+            has_table_attr_evidence = AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE in evidence_list
+            if not has_table_attr_evidence:
+                continue
+            score = _explicit_subject_match_score(
+                question_lower,
+                _table_entity_pattern(tbl_lower),
             )
-            if any(re.search(p, question_lower) for p in for_each_patterns):
-                primary_table = tbl
-                primary_reason = AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH
-                break
+            if score <= 0:
+                continue
+            explicit_candidates.append((score, len(evidence_list), tbl))
+
+        if explicit_candidates:
+            explicit_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            top_score = explicit_candidates[0][0]
+            top_scored = [c for c in explicit_candidates if c[0] == top_score]
+            if len(top_scored) == 1:
+                primary_table = top_scored[0][2]
+                primary_reason = AGENT_ROUTER_PRIMARY_REASON_EXPLICIT_SUBJECT
+            else:
+                top_evidence = max(c[1] for c in top_scored)
+                top_evidence_scored = [c for c in top_scored if c[1] == top_evidence]
+                if len(top_evidence_scored) == 1:
+                    primary_table = top_evidence_scored[0][2]
+                    primary_reason = AGENT_ROUTER_PRIMARY_REASON_EXPLICIT_SUBJECT
+
+        # Rule 1: "For each X" pattern (highest priority)
+        # Handle both plural and singular, with optional words in between
+        if not primary_table:
+            for tbl in relevant_tables:
+                tbl_lower = tbl.lower()
+                table_entity_pattern = _table_entity_pattern(tbl_lower)
+                for_each_patterns = _instantiate_entity_patterns(
+                    AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS,
+                    table_entity_pattern,
+                )
+                if any(re.search(p, question_lower) for p in for_each_patterns):
+                    primary_table = tbl
+                    primary_reason = AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH
+                    break
 
         # Rule 2: Not yet found, check "show X from Y" / "X in Y" patterns
         if not primary_table:

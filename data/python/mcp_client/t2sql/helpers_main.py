@@ -56,6 +56,7 @@ from .helpers_core import (
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _rewrite_winner_row_aggregate_misuse, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _question_wants_latest_year_scope_with_aggregate,
     # phase 4b - Aggregate in WHERE fix
@@ -2553,6 +2554,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _rewrite_latest_year_derived_subquery_misuse(s, question, ctx)
         if DEBUG_WR: print("[PH4] after latest-year derived-subquery fix:", s)
+
+        s = _canonicalize_latest_year_same_year_pattern(s, question, ctx)
+        if DEBUG_WR: print("[PH4] after latest-year canonical pattern fix:", s)
 
         s = _move_latest_year_filter_where_to_inner_on(s)
         if DEBUG_WR: print("[PH4] after latest-year WHERE->ON style fix:", s)

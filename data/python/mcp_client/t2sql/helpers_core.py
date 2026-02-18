@@ -335,8 +335,6 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
         if (
             f"including {ent} with no" in q
             or f"{ent} with no" in q
-            or f"all {ent}" in q
-            or f"every {ent}" in q
         ):
             return False
 
@@ -403,6 +401,26 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
     )
     if has_entity_mention and has_existence_object and has_existence_connector:
         return True
+
+    # Generic quantified existence intent:
+    # "X that have at least one Y ...", "X with any Y ..."
+    # Keep this schema-driven and avoid table-name hardcoding.
+    has_quantified_existence = re.search(
+        r"\b(?:at\s+least\s+one|one\s+or\s+more|any)\b",
+        q,
+        flags=re.I,
+    ) is not None
+    if has_entity_mention and has_existence_connector and has_quantified_existence:
+        mentioned_entity_roots: Set[str] = set()
+        for ent in entity_terms:
+            e = (ent or "").lower().strip()
+            if not e:
+                continue
+            if re.search(rf"\b{re.escape(e)}\b", q, flags=re.I):
+                mentioned_entity_roots.add(_to_singular(e))
+        has_multi_entity_mentions = len(mentioned_entity_roots) >= 2
+        if has_existence_object or has_multi_entity_mentions:
+            return True
 
     if not re.search(r"\bonly\b", q):
         return False
@@ -530,6 +548,13 @@ def _rewrite_left_join_to_inner_if_rhs_filtered(sql: str, question: str, ctx: st
     if _question_wants_include_zero(question, ctx):
         return sql
 
+    # Existence/filtering intent should use INNER semantics even when RHS filters
+    # were already pushed into ON (so WHERE-based detection would miss it).
+    # Keep this conservative: only auto-convert for single-join queries.
+    if _question_requires_inner_join(question, ctx):
+        if join_count(sql) == 1 and re.search(r"\bleft\s+join\b", sql, flags=re.I):
+            return re.sub(r"\bLEFT\s+JOIN\b", "JOIN", sql, count=1, flags=re.I)
+
     # Only handle the simplest, safest case: exactly one JOIN, and it's a LEFT JOIN.
     if join_count(sql) != 1:
         return sql
@@ -596,7 +621,14 @@ def _question_wants_all_entities(question: str, ctx: str = "") -> bool:
     This is more strict than _question_wants_include_zero - only triggers on explicit "all/every/each".
     """
     q = (question or "").lower()
-    
+    if not q:
+        return False
+
+    # Existence-filter intent (e.g., "have/with at least one ...") must NOT be
+    # treated as "all entities"; those queries should prefer INNER semantics.
+    if _question_requires_inner_join(question, ctx):
+        return False
+
     entity_kw = _build_entity_kw(ctx)
     
     # Pattern: "all/every/each <entity>"
@@ -5538,6 +5570,309 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str, ctx: s
         f"  ON {metric_alias}.{key_col} = {entity_alias}.{entity_key_col}\n"
         f" AND YEAR({metric_alias}.{date_col}) = {year_alias}.latest_year\n"
         f"GROUP BY {', '.join(group_items)};"
+    )
+    return fixed
+
+
+def _canonicalize_latest_year_same_year_pattern(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Canonicalize correlated latest-year filters into a derived-table pattern.
+
+    Target shape (example):
+      WHERE YEAR(o.orderDate) = (
+        SELECT MAX(YEAR(orderDate))
+        FROM orders
+        WHERE orderNumber IN (
+          SELECT orderNumber
+          FROM orderdetails
+          WHERE productCode = p.productCode
+        )
+      )
+
+    Canonicalized:
+      JOIN (
+        SELECT bridge.entity_key AS latest_key, MAX(YEAR(date_table.date_col)) AS latest_year
+        FROM bridge_table bridge
+        JOIN date_table date_table ON ...
+        GROUP BY bridge.entity_key
+      ) AS ly ON ly.latest_key = outer.entity_key
+      WHERE YEAR(outer.date_col) = ly.latest_year
+    """
+    if not sql:
+        return sql
+    if not _question_wants_latest_year_scope_with_aggregate(question):
+        return sql
+
+    low_sql = sql.lower()
+    if "latest_year" in low_sql and re.search(r"=\s*[a-z_][a-z0-9_]*\.latest_year\b", low_sql):
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+    if not parsed.get("where"):
+        return sql
+
+    from_core = parsed["from_core"].strip()
+    if not from_core:
+        return sql
+
+    alias_map = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    existing_aliases = {a.lower() for a in alias_map.keys() if a}
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    allowed_cols: Dict[str, Set[str]] = {}
+    if not analyzer and ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            allowed_cols = {t.lower(): {c.lower() for c in cols} for t, cols in allowed.items()}
+        except Exception:
+            allowed_cols = {}
+
+    def _plain_table_name(table_expr: str) -> str:
+        return (table_expr or "").replace("`", "").split(".")[-1].strip()
+
+    def _table_cols(table_name: str) -> Set[str]:
+        t = _plain_table_name(table_name).lower()
+        if not t:
+            return set()
+        if analyzer:
+            try:
+                return {c.lower() for c in analyzer.get_table_columns(t)}
+            except Exception:
+                return set()
+        return set(allowed_cols.get(t, set()))
+
+    def _pick_alias(base: str, used: Set[str]) -> str:
+        b = re.sub(r"[^A-Za-z0-9_]", "", base) or "t"
+        if not re.match(r"[A-Za-z_]", b[0]):
+            b = f"t_{b}"
+        cand = b
+        i = 2
+        while cand.lower() in used:
+            cand = f"{b}_{i}"
+            i += 1
+        used.add(cand.lower())
+        return cand
+
+    def _split_qualified_ref(expr: str) -> Optional[tuple]:
+        m = re.match(
+            r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$""",
+            (expr or "").strip(),
+        )
+        if not m:
+            return None
+        return m.group(1), m.group(2)
+
+    def _parse_year_eq_subquery(cond: str) -> Optional[tuple]:
+        c = (cond or "").strip()
+        m1 = re.match(
+            r"""(?is)^YEAR\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*=\s*\((SELECT.+)\)\s*$""",
+            c,
+        )
+        if m1:
+            return m1.group(1), m1.group(2), m1.group(3).strip()
+        m2 = re.match(
+            r"""(?is)^\((SELECT.+)\)\s*=\s*YEAR\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*$""",
+            c,
+        )
+        if m2:
+            return m2.group(2), m2.group(3), m2.group(1).strip()
+        return None
+
+    where_body = re.sub(r"^\s*WHERE\s+", "", parsed["where"].strip(), flags=re.I).strip()
+    if not where_body or _has_top_level_or(where_body):
+        return sql
+
+    conjuncts = _split_top_level_and(where_body)
+    if not conjuncts:
+        return sql
+
+    target_idx = -1
+    parsed_target = None
+
+    for i, cond in enumerate(conjuncts):
+        y = _parse_year_eq_subquery(cond)
+        if not y:
+            continue
+        outer_date_alias, outer_date_col, sub1 = y
+
+        m_sub1 = re.match(
+            r"""(?is)^\s*SELECT\s+MAX\s*\(\s*YEAR\s*\(\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*\)\s+FROM\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?\s+WHERE\s+(.+?)\s*$""",
+            sub1,
+        )
+        if not m_sub1:
+            continue
+
+        inner_date_qual = (m_sub1.group(1) or "").strip()
+        inner_date_col = m_sub1.group(2).strip()
+        inner_date_table = m_sub1.group(3).strip()
+        inner_date_alias = (m_sub1.group(4) or "").strip() or _plain_table_name(inner_date_table)
+        inner_where = (m_sub1.group(5) or "").strip()
+        if not inner_where or _has_top_level_or(inner_where):
+            continue
+        inner_conj = _split_top_level_and(inner_where)
+        if len(inner_conj) != 1:
+            continue
+
+        m_in = re.match(
+            r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s+IN\s*\((SELECT.+)\)\s*$""",
+            inner_conj[0].strip(),
+        )
+        if not m_in:
+            continue
+        inner_join_qual = (m_in.group(1) or "").strip()
+        inner_join_col = m_in.group(2).strip()
+        sub2 = (m_in.group(3) or "").strip()
+        if inner_join_qual and inner_join_qual.lower() not in {inner_date_alias.lower(), _plain_table_name(inner_date_table).lower()}:
+            continue
+
+        m_sub2 = re.match(
+            r"""(?is)^\s*SELECT\s+(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s+FROM\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?\s+WHERE\s+(.+?)\s*$""",
+            sub2,
+        )
+        if not m_sub2:
+            continue
+
+        bridge_link_qual = (m_sub2.group(1) or "").strip()
+        bridge_link_col = m_sub2.group(2).strip()
+        bridge_table = m_sub2.group(3).strip()
+        bridge_alias = (m_sub2.group(4) or "").strip() or _plain_table_name(bridge_table)
+        bridge_where = (m_sub2.group(5) or "").strip()
+        if not bridge_where or _has_top_level_or(bridge_where):
+            continue
+        bridge_conj = _split_top_level_and(bridge_where)
+        if len(bridge_conj) != 1:
+            continue
+
+        m_eq = re.match(
+            r"""(?is)^\s*(.+?)\s*=\s*(.+?)\s*$""",
+            bridge_conj[0].strip(),
+        )
+        if not m_eq:
+            continue
+        left_ref = _split_qualified_ref(m_eq.group(1))
+        right_ref = _split_qualified_ref(m_eq.group(2))
+        if not left_ref or not right_ref:
+            continue
+
+        lq, lc = left_ref
+        rq, rc = right_ref
+        bridge_aliases = {bridge_alias.lower(), _plain_table_name(bridge_table).lower()}
+
+        outer_entity_alias = None
+        outer_entity_col = None
+        bridge_entity_col = None
+
+        if rq and rq.lower() in alias_map and (not lq or lq.lower() in bridge_aliases):
+            outer_entity_alias = rq
+            outer_entity_col = rc
+            bridge_entity_col = lc
+        elif lq and lq.lower() in alias_map and (not rq or rq.lower() in bridge_aliases):
+            outer_entity_alias = lq
+            outer_entity_col = lc
+            bridge_entity_col = rc
+        else:
+            continue
+
+        if bridge_link_qual and bridge_link_qual.lower() not in bridge_aliases:
+            continue
+        if inner_date_qual and inner_date_qual.lower() not in {inner_date_alias.lower(), _plain_table_name(inner_date_table).lower()}:
+            continue
+
+        parsed_target = {
+            "outer_date_alias": outer_date_alias,
+            "outer_date_col": outer_date_col,
+            "inner_date_table": inner_date_table,
+            "inner_date_alias": inner_date_alias,
+            "inner_date_col": inner_date_col,
+            "inner_join_col": inner_join_col,
+            "bridge_table": bridge_table,
+            "bridge_alias": bridge_alias,
+            "bridge_link_col": bridge_link_col,
+            "bridge_entity_col": bridge_entity_col,
+            "outer_entity_alias": outer_entity_alias,
+            "outer_entity_col": outer_entity_col,
+        }
+        target_idx = i
+        break
+
+    if target_idx < 0 or not parsed_target:
+        return sql
+
+    outer_date_alias = parsed_target["outer_date_alias"]
+    outer_date_col = parsed_target["outer_date_col"]
+    inner_date_table = parsed_target["inner_date_table"]
+    inner_date_col = parsed_target["inner_date_col"]
+    inner_join_col = parsed_target["inner_join_col"]
+    bridge_table = parsed_target["bridge_table"]
+    bridge_link_col = parsed_target["bridge_link_col"]
+    bridge_entity_col = parsed_target["bridge_entity_col"]
+    outer_entity_alias = parsed_target["outer_entity_alias"]
+    outer_entity_col = parsed_target["outer_entity_col"]
+
+    if outer_date_alias.lower() not in alias_map:
+        return sql
+    if outer_entity_alias.lower() not in alias_map:
+        return sql
+
+    outer_date_table = alias_map.get(outer_date_alias) or alias_map.get(outer_date_alias.lower()) or outer_date_alias
+    outer_entity_table = alias_map.get(outer_entity_alias) or alias_map.get(outer_entity_alias.lower()) or outer_entity_alias
+    outer_date_cols = _table_cols(outer_date_table)
+    outer_entity_cols = _table_cols(outer_entity_table)
+    inner_date_cols = _table_cols(inner_date_table)
+    bridge_cols = _table_cols(bridge_table)
+
+    if outer_date_cols and outer_date_col.lower() not in outer_date_cols:
+        return sql
+    if outer_entity_cols and outer_entity_col.lower() not in outer_entity_cols:
+        return sql
+    if inner_date_cols and (
+        inner_date_col.lower() not in inner_date_cols
+        or inner_join_col.lower() not in inner_date_cols
+    ):
+        return sql
+    if bridge_cols and (
+        bridge_link_col.lower() not in bridge_cols
+        or bridge_entity_col.lower() not in bridge_cols
+    ):
+        return sql
+
+    used = set(existing_aliases)
+    ly_alias = _pick_alias("latest_years", used)
+    src_alias = "ly_src"
+    dt_alias = "ly_dt"
+
+    ly_join = (
+        "JOIN (\n"
+        "  SELECT\n"
+        f"    {src_alias}.{bridge_entity_col} AS latest_key,\n"
+        f"    MAX(YEAR({dt_alias}.{inner_date_col})) AS latest_year\n"
+        f"  FROM {bridge_table} AS {src_alias}\n"
+        f"  JOIN {inner_date_table} AS {dt_alias}\n"
+        f"    ON {dt_alias}.{inner_join_col} = {src_alias}.{bridge_link_col}\n"
+        f"  GROUP BY {src_alias}.{bridge_entity_col}\n"
+        f") AS {ly_alias}\n"
+        f"  ON {ly_alias}.latest_key = {outer_entity_alias}.{outer_entity_col}"
+    )
+
+    from_with_ly = f"{from_core}\n{ly_join}"
+    year_cond = f"YEAR({outer_date_alias}.{outer_date_col}) = {ly_alias}.latest_year"
+
+    keep_conj = [c.strip() for idx, c in enumerate(conjuncts) if idx != target_idx and c.strip()]
+    where_final = " AND ".join(keep_conj + [year_cond])
+
+    tail_clause = f"\n{parsed['tail'].strip()}" if parsed["tail"].strip() else ""
+    fixed = (
+        f"SELECT {parsed['select'].strip()}\n"
+        f"FROM {from_with_ly}\n"
+        f"WHERE {where_final}\n"
+        f"GROUP BY {parsed['groupby'].strip()}"
+        f"{tail_clause};"
     )
     return fixed
 

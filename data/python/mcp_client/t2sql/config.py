@@ -757,6 +757,19 @@ AGENT_ROUTER_PRIMARY_REASON_ALL = os.getenv(
     "'all X' pattern",
 ).strip()
 
+AGENT_ROUTER_PRIMARY_REASON_EXPLICIT_SUBJECT = os.getenv(
+    "AGENT_ROUTER_PRIMARY_REASON_EXPLICIT_SUBJECT",
+    "explicit subject pattern",
+).strip()
+
+AGENT_ROUTER_EXPLICIT_SUBJECT_ENTITY_PATTERNS = _env_json_list(
+    "AGENT_ROUTER_EXPLICIT_SUBJECT_ENTITY_PATTERNS",
+    [
+        r"^\s*(?:show|list|display|return|get|find|fetch)\s+(?:only\s+|all\s+)?(?:\w+\s+){0,2}__ENTITY__\b",
+        r"^\s*(?:which|what)\s+(?:\w+\s+){0,2}__ENTITY__\b",
+    ],
+)
+
 AGENT_ROUTER_FK_EVIDENCE_EXTRACT_PATTERN = os.getenv(
     "AGENT_ROUTER_FK_EVIDENCE_EXTRACT_PATTERN",
     r"^FK column '([^']+)'$",

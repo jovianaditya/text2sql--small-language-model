@@ -383,3 +383,22 @@ cases:
         ORDER BY
           total_quantity_in_latest_year DESC,
           p.productCode ASC;
+    - id: H9
+      difficulty: hard
+      question: "Show product lines that have at least one product with MSRP greater than the average MSRP of all products. For each such product line, display the product line name and the number of products in that line. Sort it so product lines with more products appear first; if there’s a tie, sort by product line name A–Z."
+      groundtruth_sql: |
+        SELECT
+          pl.productLine,
+          COUNT(*) AS product_count
+        FROM productlines AS pl
+        JOIN products AS p
+          ON p.productLine = pl.productLine
+        WHERE p.MSRP > (
+          SELECT AVG(p2.MSRP)
+          FROM products AS p2
+        )
+        GROUP BY
+          pl.productLine
+        ORDER BY
+          product_count DESC,
+          pl.productLine ASC;
