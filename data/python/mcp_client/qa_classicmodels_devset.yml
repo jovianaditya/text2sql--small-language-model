@@ -474,3 +474,34 @@ cases:
         ORDER BY
           avg_credit_limit DESC,
           o.officeCode ASC;
+    - id: H13
+      difficulty: hard
+      question: "For each employee (including employees who have no customers and customers who have no payments), show the employee id and full name, plus the most recent payment made by any of their customers. Return employee id, employee name, customer id, payment date, and amount. If there are multiple payments on the same most recent date, pick the largest amount. Sort by payment date descending, then employee number ascending."
+      groundtruth_sql: |
+        SELECT
+          t.employeeNumber,
+          t.employee_name,
+          t.customerNumber,
+          t.paymentDate,
+          t.amount
+        FROM (
+          SELECT
+            e.employeeNumber,
+            CONCAT(e.firstName, ' ', e.lastName) AS employee_name,
+            c.customerNumber,
+            p.paymentDate,
+            p.amount,
+            ROW_NUMBER() OVER (
+              PARTITION BY e.employeeNumber
+              ORDER BY p.paymentDate DESC, p.amount DESC, c.customerNumber ASC
+            ) AS rn
+          FROM employees AS e
+          LEFT JOIN customers AS c
+            ON c.salesRepEmployeeNumber = e.employeeNumber
+          LEFT JOIN payments AS p
+            ON p.customerNumber = c.customerNumber
+        ) AS t
+        WHERE t.rn = 1
+        ORDER BY
+          t.paymentDate DESC,
+          t.employeeNumber ASC;

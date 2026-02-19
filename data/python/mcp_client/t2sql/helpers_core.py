@@ -2019,11 +2019,74 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
 
     q = (question or "").lower()
     q_norm = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
+    q_snake = re.sub(r"[^a-z0-9_]+", "_", q_norm).strip("_")
 
-    wants_name = re.search(r"\bnames?\b", q_norm) is not None
-    wants_id_like = re.search(r"\b(ids?|numbers?|nomors?|nos?|codes?|kodes?)\b", q_norm) is not None
-    if not (wants_name and wants_id_like):
-        return sql
+    def _entity_wants_id_like(entity_words: List[str], table_name: str) -> bool:
+        id_terms = r"(?:ids?|numbers?|nomors?|nos?|codes?|kodes?)"
+        forms: Set[str] = {table_name.lower(), (get_singular_form(table_name) or table_name).lower()}
+        for w in entity_words:
+            ww = (w or "").strip().lower()
+            if ww:
+                forms.add(ww)
+                forms.add(ww.replace(" ", "_"))
+
+        for f in forms:
+            if not f:
+                continue
+            if any(
+                token in q_snake
+                for token in (
+                    f"{f}_id",
+                    f"{f}_ids",
+                    f"{f}_number",
+                    f"{f}_numbers",
+                    f"{f}_code",
+                    f"{f}_codes",
+                )
+            ):
+                return True
+
+        for f in forms:
+            p = re.escape((f or "").strip().lower()).replace(r"\ ", r"\s+")
+            if not p:
+                continue
+            # Direct forms: "customer id", "id of customer"
+            if re.search(rf"\b{p}\b\s+{id_terms}\b", q_norm, flags=re.I):
+                return True
+            if re.search(rf"\b{id_terms}\b\s+(?:of|for)\s+\b{p}\b", q_norm, flags=re.I):
+                return True
+            # Shorthand list style: "customer name, id" / "customer name and id"
+            if re.search(rf"\b{p}\b\s+(?:full\s+)?names?\b\s*(?:,|\band\b)\s*(?:their\s+)?{id_terms}\b", q_norm, flags=re.I):
+                return True
+
+        return False
+
+    def _entity_wants_name_like(entity_words: List[str], table_name: str) -> bool:
+        name_terms = r"(?:full\s+names?|names?)"
+        forms: Set[str] = {table_name.lower(), (get_singular_form(table_name) or table_name).lower()}
+        for w in entity_words:
+            ww = (w or "").strip().lower()
+            if ww:
+                forms.add(ww)
+                forms.add(ww.replace(" ", "_"))
+
+        for f in forms:
+            if not f:
+                continue
+            if f"{f}_name" in q_snake or f"{f}_names" in q_snake:
+                return True
+
+        for f in forms:
+            p = re.escape((f or "").strip().lower()).replace(r"\ ", r"\s+")
+            if not p:
+                continue
+            # Direct forms: "customer name", "name of customer"
+            if re.search(rf"\b{p}\b\s+{name_terms}\b", q_norm, flags=re.I):
+                return True
+            if re.search(rf"\b{name_terms}\b\s+(?:of|for)\s+\b{p}\b", q_norm, flags=re.I):
+                return True
+
+        return False
 
     parsed = _parse_select_from_groupby(sql)
     if not parsed:
@@ -2143,10 +2206,15 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
     select_items = _split_top_level_commas(parsed["select"])
     group_items = _split_top_level_commas(parsed.get("groupby", ""))
 
-    # Gather simple selected columns by (qualifier?, column).
+    # Gather selected simple columns by (qualifier?, column) and output aliases.
     selected_cols: List[tuple] = []
+    selected_aliases: Set[str] = set()
+    selected_exprs: List[str] = []
     for it in select_items:
-        expr, _a = _split_expr_alias(it)
+        expr, out_alias = _split_expr_alias(it)
+        selected_exprs.append(expr.strip())
+        if out_alias:
+            selected_aliases.add(out_alias.strip().strip("`'\"").lower())
         pcol = _parse_simple_col(expr)
         if pcol:
             qf, col = pcol
@@ -2171,6 +2239,8 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
         entity_words = _entity_words_for_table(table)
         if not any(_phrase_mentioned(q_norm, w) for w in entity_words):
             continue
+        if not (_entity_wants_id_like(entity_words, table) and _entity_wants_name_like(entity_words, table)):
+            continue
 
         id_col = get_id_column(table)
         name_col = get_name_column(table)
@@ -2183,15 +2253,35 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
         # Prefer first non-lowercase convenience alias
         qual = aliases[0]
         qual_l = qual.lower()
+        singular = (get_singular_form(table) or table).lower()
+        table_name_aliases = {
+            f"{singular}_name",
+            f"{table.lower()}_name",
+            f"{qual_l}_name",
+            "name",
+        }
 
         has_id = any(
             c == id_col_l and (qf is None or qf == qual_l or qf == t)
             for qf, c in selected_cols
         )
-        has_name = any(
+        has_name_simple = any(
             c == name_col_l and (qf is None or qf == qual_l or qf == t)
             for qf, c in selected_cols
         )
+        has_name_alias = any(a in table_name_aliases for a in selected_aliases)
+        has_fullname_expr = any(
+            re.search(
+                rf"""(?is)\bCONCAT\s*\(\s*`?{re.escape(qual)}`?\s*\.\s*`?(firstName|first_name)`?\s*,\s*'[^']*'\s*,\s*`?{re.escape(qual)}`?\s*\.\s*`?(lastName|last_name)`?\s*\)""",
+                expr,
+            )
+            or re.search(
+                rf"""(?is)\bCONCAT\s*\(\s*`?{re.escape(qual)}`?\s*\.\s*`?(lastName|last_name)`?\s*,\s*'[^']*'\s*,\s*`?{re.escape(qual)}`?\s*\.\s*`?(firstName|first_name)`?\s*\)""",
+                expr,
+            )
+            for expr in selected_exprs
+        )
+        has_name = has_name_simple or has_name_alias or has_fullname_expr
 
         if not has_id:
             prepended_cols.append(f"{qual}.{id_col}")
@@ -2209,10 +2299,15 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
                 c == id_col_l and (qf is None or qf == qual_l or qf == t)
                 for qf, c in grouped_cols
             )
-            need_g_name = not any(
-                c == name_col_l and (qf is None or qf == qual_l or qf == t)
-                for qf, c in grouped_cols
-            )
+            # If name is already satisfied via alias/expression (e.g., employee_name/CONCAT),
+            # do not force-add raw name column to GROUP BY.
+            if has_name_simple:
+                need_g_name = not any(
+                    c == name_col_l and (qf is None or qf == qual_l or qf == t)
+                    for qf, c in grouped_cols
+                )
+            else:
+                need_g_name = False
             if need_g_id:
                 group_items.append(f"{qual}.{id_col}")
                 grouped_cols.add((qual_l, id_col_l))
@@ -2528,17 +2623,22 @@ def _expand_group_by_aliases_regex(sql: str) -> str:
 
     select_part = m_select.group(1)
 
-    # Build alias -> expression map
-    alias_map = {}
-    
-    # Pattern: <expression> AS <alias>
-    for m in re.finditer(
-        r"(CASE\b.*?\bEND|\w+\s*\([^)]*\)|[A-Za-z_][A-Za-z0-9_.]*)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
-        select_part,
-        flags=re.I | re.S
-    ):
-        expr = m.group(1).strip()
-        alias = m.group(2).strip()
+    # Build alias -> expression map conservatively from top-level SELECT items.
+    # Important: only use explicit "AS alias" and never rewrite partial tokens
+    # inside qualified refs (e.g., do NOT turn p.amount into p.MAX(...)).
+    alias_map: Dict[str, str] = {}
+    select_items = _split_top_level_commas(select_part)
+    for item in select_items:
+        m_as = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m_as:
+            continue
+        expr = (m_as.group(1) or "").strip()
+        alias = (m_as.group(2) or "").strip().strip("`'\"")
+        if not expr or not alias:
+            continue
         alias_map[alias.lower()] = expr
 
     if not alias_map:
@@ -2554,24 +2654,31 @@ def _expand_group_by_aliases_regex(sql: str) -> str:
         return sql
 
     group_clause = m_group.group(1).strip()
-    
-    # Replace aliases in GROUP BY
-    def replace_alias(match):
-        col = match.group(1).strip()
-        col_lower = col.lower()
-        if col_lower in alias_map:
-            return alias_map[col_lower]
-        return col
+    group_items = _split_top_level_commas(group_clause)
 
-    # Pattern: column names in GROUP BY (comma-separated)
-    new_group = re.sub(
-        r"\b([A-Za-z_][A-Za-z0-9_]*)\b",
-        replace_alias,
-        group_clause
-    )
+    def _unquote_identifier(x: str) -> str:
+        t = (x or "").strip()
+        if len(t) >= 2 and t[0] == t[-1] and t[0] in {"`", "'", '"'}:
+            return t[1:-1].strip()
+        return t
 
-    # Replace in original SQL
-    return sql[:m_group.start(1)] + new_group + sql[m_group.end(1):]
+    # Replace only when a GROUP BY item is exactly an alias token.
+    new_group_items: List[str] = []
+    for item in group_items:
+        raw = item.strip()
+        key = _unquote_identifier(raw).lower()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", _unquote_identifier(raw)) and key in alias_map:
+            new_group_items.append(alias_map[key])
+        else:
+            new_group_items.append(raw)
+    new_group = ", ".join(new_group_items)
+
+    # Replace in original SQL, preserving clause boundaries.
+    suffix = sql[m_group.end(1):]
+    if suffix and not suffix.startswith((" ", "\n", "\t", "\r")):
+        if re.match(r"(?is)^(ORDER\s+BY|HAVING|LIMIT|;)", suffix):
+            suffix = " " + suffix
+    return sql[:m_group.start(1)] + new_group + suffix
 
 def _is_potential_winner_row(sql: str, question: str, force: bool = False) -> bool:
     """
@@ -2699,6 +2806,13 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
     new_order_items = []
     items_to_add_to_group_by = []
 
+    # Aggregate expressions in ORDER BY must never be pushed into GROUP BY
+    # (e.g., ORDER BY COUNT(*) DESC is valid and should stay as-is).
+    aggregate_func_pattern = re.compile(
+        r"\b(COUNT|SUM|AVG|MIN|MAX|STDDEV|STD|VARIANCE|VAR_POP|VAR_SAMP|GROUP_CONCAT|BIT_AND|BIT_OR|BIT_XOR|JSON_ARRAYAGG|JSON_OBJECTAGG)\s*\(",
+        re.IGNORECASE,
+    )
+
     for item in order_items:
         # Extract the base column/expression (before ASC/DESC)
         base_match = re.match(r'(.*?)\s+(ASC|DESC)\s*$', item, re.IGNORECASE)
@@ -2731,7 +2845,10 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
                 for gi in group_items_normalized
             )
 
-            if not is_in_group_by:
+            has_aggregate = bool(aggregate_func_pattern.search(base))
+            has_window = bool(re.search(r"\bOVER\s*\(", base, re.IGNORECASE))
+
+            if not is_in_group_by and not has_aggregate and not has_window:
                 # Add this ORDER BY expression to GROUP BY
                 items_to_add_to_group_by.append(base)
 
@@ -2757,7 +2874,115 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
             new_group_clause = ', '.join(new_group_items)
             sql = sql[:gb_match.start(1)] + new_group_clause + sql[gb_match.end(1):]
 
-    return sql
+    # Final safety: GROUP BY must not contain aggregate/window expressions.
+    return _drop_aggregate_or_window_items_from_group_by(sql)
+
+
+def _drop_aggregate_or_window_items_from_group_by(sql: str) -> str:
+    """
+    Remove malformed GROUP BY items that are aggregate/window expressions.
+
+    Example malformed:
+      GROUP BY customerNumber, COUNT(*)
+    """
+    if not sql or "GROUP BY" not in sql.upper():
+        return sql
+
+    s = sql
+    low = s.lower()
+
+    def _is_word_boundary(text: str, i: int, n: int) -> bool:
+        left_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        right_ok = i + n >= len(text) or not (text[i + n].isalnum() or text[i + n] == "_")
+        return left_ok and right_ok
+
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        kw_l = kw.lower()
+        n = len(kw_l)
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and i >= start and i + n <= len(text):
+                if text[i:i + n].lower() == kw_l and _is_word_boundary(text, i, n):
+                    return i
+            i += 1
+        return -1
+
+    group_pos = _find_top_level_kw(low, "group by", 0)
+    if group_pos < 0:
+        return sql
+
+    group_start = group_pos + len("group by")
+
+    end_candidates = []
+    for kw in ("having", "order by", "limit"):
+        p = _find_top_level_kw(low, kw, group_start)
+        if p >= 0:
+            end_candidates.append(p)
+    semicolon_pos = _find_top_level_kw(low, ";", group_start)
+    if semicolon_pos >= 0:
+        end_candidates.append(semicolon_pos)
+    group_end = min(end_candidates) if end_candidates else len(s)
+
+    group_clause = s[group_start:group_end].strip()
+    if not group_clause:
+        return sql
+
+    group_items = _split_top_level_commas(group_clause)
+    if not group_items:
+        return sql
+
+    aggregate_func_pattern = re.compile(
+        r"\b(COUNT|SUM|AVG|MIN|MAX|STDDEV|STD|VARIANCE|VAR_POP|VAR_SAMP|GROUP_CONCAT|BIT_AND|BIT_OR|BIT_XOR|JSON_ARRAYAGG|JSON_OBJECTAGG)\s*\(",
+        re.IGNORECASE,
+    )
+    window_pattern = re.compile(r"\bOVER\s*\(", re.IGNORECASE)
+
+    cleaned_items: List[str] = []
+    for item in group_items:
+        raw = (item or "").strip()
+        if not raw:
+            continue
+        if aggregate_func_pattern.search(raw):
+            continue
+        if window_pattern.search(raw):
+            continue
+        cleaned_items.append(raw)
+
+    if len(cleaned_items) == len(group_items) or not cleaned_items:
+        return sql
+
+    new_group = ", ".join(cleaned_items)
+    prefix = s[:group_start]
+    suffix = s[group_end:]
+    if suffix and not suffix[0].isspace():
+        suffix = " " + suffix
+    return f"{prefix} {new_group}{suffix}"
 
 
 def _normalize_alias_lengths(sql: str) -> str:
@@ -3270,96 +3495,399 @@ def _fix_mixed_max_groupby_rownumber(sql: str) -> Optional[str]:
 
     s = sql.lower()
 
-    # Detect the malformed pattern: has MAX()/MIN() + GROUP BY + ROW_NUMBER()
+    # Detect broad mixed-pattern signal.
     has_agg = bool(re.search(r"\b(max|min|sum|count|avg)\s*\(", s))
     has_group_by = "group by" in s
     has_row_number = "row_number() over" in s
-
     if not (has_agg and has_group_by and has_row_number):
-        return None  # Not the malformed pattern we're looking for
+        return None
 
-    # Also check if ROW_NUMBER is in wrong position (not in SELECT with AS)
-    # Malformed: ROW_NUMBER() OVER ... = 1 (at end, without AS)
-    # Correct: ROW_NUMBER() OVER ... AS rn (in SELECT)
+    # ------------------------------------------------------------------
+    # CASE 1: Legacy malformed pattern (ROW_NUMBER ... = 1 inside subquery)
+    # ------------------------------------------------------------------
     malformed_pattern = re.search(
         r"row_number\s*\(\s*\)\s+over\s*\([^)]+\)\s*[=<>\s]*1\s*\)",
         sql,
         re.IGNORECASE
     )
+    if malformed_pattern:
+        outer_select_match = re.search(
+            r"select\s+(.*?)\s+from\s*\(",
+            sql,
+            re.IGNORECASE | re.DOTALL
+        )
+        if not outer_select_match:
+            return None
+        outer_cols = outer_select_match.group(1).strip()
 
-    if not malformed_pattern:
+        from_table_match = re.search(
+            r"from\s+.*?\)\s*(?:as\s+)?(\w+)",
+            sql,
+            re.IGNORECASE
+        )
+        outer_alias = from_table_match.group(1) if from_table_match else "t"
+
+        base_table_match = re.search(
+            r"from\s+(\w+)\s+(?:(?!group\s+by|row_number).)*?(?=group\s+by|row_number|\))",
+            sql,
+            re.IGNORECASE
+        )
+        if not base_table_match:
+            return None
+        base_table = base_table_match.group(1)
+
+        partition_match = re.search(
+            r"partition\s+by\s+([^)]+)",
+            sql,
+            re.IGNORECASE
+        )
+        partition_by = partition_match.group(1).strip() if partition_match else ""
+
+        order_match = re.search(
+            r"order\s+by\s+([^)]+?)(?:\)|desc|asc)",
+            sql,
+            re.IGNORECASE
+        )
+        order_by = order_match.group(1).strip() if order_match else ""
+
+        select_cols = []
+        for col in re.split(r",\s*", outer_cols):
+            col = col.strip()
+            col = re.sub(r"^\w+\.", "", col)
+            col = re.sub(
+                r"^(max|min|sum|count|avg)\s*\(([^)]+)\)\s*(?:as\s+\w+)?$",
+                r"\2",
+                col,
+                flags=re.IGNORECASE
+            )
+            select_cols.append(col)
+
+        inner_select = ", ".join(select_cols)
+        outer_select = ", ".join([f"{outer_alias}.{col.strip()}" for col in select_cols])
+        fixed_sql = (
+            f"SELECT {outer_select} "
+            f"FROM (SELECT {inner_select}, "
+            f"ROW_NUMBER() OVER (PARTITION BY {partition_by} ORDER BY {order_by}) AS rn "
+            f"FROM {base_table}) {outer_alias} "
+            f"WHERE {outer_alias}.rn = 1"
+        )
+        return fixed_sql
+
+    # ------------------------------------------------------------------
+    # CASE 2: Semantic mixed pattern:
+    # outer MAX()+GROUP BY but inner derived-table already uses ROW_NUMBER rn=1.
+    # Rewrite to one consistent winner-row query at the parent grain.
+    # ------------------------------------------------------------------
+    s0 = sql.strip().rstrip(";").strip()
+    if not s0:
         return None
 
-    # ===== DETECTED: Malformed MAX/GROUP BY + ROW_NUMBER mixed =====
-    # Need to extract components and rebuild correctly
+    def _is_word_boundary(text: str, start: int, n: int) -> bool:
+        left_ok = (start == 0) or not (text[start - 1].isalnum() or text[start - 1] == "_")
+        end = start + n
+        right_ok = (end >= len(text)) or not (text[end].isalnum() or text[end] == "_")
+        return left_ok and right_ok
 
-    # 1. Extract outer query columns
-    outer_select_match = re.search(
-        r"select\s+(.*?)\s+from\s*\(",
-        sql,
-        re.IGNORECASE | re.DOTALL
-    )
-    if not outer_select_match:
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        w = kw.lower()
+        n = len(w)
+        depth = 0
+        in_sq = False
+        in_dq = False
+        in_bt = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq and not in_bt:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq and not in_bt:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if ch == "`" and not in_sq and not in_dq:
+                in_bt = not in_bt
+                i += 1
+                continue
+            if in_sq or in_dq or in_bt:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and i >= start and i + n <= len(text):
+                if text[i:i + n].lower() == w and _is_word_boundary(text, i, n):
+                    return i
+            i += 1
+        return -1
+
+    sel_pos = _find_top_level_kw(s0, "select", 0)
+    from_pos = _find_top_level_kw(s0, "from", max(0, sel_pos + 6))
+    group_pos = _find_top_level_kw(s0, "group by", max(0, from_pos + 4))
+    if sel_pos < 0 or from_pos < 0 or group_pos < 0:
         return None
 
-    outer_cols = outer_select_match.group(1).strip()
+    order_pos = _find_top_level_kw(s0, "order by", group_pos + 8)
+    limit_pos = _find_top_level_kw(s0, "limit", group_pos + 8)
+    tail_pos_candidates = [p for p in [order_pos, limit_pos] if p >= 0]
+    group_end = min(tail_pos_candidates) if tail_pos_candidates else len(s0)
 
-    # 2. Extract inner table name (for aliases)
-    from_table_match = re.search(
-        r"from\s+.*?\)\s*(?:as\s+)?(\w+)",
-        sql,
-        re.IGNORECASE
-    )
-    outer_alias = from_table_match.group(1) if from_table_match else "t"
+    select_part = s0[sel_pos + len("select"):from_pos].strip()
+    from_part = s0[from_pos + len("from"):group_pos].strip()
+    group_part = s0[group_pos + len("group by"):group_end].strip()
+    tail_part = s0[group_end:].strip() if group_end < len(s0) else ""
 
-    # 3. Extract the base table (FROM xxx before GROUP BY)
-    base_table_match = re.search(
-        r"from\s+(\w+)\s+(?:(?!group\s+by|row_number).)*?(?=group\s+by|row_number|\))",
-        sql,
-        re.IGNORECASE
-    )
-    if not base_table_match:
+    if not select_part or not from_part or not group_part:
         return None
-    base_table = base_table_match.group(1)
 
-    # 4. Extract PARTITION BY and ORDER BY from ROW_NUMBER
-    partition_match = re.search(
-        r"partition\s+by\s+([^)]+)",
-        sql,
-        re.IGNORECASE
+    select_items = _split_top_level_commas(select_part)
+    group_items = _split_top_level_commas(group_part)
+    if not select_items or not group_items:
+        return None
+
+    # Find exactly one MAX/MIN in outer SELECT.
+    agg_idx = -1
+    agg_kind = ""
+    agg_expr = ""
+
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m:
+            return item.strip(), None
+        return m.group(1).strip(), m.group(2).strip().strip("`'\"")
+
+    def _simple_col_name(expr: str) -> Optional[str]:
+        m = re.match(
+            r"""(?is)^\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$""",
+            (expr or "").strip(),
+        )
+        if not m:
+            return None
+        return m.group(1)
+
+    def _norm_expr(expr: str) -> str:
+        return re.sub(r"\s+", "", (expr or "").replace("`", "").lower())
+
+    for i, it in enumerate(select_items):
+        expr_i, _al_i = _split_expr_alias(it)
+        m_agg = re.match(r"(?is)^\s*(MAX|MIN)\s*\(\s*(.+?)\s*\)\s*$", expr_i)
+        if not m_agg:
+            continue
+        if agg_idx != -1:
+            return None
+        agg_idx = i
+        agg_kind = (m_agg.group(1) or "").upper()
+        agg_expr = (m_agg.group(2) or "").strip()
+
+    if agg_idx < 0 or not agg_expr or agg_kind not in {"MAX", "MIN"}:
+        return None
+
+    # Select a parent partition key from GROUP BY.
+    id_like = [g for g in group_items if re.search(r"(id|number|code)\b", g, flags=re.I)]
+    partition_expr = (id_like[0] if id_like else group_items[0]).strip()
+
+    # Rewrite derived join "(SELECT ... ROW_NUMBER ... ) alias ON ... alias.rn=1"
+    # into direct join to base table while preserving join key condition.
+    derived_pat = re.compile(
+        r"""(?is)
+        (?P<join_kw>\b(?:LEFT|INNER|RIGHT|FULL)?\s*JOIN)\s*
+        \(\s*SELECT\s+(?P<inner_select>[\s\S]*?)\s+FROM\s+
+        (?P<base_table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+        (?P<inner_rest>[\s\S]*?)\)\s*
+        (?:AS\s+)?(?P<d_alias>[A-Za-z_][A-Za-z0-9_]*)\s+
+        ON\s+(?P<on_clause>[\s\S]*?)
+        (?=(?:\b(?:LEFT|INNER|RIGHT|FULL)\s+JOIN\b|\bJOIN\b|$))
+        """,
+        flags=re.IGNORECASE | re.VERBOSE,
     )
-    partition_by = partition_match.group(1).strip() if partition_match else ""
 
-    order_match = re.search(
-        r"order\s+by\s+([^)]+?)(?:\)|desc|asc)",
-        sql,
-        re.IGNORECASE
+    d_match = None
+    inner_block = ""
+    for m in derived_pat.finditer(from_part):
+        d_alias = m.group("d_alias")
+        inner_block = (m.group("inner_select") or "") + " " + (m.group("inner_rest") or "")
+        on_clause = m.group("on_clause") or ""
+        if "row_number" not in inner_block.lower():
+            continue
+        if not re.search(rf"\b{re.escape(d_alias)}\.rn\s*=\s*1\b", on_clause, flags=re.I):
+            continue
+        d_match = m
+        break
+
+    if not d_match:
+        return None
+
+    join_kw = re.sub(r"\s+", " ", (d_match.group("join_kw") or "").strip())
+    base_table = (d_match.group("base_table") or "").strip()
+    d_alias = (d_match.group("d_alias") or "").strip()
+    on_clause = (d_match.group("on_clause") or "").strip()
+    if not join_kw or not base_table or not d_alias or not on_clause:
+        return None
+
+    conds = _split_top_level_and(on_clause)
+    if not conds:
+        return None
+
+    join_key_found = False
+    new_conds: List[str] = []
+    for cond in conds:
+        c = (cond or "").strip()
+        if not c:
+            continue
+        if re.search(rf"\b{re.escape(d_alias)}\.rn\s*=\s*1\b", c, flags=re.I):
+            continue
+
+        m_eq = re.match(r"(?is)^\s*(.+?)\s*=\s*(.+?)\s*$", c)
+        if m_eq:
+            lhs = (m_eq.group(1) or "").strip()
+            rhs = (m_eq.group(2) or "").strip()
+            lhs_is_d = bool(re.match(rf"(?is)^\s*`?{re.escape(d_alias)}`?\.", lhs))
+            rhs_is_d = bool(re.match(rf"(?is)^\s*`?{re.escape(d_alias)}`?\.", rhs))
+            if lhs_is_d ^ rhs_is_d:
+                d_side = lhs if lhs_is_d else rhs
+                other_side = rhs if lhs_is_d else lhs
+                d_col = re.match(
+                    rf"(?is)^\s*`?{re.escape(d_alias)}`?\.`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+                    d_side,
+                )
+                if d_col:
+                    join_key_found = True
+                    new_conds.append(f"{d_alias}.{d_col.group(1)} = {other_side}")
+                    continue
+
+        new_conds.append(c)
+
+    if not join_key_found:
+        return None
+
+    new_on = " AND ".join([c for c in new_conds if c.strip()])
+    if not new_on:
+        return None
+
+    new_join = f"{join_kw} {base_table} {d_alias} ON {new_on}"
+    new_from = from_part[:d_match.start()] + new_join + from_part[d_match.end():]
+    new_from = re.sub(r"\s{2,}", " ", new_from).strip()
+
+    # Build rewritten SELECT list and stable output names.
+    inner_items: List[str] = []
+    outer_items: List[str] = []
+    seen_names: Set[str] = set()
+    expr_to_out: Dict[str, str] = {}
+
+    metric_expr = agg_expr.strip()
+    metric_dir = "DESC" if agg_kind == "MAX" else "ASC"
+
+    date_expr = ""
+    id_tie_expr = ""
+
+    for i, it in enumerate(select_items):
+        expr_i, alias_i = _split_expr_alias(it)
+        use_expr = metric_expr if i == agg_idx else expr_i.strip()
+
+        out_name = alias_i or _simple_col_name(use_expr) or f"col_{i+1}"
+        out_name = re.sub(r"[^A-Za-z0-9_]", "_", out_name).strip("_") or f"col_{i+1}"
+        if re.match(r"^\d", out_name):
+            out_name = f"c_{out_name}"
+
+        base_name = out_name
+        suffix = 2
+        while out_name.lower() in seen_names:
+            out_name = f"{base_name}_{suffix}"
+            suffix += 1
+        seen_names.add(out_name.lower())
+
+        inner_items.append(f"{use_expr} AS {out_name}")
+        outer_items.append(f"t.{out_name}")
+        expr_to_out[_norm_expr(use_expr)] = out_name
+
+        if i != agg_idx:
+            use_low = use_expr.lower()
+            if not date_expr and any(k in use_low for k in ["date", "time", "timestamp"]):
+                date_expr = use_expr
+            if not id_tie_expr and re.search(r"(id|number|code)\b", use_low):
+                if _norm_expr(use_expr) != _norm_expr(partition_expr):
+                    id_tie_expr = use_expr
+
+    if not inner_items or not outer_items:
+        return None
+
+    # Prefer the ORDER BY sequence already present inside the derived ROW_NUMBER().
+    inner_order_parts: List[str] = []
+    m_inner_order = re.search(
+        r"""(?is)\bROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*PARTITION\s+BY\s+.*?\bORDER\s+BY\s+([^)]+)\)""",
+        inner_block or "",
     )
-    order_by = order_match.group(1).strip() if order_match else ""
+    if m_inner_order:
+        raw_inner_order = (m_inner_order.group(1) or "").strip()
+        for part in _split_top_level_commas(raw_inner_order):
+            p = (part or "").strip()
+            if not p:
+                continue
+            m_dir = re.match(r"(?is)^(.*?)\s+(ASC|DESC)\s*$", p)
+            if m_dir:
+                expr0 = (m_dir.group(1) or "").strip()
+                dir0 = (m_dir.group(2) or "").upper()
+            else:
+                expr0 = p
+                dir0 = "DESC"
+            if _simple_col_name(expr0) and "." not in expr0:
+                expr0 = f"{d_alias}.{expr0}"
+            inner_order_parts.append(f"{expr0} {dir0}")
 
-    # 5. Extract actual column names (remove MAX/MIN wrappers)
-    # Parse outer_cols to get real column names
-    select_cols = []
-    for col in re.split(r",\s*", outer_cols):
-        col = col.strip()
-        # Remove alias prefix (e.g., "p.customerNumber" -> "customerNumber")
-        col = re.sub(r"^\w+\.", "", col)
-        # Remove MAX/MIN wrapper
-        col = re.sub(r"^(max|min|sum|count|avg)\s*\(([^)]+)\)\s*(?:as\s+\w+)?$", r"\2", col, flags=re.IGNORECASE)
-        select_cols.append(col)
+    if inner_order_parts:
+        order_parts = inner_order_parts
+        if id_tie_expr:
+            present = any(_norm_expr(id_tie_expr) in _norm_expr(p) for p in inner_order_parts)
+            if not present:
+                order_parts.append(f"{id_tie_expr} ASC")
+    else:
+        # Fallback heuristic when inner order is unavailable.
+        order_parts = []
+        if date_expr:
+            order_parts.append(f"{date_expr} DESC")
+        order_parts.append(f"{metric_expr} {metric_dir}")
+        if id_tie_expr and _norm_expr(id_tie_expr) not in {_norm_expr(metric_expr), _norm_expr(date_expr)}:
+            order_parts.append(f"{id_tie_expr} ASC")
+    order_window = ", ".join(order_parts)
 
-    # 6. Build correct ROW_NUMBER query
-    inner_select = ", ".join(select_cols)
-    outer_select = ", ".join([f"{outer_alias}.{col.strip()}" for col in select_cols])
+    partition_out = expr_to_out.get(_norm_expr(partition_expr))
+    date_out = expr_to_out.get(_norm_expr(date_expr)) if date_expr else None
 
+    if date_out and partition_out:
+        outer_tail = f" ORDER BY t.{date_out} DESC, t.{partition_out} ASC"
+    elif tail_part:
+        tail_no_qual = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\.", "", tail_part)
+        outer_tail = " " + tail_no_qual.strip()
+    else:
+        outer_tail = ""
+
+    inner_sql = (
+        f"SELECT {', '.join(inner_items)}, "
+        f"ROW_NUMBER() OVER (PARTITION BY {partition_expr} ORDER BY {order_window}) AS rn "
+        f"FROM {new_from}"
+    )
     fixed_sql = (
-        f"SELECT {outer_select} "
-        f"FROM (SELECT {inner_select}, "
-        f"ROW_NUMBER() OVER (PARTITION BY {partition_by} ORDER BY {order_by}) AS rn "
-        f"FROM {base_table}) {outer_alias} "
-        f"WHERE {outer_alias}.rn = 1"
+        f"SELECT {', '.join(outer_items)} "
+        f"FROM ({inner_sql}) t "
+        f"WHERE t.rn = 1"
+        f"{outer_tail}"
     )
 
+    fixed_sql = re.sub(r"\s{2,}", " ", fixed_sql).strip()
+    if not fixed_sql.endswith(";"):
+        fixed_sql += ";"
     return fixed_sql
 
 
@@ -3536,6 +4064,167 @@ def _fix_inconsistent_subquery_alias(sql: str) -> Optional[str]:
     # print(f"[ALIAS FIX] Fixed inconsistent alias: {inconsistent_aliases} -> {correct_alias}")
 
     return fixed
+
+
+def _drop_redundant_top_groupby_after_rn_filter(sql: str) -> Optional[str]:
+    """
+    Drop top-level GROUP BY when query already filters to a single winner row via WHERE rn = N.
+
+    Pattern:
+      SELECT ... FROM (...) t WHERE t.rn = 1 GROUP BY ... [ORDER BY ...]
+
+    This GROUP BY is usually redundant and can distort semantics.
+    Conservative guards:
+    - requires ROW_NUMBER and top-level WHERE rn = N
+    - only applies when top-level SELECT has no aggregate functions
+    """
+    if not sql:
+        return None
+
+    s0 = sql.strip().rstrip(";").strip()
+    if not s0:
+        return None
+    s_up = s0.upper()
+
+    if "ROW_NUMBER" not in s_up or "GROUP BY" not in s_up or "WHERE" not in s_up:
+        return None
+    if not re.search(r"\bWHERE\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?rn\s*=\s*\d+\b", s0, flags=re.I):
+        return None
+
+    def _is_word_boundary(text: str, start: int, n: int) -> bool:
+        left_ok = (start == 0) or not (text[start - 1].isalnum() or text[start - 1] == "_")
+        end = start + n
+        right_ok = (end >= len(text)) or not (text[end].isalnum() or text[end] == "_")
+        return left_ok and right_ok
+
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        w = kw.lower()
+        n = len(w)
+        depth = 0
+        in_sq = False
+        in_dq = False
+        in_bt = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq and not in_bt:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq and not in_bt:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if ch == "`" and not in_sq and not in_dq:
+                in_bt = not in_bt
+                i += 1
+                continue
+            if in_sq or in_dq or in_bt:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and i >= start and i + n <= len(text):
+                if text[i:i + n].lower() == w and _is_word_boundary(text, i, n):
+                    return i
+            i += 1
+        return -1
+
+    sel_pos = _find_top_level_kw(s0, "select", 0)
+    from_pos = _find_top_level_kw(s0, "from", max(0, sel_pos + 6))
+    group_pos = _find_top_level_kw(s0, "group by", max(0, from_pos + 4))
+    if sel_pos < 0 or from_pos < 0 or group_pos < 0:
+        return None
+
+    select_part = s0[sel_pos + len("select"):from_pos].strip()
+    if re.search(r"\b(MAX|MIN|SUM|AVG|COUNT)\s*\(", select_part, flags=re.I):
+        return None
+
+    order_pos = _find_top_level_kw(s0, "order by", group_pos + 8)
+    limit_pos = _find_top_level_kw(s0, "limit", group_pos + 8)
+    tail_candidates = [p for p in [order_pos, limit_pos] if p >= 0]
+    group_end = min(tail_candidates) if tail_candidates else len(s0)
+
+    out = (s0[:group_pos].rstrip() + " " + s0[group_end:].lstrip()).strip()
+    out = re.sub(r"\s{2,}", " ", out)
+    if not out:
+        return None
+    if not out.endswith(";"):
+        out += ";"
+
+    return out if out != sql else None
+
+
+def _preexecute_sql_safety_pass(sql: str, question: str = "") -> str:
+    """
+    Final defensive safety pass before execution.
+    Applies conservative rewrites for high-risk anti-patterns and repeats until stable.
+    """
+    if not sql:
+        return sql
+
+    s = sql.strip()
+    if not s:
+        return sql
+    if not s.endswith(";"):
+        s += ";"
+
+    for _ in range(3):
+        prev = s
+
+        s = _drop_aggregate_or_window_items_from_group_by(s)
+
+        fixed = _fix_mixed_max_groupby_rownumber(s)
+        if fixed:
+            s = fixed
+
+        fixed = _fix_redundant_groupby_with_rn_filter(s)
+        if fixed:
+            s = fixed
+
+        fixed = _drop_redundant_top_groupby_after_rn_filter(s)
+        if fixed:
+            s = fixed
+
+        fixed = _fix_inconsistent_subquery_alias(s)
+        if fixed:
+            s = fixed
+
+        # Winner-row fallback: force rewrite if query still looks like MAX-date misuse.
+        # IMPORTANT: skip for "latest year + aggregate amount" intent, where MAX(date)
+        # is legitimately combined with SUM(amount) under year-scoped grouping.
+        latest_year_agg_intent = _question_wants_latest_year_scope_with_aggregate(question)
+        if _question_wants_winner_row(question) and not latest_year_agg_intent:
+            looks_like_agg_winner = bool(
+                re.search(r"\bGROUP\s+BY\b", s, flags=re.I)
+                and re.search(r"\b(MAX|MIN)\s*\(", s, flags=re.I)
+                and not re.search(r"\bROW_NUMBER\s*\(", s, flags=re.I)
+            )
+            if looks_like_agg_winner or _looks_like_max_date_tiebreaker(s):
+                forced = _rewrite_winner_row_guardrail(s, question, force=True)
+                if forced and not (
+                    "GROUP BY" in forced.upper() and "ROW_NUMBER" in forced.upper()
+                ):
+                    s = forced
+
+        s = _drop_aggregate_or_window_items_from_group_by(s)
+
+        if s == prev:
+            break
+
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    if s and not s.endswith(";"):
+        s += ";"
+    return s
 
 
 def _split_top_level_commas(expr: str) -> List[str]:
@@ -5021,7 +5710,27 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
     if where_clause:
         # Preserve original boolean precedence (especially OR chains).
         existing_pred = re.sub(r"^\s*WHERE\s+", "", where_clause, flags=re.I).strip()
-        where_clause = f"WHERE ({existing_pred}) AND {year_cond}"
+        # Remove stale correlated MAX(date) predicate when present.
+        # Keeping it would incorrectly reduce SUM(amount) to only max-date rows.
+        if existing_pred and not _has_top_level_or(existing_pred):
+            kept_predicates: List[str] = []
+            for cond in _split_top_level_and(existing_pred):
+                c0 = (cond or "").strip()
+                low_c0 = c0.lower()
+                is_correlated_max_date = bool(
+                    re.search(r"\b(?:in|=)\s*\(\s*select\s+max\s*\(", low_c0)
+                    and "year(" in low_c0
+                    and date_col_name.lower() in low_c0
+                )
+                if is_correlated_max_date:
+                    continue
+                kept_predicates.append(c0)
+            existing_pred = " AND ".join(p for p in kept_predicates if p)
+
+        if existing_pred:
+            where_clause = f"WHERE ({existing_pred}) AND {year_cond}"
+        else:
+            where_clause = f"WHERE {year_cond}"
     else:
         where_clause = f"WHERE {year_cond}"
 

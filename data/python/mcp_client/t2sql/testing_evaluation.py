@@ -37,6 +37,7 @@ from .config import MCP_BASE, CHROMA_DIR, COLLECTION_NAME, JSON_INPUT, OLLAMA_UR
 from .state import make_state
 from .graph import build_app
 from .mcp_execution import query_db_full, _mcp_call  # Pakai FULL query tanpa LIMIT dan _mcp_call helper
+from .helpers_core import _preexecute_sql_safety_pass
 from .utils import resolve_jsonl_paths
 
 def load_testset(yaml_path: str) -> list[dict]:
@@ -612,6 +613,9 @@ async def run_single_case(
         # Remove notes if present
         if "\n\n-- notes:" in predicted_sql:
             predicted_sql = predicted_sql.split("\n\n-- notes:")[0].strip()
+
+        # Final safety hardening before VA/EX execution.
+        predicted_sql = _preexecute_sql_safety_pass(predicted_sql, question)
         
         result["predicted_sql"] = predicted_sql
         

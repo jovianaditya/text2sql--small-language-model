@@ -19,15 +19,18 @@ from .state import make_state
 from .graph import build_app
 from .chroma_embedding import build_vector_store
 from .mcp_execution import query_db
+from .helpers_core import _preexecute_sql_safety_pass
 from .utils import _now, _log_total, _print_banner, display_table_from_json
 
 async def _exec_via_mcp(
     mcp: Client,
     sql_block: str,
     final_sql: str | None = None,
+    question: str = "",
 ):
     sql_only = (sql_block or "").split("\n\n-- notes:")[0].strip()
     sql_clean = (final_sql or sql_only).rstrip(";").strip()
+    sql_clean = _preexecute_sql_safety_pass(sql_clean, question).rstrip(";").strip()
 
     print("\n[SQL EXEC] Final query sent to MCP:")
     print(sql_clean + ";")
@@ -66,7 +69,12 @@ async def repl(paths):
         init_state = make_state(paths, first_q)
         state = app.invoke(init_state)
 
-        await _exec_via_mcp(mcp, state.get("answer", ""), state.get("final_sql"))
+        await _exec_via_mcp(
+            mcp,
+            state.get("answer", ""),
+            state.get("final_sql"),
+            first_q,
+        )
 
         _log_total("End-to-end total time (first run)", t0_total)
 
@@ -89,7 +97,12 @@ async def repl(paths):
             s2 = make_state(paths, q)
             out = app.invoke(s2)
 
-            await _exec_via_mcp(mcp, out.get("answer", ""), out.get("final_sql"))
+            await _exec_via_mcp(
+                mcp,
+                out.get("answer", ""),
+                out.get("final_sql"),
+                q,
+            )
 
             _log_total("End-to-end total time (this question)", t0_total)
 

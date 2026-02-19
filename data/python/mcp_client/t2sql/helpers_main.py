@@ -55,6 +55,7 @@ from .helpers_core import (
     _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _fix_redundant_groupby_with_rn_filter, _fix_inconsistent_subquery_alias, _looks_like_max_date_tiebreaker,
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
+    _preexecute_sql_safety_pass,
     _rewrite_winner_row_aggregate_misuse, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
@@ -1511,6 +1512,65 @@ def _build_dynamic_join_context(
     return "\n".join(lines)
 
 
+def _order_tables_by_fk_distance(primary_table: str, tables: List[str]) -> List[str]:
+    """
+    Order tables by shortest FK-graph distance from primary_table.
+    Falls back to original order when FK metadata is unavailable.
+    """
+    if not primary_table or not tables:
+        return tables
+
+    primary = (primary_table or "").strip().lower()
+    table_list = [t for t in tables if t]
+    if not table_list:
+        return table_list
+
+    try:
+        schema_fk = get_fk_relationships() or {}
+    except Exception:
+        return table_list
+
+    # Build undirected adjacency from FK metadata: source -> target and target -> source.
+    graph: Dict[str, Set[str]] = defaultdict(set)
+    for source_table, fk_map in schema_fk.items():
+        src = (source_table or "").strip().lower()
+        if not src:
+            continue
+        for _fk_col, target_table in (fk_map or {}).items():
+            tgt = (target_table or "").strip().lower()
+            if not tgt:
+                continue
+            graph[src].add(tgt)
+            graph[tgt].add(src)
+
+    if primary not in graph:
+        return table_list
+
+    # BFS shortest distance from primary.
+    distances: Dict[str, int] = {primary: 0}
+    queue: List[str] = [primary]
+    q_idx = 0
+    while q_idx < len(queue):
+        cur = queue[q_idx]
+        q_idx += 1
+        cur_dist = distances[cur]
+        for nxt in graph.get(cur, set()):
+            if nxt in distances:
+                continue
+            distances[nxt] = cur_dist + 1
+            queue.append(nxt)
+
+    original_idx = {t.lower(): i for i, t in enumerate(table_list)}
+    sorted_tables = sorted(
+        table_list,
+        key=lambda t: (
+            distances.get((t or "").strip().lower(), 10**9),
+            original_idx.get((t or "").strip().lower(), 10**9),
+        ),
+    )
+    return sorted_tables
+
+
 def _find_tables_with_implicit_columns(
     question: str,
     ranked_cols: list,
@@ -1997,6 +2057,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         if primary_table:
             other_tables = state.get("router_tables", [])
             other_tables = [t for t in other_tables if t != primary_table]
+            other_tables = _order_tables_by_fk_distance(primary_table, other_tables)
             requires_inner_join = _question_requires_inner_join(question, ctx)
             exclusion_tables = {t for t in other_tables if _question_targets_table_exclusion(question, t)}
             existence_tables = {t for t in other_tables if _question_targets_table_existence(question, t)}
@@ -2951,6 +3012,13 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     # Previously standardized table aliases to match _ALIAS_OVERRIDES.
     # Now we let the LLM decide its own aliases without hardcoded overrides.
+
+    # ---------------------------------------------------------------------------
+    # Phase 9 — Pre-Execution Safety Pass (Final Guardrail)
+    # Catch and repair remaining high-risk anti-patterns before execution.
+    # ---------------------------------------------------------------------------
+    s = _preexecute_sql_safety_pass(s, question)
+    if DEBUG_WR: print("[PH9] after pre-exec safety:", s)
 
     # ---------------------------------------------------------------------------
     # Final Polish
