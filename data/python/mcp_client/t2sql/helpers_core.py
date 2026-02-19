@@ -9,7 +9,7 @@
 # ====================== STANDARD LIBRARY IMPORT =======================
 # ======================================================================
 import re
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
@@ -18,6 +18,7 @@ from .schema_analyzer import (
     get_id_column,
     get_all_tables,
     get_transaction_tables,
+    get_fk_relationships,
     get_schema_analyzer,
     get_table_synonyms,
     get_singular_form,
@@ -302,6 +303,7 @@ def has_join(sql: str) -> bool:
 # - strip_string_literals
 # - drop_redundant_inner_join_same_key
 # - prune_ornamental_joins_safe
+# - rewrite_invalid_fk_join_conditions
 
 def join_count(sql: str) -> int:
     if not sql:
@@ -421,6 +423,36 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
         has_multi_entity_mentions = len(mentioned_entity_roots) >= 2
         if has_existence_object or has_multi_entity_mentions:
             return True
+
+    # Aggregate comparison across related entities implies filtering intent.
+    # Example: "offices where average credit limit of customers assigned to employees
+    # in that office is higher than overall average ..."
+    mentioned_entity_roots: Set[str] = set()
+    for ent in entity_terms:
+        e = (ent or "").lower().strip()
+        if not e:
+            continue
+        if re.search(rf"\b{re.escape(e)}\b", q, flags=re.I):
+            mentioned_entity_roots.add(_to_singular(e))
+
+    has_multi_entity_mentions = len(mentioned_entity_roots) >= 2
+    has_aggregate_intent = re.search(
+        r"\b(?:avg|average|mean|sum|total|count|min|max)\b",
+        q,
+        flags=re.I,
+    ) is not None
+    has_comparison_intent = re.search(
+        r"\b(?:higher|greater|more|above|over|lower|less|below|under)\s+than\b|[<>]=?",
+        q,
+        flags=re.I,
+    ) is not None
+    has_relation_intent = re.search(
+        r"\b(?:of|from|assigned\s+to|linked\s+to|related\s+to|belongs?\s+to)\b",
+        q,
+        flags=re.I,
+    ) is not None
+    if has_multi_entity_mentions and has_aggregate_intent and has_comparison_intent and has_relation_intent:
+        return True
 
     if not re.search(r"\bonly\b", q):
         return False
@@ -1218,6 +1250,207 @@ def _remove_redundant_and_ornamental_joins(sql: str) -> str:
                             continue
             # Jika bukan equi-join, hapus JOIN saja
             out = out[:m.start("full")] + " " + out[m.end("full"):] 
+    return out
+
+
+def _rewrite_invalid_fk_join_conditions(sql: str, ctx: str = "") -> str:
+    """
+    Repair invalid ON-equijoin predicates using schema FK metadata.
+
+    Conservative behavior:
+    - only considers direct table-to-table joins (skips JOIN (...subquery...))
+    - only rewrites simple qualified equi-predicates (a.col = b.col)
+    - rewrites only when there is exactly one FK relationship between the two
+      joined tables and the current predicate is a near-miss (shares at least
+      one expected FK/id column).
+    """
+    if not sql or not has_join(sql):
+        return sql
+    if re.search(r"\b(?:from|join)\s*\(", sql, flags=re.I):
+        return sql
+
+    try:
+        fk_map_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_map_raw = {}
+    if not fk_map_raw:
+        return sql
+
+    fk_map: Dict[str, Dict[str, str]] = {}
+    for src, mapping in fk_map_raw.items():
+        src_l = str(src or "").lower()
+        if not src_l:
+            continue
+        fk_map[src_l] = {}
+        for fk_col, tgt in (mapping or {}).items():
+            fk_col_l = str(fk_col or "").lower()
+            tgt_l = str(tgt or "").lower()
+            if fk_col_l and tgt_l:
+                fk_map[src_l][fk_col_l] = tgt_l
+
+    alias_to_table = _parse_from_join_aliases(sql)
+    table_token_pat = re.compile(
+        r"\b(?:from|join)\s+"
+        r"(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)"
+        r"(?:\s+(?:as\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?",
+        flags=re.I,
+    )
+    for m_tbl in table_token_pat.finditer(sql):
+        raw = (m_tbl.group("table") or "").replace("`", "")
+        tbl = raw.split(".")[-1].lower()
+        if not tbl:
+            continue
+        alias = m_tbl.group("alias")
+        alias_to_table.setdefault(tbl, tbl)
+        if alias:
+            alias_to_table.setdefault(alias, tbl)
+            alias_to_table.setdefault(alias.lower(), tbl)
+
+    if not alias_to_table:
+        return sql
+
+    def _get_table(alias_or_table: str) -> str:
+        key = (alias_or_table or "").strip()
+        return (alias_to_table.get(key) or alias_to_table.get(key.lower()) or key).lower()
+
+    def _target_join_col(target_table: str, fk_col: str) -> str:
+        id_col = get_id_column(target_table)
+        if id_col:
+            return str(id_col)
+        return fk_col
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+    table_cols_cache: Dict[str, Set[str]] = {}
+
+    def _table_cols(table_name: str) -> Set[str]:
+        t = (table_name or "").lower().strip()
+        if not t:
+            return set()
+        if t in table_cols_cache:
+            return table_cols_cache[t]
+        cols: Set[str] = set()
+        if analyzer is not None:
+            try:
+                cols.update(c.lower() for c in analyzer.get_table_columns(t))
+            except Exception:
+                pass
+        table_cols_cache[t] = cols
+        return cols
+
+    def _fk_pairs_between(left_table: str, right_table: str) -> List[Tuple[str, str, str, str]]:
+        pairs: List[Tuple[str, str, str, str]] = []
+        lt = (left_table or "").lower()
+        rt = (right_table or "").lower()
+        if not lt or not rt or lt == rt:
+            return pairs
+
+        for fk_col, tgt in fk_map.get(lt, {}).items():
+            if tgt == rt:
+                pairs.append((lt, fk_col, rt, _target_join_col(rt, fk_col)))
+        for fk_col, tgt in fk_map.get(rt, {}).items():
+            if tgt == lt:
+                pairs.append((rt, fk_col, lt, _target_join_col(lt, fk_col)))
+        return pairs
+
+    join_pat = re.compile(
+        r"""
+        (?P<full>
+            \s+
+            (?P<jtype>(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN))
+            \s+
+            (?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+            (?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?
+            \s+\bON\b\s+(?P<on>.*?)
+        )
+        (?=
+            \b(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN)\b
+            |\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b
+            |;|$
+        )
+        """,
+        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    )
+    eq_pat = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+        flags=re.I,
+    )
+
+    out = sql
+    matches = list(join_pat.finditer(out))
+    for m_join in reversed(matches):
+        on_txt = m_join.group("on") or ""
+        eq_matches = list(eq_pat.finditer(on_txt))
+        if not eq_matches:
+            continue
+
+        rebuilt = []
+        last = 0
+        changed = False
+
+        for m_eq in eq_matches:
+            rebuilt.append(on_txt[last:m_eq.start()])
+            lhs_alias, lhs_col = m_eq.group(1), m_eq.group(2)
+            rhs_alias, rhs_col = m_eq.group(3), m_eq.group(4)
+
+            lt = _get_table(lhs_alias)
+            rt = _get_table(rhs_alias)
+            pairs = _fk_pairs_between(lt, rt)
+            new_eq = m_eq.group(0)
+
+            if len(pairs) == 1:
+                fk_tbl, fk_col, tgt_tbl, tgt_col = pairs[0]
+                lhs_col_l = lhs_col.lower()
+                rhs_col_l = rhs_col.lower()
+                fk_col_l = fk_col.lower()
+                tgt_col_l = str(tgt_col).lower()
+
+                valid = (
+                    (lt == fk_tbl and rt == tgt_tbl and lhs_col_l == fk_col_l and rhs_col_l == tgt_col_l)
+                    or (rt == fk_tbl and lt == tgt_tbl and rhs_col_l == fk_col_l and lhs_col_l == tgt_col_l)
+                )
+
+                if not valid:
+                    near_miss = ({lhs_col_l, rhs_col_l} & {fk_col_l, tgt_col_l})
+                    left_cols = _table_cols(lt)
+                    right_cols = _table_cols(rt)
+                    lhs_missing = bool(left_cols) and (lhs_col_l not in left_cols)
+                    rhs_missing = bool(right_cols) and (rhs_col_l not in right_cols)
+                    invalid_column_side = lhs_missing or rhs_missing
+
+                    if near_miss or invalid_column_side:
+                        # Preserve original column casing when one side already
+                        # uses the intended FK or target key.
+                        fk_col_out = fk_col
+                        tgt_col_out = str(tgt_col)
+                        if lhs_col_l == fk_col_l:
+                            fk_col_out = lhs_col
+                        elif rhs_col_l == fk_col_l:
+                            fk_col_out = rhs_col
+                        if lhs_col_l == tgt_col_l:
+                            tgt_col_out = lhs_col
+                        elif rhs_col_l == tgt_col_l:
+                            tgt_col_out = rhs_col
+
+                        if lt == fk_tbl and rt == tgt_tbl:
+                            new_eq = f"{lhs_alias}.{fk_col_out} = {rhs_alias}.{tgt_col_out}"
+                            changed = True
+                        elif lt == tgt_tbl and rt == fk_tbl:
+                            new_eq = f"{lhs_alias}.{tgt_col_out} = {rhs_alias}.{fk_col_out}"
+                            changed = True
+
+            rebuilt.append(new_eq)
+            last = m_eq.end()
+
+        if not changed:
+            continue
+
+        rebuilt.append(on_txt[last:])
+        new_on = "".join(rebuilt)
+        out = out[:m_join.start("on")] + new_on + out[m_join.end("on"):]
+
     return out
 # =======================================================================
 # ================= Phase 2 — Syntax & Canonicalization =================
@@ -4314,6 +4547,209 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str) -> str:
     ).where(exp.EQ(this=exp.column("rn", table="t"), expression=exp.Literal.number(1)))
 
     return outer.sql(dialect="mysql")
+
+
+def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Fix SUM/AVG on non-metric columns (e.g., code/number/date/name) when
+    question intent is metric total/average.
+
+    Dynamic behavior:
+    - resolve source table from SQL alias map
+    - pick replacement metric column from same table using schema anchors
+      + lexical metric signals
+    """
+    if not sql or not question:
+        return sql
+
+    q = question.lower()
+    has_metric_intent = bool(
+        re.search(
+            r"\b(total|sum|average|avg|amount|paid|payment|quantity|qty|price|cost|sales|revenue|msrp|value)\b",
+            q,
+        )
+    )
+    if not has_metric_intent:
+        return sql
+
+    m = re.match(r"(?is)^\s*select\s+(?P<select>.*?)\s+from\s+(?P<after>.*)$", sql.strip())
+    if not m:
+        return sql
+
+    select_part = (m.group("select") or "").strip()
+    after_part = (m.group("after") or "").strip()
+    if not select_part or not after_part:
+        return sql
+
+    m_from = re.match(
+        r"(?is)^(?P<from_core>.*?)(?P<tail>\s+(?:where|group\s+by|having|order\s+by|limit)\b.*|;?\s*)$",
+        after_part,
+    )
+    from_core = (m_from.group("from_core") or "").strip() if m_from else after_part.rstrip(";").strip()
+    if not from_core:
+        return sql
+
+    alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    if not alias_to_table:
+        m_base = re.match(r"(?is)^`?([A-Za-z_][A-Za-z0-9_]*)`?", from_core)
+        if m_base:
+            t = m_base.group(1)
+            alias_to_table = {t: t, t.lower(): t}
+    if not alias_to_table:
+        return sql
+
+    table_universe = {str(t).lower() for t in alias_to_table.values() if t}
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        return sql
+    metric_tokens = {"amount", "price", "cost", "qty", "quantity", "revenue", "sales", "msrp", "value", "total"}
+    id_like_tokens = {"id", "code", "number", "name", "date", "status", "email", "phone", "address", "city", "country", "zip", "postal", "check"}
+
+    prefer_amount = bool(re.search(r"\b(amount|paid|payment)\b", q))
+    prefer_quantity = bool(re.search(r"\b(quantity|qty)\b", q))
+    prefer_price = bool(re.search(r"\b(price|cost|msrp)\b", q))
+    prefer_sales = bool(re.search(r"\b(sales|revenue)\b", q))
+    strong_metric_intent = prefer_amount or prefer_quantity or prefer_price or prefer_sales
+
+    def _clean_ident(s: str) -> str:
+        return (s or "").replace("`", "").strip().lower()
+
+    def _is_metric_like(col_l: str) -> bool:
+        return any(tok in col_l for tok in metric_tokens)
+
+    def _is_id_like(col_l: str) -> bool:
+        return any(tok in col_l for tok in id_like_tokens)
+
+    def _pick_metric_col(table_l: str, current_col_l: str) -> Optional[str]:
+        try:
+            cols = [c.lower() for c in analyzer.get_table_columns(table_l)]
+        except Exception:
+            cols = []
+        if not cols:
+            return None
+
+        try:
+            anchor_cols = {c.lower() for c in analyzer.get_anchor_columns(table_l)}
+        except Exception:
+            anchor_cols = set()
+
+        candidates = [c for c in cols if c != current_col_l and (_is_metric_like(c) or c in anchor_cols)]
+        if not candidates:
+            return None
+
+        def _score(c: str) -> int:
+            score = 0
+            if c in anchor_cols:
+                score += 20
+            if _is_metric_like(c):
+                score += 8
+            if prefer_amount and "amount" in c:
+                score += 12
+            if prefer_quantity and ("quantity" in c or "qty" in c):
+                score += 12
+            if prefer_price and any(x in c for x in ["price", "cost", "msrp"]):
+                score += 12
+            if prefer_sales and any(x in c for x in ["sales", "revenue"]):
+                score += 12
+            if _is_id_like(c):
+                score -= 8
+            return score
+
+        best = max(candidates, key=_score)
+        return best if _score(best) >= 8 else None
+
+    agg_pat = re.compile(
+        r"""(?is)\b(?P<func>SUM|AVG)\s*\(\s*(?P<distinct>DISTINCT\s+)?(?:(?P<q>`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\.\s*)?(?P<c>`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)"""
+    )
+    bool_agg_pat = re.compile(
+        r"""(?is)\b(?P<func>SUM|AVG)\s*\(\s*(?:(?P<q>`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\.\s*)?(?P<c>`?[A-Za-z_][A-Za-z0-9_]*`?)\s+IS\s+NOT\s+NULL\s*\)"""
+    )
+
+    changed = False
+
+    def _rewrite_item(item: str) -> str:
+        nonlocal changed
+
+        def _repl(m_agg: re.Match) -> str:
+            nonlocal changed
+            func = (m_agg.group("func") or "").upper()
+            distinct_kw = m_agg.group("distinct") or ""
+            qual_raw = m_agg.group("q")
+            col_raw = m_agg.group("c") or ""
+
+            col_l = _clean_ident(col_raw)
+            if _is_metric_like(col_l) or not _is_id_like(col_l):
+                return m_agg.group(0)
+
+            table_l = None
+            if qual_raw:
+                q_clean = _clean_ident(qual_raw)
+                table_l = _clean_ident(alias_to_table.get(qual_raw) or alias_to_table.get(q_clean) or "")
+            elif len(table_universe) == 1:
+                table_l = next(iter(table_universe))
+
+            if not table_l:
+                return m_agg.group(0)
+
+            replacement = _pick_metric_col(table_l, col_l)
+            if not replacement:
+                return m_agg.group(0)
+
+            changed = True
+            if qual_raw:
+                return f"{func}({distinct_kw}{qual_raw}.{replacement})"
+            return f"{func}({distinct_kw}{replacement})"
+
+        item2 = agg_pat.sub(_repl, item)
+
+        # Handle anti-pattern like SUM(pay.paymentDate IS NOT NULL) when metric intent
+        # clearly asks for amount/quantity/price/revenue style totals.
+        if strong_metric_intent:
+            def _repl_bool(m_bool: re.Match) -> str:
+                nonlocal changed
+                func = (m_bool.group("func") or "").upper()
+                qual_raw = m_bool.group("q")
+                col_raw = m_bool.group("c") or ""
+                col_l = _clean_ident(col_raw)
+
+                table_l = None
+                if qual_raw:
+                    q_clean = _clean_ident(qual_raw)
+                    table_l = _clean_ident(alias_to_table.get(qual_raw) or alias_to_table.get(q_clean) or "")
+                elif len(table_universe) == 1:
+                    table_l = next(iter(table_universe))
+
+                if not table_l:
+                    return m_bool.group(0)
+
+                replacement = _pick_metric_col(table_l, col_l)
+                if not replacement:
+                    return m_bool.group(0)
+
+                changed = True
+                if qual_raw:
+                    return f"{func}({qual_raw}.{replacement})"
+                return f"{func}({replacement})"
+
+            item2 = bool_agg_pat.sub(_repl_bool, item2)
+
+        return item2
+
+    select_items = _split_top_level_commas(select_part)
+    rebuilt_items = [_rewrite_item(it) for it in select_items]
+    if not changed:
+        return sql
+
+    new_select = ", ".join(rebuilt_items)
+    return re.sub(
+        r"(?is)^\s*select\s+.*?\s+from\s+",
+        f"SELECT {new_select} FROM ",
+        sql.strip(),
+        count=1,
+    )
+
 
 def _question_wants_latest_year_scope_with_aggregate(question: str) -> bool:
     """

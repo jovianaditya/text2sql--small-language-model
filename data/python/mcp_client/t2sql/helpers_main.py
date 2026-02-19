@@ -43,7 +43,7 @@ from .helpers_core import (
     _move_rhs_filter_from_where_to_on,  # Only triggers for "ALL entities" questions
     _rewrite_left_join_to_inner_if_not_needed, _rewrite_left_join_to_inner_if_rhs_filtered,
     _rewrite_inner_join_filter_to_exists, _rewrite_inner_join_existence_to_exists,
-    _remove_redundant_and_ornamental_joins, has_non_inner_join, join_count,
+    _remove_redundant_and_ornamental_joins, _rewrite_invalid_fk_join_conditions, has_non_inner_join, join_count,
     # phase 2
     _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns,
     # phase 3
@@ -58,6 +58,7 @@ from .helpers_core import (
     _rewrite_winner_row_aggregate_misuse, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
+    _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
     _drop_unrequested_exists_filters,
     _question_wants_latest_year_scope_with_aggregate,
@@ -723,6 +724,97 @@ def _table_mentioned(q_text: str, table: str, include_synonyms: bool = True) -> 
         if re.search(rf"\b{pattern}\b", q):
             return True
     return False
+
+
+def _question_targets_table_exclusion(question: str, table: str) -> bool:
+    """
+    Detect when a question expresses exclusion/absence intent for a specific table.
+    Examples:
+    - "with no orders"
+    - "without any payments"
+    - "have never placed orders"
+    """
+    q = (question or "").lower()
+    if not q:
+        return False
+
+    candidates = _table_mention_candidates(table, include_synonyms=True)
+    if not candidates:
+        return False
+
+    entity_alt = "|".join(
+        sorted((re.escape(c).replace(r"\ ", r"\s+") for c in candidates), key=len, reverse=True)
+    )
+
+    # Negation followed by entity mention.
+    if re.search(
+        rf"\b(?:no|without(?:\s+any)?|never|not)\b(?:[\s,;:()'\"-]+\w+){{0,10}}[\s,;:()'\"-]+(?:{entity_alt})\b",
+        q,
+        flags=re.I,
+    ):
+        return True
+
+    # Narrow reverse form to avoid cross-entity false positives like:
+    # "payment ... never ... orders" (where "never" targets orders, not payments).
+    if re.search(
+        rf"\b(?:{entity_alt})\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+\b(?:with\s+no|without(?:\s+any)?)\b",
+        q,
+        flags=re.I,
+    ):
+        return True
+
+    return False
+
+
+def _question_targets_table_existence(question: str, table: str) -> bool:
+    """
+    Detect explicit existence intent for a specific table/entity:
+    - "at least one payment"
+    - "with payments"
+    - "have made payments"
+    """
+    q = (question or "").lower()
+    if not q:
+        return False
+
+    # Exclusion intent wins for this table (e.g., "never orders").
+    if _question_targets_table_exclusion(q, table):
+        return False
+
+    candidates = _table_mention_candidates(table, include_synonyms=True)
+    if not candidates:
+        return False
+
+    entity_alt = "|".join(
+        sorted((re.escape(c).replace(r"\ ", r"\s+") for c in candidates), key=len, reverse=True)
+    )
+
+    # Quantified existence: "at least one <entity>"
+    if re.search(
+        rf"\b(?:at\s+least\s+one|one\s+or\s+more|any)\b(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b",
+        q,
+        flags=re.I,
+    ):
+        return True
+
+    # Connector pattern: "with/having <entity>"
+    if re.search(
+        rf"\b(?:with|having)\b(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+(?:{entity_alt})\b",
+        q,
+        flags=re.I,
+    ):
+        return True
+
+    # Verb-based existence mention.
+    if re.search(
+        rf"\b(?:have|has|had|made|placed|paid|ordered|purchased|bought)\b(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b",
+        q,
+        flags=re.I,
+    ):
+        return True
+
+    return False
+
 
 def _is_productline_lookup(question: str) -> bool:
     """
@@ -1905,14 +1997,24 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         if primary_table:
             other_tables = state.get("router_tables", [])
             other_tables = [t for t in other_tables if t != primary_table]
-            other_tables_str = ", ".join(other_tables) if other_tables else "none"
             requires_inner_join = _question_requires_inner_join(question, ctx)
-            join_keyword = "INNER JOIN" if requires_inner_join else "LEFT JOIN"
+            exclusion_tables = {t for t in other_tables if _question_targets_table_exclusion(question, t)}
+            existence_tables = {t for t in other_tables if _question_targets_table_existence(question, t)}
 
             # More explicit guidance - tell LLM exactly which table should be first
             hint_msg = f"TABLE ORDER (CRITICAL): Start your query with FROM {primary_table}"
-            if other_tables_str != "none":
-                hint_msg += f", then {join_keyword} {other_tables_str}"
+            if other_tables:
+                join_steps = []
+                for t in other_tables:
+                    if t in exclusion_tables:
+                        join_steps.append(f"LEFT JOIN {t}")
+                    elif t in existence_tables:
+                        join_steps.append(f"INNER JOIN {t}")
+                    elif requires_inner_join:
+                        join_steps.append(f"INNER JOIN {t}")
+                    else:
+                        join_steps.append(f"LEFT JOIN {t}")
+                hint_msg += ", then " + ", ".join(join_steps)
             if primary_reason:
                 hint_msg += f". Reason: {primary_reason}"
             hint_msg += f". Follow this exact table order."
@@ -1921,7 +2023,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             constraints.append(hint_msg)
 
             # JOIN TYPE GUIDANCE (CRITICAL)
-            if requires_inner_join:
+            if exclusion_tables and (requires_inner_join or existence_tables):
+                constraints.append(
+                    "JOIN TYPE (CRITICAL): Mixed intent detected. "
+                    "Use INNER JOIN for required-existence tables, and LEFT JOIN + IS NULL/NOT EXISTS for exclusion tables (e.g., 'no/never/without')."
+                )
+            elif requires_inner_join or existence_tables:
                 # Filtering pattern: use INNER JOIN to exclude non-matching rows
                 constraints.append(
                     "JOIN TYPE (CRITICAL): This query has explicit filtering intent (e.g., 'only ... that have/with ...'). "
@@ -2249,6 +2356,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Otherwise: convert LEFT JOIN to INNER if RHS is filtered
     s = _rewrite_left_join_to_inner_if_not_needed(s, question, ctx)
     s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question, ctx)
+    s = _rewrite_invalid_fk_join_conditions(s, ctx)
     s = _rewrite_inner_join_filter_to_exists(s)
     s = _rewrite_inner_join_existence_to_exists(s, question, ctx)
     s = _remove_redundant_and_ornamental_joins(s)
@@ -2581,6 +2689,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _rewrite_winner_row_aggregate_misuse(s, question)
         if DEBUG_WR: print("[PH4] after agg-misuse:", s)
+
+        s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
+        if DEBUG_WR: print("[PH4] after metric-agg-column fix:", s)
 
         s = _rewrite_latest_year_same_year_aggregate(s, question, ctx)
         if DEBUG_WR: print("[PH4] after latest-year-sum fix:", s)

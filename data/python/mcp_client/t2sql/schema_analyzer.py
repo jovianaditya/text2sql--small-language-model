@@ -1,28 +1,24 @@
-"""
-Dynamic Schema Analyzer - Extracts schema metadata from JSONL for agnostic Text-to-SQL.
+# ======================================================================
+# ========================= schema_analyzer.py =========================
+# ======================================================================
+# Dynamic Schema Analyzer - Extracts schema metadata from JSONL for agnostic Text-to-SQL.
+# This module parses the JSONL metadata file to build a dynamic schema configuration,
+# eliminating hardcoded table names, synonyms, and patterns.
+# Purpose:
+# - Auto-detect table types (transaction, dimension, bridge) from column patterns
+# - Extract synonyms from metadata
+# - Build FK relationship graph
+# - Infer table-specific rules dynamically
 
-This module parses the JSONL metadata file to build a dynamic schema configuration,
-eliminating hardcoded table names, synonyms, and patterns.
-
-Key Features:
-- Auto-detect table types (transaction, dimension, bridge) from column patterns
-- Extract synonyms from metadata
-- Build FK relationship graph
-- Infer table-specific rules dynamically
-"""
-
+# ======================================================================
+# ====================== STANDARD LIBRARY IMPORT =======================
+# ======================================================================
 from __future__ import annotations
-
 import json
 import re
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Any, Optional
 from collections import defaultdict
-
-
-# ======================================================================
-# ==================== SCHEMA ANALYZER =================================
-# ======================================================================
 
 class SchemaAnalyzer:
     """
@@ -91,14 +87,15 @@ class SchemaAnalyzer:
             synonyms = [s.strip().lower() for s in synonyms_str.split(",")]
             self._column_synonyms[f"{table.lower()}.{column.lower()}"].extend(synonyms)
 
-        # Extract FK info
+        # Extract FK info.
+        # Dense JSONL entries often store FK cues in `text` while sparse entries
+        # use `metadata.description`, so parse both sources.
         description = metadata.get("description", "")
-        if "Foreign Key" in description:
-            # Extract target table from "FK to {table}.{column}"
-            fk_match = re.search(r'FK to\s+(\w+)\.(\w+)', description, re.IGNORECASE)
-            if fk_match:
-                target_table = fk_match.group(1).lower()
-                self._fk_relationships[table.lower()][column.lower()] = target_table
+        fk_source = f"{description} {text}"
+        fk_match = re.search(r'FK to\s+(\w+)\.(\w+)', fk_source, re.IGNORECASE)
+        if fk_match:
+            target_table = fk_match.group(1).lower()
+            self._fk_relationships[table.lower()][column.lower()] = target_table
 
         # Extract column role
         role = self._next_field_after(text, "Role:")
@@ -150,10 +147,6 @@ class SchemaAnalyzer:
                 self._table_types[table] = "dimension"
             else:
                 self._table_types[table] = "reference"
-
-    # ====================================================================
-    # ==================== PUBLIC API =====================================
-    # ====================================================================
 
     def get_tables(self) -> Set[str]:
         """Return all table names (lowercase)."""
@@ -290,13 +283,8 @@ class SchemaAnalyzer:
 
         return None
 
-
-# ======================================================================
-# ==================== GLOBAL INSTANCE ==================================
-# ======================================================================
-
+# ============================ GLOBAL INSTANCE ============================
 _analyzer_instance: Optional[SchemaAnalyzer] = None
-
 
 def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
     """
@@ -364,10 +352,7 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
 
     return _analyzer_instance
 
-
-# ======================================================================
 # ==================== CONVENIENCE FUNCTIONS ============================
-# ======================================================================
 
 def get_all_tables() -> Set[str]:
     """Get all table names from schema."""
@@ -423,10 +408,7 @@ def get_singular_form(table: str) -> str:
     """Get singular form of table name."""
     return get_schema_analyzer().get_singular_form(table)
 
-
-# ======================================================================
 # ==================== DYNAMIC COLUMN INFERENCE =========================
-# ======================================================================
 
 def _get_original_case(table_lower: str, col_lower: str) -> str:
     """Get original column name case from metadata, fallback to lowercase."""

@@ -430,7 +430,7 @@ cases:
           o.officeCode ASC;
     - id: H11
       difficulty: hard
-      question: "Show customers who have made at least one payment but have never placed any orders (i.e., they appear in payments but not in orders). Return customerNumber, customerName, and total payment amount. Sort by total payment amount descending, then customerNumber ascending."
+      question: "Show customers who have made at least one payment but have never placed any orders. Return customer id, customer name, and total payment amount. Sort by total payment amount descending, then customer id ascending."
       groundtruth_sql: |
         SELECT
           c.customerNumber,
@@ -451,7 +451,7 @@ cases:
           c.customerNumber ASC;
     - id: H12
       difficulty: hard
-      question: "Show offices where the average creditLimit of customers assigned to employees in that office is higher than the overall average creditLimit across all customers (ignore NULL creditLimit). Return officeCode, city, and avg_credit_limit. Sort by avg_credit_limit descending, then officeCode ascending."
+      question: "Show offices where the average credit limit of customers assigned to employees in that office is higher than the overall average credit limit across all customers (ignore NULL credit limit). Return office code, city, and average credit limit. Sort by average credit limit descending, then office code ascending."
       groundtruth_sql: |
         SELECT
           o.officeCode,

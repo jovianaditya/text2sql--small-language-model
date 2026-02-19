@@ -307,6 +307,50 @@ def _explicit_subject_match_score(question_lower: str, entity_pattern: str) -> i
     return best
 
 
+def _entity_search_scope(question_lower: str, table_singular: str) -> str:
+    """
+    Build a cleaned search scope for one entity by stripping generic grammar
+    uses (e.g., "order by") that are not table mentions.
+    """
+    scope = question_lower or ""
+    patterns = AGENT_ROUTER_IGNORE_PATTERNS.get((table_singular or "").lower(), [])
+    for pat in patterns:
+        scope = re.sub(pat, " ", scope)
+    return scope
+
+
+def _question_targets_entity_exclusion(question_lower: str, table: str) -> bool:
+    """
+    Return True when question expresses exclusion/absence semantics for this entity:
+    e.g., "no orders", "never placed any orders", "without payments".
+    """
+    tbl_lower = (table or "").lower().strip()
+    if not tbl_lower:
+        return False
+
+    table_singular = get_singular_form(tbl_lower)
+    entity_pattern = _table_entity_pattern(tbl_lower)
+    if not entity_pattern or entity_pattern == r"(?:)":
+        return False
+
+    scope = _entity_search_scope(question_lower, table_singular)
+
+    # Strong direct pattern: negation terms within local window before entity mention.
+    if re.search(
+        rf"\b(?:no|without(?:\s+any)?|never|not)\b(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_pattern})\b",
+        scope,
+        flags=re.I,
+    ):
+        return True
+
+    # Backup: global exclusion phrase + explicit entity mention in same question.
+    if any(term in scope for term in AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS):
+        if re.search(rf"\b(?:{entity_pattern})\b", scope, flags=re.I):
+            return True
+
+    return False
+
+
 def _router_id_terms_pattern() -> str:
     terms = [str(t or "").strip().lower() for t in AGENT_ROUTER_ID_REFERENCE_TERMS if str(t or "").strip()]
     if not terms:
@@ -1110,12 +1154,40 @@ def router_agent(state: RAGState) -> RAGState:
                 print(f"[Router] Keeping {tbl_lower}: explicit subject entity in question")
             continue
 
+        # Preserve weak tables that are explicitly the target of exclusion intent
+        # (e.g., "customers with no orders", "never paid").
+        if _question_targets_entity_exclusion(question_lower, tbl_lower):
+            if RETRIEVE_DEBUG:
+                print(f"[Router] Keeping {tbl_lower}: exclusion target entity in question")
+            continue
+
         # Check if evidence is ONLY weak patterns
         # Strong evidence: non-FK column mentions, aggregate context
         # Weak evidence: 'for each' pattern, table+attribute pattern, FK column mentions
         weak_evidence = AGENT_ROUTER_WEAK_EVIDENCE_TAGS
         # Also check for FK column evidence (format: "FK column 'X'")
         is_only_weak = all(e in weak_evidence or e.startswith(AGENT_ROUTER_FK_EVIDENCE_PREFIX) for e in evidence_list)
+        has_fk_col_evidence = any(e.startswith(AGENT_ROUTER_FK_EVIDENCE_PREFIX) for e in evidence_list)
+        has_non_id_entity_mention = bool(
+            re.search(
+                rf"\b{table_entity_pattern}\b(?!\s+(?:{id_terms_pattern})\b)",
+                question_lower,
+            )
+        )
+        relevant_lowers = {t.lower() for t in relevant_tables}
+        neighbor_count_in_relevant = sum(
+            1 for n in fk_graph.get(tbl_lower, {}) if n in relevant_lowers and n != tbl_lower
+        )
+        is_multi_hop_bridge = neighbor_count_in_relevant >= 2
+
+        # If the entity is explicitly mentioned in non-ID form and evidence comes
+        # from FK columns, keep it only when it is a true bridge node between
+        # at least two relevant tables (prevents unnecessary joins in single-table
+        # aggregates/window queries like payments/customer or employees/offices).
+        if has_fk_col_evidence and has_non_id_entity_mention and is_multi_hop_bridge:
+            if RETRIEVE_DEBUG:
+                print(f"[Router] Keeping {tbl_lower}: explicit entity mention + FK evidence")
+            continue
 
         if is_only_weak and evidence_list:  # Has evidence, but all are weak
             table_singular = get_singular_form(tbl_lower)
