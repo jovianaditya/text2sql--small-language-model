@@ -28,8 +28,12 @@ class RAGState(TypedDict, total=False):
     # generation outputs
     answer: str
     draft_sql: str
+    draft_source: str  # llm|ir_planner
     ranked_cols: List[tuple[str, str]]
     final_sql: str
+    # Agnostic pipeline artifacts
+    intent_ir: Dict[str, Any]
+    join_plan: Dict[str, Any]
     # Jenis query hasil classifier ('lookup', 'aggregate', 'rank', dst.)
     qtype: str
     # Flag apakah pertanyaan ini butuh REGEXP/pattern handling
@@ -63,8 +67,11 @@ def make_state(paths, question: str) -> RAGState:
         "final_model": "",  # Track final model after any regeneration
         "answer": "",
         "draft_sql": "",
+        "draft_source": "",
         "ranked_cols": [],
         "final_sql": "",
+        "intent_ir": {},
+        "join_plan": {},
         "qtype": "",
         "requires_regex": False,
         "agent_notes": "",

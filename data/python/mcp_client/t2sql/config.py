@@ -136,6 +136,13 @@ MCP_TIMEOUT = int(os.getenv("MCP_CLIENT_TIMEOUT", "60"))
 # ======================================================================
 OOM_WAIT_TIME = int(os.getenv("OOM_WAIT_TIME", "35"))
 OOM_MAX_RETRIES = int(os.getenv("OOM_MAX_RETRIES", "3"))
+# IR-first deterministic planner
+AGENT_IR_ENABLED = bool(int(os.getenv("AGENT_IR_ENABLED", "1")))
+AGENT_IR_MIN_CONFIDENCE = float(os.getenv("AGENT_IR_MIN_CONFIDENCE", "0.80"))
+AGENT_IR_DEBUG = bool(int(os.getenv("AGENT_IR_DEBUG", "1")))
+AGENT_IR_ALLOW_MULTI_TABLE = bool(int(os.getenv("AGENT_IR_ALLOW_MULTI_TABLE", "0")))
+AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE = float(os.getenv("AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE", "0.85"))
+AGENT_IR_MAX_TABLES = int(os.getenv("AGENT_IR_MAX_TABLES", "1"))
 # ======================================================================
 # ============================= DEBUG ==================================
 # ======================================================================
@@ -838,6 +845,26 @@ AGENT_ROUTER_MISSING_EMPTY_PATTERN = os.getenv(
 AGENT_ROUTER_ESCALATE_ON_MULTI_TABLE = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_ON_MULTI_TABLE", "1")))
 AGENT_ROUTER_ESCALATE_ON_WINNER_ROW = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_ON_WINNER_ROW", "1")))
 AGENT_ROUTER_ESCALATE_ON_EXCLUSION = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_ON_EXCLUSION", "1")))
+AGENT_ROUTER_ESCALATE_ON_WINDOW_AGGREGATE = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_ON_WINDOW_AGGREGATE", "1")))
+AGENT_ROUTER_ESCALATE_ON_EXPLICIT_RANK = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_ON_EXPLICIT_RANK", "1")))
+AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT", "1")))
+AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B = bool(int(os.getenv("AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B", "1")))
+AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES = int(os.getenv("AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES", "3"))
+AGENT_ROUTER_ALLOW_SIMPLE_SINGLE_TABLE_SUBQUERY_3B = bool(
+    int(os.getenv("AGENT_ROUTER_ALLOW_SIMPLE_SINGLE_TABLE_SUBQUERY_3B", "1"))
+)
+AGENT_ROUTER_SUBQUERY_INTENT_PATTERN = os.getenv(
+    "AGENT_ROUTER_SUBQUERY_INTENT_PATTERN",
+    r"\b(above|below|greater\s+than|less\s+than)\s+the\s+average\b|\bcompared\s+to\s+the\s+average\b|\brelative\s+to\s+the\s+average\b|\bthan\s+the\s+overall\s+average\b|\bexists\b|\bnot\s+exists\b",
+).strip()
+AGENT_ROUTER_SIMPLE_SINGLE_TABLE_SUBQUERY_PATTERN = os.getenv(
+    "AGENT_ROUTER_SIMPLE_SINGLE_TABLE_SUBQUERY_PATTERN",
+    r"\b(greater|less|higher|lower|above|below)\s+than\s+the\s+(average|overall\s+average|mean)\b|\b(compared|relative)\s+to\s+the\s+(average|overall\s+average|mean)\b|\bthan\s+the\s+overall\s+average\b",
+).strip()
+AGENT_ROUTER_COMPLEX_SUBQUERY_CUE_PATTERN = os.getenv(
+    "AGENT_ROUTER_COMPLEX_SUBQUERY_CUE_PATTERN",
+    r"\b(exists|not\s+exists|latest|most\s+recent|newest|oldest|earliest|for\s+each|per)\b",
+).strip()
 
 AGENT_ROUTER_COMPLEXITY_SIMPLE = os.getenv("AGENT_ROUTER_COMPLEXITY_SIMPLE", "simple").strip()
 AGENT_ROUTER_COMPLEXITY_COMPLEX = os.getenv("AGENT_ROUTER_COMPLEXITY_COMPLEX", "complex").strip()

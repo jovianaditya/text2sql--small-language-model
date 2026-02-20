@@ -24,6 +24,12 @@ from .config import (
     RETRIEVE_DEBUG,
     OOM_WAIT_TIME,
     OOM_MAX_RETRIES,
+    AGENT_IR_ENABLED,
+    AGENT_IR_MIN_CONFIDENCE,
+    AGENT_IR_DEBUG,
+    AGENT_IR_ALLOW_MULTI_TABLE,
+    AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE,
+    AGENT_IR_MAX_TABLES,
     AGENT_INSTANT_REJECT_PATTERNS,
     AGENT_DEFINITE_SQL_PATTERNS,
     AGENT_GIBBERISH_KEYBOARD_PATTERNS,
@@ -97,6 +103,13 @@ from .config import (
     AGENT_ROUTER_ESCALATE_ON_MULTI_TABLE,
     AGENT_ROUTER_ESCALATE_ON_WINNER_ROW,
     AGENT_ROUTER_ESCALATE_ON_EXCLUSION,
+    AGENT_ROUTER_ESCALATE_ON_WINDOW_AGGREGATE,
+    AGENT_ROUTER_ESCALATE_ON_EXPLICIT_RANK,
+    AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT,
+    AGENT_ROUTER_SUBQUERY_INTENT_PATTERN,
+    AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B,
+    AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES,
+    AGENT_ROUTER_ALLOW_SIMPLE_SINGLE_TABLE_SUBQUERY_3B,
     AGENT_ROUTER_COMPLEXITY_SIMPLE,
     AGENT_ROUTER_COMPLEXITY_COMPLEX,
     AGENT_ROUTER_COMPLEXITY_REJECTED,
@@ -104,6 +117,8 @@ from .config import (
     AGENT_ROUTER_QTYPE_AGGREGATE,
     AGENT_ROUTER_QTYPE_RANK,
     AGENT_ROUTER_QTYPE_INVALID,
+    AGENT_ROUTER_SIMPLE_SINGLE_TABLE_SUBQUERY_PATTERN,
+    AGENT_ROUTER_COMPLEX_SUBQUERY_CUE_PATTERN,
     AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_FROM_PATTERN,
     AGENT_DRAFT_SELECT_FROM_PATTERN,
     AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_COMMA_PATTERN,
@@ -174,6 +189,8 @@ from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
 from .utils import _dbg_print_two, try_llm_json, build_router_schema
 from .generation import regenerate_with_extra_constraint
+from .intent_ir import build_intent_ir, is_ir_plannable
+from .sql_planner import build_sql_from_intent, safety_normalize_sql
 from .schema_analyzer import get_all_tables, get_singular_form, get_schema_analyzer, get_id_column, get_fk_relationships
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
     _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline,
@@ -1520,7 +1537,24 @@ def router_agent(state: RAGState) -> RAGState:
     # is simpler than winner-row patterns (highest/lowest/top) which need subqueries
     value_ranks = AGENT_ROUTER_VALUE_RANK_TERMS
     time_ranks = AGENT_ROUTER_TIME_RANK_TERMS
-    is_ranking_value = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in value_ranks)
+
+    # "at least/at most" are quantity filters, not ranking intent.
+    # Keep ranking terms, but suppress false positives for these quantifiers.
+    rank_hits: List[str] = []
+    for kw in value_ranks:
+        kw_l = str(kw or "").strip().lower()
+        if not kw_l:
+            continue
+        for m in re.finditer(rf"\b{re.escape(kw_l)}\b", question_lower):
+            if kw_l in {"least", "most"}:
+                left = question_lower[max(0, m.start() - 8):m.start()]
+                if re.search(r"\bat\s+$", left):
+                    # e.g. "at least once", "at most 10"
+                    continue
+            rank_hits.append(kw_l)
+            break
+
+    is_ranking_value = bool(rank_hits)
     is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in time_ranks)
     is_ranking = is_ranking_value or is_ranking_time
     
@@ -1741,28 +1775,120 @@ def router_agent(state: RAGState) -> RAGState:
     if not has_exclusion and is_multi_table:
         if re.search(AGENT_ROUTER_MISSING_EMPTY_PATTERN, question_lower):
             has_exclusion = True
-    
-    # ESCALATION LOGIC
-    # Escalate to 7B when complexity truly requires it:
-    # - Multi-table query (requires JOIN)
-    # - Winner-row patterns (requires ROW_NUMBER/RANK subquery)
-    # - Cross-table exclusion patterns (NOT IN, NOT EXISTS)
-    should_escalate = (
-        (AGENT_ROUTER_ESCALATE_ON_MULTI_TABLE and is_multi_table) or
-        (AGENT_ROUTER_ESCALATE_ON_WINNER_ROW and is_winner_row) or
-        (AGENT_ROUTER_ESCALATE_ON_EXCLUSION and has_exclusion)
+
+    # Subquery intent cues (e.g., compare against average/overall baseline, EXISTS wording).
+    # This is intentionally lightweight and only used for escalation policy.
+    is_subquery_intent = bool(re.search(AGENT_ROUTER_SUBQUERY_INTENT_PATTERN, question_lower))
+    has_complex_subquery_cue = bool(
+        re.search(AGENT_ROUTER_COMPLEX_SUBQUERY_CUE_PATTERN, question_lower)
+    )
+    has_exists_keyword = bool(re.search(r"\b(?:exists|not\s+exists)\b", question_lower))
+
+    # Keep simple single-table scalar subquery in 3B lane:
+    # e.g. "creditLimit greater than the average creditLimit".
+    is_simple_scalar_subquery_single_table = (
+        AGENT_ROUTER_ALLOW_SIMPLE_SINGLE_TABLE_SUBQUERY_3B
+        and is_subquery_intent
+        and not is_multi_table
+        and not is_winner_row
+        and not is_window_aggregate
+        and not is_explicit_rank_function
+        and not is_ordinal_ranking
+        and not has_exclusion
+        and bool(re.search(AGENT_ROUTER_SIMPLE_SINGLE_TABLE_SUBQUERY_PATTERN, question_lower))
+        and not has_complex_subquery_cue
+    )
+
+    # Allow simple EXISTS/NOT EXISTS in 3B lane when it is not mixed with
+    # harder intents (winner-row/window/rank/tie-break) and table fanout is small.
+    is_simple_exists_subquery = (
+        is_subquery_intent
+        and has_exists_keyword
+        and not is_winner_row
+        and not is_window_aggregate
+        and not is_explicit_rank_function
+        and not is_ordinal_ranking
+        and not has_tiebreaker
+        and len(relevant_tables) <= 2
+    )
+
+    is_complex_subquery_intent = bool(
+        is_subquery_intent
+        and not is_simple_scalar_subquery_single_table
+        and not is_simple_exists_subquery
+    )
+
+    # Multi-fact rollup detector (fanout-risk):
+    # customer + orders count + payments total/status in one grouped result.
+    # Example: total orders + total payment amount + payment_status.
+    relevant_tables_lower = {t.lower() for t in relevant_tables}
+    has_dual_fact_rollup = bool(
+        is_multi_table
+        and "orders" in relevant_tables_lower
+        and "payments" in relevant_tables_lower
+        and (
+            "customers" in relevant_tables_lower
+            or bool(re.search(r"\bcustomer", question_lower))
+        )
+        and bool(
+            re.search(
+                r"\b(total\s+number\s+of|number\s+of|count\s+of)\s+orders?\b|\btotal_orders?\b",
+                question_lower,
+                flags=re.I,
+            )
+        )
+        and bool(
+            re.search(
+                r"\b(total\s+payment(?:\s+amount)?|sum\s+of\s+payments?|total_payments?|total_payment_amount)\b",
+                question_lower,
+                flags=re.I,
+            )
+            or re.search(r"\bpayment[_\s]*status\b", question_lower, flags=re.I)
+            or ("paid" in question_lower and "unpaid" in question_lower)
+        )
     )
     
-    if is_multi_table:
-        print(f"[Router] Multi-table detected: {relevant_tables} -> escalating to 7B")
-    if is_winner_row and not is_multi_table:
-        print(f"[Router] Winner-row pattern detected (tiebreaker/subquery needed) -> escalating to 7B")
-    
+    # ESCALATION LOGIC
+    # Keep 3B for simple multi-table joins; escalate to 7B only for hard patterns.
+    max_small_tables = max(1, int(AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES))
+    escalation_reasons: List[str] = []
+
+    if AGENT_ROUTER_ESCALATE_ON_MULTI_TABLE and is_multi_table:
+        if not AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B:
+            escalation_reasons.append("multi_table_forced")
+        elif len(relevant_tables) > max_small_tables:
+            escalation_reasons.append(
+                f"multi_table_too_wide:{len(relevant_tables)}>{max_small_tables}"
+            )
+
+    if AGENT_ROUTER_ESCALATE_ON_WINNER_ROW and is_winner_row and is_multi_table:
+        escalation_reasons.append("winner_row_subquery_multi_table")
+    if AGENT_ROUTER_ESCALATE_ON_EXCLUSION and has_exclusion:
+        escalation_reasons.append("cross_table_exclusion")
+    if AGENT_ROUTER_ESCALATE_ON_WINDOW_AGGREGATE and is_window_aggregate and is_multi_table:
+        escalation_reasons.append("window_aggregate_multi_table")
+    if AGENT_ROUTER_ESCALATE_ON_EXPLICIT_RANK and is_explicit_rank_function and is_multi_table:
+        escalation_reasons.append("explicit_rank_function_multi_table")
+    if AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT and is_complex_subquery_intent:
+        if is_multi_table or has_complex_subquery_cue:
+            escalation_reasons.append("subquery_intent_complex")
+    if has_dual_fact_rollup:
+        escalation_reasons.append("multi_fact_rollup_fanout_risk")
+
+    # keep order, remove duplicates
+    escalation_reasons = list(dict.fromkeys(escalation_reasons))
+    should_escalate = bool(escalation_reasons)
+
+    if is_multi_table and not should_escalate and AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B:
+        print(f"[Router] Multi-table simple pattern detected: {relevant_tables} -> keeping 3B")
+    elif escalation_reasons:
+        print(f"[Router] Escalating to 7B. reasons={escalation_reasons}")
+
     chosen_model = LARGE_MODEL if should_escalate else SMALL_MODEL
     complexity = AGENT_ROUTER_COMPLEXITY_COMPLEX if should_escalate else AGENT_ROUTER_COMPLEXITY_SIMPLE
     
     # Tentukan QTYPE
-    if is_winner_row:
+    if is_winner_row or is_explicit_rank_function:
         qtype = AGENT_ROUTER_QTYPE_RANK
     elif has_math or has_grouping:
         qtype = AGENT_ROUTER_QTYPE_AGGREGATE
@@ -1770,7 +1896,15 @@ def router_agent(state: RAGState) -> RAGState:
         qtype = AGENT_ROUTER_QTYPE_LOOKUP
     
     print(f"[Router] Detected Tables: {relevant_tables}")
-    print(f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, Group:{has_grouping}, WinnerRow:{is_winner_row}, OrdinalRank:{is_ordinal_ranking}, Exclusion:{has_exclusion}, WindowAgg:{is_window_aggregate}, ExplicitRank:{is_explicit_rank_function}")
+    print(
+        f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, "
+        f"Group:{has_grouping}, WinnerRow:{is_winner_row}, OrdinalRank:{is_ordinal_ranking}, "
+        f"Exclusion:{has_exclusion}, WindowAgg:{is_window_aggregate}, "
+        f"ExplicitRank:{is_explicit_rank_function}, SubqueryIntent:{is_subquery_intent}, "
+        f"SimpleScalarSubquery:{is_simple_scalar_subquery_single_table}, "
+        f"SimpleExistsSubquery:{is_simple_exists_subquery}, "
+        f"DualFactRollup:{has_dual_fact_rollup}"
+    )
     print(f"[Router] Decision: {complexity.upper()} -> {chosen_model}")
 
     return {
@@ -1789,7 +1923,15 @@ def router_agent(state: RAGState) -> RAGState:
             "has_exclusion": has_exclusion,
             "is_window_aggregate": is_window_aggregate,
             "partition_hint": partition_hint,
-            "is_explicit_rank_function": is_explicit_rank_function
+            "is_explicit_rank_function": is_explicit_rank_function,
+            "is_subquery_intent": is_subquery_intent,
+            "is_simple_scalar_subquery_single_table": is_simple_scalar_subquery_single_table,
+            "is_simple_exists_subquery": is_simple_exists_subquery,
+            "is_complex_subquery_intent": is_complex_subquery_intent,
+            "has_dual_fact_rollup": has_dual_fact_rollup,
+            "table_count": len(relevant_tables),
+            "escalation_reasons": escalation_reasons,
+            "simple_multi_table_candidate": bool(is_multi_table and not should_escalate),
         }
     }
 # ======================================================================
@@ -1854,7 +1996,108 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     if decision.get("complexity") == AGENT_ROUTER_COMPLEXITY_REJECTED or decision.get("is_valid_question") is False:
         print("[DRAFT] Skipped: Question was rejected by router guard")
         return state  # Pass through unchanged
-    
+
+    question = state.get("question", "")
+    ctx = state.get("context", "")
+
+    # ------------------------------------------------------------------
+    # IR-FIRST deterministic planning (schema-agnostic)
+    # ------------------------------------------------------------------
+    if AGENT_IR_ENABLED:
+        intent_ir = build_intent_ir(
+            question=question,
+            ctx=ctx,
+            router_decision=decision,
+            primary_table=state.get("primary_table", ""),
+        )
+        state["intent_ir"] = intent_ir
+
+        mentioned_tables = intent_ir.get("mentioned_tables") or []
+        router_tables = state.get("router_tables") or []
+        ctx_allowed_ids = _parse_allowed_identifiers(ctx)
+        ctx_table_count = len(ctx_allowed_ids)
+        table_count = max(len(mentioned_tables), len(router_tables), ctx_table_count)
+        dynamic_min_conf = float(AGENT_IR_MIN_CONFIDENCE)
+        ir_gate_reasons: List[str] = []
+
+        if table_count > AGENT_IR_MAX_TABLES:
+            ir_gate_reasons.append(
+                f"table_count_exceeds_ir_max:{table_count}>{AGENT_IR_MAX_TABLES}"
+            )
+        if ctx_table_count > AGENT_IR_MAX_TABLES:
+            ir_gate_reasons.append(
+                f"context_table_count_exceeds_ir_max:{ctx_table_count}>{AGENT_IR_MAX_TABLES}"
+            )
+
+        if table_count > 1:
+            dynamic_min_conf = max(dynamic_min_conf, float(AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE))
+            if not AGENT_IR_ALLOW_MULTI_TABLE:
+                ir_gate_reasons.append("multi_table_ir_disabled")
+
+        hard_router_flags = {
+            "is_winner_row": "winner_row",
+            "has_exclusion": "exclusion",
+            "is_window_aggregate": "window_aggregate",
+            "is_explicit_rank_function": "explicit_rank",
+            "is_ordinal_ranking": "ordinal_rank",
+            "is_subquery_intent": "subquery_intent",
+        }
+        for flag, label in hard_router_flags.items():
+            if bool(decision.get(flag, False)):
+                ir_gate_reasons.append(f"router_hard:{label}")
+
+        # Percentage intent: allow IR only for supported metric patterns.
+        q_low = (question or "").lower()
+        if re.search(r"\b(percent|percentage|%\s*of|ratio|rate)\b", q_low):
+            ir_metrics = intent_ir.get("metrics") or []
+            has_supported_pct_metric = any(
+                str(m.get("agg") or "").lower() == "pct_non_null"
+                for m in ir_metrics
+                if isinstance(m, dict)
+            )
+            if not has_supported_pct_metric:
+                ir_gate_reasons.append("percentage_intent_ir_disabled")
+
+        base_plannable = is_ir_plannable(intent_ir, dynamic_min_conf)
+        ir_plannable = base_plannable and not ir_gate_reasons
+
+        if AGENT_IR_DEBUG:
+            print(
+                "[IR] confidence="
+                f"{float(intent_ir.get('confidence', 0.0) or 0.0):.2f}, "
+                f"plannable={ir_plannable}, "
+                f"table_count={table_count}, "
+                f"context_table_count={ctx_table_count}, "
+                f"min_conf={dynamic_min_conf:.2f}, "
+                f"gate_reasons={ir_gate_reasons or ['none']}"
+            )
+
+        if ir_plannable:
+            planned_sql, plan_meta = build_sql_from_intent(intent_ir, ctx)
+            if planned_sql:
+                normalized_sql, normalize_warnings = safety_normalize_sql(planned_sql)
+                if AGENT_IR_DEBUG:
+                    print(f"[IR] SQL planned successfully. warnings={normalize_warnings}")
+                if not normalized_sql.endswith(";"):
+                    normalized_sql += ";"
+                return {
+                    **state,
+                    "processing_start_time": _time.perf_counter(),
+                    "draft_inference_time": 0.0,
+                    "draft_source": "ir_planner",
+                    "join_plan": plan_meta.get("join_plan", {}),
+                    "draft_sql": normalized_sql,
+                    "agent_notes": (
+                        "Deterministic IR planner used."
+                        + (f" warnings={normalize_warnings}" if normalize_warnings else "")
+                    ),
+                }
+            else:
+                if AGENT_IR_DEBUG:
+                    print(f"[IR] planner fallback -> LLM. errors={plan_meta.get('errors')}")
+        elif AGENT_IR_DEBUG and ir_gate_reasons:
+            print(f"[IR] gated off -> LLM. reasons={ir_gate_reasons}")
+
     target_model = state.get("target_model") or LARGE_MODEL
     llm = build_llm_json(model=target_model)
 
@@ -1864,7 +2107,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     model_ready = _prewarm_model_with_oom_retry(llm, target_model)
 
     if not model_ready:
-        return {**state, "draft_sql": "SELECT 'Error: Model OOM after retries';"}
+        return {**state, "draft_source": "llm", "draft_sql": "SELECT 'Error: Model OOM after retries';"}
 
     # START TIMER: Model ready → Final SQL complete (for thesis latency benchmark)
     # This measures the core text-to-SQL processing time, excluding:
@@ -1874,9 +2117,6 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     state["processing_start_time"] = _time.perf_counter()
     print(f"[DEBUG] processing_start_time set")
 
-    question = state.get("question", "")
-    ctx = state.get("context", "")
-    
     # Panggil Dynamic Prompt Builder (helpers_main.py)
     # Segala aturan heuristik (Anti-MAX, Anti-1055, Anti-Inner Join) sudah diurus di sana.
     # Pass state for dynamic join context from retrieval results
@@ -1891,7 +2131,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     state["draft_inference_time"] = _inference_time
 
     if obj is None:
-        return {**state, "draft_sql": "SELECT 'Error: LLM failed';"}
+        return {**state, "draft_source": "llm", "draft_sql": "SELECT 'Error: LLM failed';"}
         
     draft_sql = (obj.get("sql") or "SELECT 1;").strip()
     reasoning = (obj.get("notes") or "No reasoning provided.").strip()
@@ -1934,7 +2174,12 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     
     if not draft_sql.endswith(";"): draft_sql += ";"
     print(f"[DRAFT] After cleanup: {draft_sql}")
-    return {**state, "draft_sql": draft_sql, "agent_notes": (obj.get("notes") or "").strip()}
+    return {
+        **state,
+        "draft_source": "llm",
+        "draft_sql": draft_sql,
+        "agent_notes": (obj.get("notes") or "").strip(),
+    }
 # ======================================================================
 # ======================= AGENT 3 - SQL REFINER ========================
 # ======================================================================
@@ -1944,15 +2189,49 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if decision.get("complexity") == AGENT_ROUTER_COMPLEXITY_REJECTED or decision.get("is_valid_question") is False:
         print("[REFINE] Skipped: Question was rejected by router guard")
         return state  # Pass through unchanged
-    
+
+    question = state.get("question", "")
+    ctx = state.get("context", "")
+    draft_sql = (state.get("draft_sql") or "").strip()
+    draft_source = (state.get("draft_source") or "").strip().lower()
+
+    # ------------------------------------------------------------------
+    # IR planner path: safety-only normalization + identifier validation.
+    # Skip heavy regex rewrite/regeneration to keep deterministic behavior.
+    # ------------------------------------------------------------------
+    if draft_source == "ir_planner":
+        final_sql, warnings = safety_normalize_sql(draft_sql)
+        validation_errors = validate_identifiers(final_sql, ctx)
+        corrections = ["Deterministic IR planner output"]
+        if warnings:
+            corrections.append(f"Safety warnings: {warnings}")
+        if validation_errors:
+            corrections.append(f"Identifier validation errors: {validation_errors}")
+            # Last-resort fallback to legacy normalizer for recovery.
+            final_sql = normalize_sql_pipeline(final_sql, question, ctx)
+        if not final_sql.endswith(";"):
+            final_sql += ";"
+
+        processing_start = state.get("processing_start_time")
+        if processing_start:
+            processing_time = _time.perf_counter() - processing_start
+            state["processing_time"] = processing_time
+            print(f"[DEBUG] Processing time: {processing_time:.2f}s")
+
+        return {
+            **state,
+            "validation_errors": validation_errors,
+            "final_sql": final_sql,
+            "answer": final_sql,
+            "critic_feedback": " | ".join(corrections),
+            "final_model": "ir_planner",
+        }
+
     # DYNAMIC MODEL SELECTION berdasarkan draft quality
     draft_model = state.get("target_model") or SMALL_MODEL  # Track model asal
     target_model = LARGE_MODEL  # Default untuk regeneration
     
     llm = build_llm_repair(model=target_model)
-    question = state.get("question", "")
-    ctx = state.get("context", "")
-    draft_sql = (state.get("draft_sql") or "").strip()
     
     decision = state.get("router_decision", {})
     detected_tables = state.get("router_tables") or []
@@ -2066,13 +2345,45 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     for cols in allowed_ids.values():
         all_valid_cols.update(cols)
 
+    # Static identifier validation catches undefined aliases/tables early
+    # (e.g., SUM(p.amount) without joining alias `p`).
+    identifier_errors = validate_identifiers(final_sql, ctx)
+    hard_identifier_errors = [
+        e for e in identifier_errors
+        if "not in ALLOWED" in e or "invalid column" in e or "invalid columns" in e
+    ]
+
     # 3. DECISION MATRIX
     needs_regeneration = False
     regeneration_model = LARGE_MODEL  # Default 7B untuk regeneration
     extra_instruction = ""
 
+    # --- KASUS 0: IDENTIFIER VALIDATION (HARD ERROR) ---
+    if hard_identifier_errors:
+        _dbg_print_two("[Agent3] HARD ERROR - Identifier Validation", f"{hard_identifier_errors}")
+        table_chain = " -> ".join(detected_tables) if detected_tables else "schema tables"
+        extra_instruction = (
+            "STRICT REQUIREMENT: Your SQL references undefined aliases/tables/columns. "
+            f"Errors detected: {hard_identifier_errors}. "
+            "Use only aliases that are declared in FROM/JOIN and only valid schema columns. "
+            f"Expected join scope from router tables: {table_chain}. "
+            "If selecting from child facts, explicitly JOIN them first before using their alias."
+        )
+        needs_regeneration = True
+        is_simple_multi_table_candidate = bool(
+            decision.get("simple_multi_table_candidate", False)
+        )
+        if (
+            draft_model == SMALL_MODEL
+            and complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE
+            and is_simple_multi_table_candidate
+        ):
+            regeneration_model = SMALL_MODEL
+        else:
+            regeneration_model = LARGE_MODEL
+
     # --- KASUS A: Schema Validation & Hallucination Check (HARD ERROR) ---
-    if alien_cols and AGENT_REFINE_JOIN_KEYWORD not in sql_up:
+    if alien_cols and AGENT_REFINE_JOIN_KEYWORD not in sql_up and not needs_regeneration:
         # SMART SUBQUERY HANDLING
         # Only skip validation if alien columns are INSIDE subquery (not in main SELECT)
         has_subquery = re.search(AGENT_REFINE_HAS_SUBQUERY_PATTERN, sql_up, re.IGNORECASE)
@@ -2470,22 +2781,26 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # 4. EXECUTE REGENERATION (dengan dynamic model selection)
     final_model = state.get("target_model", "")  # Default to initial model
     if needs_regeneration:
-        # Use dynamic model selection
-        llm_regen = build_llm_repair(model=regeneration_model)
-        model_label = "7B" if regeneration_model == LARGE_MODEL else "3B"
-        _dbg_print_two("[Agent3] Regenerating with", model_label)
+        def _regen_once(model_name: str, instruction: str) -> Optional[str]:
+            llm_regen_local = build_llm_repair(model=model_name)
+            model_label_local = "7B" if model_name == LARGE_MODEL else "3B"
+            _dbg_print_two("[Agent3] Regenerating with", model_label_local)
+            new_sql_local, _ = regenerate_with_extra_constraint(
+                llm_regen_local,
+                make_generation_prompt,
+                ctx,
+                question,
+                instruction,
+            )
+            if not new_sql_local:
+                return None
+            normalized_local = normalize_sql_pipeline(new_sql_local, question, ctx)
+            corrections.append(f"Regenerated ({model_label_local}) & Re-Normalized")
+            return normalized_local
 
-        new_sql, _ = regenerate_with_extra_constraint(
-            llm_regen,
-            make_generation_prompt,
-            ctx,
-            question,
-            extra_instruction
-        )
-        if new_sql:
-            final_sql = normalize_sql_pipeline(new_sql, question, ctx)
-            corrections.append(f"Regenerated ({model_label}) & Re-Normalized")
-            # Track final model used
+        regenerated_sql = _regen_once(regeneration_model, extra_instruction)
+        if regenerated_sql:
+            final_sql = regenerated_sql
             final_model = regeneration_model
 
     final_sql = final_sql.strip()

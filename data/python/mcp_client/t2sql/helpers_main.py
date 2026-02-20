@@ -60,6 +60,7 @@ from .helpers_core import (
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _rewrite_customer_orders_payment_fanout,
+    _rewrite_employee_customer_payment_rollup,
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
     _drop_unrequested_exists_filters,
@@ -180,8 +181,10 @@ def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
     m_sel = re.search(r"\bselect\b(.*?)\bfrom\b", code_only, flags=re.I | re.S)
     if m_sel:
         select_part = m_sel.group(1)
-        for m in re.finditer(r"\bas\s+([A-Za-z_]\w*)\b", select_part, flags=re.I):
-            exclude.add(m.group(1).lower())
+        for m in re.finditer(r"\bas\s+(?:`([^`]+)`|([A-Za-z_]\w*))", select_part, flags=re.I):
+            alias = (m.group(1) or m.group(2) or "").strip().lower()
+            if alias:
+                exclude.add(alias)
 
     # 6) Collect qualified usages: alias.col / table.col
     for m in re.finditer(
@@ -239,11 +242,49 @@ def validate_identifiers(sql: str, ctx: str) -> List[str]:
     used = _identify_used_identifiers(sql)
     errs: List[str] = []
 
+    schema_analyzer = None
+    try:
+        schema_analyzer = get_schema_analyzer()
+    except Exception:
+        schema_analyzer = None
+
     # --------------------------------------------------
     # Alias -> table mapping dari FROM / JOIN
     # --------------------------------------------------
     alias2table = _parse_from_join_aliases(sql)  # alias -> table (canonical)
     allowed_lower = {t.lower(): t for t in allowed.keys()}
+    schema_cols_cache: Dict[str, Set[str]] = {}
+
+    def _allowed_cols_for_table(tbl_name: str) -> Set[str]:
+        """
+        Build effective allowed columns for a table.
+        Uses request-scoped ALLOWED IDENTIFIERS, and augments with full schema
+        columns only for tables that already exist in ALLOWED.
+        This prevents false "invalid column" from sparse retrieval context
+        while still blocking unknown tables.
+        """
+        canon = (tbl_name or "").strip("`")
+        if not canon:
+            return set()
+        key = canon.lower()
+        if key in schema_cols_cache:
+            return schema_cols_cache[key]
+
+        # Start from ALLOWED block (request-scoped).
+        cols = {str(c).strip("`").lower() for c in allowed.get(canon, set())}
+
+        # Augment with real schema cols only if table itself is allowed.
+        if canon in allowed and schema_analyzer is not None:
+            try:
+                cols.update(
+                    str(c).strip("`").lower()
+                    for c in schema_analyzer.get_table_columns(canon)
+                )
+            except Exception:
+                pass
+
+        schema_cols_cache[key] = cols
+        return cols
 
     # --------------------------------------------------
     # Detect derived-table aliases: FROM ( ... ) AS t
@@ -313,7 +354,8 @@ def validate_identifiers(sql: str, ctx: str) -> List[str]:
             errs.append(f"table `{tbl}` not in ALLOWED")
             continue
 
-        bad = [c for c in cols if c not in allowed[tbl]]
+        eff_allowed = _allowed_cols_for_table(tbl)
+        bad = [c for c in cols if c.lower() not in eff_allowed]
         if bad:
             errs.append(f"{tbl} -> invalid columns: {', '.join(bad)}")
 
@@ -321,9 +363,9 @@ def validate_identifiers(sql: str, ctx: str) -> List[str]:
     # Validate unqualified columns (single-table only)
     # --------------------------------------------------
     if single_table:
-        allowed_cols = allowed.get(single_table, set())
+        allowed_cols = _allowed_cols_for_table(single_table)
         for col in used.get(None, set()):
-            if col not in allowed_cols:
+            if col.lower() not in allowed_cols:
                 errs.append(
                     f"{single_table} -> invalid column (unqualified): {col}"
                 )
@@ -1242,6 +1284,141 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
         else:
             out_parts.append(replace_in_code_segment(part))
     return "".join(out_parts)
+
+
+def _repair_backticked_identifier_phrases(sql: str, ctx: str) -> str:
+    """
+    Repair hallucinated backticked identifier phrases (e.g. `check number`)
+    into canonical schema columns (e.g. `checkNumber`) for single-table/simple
+    drafts. Keep explicit output aliases (AS `...`) untouched.
+    """
+    if not sql or "`" not in sql:
+        return sql
+
+    allowed = _parse_allowed_identifiers(ctx)
+    if not allowed:
+        return sql
+
+    allowed_tables_case: Dict[str, str] = {}
+    allowed_cols_case: Dict[str, str] = {}
+    for table, cols in allowed.items():
+        t_case = str(table).strip("`")
+        if t_case:
+            allowed_tables_case[t_case.lower()] = t_case
+        for col in cols:
+            c_case = str(col).strip("`")
+            if c_case:
+                allowed_cols_case.setdefault(c_case.lower(), c_case)
+
+    if not allowed_cols_case:
+        return sql
+
+    stop_tokens = {
+        "the", "a", "an", "of", "for", "to", "with", "any", "all", "each",
+        "every", "single", "exactly", "display", "show", "list",
+    }
+
+    def _phrase_tokens(text: str, drop_stopwords: bool = False) -> List[str]:
+        split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text or "")
+        tokens = re.findall(r"[a-z0-9]+", split_camel.lower())
+        if drop_stopwords:
+            tokens = [t for t in tokens if t not in stop_tokens]
+        return tokens
+
+    def _phrase_key(text: str, drop_stopwords: bool = False) -> str:
+        return "".join(_phrase_tokens(text, drop_stopwords=drop_stopwords))
+
+    key_to_col: Dict[str, Optional[str]] = {}
+
+    def _put_key(key: str, canon_col: str) -> None:
+        if not key:
+            return
+        prev = key_to_col.get(key)
+        if prev is None and key not in key_to_col:
+            key_to_col[key] = canon_col
+        elif prev != canon_col:
+            key_to_col[key] = None
+
+    # Canonical column keys.
+    for canon_col in allowed_cols_case.values():
+        _put_key(_phrase_key(canon_col, drop_stopwords=False), canon_col)
+        _put_key(_phrase_key(canon_col, drop_stopwords=True), canon_col)
+
+    # Synonym-based keys from metadata.
+    for table, cols in allowed.items():
+        for col in cols:
+            canon_col = allowed_cols_case.get(str(col).lower(), str(col))
+            for syn in get_column_synonyms(table, col) or []:
+                syn_txt = str(syn or "").strip()
+                if not syn_txt:
+                    continue
+                _put_key(_phrase_key(syn_txt, drop_stopwords=False), canon_col)
+                _put_key(_phrase_key(syn_txt, drop_stopwords=True), canon_col)
+
+    quoted_ident = re.compile(r"`([^`]+)`")
+
+    def _best_overlap_match(raw_text: str) -> Optional[str]:
+        raw_tokens = _phrase_tokens(raw_text, drop_stopwords=True)
+        if not raw_tokens:
+            return None
+        raw_set = set(raw_tokens)
+
+        best_col: Optional[str] = None
+        best_score = 0.0
+        for canon_col in allowed_cols_case.values():
+            col_tokens = _phrase_tokens(canon_col, drop_stopwords=True)
+            if not col_tokens:
+                continue
+            col_set = set(col_tokens)
+            overlap = raw_set.intersection(col_set)
+            if not overlap:
+                continue
+            score = len(overlap) / max(1, len(raw_set))
+            if "amount" in raw_set and "amount" in col_set:
+                score += 0.40
+            if "number" in raw_set and "number" in col_set:
+                score += 0.20
+            if overlap == raw_set:
+                score += 0.15
+            if score > best_score:
+                best_score = score
+                best_col = canon_col
+
+        if best_score >= 0.65:
+            return best_col
+        return None
+
+    def _replace_identifier(m: re.Match) -> str:
+        raw = (m.group(1) or "").strip()
+        if not raw:
+            return m.group(0)
+
+        # Preserve explicit output aliases.
+        prefix = sql[max(0, m.start() - 16):m.start()]
+        if re.search(r"\bAS\s+$", prefix, flags=re.I):
+            return m.group(0)
+
+        low = raw.lower()
+        if low in allowed_tables_case:
+            return f"`{allowed_tables_case[low]}`"
+        if low in allowed_cols_case:
+            return f"`{allowed_cols_case[low]}`"
+
+        candidate = None
+        key_full = _phrase_key(raw, drop_stopwords=False)
+        key_drop = _phrase_key(raw, drop_stopwords=True)
+        if key_full:
+            candidate = key_to_col.get(key_full)
+        if not candidate and key_drop:
+            candidate = key_to_col.get(key_drop)
+        if not candidate:
+            candidate = _best_overlap_match(raw)
+
+        if candidate:
+            return f"`{candidate}`"
+        return m.group(0)
+
+    return quoted_ident.sub(_replace_identifier, sql)
 
 # ======================================================================
 # ==================== DYNAMIC JOIN CONTEXT FROM RETRIEVAL ==============
@@ -2796,6 +2973,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
         if DEBUG_WR: print("[PH4] after metric-agg-column fix:", s)
 
+        s = _rewrite_employee_customer_payment_rollup(s, question, ctx)
+        if DEBUG_WR: print("[PH4] after employee-customer-payment rollup fix:", s)
+
         s = _rewrite_customer_orders_payment_fanout(s, question, ctx)
         if DEBUG_WR: print("[PH4] after customer-order-payment fanout fix:", s)
 
@@ -2852,12 +3032,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     # Phase 5 — Pattern, REGEXP, and Predicate Normalization
     # ---------------------------------------------------------------------------
-    # print("\n[PH5] start ----")  # ADD THIS
-    # s = _guardrail_fix_like_regex_anchors(s, question)
-    # print(f"[PH5] after fix_anchors: {s[:200]}")  # ADD THIS
-    # s = _rewrite_simple_regexp_to_like(s, question)
-    # s = _guardrail_fix_mysql_regexp_literals(s)
-    # print(f"[PH5] end ---- {s}\n")  # ADD THIS
+    if re.search(r"\b(?:regexp|rlike)\b", s, flags=re.I):
+        s = _guardrail_fix_like_regex_anchors(s, question)
+        s = _guardrail_fix_mysql_regexp_literals(s)
     # ---------------------------------------------------------------------------
     # Phase 6 — NULL / DISTINCT / Result Cardinality Policies
     # ---------------------------------------------------------------------------
@@ -3089,6 +3266,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
         s = normalize_anchor_for_simple_inner_join(s, pref)
 
     s = _repair_with_aliases(s, ctx)
+    s = _repair_backticked_identifier_phrases(s, ctx)
     s = _postprocess_sql(s, question, ctx)
     _dbg_print_two("[normalize] output sql:", s)
     return s

@@ -44,10 +44,10 @@ for urn in $CONTAINER_URNS; do
 done
 
 # running EVALUATION
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx"
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx" 2>&1 | tee run_full.log
 # hard
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --hard"
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --hard" 2>&1 | tee run_hard.log
 # medium
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --medium"
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --medium" 2>&1 | tee run_medium.log
 # easy
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy"
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy" 2>&1 | tee run_easy.log

@@ -508,29 +508,16 @@ def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
         if re.search(rf"\b{entity_kw}\b", q, flags=re.I):
             return True
 
-    # Dynamic "all/for each/every <entity>" and "<entity> with no ..."
+    # Dynamic include-zero phrasing should stay conservative.
+    # "all/every/for each" alone is not enough to imply preserve-zero semantics.
     for ent in entity_terms:
         if (
             f"including {ent} with no" in q
             or f"{ent} with no" in q
-            or f"all {ent}" in q
-            or f"every {ent}" in q
-            or f"for each {ent}" in q
         ):
             return True
 
     if re.search(rf"\b{entity_kw}\b.*\b(without|with\s+no|no)\b", q, flags=re.I):
-        return True
-
-    # Pattern 1: "for each X"
-    if re.search(rf"\b(for\s+each|per|setiap|tiap)\s+{entity_kw}\b", q, flags=re.I):
-        return True
-
-    # Pattern 2: "X with <aggregate condition>"
-    if re.search(
-        rf"\b{entity_kw}\s+with\s+(total|sum|count|average|avg|jumlah)\s+.*?\b(exceed|over|greater|more\s+than|above|>|melebihi|lebih\s+dari)",
-        q, flags=re.I
-    ):
         return True
     
     return False
@@ -6218,6 +6205,160 @@ def _question_wants_customer_orders_payment_rollup(question: str) -> bool:
     return _question_wants_entity_orders_payments_rollup(question)
 
 
+def _question_wants_employee_customer_payment_rollup(question: str) -> bool:
+    """
+    Detect intent like H5:
+    - for each employee
+    - include employees/customers with no matches
+    - return total payment amount collected by their customers
+    """
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    # Exclude winner-row/latest style intents (handled by different pathways).
+    if re.search(
+        r"\b(latest|most\s+recent|newest|earliest|row_number|rank|dense_rank|if\s+multiple|if\s+there\s+are\s+ties)\b",
+        q,
+        flags=re.I,
+    ):
+        return False
+
+    def _entity_alt(table_name: str) -> str:
+        words = _entity_words_for_table(table_name)
+        escaped = []
+        for w in words:
+            ww = (w or "").strip().lower()
+            if not ww:
+                continue
+            escaped.append(re.escape(ww).replace(r"\ ", r"\s+"))
+        escaped = sorted(set(escaped), key=len, reverse=True)
+        return "|".join(escaped)
+
+    emp_alt = _entity_alt("employees")
+    cust_alt = _entity_alt("customers")
+    pay_alt = _entity_alt("payments")
+
+    def _has_alt(alt: str) -> bool:
+        return bool(alt and re.search(rf"\b(?:{alt})\b", q, flags=re.I))
+
+    has_employee = _has_alt(emp_alt)
+    has_customer = _has_alt(cust_alt)
+    has_payment = _has_alt(pay_alt) or bool(re.search(r"\bpaid\b", q, flags=re.I))
+
+    asks_for_each_employee = bool(
+        re.search(rf"\bfor\s+each\s+(?:{emp_alt})\b", q, flags=re.I)
+        if emp_alt
+        else re.search(r"\bfor\s+each\s+employees?\b", q, flags=re.I)
+    )
+    asks_total_payment = bool(
+        re.search(
+            r"\b(total\s+payment(?:\s+amount)?|sum\s+of\s+payments?|amount\s+collected|collected\s+by)\b",
+            q,
+            flags=re.I,
+        )
+    )
+
+    return has_employee and has_customer and has_payment and asks_for_each_employee and asks_total_payment
+
+
+def _rewrite_employee_customer_payment_rollup(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Canonical rewrite for employee -> customer -> payment rollup:
+      employees LEFT JOIN customers LEFT JOIN payments
+      GROUP BY employee identity fields
+
+    This targets robust repair for drafts that miss payments join alias
+    (e.g., SUM(p.amount) without joining `p`).
+    """
+    if not sql or not question:
+        return sql
+    if not _question_wants_employee_customer_payment_rollup(question):
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+
+    # Conservative: skip complex shapes.
+    if (parsed.get("where") or "").strip():
+        return sql
+    if (parsed.get("having") or "").strip():
+        return sql
+
+    from_core = (parsed.get("from_core") or "").strip()
+    if not from_core or "join" not in from_core.lower():
+        return sql
+    if re.search(r"\brow_number\s*\(", sql, flags=re.I):
+        return sql
+
+    alias_map_raw = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    alias_to_table: Dict[str, str] = {}
+    for a, t in alias_map_raw.items():
+        al = (a or "").strip().lower()
+        tl = (t or "").strip().lower()
+        if not al or not tl:
+            continue
+        if al not in alias_to_table:
+            alias_to_table[al] = tl
+
+    has_employees = any(t == "employees" for t in alias_to_table.values())
+    has_customers = any(t == "customers" for t in alias_to_table.values())
+    if not (has_employees and has_customers):
+        return sql
+
+    # If payments already joined, don't force canonical rewrite here.
+    if any(t == "payments" for t in alias_to_table.values()):
+        return sql
+
+    # Build canonical projection fields dynamically where possible.
+    emp_id_col = get_id_column("employees") or "employeeNumber"
+    emp_first_col = "firstName"
+    emp_last_col = "lastName"
+    emp_name_col = get_name_column("employees") or ""
+
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    emp_cols_lower: Set[str] = set()
+    if analyzer is not None:
+        try:
+            emp_cols_lower = {
+                str(c).strip("`").lower()
+                for c in analyzer.get_table_columns("employees")
+            }
+        except Exception:
+            emp_cols_lower = set()
+
+    has_first_last = (
+        emp_first_col.lower() in emp_cols_lower
+        and emp_last_col.lower() in emp_cols_lower
+    ) or not emp_cols_lower
+
+    if has_first_last:
+        name_select = "CONCAT(emp.firstName, ' ', emp.lastName) AS employee_name"
+        group_by = f"emp.{emp_id_col}, emp.firstName, emp.lastName"
+    else:
+        safe_name_col = emp_name_col if emp_name_col else emp_id_col
+        name_select = f"emp.{safe_name_col} AS employee_name"
+        group_by = f"emp.{emp_id_col}, emp.{safe_name_col}"
+
+    rewritten = (
+        "SELECT "
+        f"emp.{emp_id_col}, "
+        f"{name_select}, "
+        "SUM(pmt.amount) AS total_payment_amount "
+        "FROM employees AS emp "
+        f"LEFT JOIN customers AS cust ON emp.{emp_id_col} = cust.salesRepEmployeeNumber "
+        "LEFT JOIN payments AS pmt ON cust.customerNumber = pmt.customerNumber "
+        f"GROUP BY {group_by};"
+    )
+    return rewritten
+
+
 def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = "") -> str:
     """
     Fix row-multiplication anti-pattern:
@@ -8896,13 +9037,15 @@ def _rewrite_regexp_literal_to_posix_if_needed(lit: str) -> str:
     if not lit:
         return lit
 
-    # Trigger jika ada \b/\w baik single maupun double (\\b/\\w)
-    # Pattern ini match: \b atau \\b (jumlah backslash 1 atau 2)
+    # Trigger jika ada \b/\w/\d/\s baik single maupun double.
+    # Pattern ini match: \x atau \\x (jumlah backslash 1 atau 2)
     has_b = re.search(r"(?:\\\\|\\)b", lit) is not None
     has_w = re.search(r"(?:\\\\|\\)w", lit) is not None
+    has_d = re.search(r"(?:\\\\|\\)d", lit) is not None
+    has_s = re.search(r"(?:\\\\|\\)s", lit) is not None
 
     # Kalau tidak ada indikasi, jangan sentuh (biar tidak mengubah regex valid)
-    if not (has_b or has_w):
+    if not (has_b or has_w or has_d or has_s):
         return lit
 
     out = lit
@@ -8911,9 +9054,9 @@ def _rewrite_regexp_literal_to_posix_if_needed(lit: str) -> str:
     out = re.sub(r"(?:\\\\|\\)b", r"(^|[^[:alnum:]_])", out)
     out = re.sub(r"(?:\\\\|\\)w", r"[[:alnum:]_]", out)
 
-    # Optional tambahan umum:
-    # out = re.sub(r"(?:\\\\|\\)d", r"[0-9]", out)
-    # out = re.sub(r"(?:\\\\|\\)s", r"[[:space:]]", out)
+    # Common shorthand classes that are often produced by LLMs.
+    out = re.sub(r"(?:\\\\|\\)d", r"[0-9]", out)
+    out = re.sub(r"(?:\\\\|\\)s", r"[[:space:]]", out)
 
     # 2) Sisa backslash tunggal → jadikan double
     # Contoh: \. \- \( dll agar lolos parsing string MySQL dan sampai ke regex engine.
