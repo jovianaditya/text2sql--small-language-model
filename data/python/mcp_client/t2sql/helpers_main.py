@@ -56,9 +56,10 @@ from .helpers_core import (
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _preexecute_sql_safety_pass,
-    _rewrite_winner_row_aggregate_misuse, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _rewrite_winner_row_aggregate_misuse, _fix_winner_row_window_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
+    _rewrite_customer_orders_payment_fanout,
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
     _drop_unrequested_exists_filters,
@@ -777,9 +778,12 @@ def _question_targets_table_existence(question: str, table: str) -> bool:
     q = (question or "").lower()
     if not q:
         return False
+    # Ignore quoted label text (e.g., "'Paid'/'Unpaid'") to avoid false
+    # existence triggers from output aliases/status literals.
+    q_sem = re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"", " ", q)
 
     # Exclusion intent wins for this table (e.g., "never orders").
-    if _question_targets_table_exclusion(q, table):
+    if _question_targets_table_exclusion(q_sem, table):
         return False
 
     candidates = _table_mention_candidates(table, include_synonyms=True)
@@ -793,23 +797,34 @@ def _question_targets_table_existence(question: str, table: str) -> bool:
     # Quantified existence: "at least one <entity>"
     if re.search(
         rf"\b(?:at\s+least\s+one|one\s+or\s+more|any)\b(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b",
-        q,
+        q_sem,
         flags=re.I,
     ):
         return True
 
-    # Connector pattern: "with/having <entity>"
-    if re.search(
-        rf"\b(?:with|having)\b(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+(?:{entity_alt})\b",
-        q,
+    # Avoid false positives for metric-request phrasing:
+    # "with total payment amount", "having average orders", etc.
+    metric_connector_match = re.search(
+        rf"\b(?:with|having)\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
+        rf"\b(?:total|sum|count|average|avg|amount|number)\b"
+        rf"(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+(?:{entity_alt})\b",
+        q_sem,
         flags=re.I,
-    ):
+    )
+
+    # Connector pattern: "with/having <entity>"
+    connector_match = re.search(
+        rf"\b(?:with|having)\b(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+(?:{entity_alt})\b",
+        q_sem,
+        flags=re.I,
+    )
+    if connector_match and not metric_connector_match:
         return True
 
     # Verb-based existence mention.
     if re.search(
         rf"\b(?:have|has|had|made|placed|paid|ordered|purchased|bought)\b(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b",
-        q,
+        q_sem,
         flags=re.I,
     ):
         return True
@@ -1195,12 +1210,21 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
 
     keywords = _SQL_KEYWORDS
     token_pat = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+    # Preserve explicit aliases (e.g., AS customer_id) and their references.
+    # Without this, alias repair can rewrite output alias tokens into schema columns.
+    protected_aliases = {
+        (m.group(1) or "").lower()
+        for m in re.finditer(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b", sql, flags=re.I)
+        if m.group(1)
+    }
 
     def replace_in_code_segment(seg: str) -> str:
         def smart_repl(m):
             w = m.group(0)
             lw = w.lower()
             if lw in keywords:
+                return w
+            if lw in protected_aliases:
                 return w
             canon = global_map.get(lw)
             if not canon:
@@ -2062,6 +2086,11 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             exclusion_tables = {t for t in other_tables if _question_targets_table_exclusion(question, t)}
             existence_tables = {t for t in other_tables if _question_targets_table_existence(question, t)}
 
+            # Join type must be decided per table.
+            # Global "requires_inner_join" is only a fallback when no table-level
+            # existence/exclusion target can be identified.
+            force_inner_all = bool(requires_inner_join and not exclusion_tables and not existence_tables)
+
             # More explicit guidance - tell LLM exactly which table should be first
             hint_msg = f"TABLE ORDER (CRITICAL): Start your query with FROM {primary_table}"
             if other_tables:
@@ -2071,7 +2100,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                         join_steps.append(f"LEFT JOIN {t}")
                     elif t in existence_tables:
                         join_steps.append(f"INNER JOIN {t}")
-                    elif requires_inner_join:
+                    elif force_inner_all:
                         join_steps.append(f"INNER JOIN {t}")
                     else:
                         join_steps.append(f"LEFT JOIN {t}")
@@ -2084,12 +2113,18 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             constraints.append(hint_msg)
 
             # JOIN TYPE GUIDANCE (CRITICAL)
-            if exclusion_tables and (requires_inner_join or existence_tables):
+            if exclusion_tables and (existence_tables or force_inner_all):
                 constraints.append(
                     "JOIN TYPE (CRITICAL): Mixed intent detected. "
                     "Use INNER JOIN for required-existence tables, and LEFT JOIN + IS NULL/NOT EXISTS for exclusion tables (e.g., 'no/never/without')."
                 )
-            elif requires_inner_join or existence_tables:
+            elif existence_tables:
+                constraints.append(
+                    "JOIN TYPE (CRITICAL): Use INNER JOIN only for tables explicitly required by existence intent "
+                    "(e.g., 'at least one', 'with/having/placed/paid ...'). "
+                    "Use LEFT JOIN for non-target related tables to avoid dropping primary rows."
+                )
+            elif force_inner_all:
                 # Filtering pattern: use INNER JOIN to exclude non-matching rows
                 constraints.append(
                     "JOIN TYPE (CRITICAL): This query has explicit filtering intent (e.g., 'only ... that have/with ...'). "
@@ -2433,127 +2468,131 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Plain columns: columnName AS alias → columnName (remove ALL aliases)
     # Computed expressions: COUNT(*) AS alias → KEEP (functions need aliases)
     # ---------------------------------------------------------------------------
-    # List of SQL functions that indicate computed expressions.
-    computed_func_patterns = [
-        r'COUNT\s*\(', r'SUM\s*\(', r'AVG\s*\(', r'MIN\s*\(', r'MAX\s*\(',
-        r'CASE\s+WHEN', r'IF\s*\(', r'COALESCE\s*\(', r'NULLIF\s*\(',
-        r'CAST\s*\(', r'CONVERT\s*\(', r'DATE_FORMAT\s*\(',
-        r'ROW_NUMBER\s*\(', r'RANK\s*\(', r'DENSE_RANK\s*\(',
-        r'LAG\s*\(', r'LEAD\s*\(', r'FIRST_VALUE\s*\(', r'LAST_VALUE\s*\(',
-        r'CONCAT\s*\(', r'GROUP_CONCAT\s*\(', r'SUBSTRING\s*\(', r'SUBSTR\s*\(',
-        r'UPPER\s*\(', r'LOWER\s*\(', r'TRIM\s*\(', r'LENGTH\s*\('
-    ]
+    # Plain-column alias stripping is only safe for simple single-table shapes.
+    # For JOIN/subquery queries, aliases are often semantically meaningful
+    # (selected output names and ORDER BY alias references), so keep them.
+    if not has_join(s) and not re.search(r"\bFROM\s*\(", s, flags=re.I):
+        # List of SQL functions that indicate computed expressions.
+        computed_func_patterns = [
+            r'COUNT\s*\(', r'SUM\s*\(', r'AVG\s*\(', r'MIN\s*\(', r'MAX\s*\(',
+            r'CASE\s+WHEN', r'IF\s*\(', r'COALESCE\s*\(', r'NULLIF\s*\(',
+            r'CAST\s*\(', r'CONVERT\s*\(', r'DATE_FORMAT\s*\(',
+            r'ROW_NUMBER\s*\(', r'RANK\s*\(', r'DENSE_RANK\s*\(',
+            r'LAG\s*\(', r'LEAD\s*\(', r'FIRST_VALUE\s*\(', r'LAST_VALUE\s*\(',
+            r'CONCAT\s*\(', r'GROUP_CONCAT\s*\(', r'SUBSTRING\s*\(', r'SUBSTR\s*\(',
+            r'UPPER\s*\(', r'LOWER\s*\(', r'TRIM\s*\(', r'LENGTH\s*\('
+        ]
 
-    def _find_top_level_from_idx(text: str) -> int:
-        depth = 0
-        in_sq = False
-        in_dq = False
-        in_bt = False
-        i = 0
-        while i < len(text):
-            ch = text[i]
-            if ch == "'" and not in_dq and not in_bt:
-                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
-                    i += 2
+        def _find_top_level_from_idx(text: str) -> int:
+            depth = 0
+            in_sq = False
+            in_dq = False
+            in_bt = False
+            i = 0
+            while i < len(text):
+                ch = text[i]
+                if ch == "'" and not in_dq and not in_bt:
+                    if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_sq = not in_sq
+                    i += 1
                     continue
-                in_sq = not in_sq
-                i += 1
-                continue
-            if ch == '"' and not in_sq and not in_bt:
-                if in_dq and i + 1 < len(text) and text[i + 1] == '"':
-                    i += 2
+                if ch == '"' and not in_sq and not in_bt:
+                    if in_dq and i + 1 < len(text) and text[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_dq = not in_dq
+                    i += 1
                     continue
-                in_dq = not in_dq
+                if ch == "`" and not in_sq and not in_dq:
+                    in_bt = not in_bt
+                    i += 1
+                    continue
+                if in_sq or in_dq or in_bt:
+                    i += 1
+                    continue
+                if ch == "(":
+                    depth += 1
+                    i += 1
+                    continue
+                if ch == ")":
+                    depth = max(0, depth - 1)
+                    i += 1
+                    continue
+                if (
+                    depth == 0
+                    and i + 4 <= len(text)
+                    and text[i:i + 4].lower() == "from"
+                    and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))
+                    and (i + 4 == len(text) or not (text[i + 4].isalnum() or text[i + 4] == "_"))
+                ):
+                    return i
                 i += 1
-                continue
-            if ch == "`" and not in_sq and not in_dq:
-                in_bt = not in_bt
-                i += 1
-                continue
-            if in_sq or in_dq or in_bt:
-                i += 1
-                continue
-            if ch == "(":
-                depth += 1
-                i += 1
-                continue
-            if ch == ")":
-                depth = max(0, depth - 1)
-                i += 1
-                continue
-            if (
-                depth == 0
-                and i + 4 <= len(text)
-                and text[i:i + 4].lower() == "from"
-                and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))
-                and (i + 4 == len(text) or not (text[i + 4].isalnum() or text[i + 4] == "_"))
-            ):
-                return i
-            i += 1
-        return -1
+            return -1
 
-    # Apply this rule ONLY to top-level SELECT list to avoid stripping table aliases
-    # from FROM/JOIN clauses (e.g., "FROM customers AS cust").
-    from_idx = _find_top_level_from_idx(s)
-    select_segment = s if from_idx < 0 else s[:from_idx]
-    remainder_segment = "" if from_idx < 0 else s[from_idx:]
+        # Apply this rule ONLY to top-level SELECT list to avoid stripping table aliases
+        # from FROM/JOIN clauses (e.g., "FROM customers AS cust").
+        from_idx = _find_top_level_from_idx(s)
+        select_segment = s if from_idx < 0 else s[:from_idx]
+        remainder_segment = "" if from_idx < 0 else s[from_idx:]
 
-    # Pattern to match: plain_column AS alias or table.column AS alias.
-    # Only match if NOT a computed expression.
-    def remove_plain_column_alias(match):
-        column_ref = match.group(1)
-        alias_name = match.group(2)
-        alias_clean = alias_name.strip('\'"`')
-        combined = column_ref + ' ' + alias_clean
-        for func_pattern in computed_func_patterns:
-            if re.search(func_pattern, combined, re.IGNORECASE):
-                return match.group(0)
-        return column_ref
+        # Pattern to match: plain_column AS alias or table.column AS alias.
+        # Only match if NOT a computed expression.
+        def remove_plain_column_alias(match):
+            column_ref = match.group(1)
+            alias_name = match.group(2)
+            alias_clean = alias_name.strip('\'"`')
+            combined = column_ref + ' ' + alias_clean
+            for func_pattern in computed_func_patterns:
+                if re.search(func_pattern, combined, re.IGNORECASE):
+                    return match.group(0)
+            return column_ref
 
-    def remove_plain_column_alias_quoted(match):
-        column_ref = match.group(1)
-        alias_name = match.group(3)
-        alias_clean = alias_name.strip('\'"`')
-        combined = column_ref + ' ' + alias_clean
-        for func_pattern in computed_func_patterns:
-            if re.search(func_pattern, combined, re.IGNORECASE):
-                return match.group(0)
-        return column_ref
+        def remove_plain_column_alias_quoted(match):
+            column_ref = match.group(1)
+            alias_name = match.group(3)
+            alias_clean = alias_name.strip('\'"`')
+            combined = column_ref + ' ' + alias_clean
+            for func_pattern in computed_func_patterns:
+                if re.search(func_pattern, combined, re.IGNORECASE):
+                    return match.group(0)
+            return column_ref
 
-    # Protect CASE ... END AS alias in SELECT segment.
-    case_aliases = {}
-    def protect_case_aliases(match):
-        alias = f"__CASE_ALIAS_{len(case_aliases)}__"
-        case_aliases[alias] = match.group(0)
-        return alias
+        # Protect CASE ... END AS alias in SELECT segment.
+        case_aliases = {}
+        def protect_case_aliases(match):
+            alias = f"__CASE_ALIAS_{len(case_aliases)}__"
+            case_aliases[alias] = match.group(0)
+            return alias
 
-    select_segment = re.sub(
-        r'\bCASE\s+WHEN\b.+?\bEND\b\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)',
-        protect_case_aliases,
-        select_segment,
-        flags=re.IGNORECASE | re.DOTALL
-    )
+        select_segment = re.sub(
+            r'\bCASE\s+WHEN\b.+?\bEND\b\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)',
+            protect_case_aliases,
+            select_segment,
+            flags=re.IGNORECASE | re.DOTALL
+        )
 
-    # Pattern 1: quoted aliases in SELECT list.
-    select_segment = re.sub(
-        r"([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+AS\s+(['\"])([^'\"]+)\2",
-        remove_plain_column_alias_quoted,
-        select_segment,
-        flags=re.IGNORECASE
-    )
+        # Pattern 1: quoted aliases in SELECT list.
+        select_segment = re.sub(
+            r"([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+AS\s+(['\"])([^'\"]+)\2",
+            remove_plain_column_alias_quoted,
+            select_segment,
+            flags=re.IGNORECASE
+        )
 
-    # Pattern 2: unquoted aliases in SELECT list.
-    select_segment = re.sub(
-        r"([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-        remove_plain_column_alias,
-        select_segment,
-        flags=re.IGNORECASE
-    )
+        # Pattern 2: unquoted aliases in SELECT list.
+        select_segment = re.sub(
+            r"([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+            remove_plain_column_alias,
+            select_segment,
+            flags=re.IGNORECASE
+        )
 
-    # Restore protected CASE aliases and recombine SQL.
-    for alias, original in case_aliases.items():
-        select_segment = select_segment.replace(alias, original)
-    s = select_segment + remainder_segment
+        # Restore protected CASE aliases and recombine SQL.
+        for alias, original in case_aliases.items():
+            select_segment = select_segment.replace(alias, original)
+        s = select_segment + remainder_segment
 
     # NEW: Normalize overly long aliases by removing filler words
     s = _normalize_alias_lengths(s)
@@ -2751,8 +2790,14 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_winner_row_aggregate_misuse(s, question)
         if DEBUG_WR: print("[PH4] after agg-misuse:", s)
 
+        s = _fix_winner_row_window_order_priority(s, question)
+        if DEBUG_WR: print("[PH4] after winner-row window order fix:", s)
+
         s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
         if DEBUG_WR: print("[PH4] after metric-agg-column fix:", s)
+
+        s = _rewrite_customer_orders_payment_fanout(s, question, ctx)
+        if DEBUG_WR: print("[PH4] after customer-order-payment fanout fix:", s)
 
         s = _rewrite_latest_year_same_year_aggregate(s, question, ctx)
         if DEBUG_WR: print("[PH4] after latest-year-sum fix:", s)

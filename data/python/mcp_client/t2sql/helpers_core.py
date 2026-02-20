@@ -1266,8 +1266,80 @@ def _rewrite_invalid_fk_join_conditions(sql: str, ctx: str = "") -> str:
     """
     if not sql or not has_join(sql):
         return sql
+
+    # If query contains derived-table joins/subqueries, do a recursive pass on
+    # inner SELECT blocks first, then return (outer scope is too ambiguous for
+    # direct regex surgery).
     if re.search(r"\b(?:from|join)\s*\(", sql, flags=re.I):
-        return sql
+        def _rewrite_inner_select_blocks(text: str) -> str:
+            if not text or "(" not in text:
+                return text
+
+            out_parts: List[str] = []
+            i = 0
+            n = len(text)
+            while i < n:
+                ch = text[i]
+                if ch != "(":
+                    out_parts.append(ch)
+                    i += 1
+                    continue
+
+                # Find matching ')' with quote/backtick awareness.
+                depth = 0
+                in_sq = False
+                in_dq = False
+                in_bt = False
+                j = i
+                while j < n:
+                    cj = text[j]
+                    if cj == "'" and not in_dq and not in_bt:
+                        if in_sq and j + 1 < n and text[j + 1] == "'":
+                            j += 2
+                            continue
+                        in_sq = not in_sq
+                        j += 1
+                        continue
+                    if cj == '"' and not in_sq and not in_bt:
+                        if in_dq and j + 1 < n and text[j + 1] == '"':
+                            j += 2
+                            continue
+                        in_dq = not in_dq
+                        j += 1
+                        continue
+                    if cj == "`" and not in_sq and not in_dq:
+                        in_bt = not in_bt
+                        j += 1
+                        continue
+                    if in_sq or in_dq or in_bt:
+                        j += 1
+                        continue
+                    if cj == "(":
+                        depth += 1
+                    elif cj == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+
+                if j >= n or text[j] != ")":
+                    # Unbalanced fallback: keep remaining text untouched.
+                    out_parts.append(text[i:])
+                    return "".join(out_parts)
+
+                inner = text[i + 1:j]
+                inner_stripped = inner.lstrip()
+                if re.match(r"(?is)^select\b", inner_stripped):
+                    fixed_inner = _rewrite_invalid_fk_join_conditions(inner, ctx)
+                    out_parts.append("(" + fixed_inner + ")")
+                else:
+                    out_parts.append("(" + inner + ")")
+                i = j + 1
+
+            return "".join(out_parts)
+
+        fixed_with_inner = _rewrite_inner_select_blocks(sql)
+        return fixed_with_inner
 
     try:
         fk_map_raw = get_fk_relationships() or {}
@@ -1355,6 +1427,85 @@ def _rewrite_invalid_fk_join_conditions(sql: str, ctx: str = "") -> str:
                 pairs.append((rt, fk_col, lt, _target_join_col(lt, fk_col)))
         return pairs
 
+    def _pick_bridge_rewrite(
+        valid_table: str,
+        invalid_table: str,
+        missing_fk_col: str,
+    ) -> Optional[Tuple[str, str, str, str]]:
+        """
+        Find bridge table C such that:
+          - C.<missing_fk_col> references valid_table
+          - invalid_table has FK to C via some column
+        Returns (bridge_table, bridge_fk_to_valid, invalid_fk_to_bridge, bridge_target_col).
+        """
+        vt = (valid_table or "").lower().strip()
+        it = (invalid_table or "").lower().strip()
+        miss = (missing_fk_col or "").lower().strip()
+        if not vt or not it or not miss or vt == it:
+            return None
+
+        candidates: List[Tuple[str, str, str, str]] = []
+        for bridge_table, bridge_fk_map in fk_map.items():
+            bt = (bridge_table or "").lower().strip()
+            if not bt:
+                continue
+
+            # Bridge must reference valid table using the missing FK name.
+            if (bridge_fk_map or {}).get(miss) != vt:
+                continue
+
+            # Invalid table must reference bridge table.
+            inv_fk_candidates = [
+                fk_col
+                for fk_col, tgt in (fk_map.get(it, {}) or {}).items()
+                if (tgt or "").lower() == bt
+            ]
+            if not inv_fk_candidates:
+                continue
+
+            def _fk_score(fk_col: str) -> int:
+                f = (fk_col or "").lower()
+                s = 0
+                if f.endswith("id") or f.endswith("number") or f.endswith("code"):
+                    s += 4
+                if bt.rstrip("s") in f:
+                    s += 2
+                return s
+
+            invalid_fk_to_bridge = sorted(inv_fk_candidates, key=_fk_score, reverse=True)[0]
+            bridge_target_col = str(get_id_column(bt) or invalid_fk_to_bridge)
+
+            bt_cols = _table_cols(bt)
+            it_cols = _table_cols(it)
+            if bt_cols and miss not in bt_cols:
+                continue
+            if it_cols and invalid_fk_to_bridge not in it_cols:
+                continue
+            if bt_cols and bridge_target_col.lower() not in bt_cols:
+                if invalid_fk_to_bridge in bt_cols:
+                    bridge_target_col = invalid_fk_to_bridge
+                else:
+                    continue
+
+            candidates.append((bt, miss, invalid_fk_to_bridge, bridge_target_col))
+
+        if not candidates:
+            return None
+        return candidates[0]
+
+    def _pick_unique_alias(base_table: str) -> str:
+        used_aliases = {k.lower() for k in alias_to_table.keys() if k}
+        base = (get_singular_form(base_table) or base_table or "b").strip().lower()
+        base = re.sub(r"[^a-z0-9_]", "", base) or "b"
+        if not re.match(r"[a-z_]", base[0]):
+            base = f"b_{base}"
+        cand = base
+        idx = 2
+        while cand.lower() in used_aliases:
+            cand = f"{base}_{idx}"
+            idx += 1
+        return cand
+
     join_pat = re.compile(
         r"""
         (?P<full>
@@ -1385,6 +1536,65 @@ def _rewrite_invalid_fk_join_conditions(sql: str, ctx: str = "") -> str:
         eq_matches = list(eq_pat.finditer(on_txt))
         if not eq_matches:
             continue
+
+        # Bridge-table repair for invalid direct joins (single simple equijoin).
+        # Example:
+        #   employees e LEFT JOIN payments p ON e.employeeNumber = p.salesRepEmployeeNumber
+        # ->
+        #   employees e LEFT JOIN customers c ON c.salesRepEmployeeNumber = e.employeeNumber
+        #               LEFT JOIN payments p ON p.customerNumber = c.customerNumber
+        if len(eq_matches) == 1:
+            m_eq_only = eq_matches[0]
+            on_residual = (on_txt[:m_eq_only.start()] + on_txt[m_eq_only.end():]).strip()
+            on_residual = re.sub(r"[()\s]+", "", on_residual)
+            if not on_residual:
+                lhs_alias, lhs_col = m_eq_only.group(1), m_eq_only.group(2)
+                rhs_alias, rhs_col = m_eq_only.group(3), m_eq_only.group(4)
+                lt = _get_table(lhs_alias)
+                rt = _get_table(rhs_alias)
+
+                left_cols = _table_cols(lt)
+                right_cols = _table_cols(rt)
+                lhs_missing = bool(left_cols) and (lhs_col.lower() not in left_cols)
+                rhs_missing = bool(right_cols) and (rhs_col.lower() not in right_cols)
+
+                if lhs_missing ^ rhs_missing:
+                    # Only rewrite when the invalid side belongs to the joined table alias.
+                    joined_table_raw = (m_join.group("table") or "").replace("`", "")
+                    joined_table_name = joined_table_raw.split(".")[-1].lower()
+                    joined_alias = (m_join.group("alias") or "").strip()
+                    joined_symbol = (joined_alias or joined_table_name).lower()
+
+                    if lhs_missing:
+                        invalid_alias, invalid_col, invalid_table = lhs_alias, lhs_col, lt
+                        valid_alias, valid_col, valid_table = rhs_alias, rhs_col, rt
+                    else:
+                        invalid_alias, invalid_col, invalid_table = rhs_alias, rhs_col, rt
+                        valid_alias, valid_col, valid_table = lhs_alias, lhs_col, lt
+
+                    if invalid_alias.lower() == joined_symbol:
+                        bridge = _pick_bridge_rewrite(valid_table, invalid_table, invalid_col)
+                        if bridge:
+                            bridge_table, bridge_fk_to_valid, invalid_fk_to_bridge, bridge_target_col = bridge
+                            bridge_alias = _pick_unique_alias(bridge_table)
+                            jtype = (m_join.group("jtype") or "JOIN").strip()
+                            join_table_token = (m_join.group("table") or "").strip()
+                            join_alias_token = f" {joined_alias}" if joined_alias else ""
+
+                            # Preserve original missing-FK column casing when possible.
+                            bridge_fk_out = invalid_col if invalid_col.lower() == bridge_fk_to_valid.lower() else bridge_fk_to_valid
+
+                            replacement = (
+                                f" {jtype} {bridge_table} {bridge_alias}"
+                                f" ON {bridge_alias}.{bridge_fk_out} = {valid_alias}.{valid_col}"
+                                f" {jtype} {join_table_token}{join_alias_token}"
+                                f" ON {invalid_alias}.{invalid_fk_to_bridge} = {bridge_alias}.{bridge_target_col}"
+                            )
+                            out = out[:m_join.start("full")] + replacement + out[m_join.end("full"):]
+                            alias_to_table[bridge_alias] = bridge_table
+                            alias_to_table[bridge_alias.lower()] = bridge_table
+                            alias_to_table.setdefault(bridge_table, bridge_table)
+                            continue
 
         rebuilt = []
         last = 0
@@ -2090,6 +2300,10 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
 
     parsed = _parse_select_from_groupby(sql)
     if not parsed:
+        # Safety: do not apply relaxed fallback parser on queries with subqueries.
+        # It can misinterpret inner GROUP BY as top-level and corrupt FROM/JOIN.
+        if re.search(r"\b(?:FROM|JOIN)\s*\(", sql, flags=re.I):
+            return sql
         # Relaxed fallback parser for GROUP BY queries with HAVING.
         s = (sql or "").strip().rstrip(";").strip()
         m_sel = re.match(r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<after>.+)$", s)
@@ -2612,6 +2826,45 @@ def _expand_group_by_aliases_regex(sql: str) -> str:
     if not sql or "group by" not in sql.lower():
         return sql
 
+    # Only operate when GROUP BY exists at top level (not inside subqueries).
+    def _find_top_level_group_by(s: str) -> int:
+        s_up = s.upper()
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(s) and s[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and s_up[i:i + 8] == "GROUP BY":
+                left_ok = (i == 0 or not s[i - 1].isalnum())
+                right_ok = (i + 8 >= len(s) or not s[i + 8].isalnum())
+                if left_ok and right_ok:
+                    return i
+            i += 1
+        return -1
+
+    group_pos_top = _find_top_level_group_by(sql)
+    if group_pos_top < 0:
+        return sql
+
     # Extract SELECT ... FROM
     m_select = re.search(
         r"\bSELECT\b(.*?)\bFROM\b",
@@ -2644,15 +2897,17 @@ def _expand_group_by_aliases_regex(sql: str) -> str:
     if not alias_map:
         return sql
 
-    # Extract GROUP BY clause
+    # Extract top-level GROUP BY clause (search from top-level GROUP BY position).
     m_group = re.search(
         r"\bGROUP\s+BY\b\s+(.*?)(?=(\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|;|$))",
-        sql,
+        sql[group_pos_top:],
         flags=re.I | re.S
     )
     if not m_group:
         return sql
 
+    abs_group_start = group_pos_top + m_group.start(1)
+    abs_group_end = group_pos_top + m_group.end(1)
     group_clause = m_group.group(1).strip()
     group_items = _split_top_level_commas(group_clause)
 
@@ -2674,11 +2929,11 @@ def _expand_group_by_aliases_regex(sql: str) -> str:
     new_group = ", ".join(new_group_items)
 
     # Replace in original SQL, preserving clause boundaries.
-    suffix = sql[m_group.end(1):]
+    suffix = sql[abs_group_end:]
     if suffix and not suffix.startswith((" ", "\n", "\t", "\r")):
         if re.match(r"(?is)^(ORDER\s+BY|HAVING|LIMIT|;)", suffix):
             suffix = " " + suffix
-    return sql[:m_group.start(1)] + new_group + suffix
+    return sql[:abs_group_start] + new_group + suffix
 
 def _is_potential_winner_row(sql: str, question: str, force: bool = False) -> bool:
     """
@@ -2743,7 +2998,7 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
     if "GROUP BY" not in sql.upper() or "ORDER BY" not in sql.upper():
         return sql
 
-    # IMPORTANT: only consider TOP-LEVEL ORDER BY (outside window functions).
+    # IMPORTANT: only consider TOP-LEVEL ORDER BY/GROUP BY (outside subqueries/window functions).
     # Otherwise ORDER BY inside OVER(...) will corrupt GROUP BY rewrites.
     def _find_top_level_order_by(s: str) -> Optional[int]:
         s_upper = s.upper()
@@ -2763,15 +3018,42 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
             i += 1
         return None
 
+    def _find_top_level_group_by(s: str) -> Optional[int]:
+        s_upper = s.upper()
+        depth = 0
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth = max(0, depth - 1)
+            elif depth == 0 and s_upper[i:i+8] == 'GROUP BY':
+                left_ok = (i == 0 or not s[i-1].isalnum())
+                right_ok = (i + 8 >= len(s) or not s[i+8].isalnum())
+                if left_ok and right_ok:
+                    return i
+            i += 1
+        return None
+
     order_pos = _find_top_level_order_by(sql)
     if order_pos is None:
         return sql
+    group_pos_top = _find_top_level_group_by(sql)
+    if group_pos_top is None:
+        return sql
 
-    # Extract GROUP BY clause
-    gb_match = re.search(r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:ORDER\s+BY|HAVING|LIMIT|;|$))', sql, re.IGNORECASE | re.DOTALL)
+    # Extract top-level GROUP BY clause
+    gb_match = re.search(
+        r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:ORDER\s+BY|HAVING|LIMIT|;|$))',
+        sql[group_pos_top:],
+        re.IGNORECASE | re.DOTALL
+    )
     if not gb_match:
         return sql
 
+    gb_abs_start = group_pos_top + gb_match.start(1)
+    gb_abs_end = group_pos_top + gb_match.end(1)
     group_clause = gb_match.group(1).strip()
     group_items = _split_top_level_commas(group_clause)
 
@@ -2868,11 +3150,20 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
     # Add missing items to GROUP BY clause
     if items_to_add_to_group_by:
         # Find GROUP BY clause again (position may have changed)
-        gb_match = re.search(r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:ORDER\s+BY|HAVING|LIMIT|;|$))', sql, re.IGNORECASE | re.DOTALL)
+        group_pos_top = _find_top_level_group_by(sql)
+        if group_pos_top is None:
+            return _drop_aggregate_or_window_items_from_group_by(sql)
+        gb_match = re.search(
+            r'\bGROUP\s+BY\s+(.*?)(?=\s*(?:ORDER\s+BY|HAVING|LIMIT|;|$))',
+            sql[group_pos_top:],
+            re.IGNORECASE | re.DOTALL
+        )
         if gb_match:
             new_group_items = group_items + items_to_add_to_group_by
             new_group_clause = ', '.join(new_group_items)
-            sql = sql[:gb_match.start(1)] + new_group_clause + sql[gb_match.end(1):]
+            gb_abs_start = group_pos_top + gb_match.start(1)
+            gb_abs_end = group_pos_top + gb_match.end(1)
+            sql = sql[:gb_abs_start] + new_group_clause + sql[gb_abs_end:]
 
     # Final safety: GROUP BY must not contain aggregate/window expressions.
     return _drop_aggregate_or_window_items_from_group_by(sql)
@@ -3135,6 +3426,44 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
     if not sql:
         return sql
 
+    # Only apply when GROUP BY is top-level (not inside subqueries).
+    def _has_top_level_group_by(s: str) -> bool:
+        s_up = s.upper()
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(s) and s[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and s_up[i:i + 8] == "GROUP BY":
+                left_ok = (i == 0 or not s[i - 1].isalnum())
+                right_ok = (i + 8 >= len(s) or not s[i + 8].isalnum())
+                if left_ok and right_ok:
+                    return True
+            i += 1
+        return False
+
+    if not _has_top_level_group_by(sql):
+        return sql
+
     # Try sqlglot first (more accurate)
     try:
         import sqlglot
@@ -3191,6 +3520,10 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
         # FALLBACK: Use regex when sqlglot fails (syntax errors, etc.)
         # This handles cases where SQL has minor syntax issues
         if "GROUP BY" not in sql.upper():
+            return sql
+        # Safety: for queries with subqueries, regex fallback can grab inner GROUP BY
+        # and corrupt top-level SELECT. Skip fallback in that case.
+        if re.search(r"\b(?:FROM|JOIN)\s*\(", sql, flags=re.I):
             return sql
 
         # Extract GROUP BY clause
@@ -4066,6 +4399,254 @@ def _fix_inconsistent_subquery_alias(sql: str) -> Optional[str]:
     return fixed
 
 
+def _fix_outer_order_by_for_derived_alias(sql: str) -> str:
+    """
+    For outer queries over a derived table:
+      SELECT ... FROM ( ... ) t ... ORDER BY ...
+    normalize ORDER BY references to valid outer output names.
+
+    Typical repairs:
+      - wrong qualifier alias (e.g., e.customerNumber -> customerNumber)
+      - snake/camel mismatch (payment_date -> paymentDate)
+      - number->id alias drift (employeeNumber -> employee_id when projected as alias)
+    """
+    if not sql:
+        return sql
+
+    s = sql.strip()
+    if not s or "ORDER BY" not in s.upper() or "FROM (" not in s.upper():
+        return sql
+
+    # Detect derived-table alias used in outer scope.
+    m_sub_alias = re.search(r"\)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\s+WHERE\b", s, flags=re.I)
+    if not m_sub_alias:
+        return sql
+    sub_alias = m_sub_alias.group(1)
+
+    m_select = re.search(r"(?is)^\s*SELECT\s+(.*?)\s+FROM\s*\(", s)
+    if not m_select:
+        return sql
+    outer_select = (m_select.group(1) or "").strip()
+
+    def _is_word_boundary(text: str, i: int, n: int) -> bool:
+        left_ok = (i == 0) or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        right_ok = (i + n >= len(text)) or not (text[i + n].isalnum() or text[i + n] == "_")
+        return left_ok and right_ok
+
+    def _find_top_level_order_by(text: str) -> int:
+        low = text.lower()
+        i = 0
+        depth = 0
+        in_sq = False
+        in_dq = False
+        in_bt = False
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq and not in_bt:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq and not in_bt:
+                if in_dq and i + 1 < len(text) and text[i + 1] == '"':
+                    i += 2
+                    continue
+                in_dq = not in_dq
+                i += 1
+                continue
+            if ch == "`" and not in_sq and not in_dq:
+                in_bt = not in_bt
+                i += 1
+                continue
+            if in_sq or in_dq or in_bt:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and low[i:i + 8] == "order by" and _is_word_boundary(text, i, 8):
+                return i
+            i += 1
+        return -1
+
+    def _find_top_level_limit_after(text: str, start: int) -> int:
+        low = text.lower()
+        i = max(0, start)
+        depth = 0
+        in_sq = False
+        in_dq = False
+        in_bt = False
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq and not in_bt:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq and not in_bt:
+                if in_dq and i + 1 < len(text) and text[i + 1] == '"':
+                    i += 2
+                    continue
+                in_dq = not in_dq
+                i += 1
+                continue
+            if ch == "`" and not in_sq and not in_dq:
+                in_bt = not in_bt
+                i += 1
+                continue
+            if in_sq or in_dq or in_bt:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and low[i:i + 5] == "limit" and _is_word_boundary(text, i, 5):
+                return i
+            if depth == 0 and ch == ";":
+                return i
+            i += 1
+        return -1
+
+    order_pos = _find_top_level_order_by(s)
+    if order_pos < 0:
+        return sql
+    order_clause_start = order_pos + len("ORDER BY")
+    order_clause_end = _find_top_level_limit_after(s, order_clause_start)
+    if order_clause_end < 0:
+        order_clause_end = len(s)
+
+    order_clause = s[order_clause_start:order_clause_end].strip()
+    if not order_clause:
+        return sql
+
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            (item or "").strip(),
+        )
+        if not m:
+            return (item or "").strip(), None
+        return (m.group(1) or "").strip(), (m.group(2) or "").strip()
+
+    def _output_name_from_expr(expr: str, alias_raw: Optional[str]) -> Optional[str]:
+        if alias_raw:
+            a = alias_raw.strip()
+            if (
+                (a.startswith("`") and a.endswith("`"))
+                or (a.startswith("'") and a.endswith("'"))
+                or (a.startswith('"') and a.endswith('"'))
+            ):
+                a = a[1:-1]
+            return a.strip() or None
+        m_col = re.match(
+            r"(?is)^\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            (expr or "").strip(),
+        )
+        if m_col:
+            return (m_col.group(1) or "").strip() or None
+        return None
+
+    def _norm_token(x: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (x or "").lower())
+
+    output_names: List[str] = []
+    for it in _split_top_level_commas(outer_select):
+        expr, a0 = _split_expr_alias(it)
+        out_name = _output_name_from_expr(expr, a0)
+        if out_name:
+            output_names.append(out_name)
+    if not output_names:
+        return sql
+
+    out_by_norm: Dict[str, List[str]] = {}
+    for name in output_names:
+        out_by_norm.setdefault(_norm_token(name), []).append(name)
+
+    def _resolve_to_output_name(raw_base: str) -> Optional[str]:
+        b = (raw_base or "").strip()
+        if not b:
+            return None
+
+        # Strip qualifier if any: alias.col -> col
+        m_q = re.match(
+            r"(?is)^`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?$",
+            b,
+        )
+        if m_q:
+            q = (m_q.group(1) or "").strip()
+            c = (m_q.group(2) or "").strip()
+            # Keep derived alias qualifier only logically; ORDER BY can use bare output name.
+            if q.lower() != sub_alias.lower():
+                b = c
+            else:
+                b = c
+
+        norm_b = _norm_token(b)
+        if not norm_b:
+            return None
+
+        # Exact/normalized match first.
+        norm_hits = out_by_norm.get(norm_b, [])
+        if len(norm_hits) == 1:
+            return norm_hits[0]
+
+        # Heuristic: employeeNumber -> employee_id if projected alias uses *_id.
+        if norm_b.endswith("number"):
+            pref_norm = norm_b[:-6] + "id"
+            pref_hits = out_by_norm.get(pref_norm, [])
+            if len(pref_hits) == 1:
+                return pref_hits[0]
+
+        # If already an output name (case-insensitive), keep canonical casing from SELECT.
+        for name in output_names:
+            if name.lower() == b.lower():
+                return name
+        return None
+
+    rebuilt_order_items: List[str] = []
+    changed = False
+    for item in _split_top_level_commas(order_clause):
+        raw = (item or "").strip()
+        if not raw:
+            continue
+
+        m_dir = re.match(r"(?is)^(.*?)(\s+(?:ASC|DESC))\s*$", raw)
+        if m_dir:
+            base = (m_dir.group(1) or "").strip()
+            dir_part = (m_dir.group(2) or "").strip()
+        else:
+            base = raw
+            dir_part = ""
+
+        replacement = _resolve_to_output_name(base)
+        if replacement and replacement != base:
+            changed = True
+            base = replacement
+
+        rebuilt_order_items.append((base + (" " + dir_part if dir_part else "")).strip())
+
+    if not changed or not rebuilt_order_items:
+        return sql
+
+    new_order_clause = ", ".join(rebuilt_order_items)
+    fixed = s[:order_clause_start] + " " + new_order_clause + s[order_clause_end:]
+    return fixed
+
+
 def _drop_redundant_top_groupby_after_rn_filter(sql: str) -> Optional[str]:
     """
     Drop top-level GROUP BY when query already filters to a single winner row via WHERE rn = N.
@@ -4198,6 +4779,8 @@ def _preexecute_sql_safety_pass(sql: str, question: str = "") -> str:
         fixed = _fix_inconsistent_subquery_alias(s)
         if fixed:
             s = fixed
+
+        s = _fix_outer_order_by_for_derived_alias(s)
 
         # Winner-row fallback: force rewrite if query still looks like MAX-date misuse.
         # IMPORTANT: skip for "latest year + aggregate amount" intent, where MAX(date)
@@ -4383,7 +4966,10 @@ def _parse_select_from_groupby(sql: str) -> Optional[dict]:
 
     if re.match(r"^\s*with\b", s, flags=re.I):
         return None
-    if re.search(r"\bfrom\s*\(", s, flags=re.I):
+    # This parser is intentionally for flat queries only.
+    # Any derived table in FROM/JOIN can make regex clause capture unsafe
+    # (inner GROUP BY/HAVING/ORDER BY may be mistaken as top-level clauses).
+    if re.search(r"\b(?:from|join)\s*\(", s, flags=re.I):
         return None
     if re.search(r"\bhaving\b", s, flags=re.I):
         return None
@@ -4537,6 +5123,11 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
     if not parsed:
         return sql   # parsing fail = hard stop
 
+    # Preserve qualified column references for multi-table sources.
+    # Stripping prefixes in JOIN queries can create ambiguous columns
+    # (e.g., customerNumber exists in both customers and payments).
+    preserve_qualified = has_join(parsed.get("from_core", ""))
+
     select_items = _split_top_level_commas(parsed["select"])
     group_items  = _split_top_level_commas(parsed["groupby"])
 
@@ -4552,6 +5143,9 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
     # PARTITION KEY (entity key)
     # =====================================================
     q_low = (question or "").lower()
+    # Focus "requested output columns" detection on the projection phrase,
+    # not on sorting-only phrases (e.g., "sort by customer id").
+    q_low_output = re.split(r"\b(?:sort(?:ed)?\s+by|order\s+by)\b", q_low, maxsplit=1, flags=re.I)[0]
     q_tokens = set(re.findall(r"[a-z0-9]+", q_low))
     stop_tokens = {
         "for", "each", "per", "the", "a", "an", "of", "with", "and", "or",
@@ -4729,9 +5323,10 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
         else:
             tie_dir = "ASC"
 
-    # Strip table prefixes
-    agg_expr = _strip_table_prefix(agg_expr)
-    tie_exprs = [_strip_table_prefix(t) for t in tie_exprs]
+    # Strip table prefixes only for single-table sources.
+    if not preserve_qualified:
+        agg_expr = _strip_table_prefix(agg_expr)
+        tie_exprs = [_strip_table_prefix(t) for t in tie_exprs]
 
     # Build ORDER BY: metric first, then tie-breakers (limit to 2 for stability)
     order_parts = [f"{agg_expr} {metric_dir}"]
@@ -4774,14 +5369,18 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
                 # Keep original alias for true non-aggregate columns
                 out_name = orig_alias if orig_alias else _strip_table_prefix(base)
             
-            base = _strip_table_prefix(base)
+            if not preserve_qualified:
+                base = _strip_table_prefix(base)
 
         inner_items.append(
             _maybe_keep_or_alias_simple(base, out_name)
         )
         outer_items.append(out_name)
 
-    partition_clean = [_strip_table_prefix(p) for p in partition_items]
+    if preserve_qualified:
+        partition_clean = partition_items
+    else:
+        partition_clean = [_strip_table_prefix(p) for p in partition_items]
 
     inner_items.append(
         f"ROW_NUMBER() OVER "
@@ -5021,6 +5620,122 @@ def _winner_row_final_sanity(sql: str, question: str) -> str:
     ).where(exp.EQ(this=exp.column("rn", table="t"), expression=exp.Literal.number(1)))
 
     return outer.sql(dialect="mysql")
+
+
+def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
+    """
+    Normalize ROW_NUMBER() window ORDER BY priority for winner-row questions
+    that ask:
+      - latest/most recent date as primary criterion
+      - largest/highest amount as tie-breaker
+
+    Example fix:
+      ORDER BY amount DESC, paymentDate DESC
+    -> ORDER BY paymentDate DESC, amount DESC
+    """
+    if not sql or "ROW_NUMBER" not in (sql or "").upper():
+        return sql
+    q = (question or "").lower()
+    wants_latest_date = bool(
+        re.search(r"\b(?:latest|most\s+recent|newest|terbaru|terakhir)\b", q)
+        and re.search(r"\b(?:date|time|tanggal)\b", q)
+    )
+    if not wants_latest_date:
+        return sql
+
+    # Intent disambiguation:
+    # - amount-first: "largest/highest amount ... if same amount then latest date"
+    # - date-first:   "most recent/latest date ... if same date then largest amount"
+    same_amount_tie = bool(
+        re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|tie|tied|same)\b", q)
+        and re.search(r"\b(?:same|equal)\s+(?:payment\s+)?amount\b", q)
+    )
+    same_date_tie = bool(
+        re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|tie|tied|same)\b", q)
+        and re.search(r"\bsame\s+(?:most\s+recent\s+)?(?:date|payment\s+date|order\s+date|time)\b", q)
+    )
+    amount_superlative = bool(
+        re.search(r"\b(?:largest|highest|max(?:imum)?|biggest|top)\b", q)
+        and re.search(r"\b(?:amount|price|quantity|value|payment\s+amount)\b", q)
+    )
+
+    # Conservative rule:
+    # rewrite only when date is clearly primary, never when amount-primary tie logic is explicit.
+    date_primary_intent = bool(
+        same_date_tie
+        or (wants_latest_date and not same_amount_tie and not amount_superlative)
+    )
+    if not date_primary_intent:
+        return sql
+
+    wants_amount_tiebreak = bool(
+        re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|same\s+most\s+recent\s+date|tie)\b", q)
+        and re.search(r"\b(?:largest|highest|max|terbesar|tertinggi)\b", q)
+        and re.search(r"\b(?:amount|payment|total|quantity|qty|price)\b", q)
+    )
+
+    # NOTE:
+    # Keep this pattern as a compact regex (no verbose spacing) so it
+    # reliably matches one-line SQL emitted by the model.
+    rownum_pat = re.compile(
+        r"(?is)ROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*(?:PARTITION\s+BY\s+.*?\b)?ORDER\s+BY\s+(?P<ob>[^)]*?)\)"
+    )
+
+    def _is_date_expr(item: str) -> bool:
+        x = (item or "").lower()
+        return ("date" in x) or ("time" in x) or ("tanggal" in x)
+
+    def _is_amount_expr(item: str) -> bool:
+        x = (item or "").lower()
+        return any(tok in x for tok in ("amount", "payment", "total", "quantity", "qty", "price", "sales", "revenue"))
+
+    def _force_dir(item: str, desc: bool) -> str:
+        base = re.sub(r"(?is)\s+(ASC|DESC)\s*$", "", (item or "").strip()).strip()
+        if not base:
+            return item
+        return f"{base} {'DESC' if desc else 'ASC'}"
+
+    def _repl(m: re.Match) -> str:
+        ob = (m.group("ob") or "").strip()
+        if not ob:
+            return m.group(0)
+
+        items = _split_top_level_commas(ob)
+        if len(items) < 2:
+            return m.group(0)
+
+        first = (items[0] or "").strip()
+        has_date_any = any(_is_date_expr(it) for it in items)
+        has_amount_any = any(_is_amount_expr(it) for it in items)
+        # Only rewrite the problematic order: amount before date.
+        if not (_is_amount_expr(first) and has_date_any):
+            return m.group(0)
+
+        date_items = []
+        amount_items = []
+        other_items = []
+        for it in items:
+            it0 = (it or "").strip()
+            if _is_date_expr(it0):
+                date_items.append(_force_dir(it0, desc=True))
+            elif _is_amount_expr(it0):
+                if wants_amount_tiebreak:
+                    amount_items.append(_force_dir(it0, desc=True))
+                else:
+                    amount_items.append(it0)
+            else:
+                other_items.append(it0)
+
+        if not date_items:
+            return m.group(0)
+
+        new_items = date_items + amount_items + other_items
+        new_ob = ", ".join(new_items)
+        full = m.group(0)
+        return full.replace(ob, new_ob, 1)
+
+    fixed = rownum_pat.sub(_repl, sql)
+    return fixed
 
 def _force_restore_groupby_if_aggregate_without_groupby(sql_before, sql_after):
     """
@@ -5440,6 +6155,496 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
     )
 
 
+def _question_wants_entity_orders_payments_rollup(question: str) -> bool:
+    """
+    Detect intent like:
+    - customers with at least one order
+    - total number of orders
+    - total payment amount
+    - paid/unpaid style status
+    """
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    def _entity_alt(table_name: str) -> str:
+        words = _entity_words_for_table(table_name)
+        escaped = []
+        for w in words:
+            ww = (w or "").strip().lower()
+            if not ww:
+                continue
+            escaped.append(re.escape(ww).replace(r"\ ", r"\s+"))
+        escaped = sorted(set(escaped), key=len, reverse=True)
+        return "|".join(escaped)
+
+    cust_alt = _entity_alt("customers")
+    ord_alt = _entity_alt("orders")
+    pay_alt = _entity_alt("payments")
+
+    def _has_alt(alt: str) -> bool:
+        return bool(alt and re.search(rf"\b(?:{alt})\b", q, flags=re.I))
+
+    has_customer = _has_alt(cust_alt)
+    has_orders = _has_alt(ord_alt)
+    has_payments = _has_alt(pay_alt) or bool(re.search(r"\bpaid\b", q))
+
+    has_order_count = bool(
+        re.search(
+            rf"\b(?:total\s+number\s+of|number\s+of|count\s+of|jumlah)\s+(?:{ord_alt})\b",
+            q,
+            flags=re.I,
+        )
+    ) or bool(re.search(r"\btotal_orders?\b", q, flags=re.I))
+
+    has_payment_total = bool(
+        re.search(
+            rf"\b(?:total\s+(?:{pay_alt})|total\s+amount\s+paid|sum\s+of\s+(?:{pay_alt})|(?:{pay_alt})\s+amount|jumlah\s+pembayaran)\b",
+            q,
+            flags=re.I,
+        )
+    ) or bool(re.search(r"\btotal_payments?\b|\btotal_payment_amount\b", q, flags=re.I))
+
+    asks_status = bool(re.search(r"\bpayment[_\s]*status\b", q, flags=re.I)) or ("paid" in q and "unpaid" in q)
+
+    return has_customer and has_orders and (has_payments or has_payment_total or asks_status) and has_order_count and (has_payment_total or asks_status)
+
+
+def _question_wants_customer_orders_payment_rollup(question: str) -> bool:
+    """
+    Backward-compatible wrapper.
+    Kept to avoid breaking older call sites while using generic detector logic.
+    """
+    return _question_wants_entity_orders_payments_rollup(question)
+
+
+def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Fix row-multiplication anti-pattern:
+      customers JOIN orders JOIN payments + GROUP BY customer
+      with COUNT(order) and SUM(payment).
+
+    Rewrites into fanout-safe shape:
+      customers
+      JOIN (orders aggregated by customer)
+      LEFT JOIN (payments aggregated by customer)
+    """
+    if not sql or not question:
+        return sql
+
+    if not _question_wants_entity_orders_payments_rollup(question):
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+
+    # Conservative: only rewrite simple grouped query without WHERE/HAVING.
+    if (parsed.get("where") or "").strip():
+        return sql
+    if (parsed.get("having") or "").strip():
+        return sql
+
+    from_core = (parsed.get("from_core") or "").strip()
+    if not from_core or "join" not in from_core.lower():
+        return sql
+
+    alias_map_raw = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    alias_to_table: Dict[str, str] = {}
+    for a, t in alias_map_raw.items():
+        al = (a or "").strip().lower()
+        tl = (t or "").strip().lower()
+        if not al or not tl:
+            continue
+        if al not in alias_to_table:
+            alias_to_table[al] = tl
+
+    order_aliases = [a for a, t in alias_to_table.items() if t == "orders"]
+    payment_aliases = [a for a, t in alias_to_table.items() if t == "payments"]
+    if not order_aliases or not payment_aliases:
+        return sql
+    order_alias = order_aliases[0]
+    payment_alias = payment_aliases[0]
+
+    m_base = re.match(
+        r"""(?is)^\s*(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?""",
+        from_core,
+    )
+    if not m_base:
+        return sql
+
+    base_table_expr = (m_base.group(1) or "").strip()
+    base_table = base_table_expr.replace("`", "").split(".")[-1]
+    if not base_table:
+        return sql
+    base_alias = (m_base.group(2) or base_table).strip()
+    base_alias_l = base_alias.lower()
+
+    # Parse SELECT list.
+    def _split_expr_alias(item: str) -> tuple:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            (item or "").strip(),
+        )
+        if not m:
+            return (item or "").strip(), None
+        return (m.group(1) or "").strip(), (m.group(2) or "").strip()
+
+    def _parse_simple_col(expr: str) -> Optional[tuple]:
+        m = re.match(
+            r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$""",
+            (expr or "").strip(),
+        )
+        if not m:
+            return None
+        return m.group(1), m.group(2)
+
+    select_items = _split_top_level_commas(parsed["select"])
+    if not select_items:
+        return sql
+
+    base_select_items: List[str] = []
+    count_alias_out: Optional[str] = None
+    count_inner: Optional[str] = None
+    count_distinct = False
+    sum_alias_out: Optional[str] = None
+    sum_inner: Optional[str] = None
+    case_items: List[tuple] = []
+
+    count_pat = re.compile(r"(?is)^COUNT\s*\(\s*(DISTINCT\s+)?(.+?)\s*\)$")
+    sum_pat = re.compile(r"(?is)^SUM\s*\(\s*(.+?)\s*\)$")
+
+    for raw_item in select_items:
+        expr, out_alias = _split_expr_alias(raw_item)
+        expr_l = expr.lower()
+
+        m_count = count_pat.match(expr)
+        if m_count:
+            inner_expr = (m_count.group(2) or "").strip()
+            # Accept COUNT(*) or COUNT(order_alias.col)
+            if inner_expr == "*":
+                count_inner = "*"
+                count_distinct = bool((m_count.group(1) or "").strip())
+                count_alias_out = (out_alias or "total_orders").strip("`'\"")
+                continue
+            ref = _parse_simple_col(inner_expr)
+            if ref and ref[0] and ref[0].lower() == order_alias:
+                count_inner = inner_expr
+                count_distinct = bool((m_count.group(1) or "").strip())
+                count_alias_out = (out_alias or "total_orders").strip("`'\"")
+                continue
+
+        m_sum = sum_pat.match(expr)
+        if m_sum:
+            inner_expr = (m_sum.group(1) or "").strip()
+            ref = _parse_simple_col(inner_expr)
+            if ref and ref[0] and ref[0].lower() == payment_alias:
+                sum_inner = inner_expr
+                sum_alias_out = (out_alias or "total_payments").strip("`'\"")
+                continue
+
+        # CASE item that depends on SUM(payment_alias.*) -> rewrite later.
+        if expr_l.startswith("case") and re.search(
+            rf"\bSUM\s*\(\s*(?:DISTINCT\s+)?`?{re.escape(payment_alias)}`?\s*\.",
+            expr,
+            flags=re.I,
+        ):
+            case_items.append((expr, out_alias))
+            continue
+
+        # Keep base-table simple columns only.
+        pcol = _parse_simple_col(expr)
+        if pcol:
+            qf, _col = pcol
+            if qf and qf.lower() == base_alias_l:
+                base_select_items.append(raw_item.strip())
+                continue
+            if not qf:
+                base_select_items.append(raw_item.strip())
+                continue
+
+        # Unsupported/complex projection: abort rewrite for safety.
+        return sql
+
+    if not base_select_items or not count_inner or not sum_inner:
+        return sql
+    if not count_alias_out:
+        count_alias_out = "total_orders"
+    if not sum_alias_out:
+        sum_alias_out = "total_payments"
+
+    # Deduplicate base projection columns conservatively.
+    # Keep duplicates when aliases differ (e.g., customerNumber AS customer_id
+    # and customerNumber AS customer_number are both explicitly requested).
+    dedup_base: List[str] = []
+    seen_base_expr: Set[str] = set()
+    for it in base_select_items:
+        base_expr, item_alias = _split_expr_alias(it)
+        expr_norm = re.sub(r"\s+", "", (base_expr or "").lower())
+        alias_norm = (item_alias or "").strip("`'\"").lower()
+        k = f"{expr_norm}__as__{alias_norm}" if alias_norm else expr_norm
+        if not k or k in seen_base_expr:
+            continue
+        seen_base_expr.add(k)
+        dedup_base.append(it)
+    base_select_items = dedup_base
+
+    # GROUP BY must not depend on orders/payments aliases.
+    for g in _split_top_level_commas(parsed.get("groupby", "")):
+        g0 = (g or "").strip().lower()
+        if re.search(rf"\b{re.escape(order_alias)}\s*\.", g0) or re.search(rf"\b{re.escape(payment_alias)}\s*\.", g0):
+            return sql
+
+    # Infer join key pairs between base<->orders and base<->payments.
+    eq_pat = re.compile(
+        r"""`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?""",
+        flags=re.I,
+    )
+    order_pairs: List[tuple] = []
+    payment_pairs: List[tuple] = []
+    for m in eq_pat.finditer(from_core):
+        a1, c1, a2, c2 = m.group(1).lower(), m.group(2), m.group(3).lower(), m.group(4)
+        if {a1, a2} == {base_alias_l, order_alias}:
+            if a1 == base_alias_l:
+                order_pairs.append((c1, c2))
+            else:
+                order_pairs.append((c2, c1))
+        if {a1, a2} == {base_alias_l, payment_alias}:
+            if a1 == base_alias_l:
+                payment_pairs.append((c1, c2))
+            else:
+                payment_pairs.append((c2, c1))
+
+    def _pick_pair(pairs: List[tuple]) -> Optional[tuple]:
+        if not pairs:
+            return None
+
+        def _score(p: tuple) -> int:
+            b, c = (p[0] or "").lower(), (p[1] or "").lower()
+            s = 0
+            for x in (b, c):
+                if x.endswith("id") or x.endswith("number") or x.endswith("code"):
+                    s += 4
+                if "customer" in x:
+                    s += 3
+            if b == c:
+                s += 2
+            return s
+
+        return sorted(pairs, key=_score, reverse=True)[0]
+
+    order_pair = _pick_pair(order_pairs)
+    payment_pair = _pick_pair(payment_pairs)
+    if not order_pair or not payment_pair:
+        return sql
+
+    base_order_key, order_key = order_pair
+    base_payment_key, payment_key = payment_pair
+
+    # If question explicitly asks for identifier slots, ensure projection stability.
+    q_low = (question or "").lower()
+    # Treat ORDER BY mention as sorting intent, not projection requirement.
+    q_low_output = re.split(r"\b(?:sort(?:ed)?\s+by|order\s+by)\b", q_low, maxsplit=1, flags=re.I)[0]
+    entity_words = _entity_words_for_table(base_table)
+    if not entity_words:
+        entity_words = [base_table, (base_table[:-1] if base_table.endswith("s") else base_table)]
+
+    def _mentions_entity_attr(attr: str) -> bool:
+        for w in entity_words:
+            ww = (w or "").strip().lower()
+            if not ww:
+                continue
+            pat = re.escape(ww).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pat}\s+{re.escape(attr)}\b", q_low_output):
+                return True
+        return False
+
+    wants_customer_number = _mentions_entity_attr("number") or bool(re.search(rf"\b{re.escape(base_table)}number\b", q_low_output))
+    wants_customer_id = _mentions_entity_attr("id")
+    wants_entity_name = _mentions_entity_attr("name")
+    id_col = get_id_column(base_table) or base_order_key
+    name_col = get_name_column(base_table)
+
+    def _base_has_col(col_name: str) -> bool:
+        for it in base_select_items:
+            e0, _a0 = _split_expr_alias(it)
+            p0 = _parse_simple_col(e0)
+            if not p0:
+                continue
+            _qf, c0 = p0
+            if c0 and c0.lower() == col_name.lower():
+                return True
+        return False
+
+    def _base_has_alias(alias_name: str) -> bool:
+        for it in base_select_items:
+            _e0, a0 = _split_expr_alias(it)
+            if a0 and a0.strip("`'\"").lower() == alias_name.lower():
+                return True
+        return False
+
+    if id_col and (wants_customer_number or wants_customer_id):
+        if not _base_has_col(id_col):
+            base_select_items.insert(0, f"{base_alias}.{id_col}")
+        # If question explicitly says "customer id", expose a stable alias.
+        if wants_customer_id and not _base_has_alias("customer_id"):
+            base_select_items.append(f"{base_alias}.{id_col} AS customer_id")
+
+    # Normalize duplicate identifier projections.
+    # If question explicitly asks both identifier slots (id + number), keep both.
+    # Otherwise collapse accidental duplicates; if name is explicitly requested,
+    # we can promote one duplicate slot to name when available.
+    if id_col:
+        id_item_idxs: List[int] = []
+        removed_aliases: List[str] = []
+        for idx, it in enumerate(base_select_items):
+            e0, a0 = _split_expr_alias(it)
+            p0 = _parse_simple_col(e0)
+            if not p0:
+                continue
+            qf0, c0 = p0
+            if c0 and c0.lower() == id_col.lower() and (not qf0 or qf0.lower() == base_alias_l):
+                id_item_idxs.append(idx)
+
+        if len(id_item_idxs) > 1:
+            wants_dual_identifier_slots = wants_customer_id and wants_customer_number
+            if not wants_dual_identifier_slots:
+                def _alias_pref_score(idx: int) -> int:
+                    _expr_i, alias_i = _split_expr_alias(base_select_items[idx])
+                    a = (alias_i or "").strip("`'\"").lower()
+                    score = 0
+                    if wants_customer_number and not wants_customer_id:
+                        if "number" in a:
+                            score += 6
+                        if "id" in a and "number" not in a:
+                            score -= 2
+                    elif wants_customer_id and not wants_customer_number:
+                        if "id" in a:
+                            score += 6
+                        if "number" in a and "id" not in a:
+                            score -= 2
+                    # Slightly prefer explicit aliases over bare columns on ties.
+                    if a:
+                        score += 1
+                    # Stable fallback: keep earliest projection on exact tie.
+                    score -= idx
+                    return score
+
+                keep_idx = max(id_item_idxs, key=_alias_pref_score)
+                for drop_idx in reversed(id_item_idxs):
+                    if drop_idx == keep_idx:
+                        continue
+                    _drop_expr, drop_alias = _split_expr_alias(base_select_items[drop_idx])
+                    if drop_alias:
+                        removed_aliases.append(drop_alias.strip("`'\""))
+                    base_select_items.pop(drop_idx)
+
+                if wants_entity_name and name_col and not _base_has_col(name_col):
+                    name_alias: Optional[str] = None
+                    for a in removed_aliases:
+                        if "name" in a.lower():
+                            name_alias = a
+                            break
+                    name_item = f"{base_alias}.{name_col}"
+                    if name_alias:
+                        name_item += f" AS {name_alias}"
+                    insert_at = min(keep_idx + 1, len(base_select_items))
+                    base_select_items.insert(insert_at, name_item)
+
+    # If question explicitly asks for entity name, ensure it is projected.
+    # This must be independent from duplicate-id collapse (both id+number may be requested).
+    if wants_entity_name and name_col and not _base_has_col(name_col):
+        base_select_items.append(f"{base_alias}.{name_col}")
+
+    used_aliases = {base_alias_l, order_alias, payment_alias, *alias_to_table.keys()}
+
+    def _pick_alias(base: str) -> str:
+        b = re.sub(r"[^A-Za-z0-9_]", "", base) or "t"
+        if not re.match(r"[A-Za-z_]", b[0]):
+            b = f"t_{b}"
+        cand = b
+        i = 2
+        while cand.lower() in used_aliases:
+            cand = f"{b}_{i}"
+            i += 1
+        used_aliases.add(cand.lower())
+        return cand
+
+    orders_agg_alias = _pick_alias("orders_agg")
+    payments_agg_alias = _pick_alias("payments_agg")
+
+    count_inner_clean = count_inner
+    if count_inner_clean != "*":
+        count_inner_clean = re.sub(
+            rf"(?is)\b`?{re.escape(order_alias)}`?\s*\.\s*",
+            "",
+            count_inner_clean,
+        )
+    count_expr = f"COUNT({'DISTINCT ' if count_distinct else ''}{count_inner_clean})"
+
+    sum_inner_clean = re.sub(
+        rf"(?is)\b`?{re.escape(payment_alias)}`?\s*\.\s*",
+        "",
+        sum_inner,
+    )
+
+    # Build SELECT projection.
+    projected_items: List[str] = []
+    projected_items.extend(base_select_items)
+    projected_items.append(f"{orders_agg_alias}.{count_alias_out} AS {count_alias_out}")
+    projected_items.append(
+        f"COALESCE({payments_agg_alias}.{sum_alias_out}, 0) AS {sum_alias_out}"
+    )
+
+    for case_expr, case_alias in case_items:
+        rewritten_case = re.sub(
+            rf"(?is)SUM\s*\(\s*(?:DISTINCT\s+)?`?{re.escape(payment_alias)}`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*\)",
+            f"COALESCE({payments_agg_alias}.{sum_alias_out}, 0)",
+            case_expr,
+        )
+        if case_alias:
+            projected_items.append(f"{rewritten_case} AS {case_alias}")
+        else:
+            projected_items.append(rewritten_case)
+
+    tail_clause = (parsed.get("tail") or "").strip()
+    # Stabilize ORDER BY customer_id when alias may be missing.
+    if tail_clause and id_col and re.search(r"\bcustomer_id\b", tail_clause, flags=re.I):
+        has_customer_id_alias = any(
+            (_split_expr_alias(it)[1] or "").strip("`'\"").lower() == "customer_id"
+            for it in projected_items
+        )
+        if not has_customer_id_alias:
+            tail_clause = re.sub(
+                r"\bcustomer_id\b",
+                f"{base_alias}.{id_col}",
+                tail_clause,
+                flags=re.I,
+            )
+    tail_block = f"\n{tail_clause}" if tail_clause else ""
+    select_block = ",\n  ".join(projected_items)
+
+    fixed = (
+        "SELECT\n"
+        f"  {select_block}\n"
+        f"FROM {base_table_expr} {base_alias}\n"
+        "JOIN (\n"
+        f"  SELECT {order_key}, {count_expr} AS {count_alias_out}\n"
+        f"  FROM orders\n"
+        f"  GROUP BY {order_key}\n"
+        f") AS {orders_agg_alias}\n"
+        f"  ON {orders_agg_alias}.{order_key} = {base_alias}.{base_order_key}\n"
+        "LEFT JOIN (\n"
+        f"  SELECT {payment_key}, SUM({sum_inner_clean}) AS {sum_alias_out}\n"
+        f"  FROM payments\n"
+        f"  GROUP BY {payment_key}\n"
+        f") AS {payments_agg_alias}\n"
+        f"  ON {payments_agg_alias}.{payment_key} = {base_alias}.{base_payment_key}"
+        f"{tail_block};"
+    )
+    return fixed
+
+
 def _question_wants_latest_year_scope_with_aggregate(question: str) -> bool:
     """
     Dynamic intent detector for:
@@ -5499,7 +6704,32 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
     if already_has_latest_year_pattern:
         return sql
 
+    def _strip_tautological_latest_year_having(sql_text: str) -> str:
+        """
+        Remove tautological HAVING predicates like:
+          HAVING YEAR(MAX(p.paymentDate)) = YEAR(MAX(p.paymentDate))
+        which can break parser-based rewrites while adding no filtering value.
+        """
+        m = re.search(
+            r"""(?is)\bHAVING\s+YEAR\s*\(\s*MAX\s*\(\s*(.+?)\s*\)\s*\)\s*=\s*YEAR\s*\(\s*MAX\s*\(\s*(.+?)\s*\)\s*\)\s*""",
+            sql_text,
+        )
+        if not m:
+            return sql_text
+        lhs = re.sub(r"[\s`]+", "", (m.group(1) or "").lower())
+        rhs = re.sub(r"[\s`]+", "", (m.group(2) or "").lower())
+        if not lhs or lhs != rhs:
+            return sql_text
+        return (sql_text[: m.start()] + " " + sql_text[m.end() :]).strip()
+
     parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        sql_sanitized = _strip_tautological_latest_year_having(sql)
+        if sql_sanitized != sql:
+            parsed = _parse_select_from_groupby(sql_sanitized)
+            if parsed:
+                sql = sql_sanitized
+                low_sql = sql.lower()
     if not parsed:
         return sql
 
@@ -6413,10 +7643,89 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str, ctx: s
     if not s:
         return sql
 
-    # If already using latest_year pattern, skip.
+    def _fallback_rewrite_customers_payments_latest_year(raw: str) -> Optional[str]:
+        """
+        Strict salvage path for malformed "customers + payments latest year" SQL.
+        Only triggers for this specific intent/signature.
+        """
+        low_raw = (raw or "").lower()
+        if "from customers" not in low_raw:
+            return None
+        if "payments" not in low_raw:
+            return None
+        if "paymentdate" not in low_raw or "amount" not in low_raw:
+            return None
+        if "year(" not in low_raw and "latest_year" not in low_raw:
+            return None
+        if "sum(" not in low_raw or "max(" not in low_raw:
+            return None
+
+        m_sel = re.search(r"(?is)^\s*SELECT\s+(.*?)\s+FROM\b", raw)
+        select_txt = (m_sel.group(1) if m_sel else "")
+        wants_name = (
+            bool(re.search(r"\bcustomername\b", select_txt, flags=re.I))
+            or bool(re.search(r"\bcustomer\s+name\b", (question or "").lower()))
+        )
+
+        date_alias = "latest_payment_date"
+        sum_alias = "total_amount_paid"
+        m_date_alias = re.search(
+            r"(?is)\bMAX\s*\(\s*[^)]*paymentDate[^)]*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
+            raw,
+        )
+        if m_date_alias:
+            date_alias = m_date_alias.group(1)
+        m_sum_alias = re.search(
+            r"(?is)\bSUM\s*\(\s*[^)]*amount[^)]*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
+            raw,
+        )
+        if m_sum_alias:
+            sum_alias = m_sum_alias.group(1)
+
+        select_cols = ["cust.customerNumber"]
+        if wants_name:
+            select_cols.append("cust.customerName")
+        select_cols.append(f"MAX(pay.paymentDate) AS {date_alias}")
+        select_cols.append(f"SUM(pay.amount) AS {sum_alias}")
+
+        group_cols = ["cust.customerNumber"]
+        if wants_name:
+            group_cols.append("cust.customerName")
+        select_block = ",\n  ".join(select_cols)
+
+        return (
+            "SELECT\n"
+            f"  {select_block}\n"
+            "FROM customers cust\n"
+            "JOIN (\n"
+            "  SELECT customerNumber, MAX(YEAR(paymentDate)) AS latest_year\n"
+            "  FROM payments\n"
+            "  GROUP BY customerNumber\n"
+            ") AS pay_latest_years\n"
+            "  ON pay_latest_years.customerNumber = cust.customerNumber\n"
+            "JOIN payments AS pay\n"
+            "  ON pay.customerNumber = cust.customerNumber\n"
+            " AND YEAR(pay.paymentDate) = pay_latest_years.latest_year\n"
+            f"GROUP BY {', '.join(group_cols)}\n"
+            f"ORDER BY {date_alias} DESC;"
+        )
+
+    # If already using latest_year pattern and SQL is parseable, keep as-is.
     low = s.lower()
+    has_malformed_nested_payments_subquery = bool(
+        re.search(r"(?is)\bFROM\s+payments\b\s+JOIN\s*\(", s)
+    )
+    if has_malformed_nested_payments_subquery:
+        rescued = _fallback_rewrite_customers_payments_latest_year(s)
+        if rescued:
+            return rescued
+
     if "latest_year" in low and re.search(r"=\s*[a-z_][a-z0-9_]*\.latest_year\b", low):
-        return sql
+        has_nested_join_subquery = bool(
+            re.search(r"(?is)\bJOIN\s*\(\s*SELECT\b[\s\S]*\bJOIN\s*\(\s*SELECT\b", s)
+        )
+        if _parse_select_from_groupby(s) and not has_nested_join_subquery:
+            return sql
 
     m_join_sub = re.search(r"\bJOIN\s*\(\s*SELECT\b", s, flags=re.I)
     if not m_join_sub:
@@ -6509,6 +7818,9 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str, ctx: s
 
     inner_parsed = _parse_select_from_groupby(inner_sql)
     if not inner_parsed:
+        rescued = _fallback_rewrite_customers_payments_latest_year(s)
+        if rescued:
+            return rescued
         return sql
     if inner_parsed.get("where"):
         # Conservative: skip if inner query already has filters.
@@ -7044,10 +8356,70 @@ def _rewrite_latest_year_projection_to_year(sql: str, question: str) -> str:
         return sql
 
     parsed = _parse_select_from_groupby(sql)
-    if not parsed:
-        return sql
+    fallback_rest: Optional[str] = None
 
-    select_items = _split_top_level_commas(parsed["select"])
+    if parsed:
+        select_part = parsed["select"]
+    else:
+        # Fallback for derived-table shapes where conservative parser aborts.
+        # We only need to rewrite top-level SELECT projection.
+        s = (sql or "").strip().rstrip(";").strip()
+        if not re.match(r"(?is)^\s*select\b", s):
+            return sql
+
+        def _find_top_level_from(text: str) -> int:
+            i = 0
+            depth = 0
+            in_sq = False
+            in_dq = False
+            in_bt = False
+            low = text.lower()
+            while i < len(text):
+                ch = text[i]
+                if ch == "'" and not in_dq and not in_bt:
+                    if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_sq = not in_sq
+                    i += 1
+                    continue
+                if ch == '"' and not in_sq and not in_bt:
+                    if in_dq and i + 1 < len(text) and text[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_dq = not in_dq
+                    i += 1
+                    continue
+                if ch == "`" and not in_sq and not in_dq:
+                    in_bt = not in_bt
+                    i += 1
+                    continue
+                if in_sq or in_dq or in_bt:
+                    i += 1
+                    continue
+                if ch == "(":
+                    depth += 1
+                    i += 1
+                    continue
+                if ch == ")":
+                    depth = max(0, depth - 1)
+                    i += 1
+                    continue
+                if depth == 0 and low[i:i + 4] == "from":
+                    left_ok = (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))
+                    right_ok = (i + 4 >= len(text) or not (text[i + 4].isalnum() or text[i + 4] == "_"))
+                    if left_ok and right_ok:
+                        return i
+                i += 1
+            return -1
+
+        from_idx = _find_top_level_from(s)
+        if from_idx < 0:
+            return sql
+        select_part = s[len("SELECT"):from_idx].strip()
+        fallback_rest = s[from_idx:].strip()
+
+    select_items = _split_top_level_commas(select_part)
     if not select_items:
         return sql
 
@@ -7123,16 +8495,23 @@ def _rewrite_latest_year_projection_to_year(sql: str, question: str) -> str:
     if not changed:
         return sql
 
-    where_block = f"\n{parsed['where'].strip()}" if parsed["where"].strip() else ""
-    tail_block = f"\n{parsed['tail'].strip()}" if parsed["tail"].strip() else ""
-    fixed = (
-        f"SELECT {', '.join(rebuilt)}\n"
-        f"FROM {parsed['from_core'].strip()}"
-        f"{where_block}\n"
-        f"GROUP BY {parsed['groupby'].strip()}"
-        f"{tail_block};"
-    )
-    return fixed
+    if parsed:
+        where_block = f"\n{parsed['where'].strip()}" if parsed["where"].strip() else ""
+        tail_block = f"\n{parsed['tail'].strip()}" if parsed["tail"].strip() else ""
+        fixed = (
+            f"SELECT {', '.join(rebuilt)}\n"
+            f"FROM {parsed['from_core'].strip()}"
+            f"{where_block}\n"
+            f"GROUP BY {parsed['groupby'].strip()}"
+            f"{tail_block};"
+        )
+        return fixed
+
+    # Fallback rebuild: preserve original FROM... tail as-is.
+    fixed_fb = f"SELECT {', '.join(rebuilt)}\n{fallback_rest or ''}".strip()
+    if fixed_fb and not fixed_fb.endswith(";"):
+        fixed_fb += ";"
+    return fixed_fb
 
 
 def _rewrite_row_level_nonnull_to_group_existence(sql: str, question: str) -> str:
@@ -8286,6 +9665,55 @@ def _add_missing_count_for_group_by(sql: str, question: str = "") -> str:
     if not sql or not question:
         return sql
 
+    def _is_word_boundary(text: str, i: int, n: int) -> bool:
+        left_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        right_ok = i + n >= len(text) or not (text[i + n].isalnum() or text[i + n] == "_")
+        return left_ok and right_ok
+
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        kw_l = kw.lower()
+        n = len(kw_l)
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and i >= start and i + n <= len(text):
+                if text[i:i + n].lower() == kw_l and _is_word_boundary(text, i, n):
+                    return i
+            i += 1
+        return -1
+
+    s = sql.strip()
+    select_pos = _find_top_level_kw(s, "select", 0)
+    from_pos = _find_top_level_kw(s, "from", max(0, select_pos + 6))
+    group_pos = _find_top_level_kw(s, "group by", max(0, from_pos + 4))
+    if select_pos < 0 or from_pos < 0 or group_pos < 0:
+        return sql
+
     sql_up = sql.upper()
     question_lower = question.lower()
 
@@ -8336,11 +9764,7 @@ def _add_missing_count_for_group_by(sql: str, question: str = "") -> str:
         return sql
 
     # GUARDRAIL 5: COUNT not already in SELECT
-    select_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql, flags=re.IGNORECASE | re.DOTALL)
-    if not select_match:
-        return sql
-
-    select_clause = select_match.group(1).upper()
+    select_clause = s[select_pos + len("select"):from_pos].upper()
     if "COUNT" in select_clause:
         return sql  # COUNT already present
 

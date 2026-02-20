@@ -2248,9 +2248,29 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         # STEP 1: Ambil tokens HANYA dari klausa SELECT (Bukan seluruh SQL)
         # Tujuannya agar kolom yang hanya ada di WHERE/ORDER BY tetap terdeteksi sebagai "missing" di output
         select_match_chk = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, final_sql, re.IGNORECASE | re.DOTALL)
-        select_text_chk = select_match_chk.group(1).lower() if select_match_chk else ""
+        select_text_chk_raw = select_match_chk.group(1) if select_match_chk else ""
+        select_text_chk = select_text_chk_raw.lower()
         # Tokenize hanya bagian SELECT
         select_tokens_chk = set(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, select_text_chk))
+
+        # Semantic SELECT tokens:
+        # - direct token (customernumber)
+        # - underscore parts (total_payment_amount -> total/payment/amount)
+        # - camel parts (totalPaymentAmount -> total/payment/amount)
+        select_semantic_tokens = set(select_tokens_chk)
+        select_tokens_raw_case = set(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, select_text_chk_raw))
+        for tok_raw in select_tokens_raw_case:
+            tok_low = tok_raw.lower()
+            if not tok_low:
+                continue
+            select_semantic_tokens.add(tok_low)
+            for part in tok_low.split("_"):
+                if part:
+                    select_semantic_tokens.add(part)
+            camel_spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r"\1 \2", tok_raw)
+            for part in re.findall(r"[a-z0-9]+", camel_spaced.lower()):
+                if part:
+                    select_semantic_tokens.add(part)
         
         # STEP 1b: Ambil tokens dari WHERE/HAVING/subquery (kolom yang dipakai sebagai filter)
         # Kolom yang sudah dipakai di WHERE tidak perlu ada di SELECT (bukan "missing")
@@ -2273,12 +2293,34 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             
             # STEP 2: Logic Check yang Lebih Akurat
             # Skip jika kolom sudah ada di SELECT tokens, atau jika ada wildcard (*)
-            if col_lower in select_tokens_chk or AGENT_REFINE_WILDCARD_TOKEN in select_text_chk:
+            if col_lower in select_semantic_tokens or AGENT_REFINE_WILDCARD_TOKEN in select_text_chk:
                 continue
             
             # Skip jika kolom sudah dipakai di WHERE/HAVING (artinya dipakai sebagai filter, bukan output)
             if col_lower in where_having_tokens:
                 continue
+
+            # Treat common *_number and *_id forms as equivalent semantic outputs.
+            # Example: employeeNumber requested, employee_id selected.
+            m_num = re.match(r"^([a-z_]+)number$", col_lower)
+            if m_num:
+                ent = (m_num.group(1) or "").rstrip("_")
+                if ent and (
+                    f"{ent}id" in select_semantic_tokens
+                    or f"{ent}_id" in select_semantic_tokens
+                    or (ent in select_semantic_tokens and "id" in select_semantic_tokens)
+                ):
+                    continue
+
+            m_id = re.match(r"^([a-z_]+)id$", col_lower)
+            if m_id:
+                ent = (m_id.group(1) or "").rstrip("_")
+                if ent and (
+                    f"{ent}number" in select_semantic_tokens
+                    or f"{ent}_number" in select_semantic_tokens
+                    or (ent in select_semantic_tokens and "number" in select_semantic_tokens)
+                ):
+                    continue
             
             clean_name = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r'\1 \2', col_raw)
             clean_name = clean_name.replace('_', ' ').lower()

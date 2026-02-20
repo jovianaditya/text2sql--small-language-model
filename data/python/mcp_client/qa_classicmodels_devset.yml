@@ -505,3 +505,36 @@ cases:
         ORDER BY
           t.paymentDate DESC,
           t.employeeNumber ASC;
+    - id: H14
+      difficulty: hard
+      question: "Show customers who have placed at least one order. For each such customer, return customer id, customer name, total number of orders, total payment amount, and a payment_status flag ('Paid' if total payments > 0 else 'Unpaid'). Sort by total orders descending, then customer id."
+      groundtruth_sql: |
+        SELECT
+          c.customerNumber,
+          c.customerName,
+          o.total_orders,
+          COALESCE(p.total_payments, 0) AS total_payments,
+          CASE
+            WHEN COALESCE(p.total_payments, 0) > 0 THEN 'Paid'
+            ELSE 'Unpaid'
+          END AS payment_status
+        FROM customers AS c
+        JOIN (
+          SELECT
+            customerNumber,
+            COUNT(*) AS total_orders
+          FROM orders
+          GROUP BY customerNumber
+        ) AS o
+          ON o.customerNumber = c.customerNumber
+        LEFT JOIN (
+          SELECT
+            customerNumber,
+            SUM(amount) AS total_payments
+          FROM payments
+          GROUP BY customerNumber
+        ) AS p
+          ON p.customerNumber = c.customerNumber
+        ORDER BY
+          o.total_orders DESC,
+          c.customerNumber ASC;
