@@ -147,6 +147,10 @@ AGENT_IR_MAX_TABLES = int(os.getenv("AGENT_IR_MAX_TABLES", "1"))
 # AST guardrails (sqlglot-based safety checks in refine phase)
 AGENT_AST_GUARDS_ENABLED = bool(int(os.getenv("AGENT_AST_GUARDS_ENABLED", "1")))
 AGENT_AST_GUARDS_DEBUG = bool(int(os.getenv("AGENT_AST_GUARDS_DEBUG", "0")))
+AGENT_AST_SEMANTIC_FIRST = bool(int(os.getenv("AGENT_AST_SEMANTIC_FIRST", "1")))
+AGENT_NORMALIZE_REWRITE_BUDGET = int(os.getenv("AGENT_NORMALIZE_REWRITE_BUDGET", "1"))
+AGENT_NORMALIZE_EARLY_STOP = bool(int(os.getenv("AGENT_NORMALIZE_EARLY_STOP", "1")))
+AGENT_REGEN_PRECHECK_ENABLED = bool(int(os.getenv("AGENT_REGEN_PRECHECK_ENABLED", "1")))
 # ======================================================================
 # ============================= DEBUG ==================================
 # ======================================================================

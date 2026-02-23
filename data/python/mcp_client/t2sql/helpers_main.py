@@ -13,7 +13,7 @@
 # ======================================================================
 import re
 import json
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 from collections import defaultdict
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
@@ -21,6 +21,13 @@ from collections import defaultdict
 if TYPE_CHECKING:
     from .state import RAGState
 from .utils import _dbg_print_two
+from .config import (
+    AGENT_AST_GUARDS_ENABLED,
+    AGENT_AST_GUARDS_DEBUG,
+    AGENT_AST_SEMANTIC_FIRST,
+    AGENT_NORMALIZE_REWRITE_BUDGET,
+    AGENT_NORMALIZE_EARLY_STOP,
+)
 from .schema_analyzer import (
     get_transaction_tables,
     get_anchor_columns,
@@ -73,6 +80,7 @@ from .helpers_core import (
     _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _guardrail_fix_mysql_regexp_literals,
     # phase 6
     _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _strip_unneeded_count_distinct, _parse_from_join_aliases,
+    _ast_guardrails,
     # phase 7
     _simplify_default_window_frame, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
 )
@@ -2997,12 +3005,15 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_latest_year_projection_to_year(s, question)
         if DEBUG_WR: print("[PH4] after latest-year projection->year fix:", s)
         
-        s = _fix_aggregate_in_where(s)
-        if DEBUG_WR: print(f"[PH4] after agg-in-where fix: {s}")
+        if not AGENT_AST_SEMANTIC_FIRST:
+            s = _fix_aggregate_in_where(s)
+            if DEBUG_WR: print(f"[PH4] after agg-in-where fix: {s}")
 
-        # Fix raw column WHERE -> HAVING for aggregate questions
-        s = _fix_raw_column_where_to_having(s, question)
-        if DEBUG_WR: print(f"[PH4] after raw-where-to-having fix: {s}")
+            # Fix raw column WHERE -> HAVING for aggregate questions
+            s = _fix_raw_column_where_to_having(s, question)
+            if DEBUG_WR: print(f"[PH4] after raw-where-to-having fix: {s}")
+        elif DEBUG_WR:
+            print("[PH4] AST semantic-first enabled: skip regex agg/having surgery")
 
         # Add missing COUNT(*) for GROUP BY aggregates
         s = _add_missing_count_for_group_by(s, question)
@@ -3023,10 +3034,13 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         if DEBUG_WR: print("[PH4] end ----", s, "\n")
     else:
             # Phase 4 was skipped due to goto_phase5, but still need aggregate fix
-            s = _fix_aggregate_in_where(s)
-            if DEBUG_WR: print(f"[PH4-FORCE] after agg-in-where fix: {s}")
-            s = _fix_raw_column_where_to_having(s, question)
-            if DEBUG_WR: print(f"[PH4-FORCE] after raw-where-to-having fix: {s}")
+            if not AGENT_AST_SEMANTIC_FIRST:
+                s = _fix_aggregate_in_where(s)
+                if DEBUG_WR: print(f"[PH4-FORCE] after agg-in-where fix: {s}")
+                s = _fix_raw_column_where_to_having(s, question)
+                if DEBUG_WR: print(f"[PH4-FORCE] after raw-where-to-having fix: {s}")
+            elif DEBUG_WR:
+                print("[PH4-FORCE] AST semantic-first enabled: skip regex agg/having surgery")
             s = _add_missing_count_for_group_by(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after add-count fix: {s}")        
     # ---------------------------------------------------------------------------
@@ -3259,7 +3273,41 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
     if not raw_sql:
         return raw_sql
 
-    s = _postprocess_sql(raw_sql, question, ctx)
+    rewrite_budget = max(1, int(AGENT_NORMALIZE_REWRITE_BUDGET))
+    rewrite_count = 0
+
+    def _semantic_fingerprint(text: str) -> str:
+        t = (text or "").strip().rstrip(";")
+        t = _collapse_spaces_outside_quotes(t)
+        t = re.sub(r"\s+", " ", t).strip().lower()
+        return t
+
+    def _collect_hard_identifier_errors(errors: List[str]) -> List[str]:
+        return [
+            e for e in (errors or [])
+            if "not in ALLOWED" in e or "invalid column" in e or "invalid columns" in e
+        ]
+
+    def _apply_postprocess(sql_in: str) -> str:
+        nonlocal rewrite_count
+        before_fp = _semantic_fingerprint(sql_in)
+        out = _postprocess_sql(sql_in, question, ctx)
+        after_fp = _semantic_fingerprint(out)
+        if before_fp != after_fp:
+            rewrite_count += 1
+        return out
+
+    def _ast_stabilize(sql_in: str) -> tuple[str, Dict[str, Any]]:
+        if not AGENT_AST_GUARDS_ENABLED:
+            return sql_in, {}
+        ast_sql, ast_meta = _ast_guardrails(sql_in, ctx=ctx, question=question)
+        if ast_meta.get("parse_ok", False) and ast_meta.get("fixes"):
+            sql_in = ast_sql
+        if AGENT_AST_GUARDS_DEBUG and ast_meta.get("warnings"):
+            _dbg_print_two("[AST] warnings", f"{ast_meta.get('warnings')}")
+        return sql_in, ast_meta
+
+    s = _apply_postprocess(raw_sql)
 
     if ranked_cols:
         pref = pick_preferred_anchor_from_ranked_cols(ranked_cols, top_n=12)
@@ -3267,6 +3315,31 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
 
     s = _repair_with_aliases(s, ctx)
     s = _repair_backticked_identifier_phrases(s, ctx)
-    s = _postprocess_sql(s, question, ctx)
+    s, ast_meta = _ast_stabilize(s)
+
+    parse_ok = bool(ast_meta.get("parse_ok", False)) if AGENT_AST_GUARDS_ENABLED else True
+    hard_identifier_errors = _collect_hard_identifier_errors(validate_identifiers(s, ctx))
+
+    should_early_stop = (
+        AGENT_NORMALIZE_EARLY_STOP
+        and parse_ok
+        and not hard_identifier_errors
+        and (rewrite_count >= rewrite_budget or rewrite_budget <= 1)
+    )
+
+    if should_early_stop:
+        s = _collapse_spaces_outside_quotes(s)
+        _dbg_print_two("[normalize] output sql:", s)
+        return s
+
+    needs_second_pass = (
+        rewrite_count < rewrite_budget
+        or not parse_ok
+        or bool(hard_identifier_errors)
+    )
+    if needs_second_pass:
+        s = _apply_postprocess(s)
+        s, _ = _ast_stabilize(s)
+
     _dbg_print_two("[normalize] output sql:", s)
     return s

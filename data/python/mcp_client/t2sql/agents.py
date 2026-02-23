@@ -32,6 +32,7 @@ from .config import (
     AGENT_IR_MAX_TABLES,
     AGENT_AST_GUARDS_ENABLED,
     AGENT_AST_GUARDS_DEBUG,
+    AGENT_REGEN_PRECHECK_ENABLED,
     AGENT_INSTANT_REJECT_PATTERNS,
     AGENT_DEFINITE_SQL_PATTERNS,
     AGENT_GIBBERISH_KEYBOARD_PATTERNS,
@@ -2837,21 +2838,153 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 return ""
             return "ALLOWED IDENTIFIERS SNAPSHOT:\n- " + "\n- ".join(chunks)
 
-        def _regen_once(model_name: str, instruction: str, tag: str) -> Optional[Dict[str, Any]]:
+        def _join_constraints_hint(max_edges: int = 8) -> str:
+            allowed_map = _parse_allowed_identifiers(ctx)
+            if not allowed_map:
+                return ""
+
+            allowed_tables = {str(t).strip("`").lower() for t in allowed_map.keys() if str(t).strip()}
+            routed_tables = {str(t).strip("`").lower() for t in (detected_tables or []) if str(t).strip()}
+            if routed_tables:
+                table_scope = allowed_tables.intersection(routed_tables) or routed_tables
+            else:
+                table_scope = allowed_tables
+
+            if not table_scope:
+                return ""
+
+            edges: List[str] = []
+            seen: Set[str] = set()
+
+            fk_map = {}
+            try:
+                fk_map = get_fk_relationships() or {}
+            except Exception:
+                fk_map = {}
+
+            for src, rels in fk_map.items():
+                src_l = str(src or "").strip("`").lower()
+                if not src_l or src_l not in table_scope:
+                    continue
+                for fk_col, tgt in (rels or {}).items():
+                    tgt_l = str(tgt or "").strip("`").lower()
+                    fk_l = str(fk_col or "").strip("`").lower()
+                    if not tgt_l or not fk_l or tgt_l not in table_scope:
+                        continue
+                    tgt_id = (get_id_column(tgt_l) or "").strip("`")
+                    if tgt_id:
+                        edge = f"{src_l}.{fk_l} = {tgt_l}.{tgt_id}"
+                    else:
+                        edge = f"{src_l}.{fk_l} -> {tgt_l}"
+                    if edge not in seen:
+                        seen.add(edge)
+                        edges.append(edge)
+                    if len(edges) >= max_edges:
+                        break
+                if len(edges) >= max_edges:
+                    break
+
+            fk_ctx_map = _extract_fk_from_context(ctx)
+            for src, rels in (fk_ctx_map or {}).items():
+                src_l = str(src or "").strip("`").lower()
+                if not src_l or src_l not in table_scope:
+                    continue
+                for fk_col, tgt in (rels or {}).items():
+                    tgt_l = str(tgt or "").strip("`").lower()
+                    fk_l = str(fk_col or "").strip("`").lower()
+                    if not tgt_l or not fk_l or tgt_l not in table_scope:
+                        continue
+                    tgt_id = (get_id_column(tgt_l) or "").strip("`")
+                    if tgt_id:
+                        edge = f"{src_l}.{fk_l} = {tgt_l}.{tgt_id}"
+                    else:
+                        edge = f"{src_l}.{fk_l} -> {tgt_l}"
+                    if edge not in seen:
+                        seen.add(edge)
+                        edges.append(edge)
+                    if len(edges) >= max_edges:
+                        break
+                if len(edges) >= max_edges:
+                    break
+
+            if not edges:
+                return ""
+            return "JOIN KEY HINTS:\n- " + "\n- ".join(edges)
+
+        def _regen_constraint_pack(instruction: str, strict_schema: bool = False) -> str:
+            pieces = [instruction]
+            base_rules = [
+                "STRICT OUTPUT CONSTRAINTS:",
+                "- Use ONLY tables/columns from ALLOWED IDENTIFIERS SNAPSHOT.",
+                "- Use JOIN predicates only from JOIN KEY HINTS (or exact FK-equivalent).",
+                "- Do NOT invent table names, columns, or aliases outside allowed scope.",
+            ]
+            if strict_schema:
+                base_rules.extend([
+                    "- Keep SQL minimal and deterministic; avoid unnecessary derived tables.",
+                    "- If single-source query is possible, avoid extra joins.",
+                ])
+            pieces.append("\n".join(base_rules))
+
+            allowed_hint = _allowed_identifiers_hint()
+            if allowed_hint:
+                pieces.append(allowed_hint)
+            join_hint = _join_constraints_hint()
+            if join_hint:
+                pieces.append(join_hint)
+            return "\n\n".join(pieces)
+
+        def _regen_once(model_name: str, instruction: str, tag: str, strict_schema: bool = False) -> Optional[Dict[str, Any]]:
             llm_regen_local = build_llm_repair(model=model_name)
             model_label_local = "7B" if model_name == LARGE_MODEL else "3B"
             _dbg_print_two("[Agent3] Regenerating with", f"{model_label_local} ({tag})")
+
+            packed_instruction = _regen_constraint_pack(instruction, strict_schema=strict_schema)
             new_sql_local, _ = regenerate_with_extra_constraint(
                 llm_regen_local,
                 make_generation_prompt,
                 ctx,
                 question,
-                instruction,
+                packed_instruction,
             )
             if not new_sql_local:
                 return None
 
-            candidate_sql = normalize_sql_pipeline(new_sql_local, question, ctx)
+            quick_sql = new_sql_local.strip()
+            if not quick_sql.endswith(";"):
+                quick_sql += ";"
+
+            quick_ast_meta: Dict[str, Any] = {}
+            if AGENT_AST_GUARDS_ENABLED:
+                quick_ast_sql, quick_ast_meta = _ast_guardrails(
+                    quick_sql,
+                    ctx=ctx,
+                    question=question,
+                )
+                if quick_ast_meta.get("parse_ok", False) and quick_ast_meta.get("fixes"):
+                    quick_sql = quick_ast_sql
+
+            quick_join_warnings = [
+                str(w)
+                for w in (quick_ast_meta.get("warnings") or [])
+                if str(w).startswith("suspicious_join_key:")
+            ]
+            quick_identifier_errors = validate_identifiers(quick_sql, ctx)
+            quick_hard_errors = _collect_hard_identifier_errors(quick_identifier_errors)
+
+            if AGENT_REGEN_PRECHECK_ENABLED and (quick_hard_errors or quick_join_warnings):
+                return {
+                    "sql": quick_sql,
+                    "model": model_name,
+                    "tag": tag,
+                    "identifier_errors": quick_identifier_errors,
+                    "hard_identifier_errors": quick_hard_errors,
+                    "join_risk_warnings": quick_join_warnings,
+                    "join_risk_count": len(quick_join_warnings),
+                    "early_rejected": True,
+                }
+
+            candidate_sql = normalize_sql_pipeline(quick_sql, question, ctx)
             ast_meta_local: Dict[str, Any] = {}
             if AGENT_AST_GUARDS_ENABLED:
                 ast_sql_local, ast_meta_local = _ast_guardrails(
@@ -2873,12 +3006,20 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
             id_errors_local = validate_identifiers(candidate_sql, ctx)
             hard_errors_local = _collect_hard_identifier_errors(id_errors_local)
+            join_warnings_local = [
+                str(w)
+                for w in (ast_meta_local.get("warnings") or [])
+                if str(w).startswith("suspicious_join_key:")
+            ]
             return {
                 "sql": candidate_sql,
                 "model": model_name,
                 "tag": tag,
                 "identifier_errors": id_errors_local,
                 "hard_identifier_errors": hard_errors_local,
+                "join_risk_warnings": join_warnings_local,
+                "join_risk_count": len(join_warnings_local),
+                "early_rejected": False,
             }
 
         attempts: List[Dict[str, Any]] = []
@@ -2886,12 +3027,11 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         if primary_attempt:
             attempts.append(primary_attempt)
 
-        primary_hard_errors = (
-            primary_attempt.get("hard_identifier_errors", [])
-            if primary_attempt
-            else ["regen_failed"]
+        primary_blockers = (
+            (primary_attempt.get("hard_identifier_errors", []) if primary_attempt else [])
+            or (primary_attempt.get("join_risk_warnings", []) if primary_attempt else [])
         )
-        if regeneration_model == SMALL_MODEL and primary_hard_errors:
+        if regeneration_model == SMALL_MODEL and primary_blockers:
             strict_instruction = (
                 f"{extra_instruction}\n"
                 "STRICT REQUIREMENT: Use EXACT schema identifiers only. "
@@ -2899,14 +3039,22 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "If table is single-source, avoid unnecessary aliasing.\n"
                 f"{_allowed_identifiers_hint()}"
             )
-            small_retry = _regen_once(SMALL_MODEL, strict_instruction, "small_strict_retry")
+            small_retry = _regen_once(
+                SMALL_MODEL,
+                strict_instruction,
+                "small_strict_retry",
+                strict_schema=True,
+            )
             if small_retry:
                 attempts.append(small_retry)
 
-        # Last fallback only when 3B retries still keep hard identifier issues.
-        have_clean_candidate = any(not a.get("hard_identifier_errors") for a in attempts)
+        # Last fallback only when 3B retries still keep hard identifier/join-key issues.
+        have_clean_candidate = any(
+            not a.get("hard_identifier_errors") and int(a.get("join_risk_count", 0)) == 0
+            for a in attempts
+        )
         if not have_clean_candidate and regeneration_model == SMALL_MODEL:
-            large_retry = _regen_once(LARGE_MODEL, extra_instruction, "fallback_7b")
+            large_retry = _regen_once(LARGE_MODEL, extra_instruction, "fallback_7b", strict_schema=True)
             if large_retry:
                 attempts.append(large_retry)
 
@@ -2915,6 +3063,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 attempts,
                 key=lambda a: (
                     len(a.get("hard_identifier_errors") or []),
+                    int(a.get("join_risk_count", 0)),
                     len(a.get("identifier_errors") or []),
                 ),
             )
@@ -2925,9 +3074,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             corrections.append(
                 f"Regenerated ({best_label}) [{best.get('tag')}] & Re-Normalized"
             )
+            if best.get("early_rejected"):
+                corrections.append("Candidate precheck rejected for schema/join risk before heavy normalization")
             if best.get("hard_identifier_errors"):
                 corrections.append(
                     f"Residual identifier warnings: {best.get('hard_identifier_errors')}"
+                )
+            if best.get("join_risk_warnings"):
+                corrections.append(
+                    f"Join-key warnings: {best.get('join_risk_warnings')}"
                 )
         else:
             corrections.append("Regeneration failed: no candidate SQL returned")

@@ -9307,6 +9307,195 @@ def _ast_guardrails(sql: str, ctx: str = "", question: str = "") -> Tuple[str, D
     if sel is None:
         return sql, meta
 
+    def _flatten_top_and(expr_in: Optional["exp.Expression"]) -> List["exp.Expression"]:
+        if expr_in is None:
+            return []
+        if isinstance(expr_in, exp.And):
+            return _flatten_top_and(expr_in.this) + _flatten_top_and(expr_in.expression)
+        return [expr_in]
+
+    def _build_and(exprs: List["exp.Expression"]) -> Optional["exp.Expression"]:
+        cleaned = [e for e in exprs if e is not None]
+        if not cleaned:
+            return None
+        out = cleaned[0]
+        for nxt in cleaned[1:]:
+            out = exp.And(this=out, expression=nxt)
+        return out
+
+    def _question_has_agg_threshold(q: str) -> bool:
+        ql = (q or "").lower()
+        if not ql:
+            return False
+        agg_tokens = ("average", "avg", "sum", "total", "count", "maximum", "minimum", "max", "min")
+        cmp_tokens = ("above", "below", "greater", "less", "over", "under", "more than", "less than", ">", "<", ">=", "<=")
+        return any(t in ql for t in agg_tokens) and any(t in ql for t in cmp_tokens)
+
+    def _expr_contains_agg(expr_in: Optional["exp.Expression"]) -> bool:
+        """
+        Detect aggregate functions only in the current expression scope.
+        Aggregates inside scalar subqueries (e.g. col > (SELECT AVG(...))) must
+        not trigger WHERE->HAVING rewrites, because those predicates are valid
+        row-level filters pre-grouping.
+        """
+        if expr_in is None:
+            return False
+
+        def _has_agg_no_subquery(node: "exp.Expression") -> bool:
+            if isinstance(node, exp.Subquery):
+                return False
+            if isinstance(node, exp.AggFunc):
+                return True
+            for child in node.iter_expressions():
+                if _has_agg_no_subquery(child):
+                    return True
+            return False
+
+        return _has_agg_no_subquery(expr_in)
+
+    # -----------------------------
+    # 0) AST-first semantic rewrites (conservative)
+    # -----------------------------
+    # 0a) GROUP BY query: move aggregate predicates from WHERE -> HAVING.
+    group_arg = sel.args.get("group")
+    where_arg = sel.args.get("where")
+    if group_arg is not None and isinstance(where_arg, exp.Where):
+        where_cond = where_arg.this
+        conds = _flatten_top_and(where_cond)
+        move_to_having: List["exp.Expression"] = []
+        keep_in_where: List["exp.Expression"] = []
+        for c in conds:
+            # Keep scalar-subquery predicates in WHERE; moving them to HAVING
+            # can break semantics and MySQL grouping validity.
+            if c.find(exp.Subquery):
+                keep_in_where.append(c.copy())
+                continue
+            if _expr_contains_agg(c):
+                move_to_having.append(c.copy())
+            else:
+                keep_in_where.append(c.copy())
+
+        if move_to_having:
+            new_where = _build_and(keep_in_where)
+            if new_where is None:
+                sel.set("where", None)
+            else:
+                sel.set("where", exp.Where(this=new_where))
+
+            existing_having = sel.args.get("having")
+            existing_having_cond = None
+            if isinstance(existing_having, exp.Having):
+                existing_having_cond = existing_having.this
+            merged_having = _build_and(
+                ([existing_having_cond.copy()] if existing_having_cond is not None else [])
+                + move_to_having
+            )
+            if merged_having is not None:
+                sel.set("having", exp.Having(this=merged_having))
+                meta["fixes"].append("agg_where_to_having_ast")
+
+    # 0b) Aggregate-threshold intent: raw metric comparisons in WHERE -> HAVING.
+    # Example:
+    #   WHERE amount > 50000 with SELECT AVG(amount) ... GROUP BY ...
+    # becomes:
+    #   HAVING AVG(amount) > 50000
+    group_arg = sel.args.get("group")
+    where_arg = sel.args.get("where")
+    if (
+        group_arg is not None
+        and isinstance(where_arg, exp.Where)
+        and _question_has_agg_threshold(question)
+    ):
+        agg_map: Dict[str, "exp.Expression"] = {}
+        for item in sel.expressions or []:
+            base = item.this if isinstance(item, exp.Alias) else item
+            if base is None:
+                continue
+            for agg in base.find_all(exp.AggFunc):
+                cols = [c for c in agg.find_all(exp.Column)]
+                if len(cols) != 1:
+                    continue
+                c0 = cols[0]
+                key_name = str(c0.name or "").strip("`").lower()
+                if not key_name:
+                    continue
+                if key_name not in agg_map:
+                    agg_map[key_name] = agg.copy()
+
+        if agg_map:
+            cmp_types = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ)
+
+            def _is_literalish(x: Optional["exp.Expression"]) -> bool:
+                return isinstance(x, (exp.Literal, exp.Null))
+
+            def _rewrite_cmp(expr_in: "exp.Expression") -> Optional["exp.Expression"]:
+                if not isinstance(expr_in, cmp_types):
+                    return None
+                if _expr_contains_agg(expr_in):
+                    return None
+
+                left = getattr(expr_in, "this", None)
+                right = getattr(expr_in, "expression", None)
+                if left is None or right is None:
+                    return None
+
+                # Avoid moving joins/column-vs-column predicates.
+                if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+                    return None
+                if not (_is_literalish(left) or _is_literalish(right)):
+                    return None
+
+                changed = False
+                new_expr = expr_in.copy()
+                new_left = getattr(new_expr, "this", None)
+                new_right = getattr(new_expr, "expression", None)
+
+                if isinstance(new_left, exp.Column):
+                    lk = str(new_left.name or "").strip("`").lower()
+                    agg_expr = agg_map.get(lk)
+                    if agg_expr is not None:
+                        new_expr.set("this", agg_expr.copy())
+                        changed = True
+
+                if isinstance(new_right, exp.Column):
+                    rk = str(new_right.name or "").strip("`").lower()
+                    agg_expr = agg_map.get(rk)
+                    if agg_expr is not None:
+                        new_expr.set("expression", agg_expr.copy())
+                        changed = True
+
+                return new_expr if changed else None
+
+            where_cond = where_arg.this
+            conds = _flatten_top_and(where_cond)
+            move_to_having: List["exp.Expression"] = []
+            keep_in_where: List["exp.Expression"] = []
+            for c in conds:
+                rewritten = _rewrite_cmp(c)
+                if rewritten is not None:
+                    move_to_having.append(rewritten)
+                else:
+                    keep_in_where.append(c.copy())
+
+            if move_to_having:
+                new_where = _build_and(keep_in_where)
+                if new_where is None:
+                    sel.set("where", None)
+                else:
+                    sel.set("where", exp.Where(this=new_where))
+
+                existing_having = sel.args.get("having")
+                existing_having_cond = None
+                if isinstance(existing_having, exp.Having):
+                    existing_having_cond = existing_having.this
+                merged_having = _build_and(
+                    ([existing_having_cond.copy()] if existing_having_cond is not None else [])
+                    + move_to_having
+                )
+                if merged_having is not None:
+                    sel.set("having", exp.Having(this=merged_having))
+                    meta["fixes"].append("raw_metric_where_to_having_ast")
+
     # -----------------------------
     # Top-level alias -> table map
     # -----------------------------
