@@ -1954,6 +1954,283 @@ def _collect_hard_identifier_errors(errors: List[str]) -> List[str]:
         if "not in ALLOWED" in e or "invalid column" in e or "invalid columns" in e
     ]
 
+def _deterministic_sql_acceptance_gate(
+    sql: str,
+    ctx: str,
+    question: str = "",
+    *,
+    strict_join_key: bool = False,
+) -> Dict[str, Any]:
+    """
+    Deterministic SQL acceptance gate before execution.
+    Checks:
+    - SQL parseability (sqlglot / mysql dialect)
+    - Identifier validity (table/column/alias scope)
+    - Ambiguous unqualified columns (multi-table)
+    - GROUP BY projection consistency (obvious 1055 risks)
+    - Optional join-key sanity strictness (from AST warnings)
+    """
+    verdict: Dict[str, Any] = {
+        "accepted": False,
+        "sql": (sql or "").strip(),
+        "reasons": [],
+        "parse_error": "",
+        "identifier_errors": [],
+        "hard_identifier_errors": [],
+        "ambiguous_unqualified_columns": [],
+        "group_projection_violations": [],
+        "join_risk_warnings": [],
+        "ast_fixes": [],
+        "ast_warnings": [],
+    }
+
+    candidate_sql = (sql or "").strip()
+    if not candidate_sql:
+        verdict["reasons"].append("empty_sql")
+        return verdict
+
+    ast_sql, ast_meta = _ast_guardrails(candidate_sql, ctx=ctx, question=question)
+    if ast_meta.get("parse_ok", False):
+        if ast_meta.get("fixes"):
+            verdict["ast_fixes"] = list(ast_meta.get("fixes") or [])
+            candidate_sql = ast_sql
+    else:
+        verdict["parse_error"] = str(ast_meta.get("error") or "parse_failed")
+        verdict["reasons"].append("parse_error")
+        return verdict
+
+    ast_warnings = [str(w) for w in (ast_meta.get("warnings") or [])]
+    verdict["ast_warnings"] = ast_warnings
+    join_warnings = [w for w in ast_warnings if w.startswith("suspicious_join_key:")]
+    verdict["join_risk_warnings"] = join_warnings
+    if strict_join_key and join_warnings:
+        verdict["reasons"].append("suspicious_join_key")
+
+    identifier_errors = validate_identifiers(candidate_sql, ctx)
+    hard_identifier_errors = _collect_hard_identifier_errors(identifier_errors)
+    verdict["identifier_errors"] = identifier_errors
+    verdict["hard_identifier_errors"] = hard_identifier_errors
+    if hard_identifier_errors:
+        verdict["reasons"].append("hard_identifier")
+    elif identifier_errors:
+        verdict["reasons"].append("identifier")
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        parsed = sqlglot.parse_one(candidate_sql, read="mysql")
+        sel = parsed.find(exp.Select)
+        if sel is None:
+            verdict["reasons"].append("no_select")
+            verdict["sql"] = candidate_sql
+            return verdict
+
+        def _is_nested_subquery_column(col_expr: "exp.Column") -> bool:
+            anc = getattr(col_expr, "parent", None)
+            while anc is not None:
+                if anc is sel:
+                    return False
+                if isinstance(anc, exp.Subquery):
+                    return True
+                anc = getattr(anc, "parent", None)
+            return False
+
+        def _norm_expr(expr_in: "exp.Expression") -> str:
+            s = expr_in.sql(dialect="mysql")
+            s = s.replace("`", "").strip().lower()
+            return re.sub(r"\s+", " ", s)
+
+        # Build top-level table scope
+        alias_to_table: Dict[str, str] = {}
+
+        def _register_src(src: Optional["exp.Expression"]) -> None:
+            if src is None:
+                return
+            if isinstance(src, exp.Table):
+                table_name = str(src.name or "").strip("`").lower()
+                if not table_name:
+                    return
+                alias_name = str(src.alias_or_name or table_name).strip("`").lower()
+                if alias_name:
+                    alias_to_table.setdefault(alias_name, table_name)
+                alias_to_table.setdefault(table_name, table_name)
+            elif isinstance(src, exp.Subquery):
+                alias_name = str(src.alias_or_name or "").strip("`").lower()
+                if alias_name:
+                    alias_to_table.setdefault(alias_name, f"__derived__:{alias_name}")
+
+        from_arg = sel.args.get("from") or sel.args.get("from_")
+        if from_arg is not None:
+            _register_src(getattr(from_arg, "this", None))
+        for j in sel.args.get("joins") or []:
+            _register_src(getattr(j, "this", None))
+
+        # Build table->column map from context + schema metadata
+        allowed_ids = _parse_allowed_identifiers(ctx or "")
+        allowed_by_lower: Dict[str, Set[str]] = {}
+        for t, cols in (allowed_ids or {}).items():
+            tl = str(t or "").strip("`").lower()
+            if not tl:
+                continue
+            allowed_by_lower.setdefault(tl, set()).update(
+                str(c or "").strip("`").lower() for c in (cols or set()) if str(c or "").strip()
+            )
+
+        analyzer = None
+        try:
+            analyzer = get_schema_analyzer()
+        except Exception:
+            analyzer = None
+
+        table_cols: Dict[str, Set[str]] = {}
+        for _, table_name in alias_to_table.items():
+            if str(table_name).startswith("__derived__:"):
+                continue
+            table_lower = str(table_name).lower()
+            cols = set(allowed_by_lower.get(table_lower, set()))
+            if analyzer is not None:
+                try:
+                    cols.update(
+                        str(c).strip("`").lower()
+                        for c in analyzer.get_table_columns(table_lower)
+                    )
+                except Exception:
+                    pass
+            table_cols[table_lower] = cols
+
+        # Detect ambiguous unqualified columns only when >1 base table
+        base_tables = [t for t in table_cols.keys() if t and not t.startswith("__derived__:")]
+        if len(base_tables) > 1:
+            col_to_owners: Dict[str, Set[str]] = {}
+            for t, cols in table_cols.items():
+                for c in cols:
+                    col_to_owners.setdefault(c, set()).add(t)
+
+            projection_aliases = {
+                str(it.alias or "").strip("`").lower()
+                for it in (sel.expressions or [])
+                if isinstance(it, exp.Alias) and str(it.alias or "").strip()
+            }
+
+            def _is_order_by_ref(col_expr: "exp.Column") -> bool:
+                anc = getattr(col_expr, "parent", None)
+                while anc is not None:
+                    if anc is sel:
+                        return False
+                    if isinstance(anc, exp.Ordered):
+                        return True
+                    anc = getattr(anc, "parent", None)
+                return False
+
+            ambiguous_cols: Set[str] = set()
+            for col in sel.find_all(exp.Column):
+                if _is_nested_subquery_column(col):
+                    continue
+                if str(col.table or "").strip():
+                    continue
+                cname = str(col.name or "").strip("`").lower()
+                if not cname:
+                    continue
+                # ORDER BY can legally refer to SELECT alias; skip that case.
+                if cname in projection_aliases and _is_order_by_ref(col):
+                    continue
+                owners = col_to_owners.get(cname, set())
+                if len(owners) > 1:
+                    ambiguous_cols.add(cname)
+
+            if ambiguous_cols:
+                verdict["ambiguous_unqualified_columns"] = sorted(ambiguous_cols)
+                verdict["reasons"].append("ambiguous_unqualified")
+
+        # GROUP BY projection consistency check (obvious 1055 risk)
+        group_arg = sel.args.get("group")
+        if group_arg is not None:
+            group_norm = {_norm_expr(g) for g in (group_arg.expressions or [])}
+            group_col_names = {
+                str(g.name or "").strip("`").lower()
+                for g in (group_arg.expressions or [])
+                if isinstance(g, exp.Column)
+            }
+            projection_violations: Set[str] = set()
+            for item in sel.expressions or []:
+                expr_node = item.this if isinstance(item, exp.Alias) else item
+                if expr_node is None:
+                    continue
+                if isinstance(expr_node, (exp.Star, exp.Literal)):
+                    continue
+                if expr_node.find(exp.AggFunc) or expr_node.find(exp.Window):
+                    continue
+                if isinstance(expr_node, exp.Column):
+                    expr_norm = _norm_expr(expr_node)
+                    expr_name = str(expr_node.name or "").strip("`").lower()
+                    alias_name = str(item.alias_or_name or "").strip("`").lower()
+                    if (
+                        expr_norm not in group_norm
+                        and expr_name not in group_col_names
+                        and alias_name not in group_col_names
+                    ):
+                        projection_violations.add(expr_norm)
+
+            if projection_violations:
+                verdict["group_projection_violations"] = sorted(projection_violations)
+                verdict["reasons"].append("group_projection_mismatch")
+
+    except Exception as e:
+        verdict["parse_error"] = f"acceptance_gate_error:{e}"
+        verdict["reasons"].append("acceptance_gate_internal_error")
+
+    verdict["sql"] = candidate_sql
+    verdict["accepted"] = len(verdict["reasons"]) == 0
+    return verdict
+
+
+def _build_gate_retry_instruction(base_instruction: str, gate: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    if base_instruction:
+        lines.append(base_instruction.strip())
+    lines.append(
+        "STRICT REQUIREMENT: SQL failed deterministic acceptance checks. "
+        "Fix every blocker below and return one valid MySQL SELECT query only."
+    )
+
+    reasons = gate.get("reasons") or []
+    if reasons:
+        lines.append(f"- Gate reasons: {reasons}")
+
+    hard_errors = gate.get("hard_identifier_errors") or []
+    if hard_errors:
+        lines.append(f"- Identifier blockers: {hard_errors}")
+
+    identifier_errors = gate.get("identifier_errors") or []
+    if identifier_errors and not hard_errors:
+        lines.append(f"- Identifier warnings: {identifier_errors}")
+
+    amb_cols = gate.get("ambiguous_unqualified_columns") or []
+    if amb_cols:
+        lines.append(
+            "- Ambiguous unqualified columns detected: "
+            f"{amb_cols}. You MUST qualify them with explicit table aliases."
+        )
+
+    group_issues = gate.get("group_projection_violations") or []
+    if group_issues:
+        lines.append(
+            "- GROUP BY mismatch: these raw projected columns are not grouped/aggregated: "
+            f"{group_issues}."
+        )
+
+    join_warnings = gate.get("join_risk_warnings") or []
+    if join_warnings:
+        lines.append(f"- Suspicious join keys: {join_warnings}")
+
+    parse_error = gate.get("parse_error") or ""
+    if parse_error:
+        lines.append(f"- Parse error: {parse_error}")
+
+    return "\n".join(lines)
+
+
 def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM_MAX_RETRIES) -> bool:
         global _last_model_warmup
         # Get keep_alive in seconds
@@ -2228,14 +2505,28 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # ------------------------------------------------------------------
     if draft_source == "ir_planner":
         final_sql, warnings = safety_normalize_sql(draft_sql)
-        validation_errors = validate_identifiers(final_sql, ctx)
         corrections = ["Deterministic IR planner output"]
+        gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
+        final_sql = str(gate.get("sql") or final_sql)
+        validation_errors = list(gate.get("identifier_errors") or [])
         if warnings:
             corrections.append(f"Safety warnings: {warnings}")
-        if validation_errors:
-            corrections.append(f"Identifier validation errors: {validation_errors}")
+        if gate.get("ast_fixes"):
+            corrections.append(f"AST gate fixes: {gate.get('ast_fixes')}")
+        if not gate.get("accepted", False):
+            corrections.append(f"Acceptance gate blocked SQL: {gate.get('reasons')}")
+        if validation_errors or gate.get("parse_error"):
+            if validation_errors:
+                corrections.append(f"Identifier validation errors: {validation_errors}")
             # Last-resort fallback to legacy normalizer for recovery.
             final_sql = normalize_sql_pipeline(final_sql, question, ctx)
+            gate_after_fallback = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
+            final_sql = str(gate_after_fallback.get("sql") or final_sql)
+            validation_errors = list(gate_after_fallback.get("identifier_errors") or validation_errors)
+            if not gate_after_fallback.get("accepted", False):
+                corrections.append(
+                    f"Post-fallback acceptance warnings: {gate_after_fallback.get('reasons')}"
+                )
         if not final_sql.endswith(";"):
             final_sql += ";"
 
@@ -2819,6 +3110,19 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                          break
                 if needs_regeneration: break
 
+    # --- FINAL PRE-EXEC ACCEPTANCE GATE (deterministic) ---
+    pre_gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
+    gated_sql = str(pre_gate.get("sql") or final_sql)
+    if gated_sql and gated_sql != final_sql:
+        final_sql = gated_sql
+        corrections.append("Deterministic acceptance gate rewrites applied")
+
+    if not needs_regeneration and not pre_gate.get("accepted", False):
+        _dbg_print_two("[Agent3] HARD ERROR - Acceptance Gate", f"{pre_gate.get('reasons')}")
+        extra_instruction = _build_gate_retry_instruction("", pre_gate)
+        needs_regeneration = True
+        regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
+
     # 4. EXECUTE REGENERATION (validation-aware, AST-stabilized)
     final_model = state.get("target_model", "")  # Default to initial model
     if needs_regeneration:
@@ -2950,67 +3254,21 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             if not new_sql_local:
                 return None
 
-            quick_sql = new_sql_local.strip()
-            if not quick_sql.endswith(";"):
-                quick_sql += ";"
-
-            quick_ast_meta: Dict[str, Any] = {}
-            if AGENT_AST_GUARDS_ENABLED:
-                quick_ast_sql, quick_ast_meta = _ast_guardrails(
-                    quick_sql,
-                    ctx=ctx,
-                    question=question,
-                )
-                if quick_ast_meta.get("parse_ok", False) and quick_ast_meta.get("fixes"):
-                    quick_sql = quick_ast_sql
-
-            quick_join_warnings = [
-                str(w)
-                for w in (quick_ast_meta.get("warnings") or [])
-                if str(w).startswith("suspicious_join_key:")
-            ]
-            quick_identifier_errors = validate_identifiers(quick_sql, ctx)
-            quick_hard_errors = _collect_hard_identifier_errors(quick_identifier_errors)
-
-            if AGENT_REGEN_PRECHECK_ENABLED and (quick_hard_errors or quick_join_warnings):
-                return {
-                    "sql": quick_sql,
-                    "model": model_name,
-                    "tag": tag,
-                    "identifier_errors": quick_identifier_errors,
-                    "hard_identifier_errors": quick_hard_errors,
-                    "join_risk_warnings": quick_join_warnings,
-                    "join_risk_count": len(quick_join_warnings),
-                    "early_rejected": True,
-                }
-
-            candidate_sql = normalize_sql_pipeline(quick_sql, question, ctx)
-            ast_meta_local: Dict[str, Any] = {}
-            if AGENT_AST_GUARDS_ENABLED:
-                ast_sql_local, ast_meta_local = _ast_guardrails(
-                    candidate_sql,
-                    ctx=ctx,
-                    question=question,
-                )
-                if ast_meta_local.get("parse_ok", False):
-                    if ast_meta_local.get("fixes"):
-                        candidate_sql = ast_sql_local
-                    if AGENT_AST_GUARDS_DEBUG and ast_meta_local.get("warnings"):
-                        _dbg_print_two("[AST] warnings", f"{ast_meta_local.get('warnings')}")
-                elif AGENT_AST_GUARDS_DEBUG and ast_meta_local.get("error"):
-                    _dbg_print_two("[AST] parse skipped", f"{ast_meta_local.get('error')}")
-
-            candidate_sql = candidate_sql.strip()
+            candidate_sql = normalize_sql_pipeline(str(new_sql_local).strip(), question, ctx)
+            gate_local = _deterministic_sql_acceptance_gate(
+                candidate_sql,
+                ctx=ctx,
+                question=question,
+                strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+            )
+            candidate_sql = str(gate_local.get("sql") or candidate_sql).strip()
             if not candidate_sql.endswith(";"):
                 candidate_sql += ";"
 
-            id_errors_local = validate_identifiers(candidate_sql, ctx)
-            hard_errors_local = _collect_hard_identifier_errors(id_errors_local)
-            join_warnings_local = [
-                str(w)
-                for w in (ast_meta_local.get("warnings") or [])
-                if str(w).startswith("suspicious_join_key:")
-            ]
+            id_errors_local = list(gate_local.get("identifier_errors") or [])
+            hard_errors_local = list(gate_local.get("hard_identifier_errors") or [])
+            join_warnings_local = list(gate_local.get("join_risk_warnings") or [])
+            gate_reasons_local = list(gate_local.get("reasons") or [])
             return {
                 "sql": candidate_sql,
                 "model": model_name,
@@ -3019,7 +3277,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "hard_identifier_errors": hard_errors_local,
                 "join_risk_warnings": join_warnings_local,
                 "join_risk_count": len(join_warnings_local),
-                "early_rejected": False,
+                "gate_accepted": bool(gate_local.get("accepted", False)),
+                "gate_reasons": gate_reasons_local,
+                "gate_parse_error": str(gate_local.get("parse_error") or ""),
+                "group_projection_violations": list(gate_local.get("group_projection_violations") or []),
+                "ambiguous_unqualified_columns": list(gate_local.get("ambiguous_unqualified_columns") or []),
+                "early_rejected": bool(
+                    AGENT_REGEN_PRECHECK_ENABLED and not bool(gate_local.get("accepted", False))
+                ),
             }
 
         attempts: List[Dict[str, Any]] = []
@@ -3027,71 +3292,100 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         if primary_attempt:
             attempts.append(primary_attempt)
 
-        primary_blockers = (
-            (primary_attempt.get("hard_identifier_errors", []) if primary_attempt else [])
-            or (primary_attempt.get("join_risk_warnings", []) if primary_attempt else [])
-        )
-        if regeneration_model == SMALL_MODEL and primary_blockers:
-            strict_instruction = (
-                f"{extra_instruction}\n"
-                "STRICT REQUIREMENT: Use EXACT schema identifiers only. "
-                "Do NOT invent aliases or column names. "
-                "If table is single-source, avoid unnecessary aliasing.\n"
-                f"{_allowed_identifiers_hint()}"
+        current_attempt = primary_attempt
+
+        # Single targeted retry with the SAME model when gate still fails.
+        if current_attempt and not current_attempt.get("gate_accepted", False):
+            retry_instruction = _build_gate_retry_instruction(
+                extra_instruction,
+                {
+                    "reasons": current_attempt.get("gate_reasons") or [],
+                    "hard_identifier_errors": current_attempt.get("hard_identifier_errors") or [],
+                    "identifier_errors": current_attempt.get("identifier_errors") or [],
+                    "ambiguous_unqualified_columns": current_attempt.get("ambiguous_unqualified_columns") or [],
+                    "group_projection_violations": current_attempt.get("group_projection_violations") or [],
+                    "join_risk_warnings": current_attempt.get("join_risk_warnings") or [],
+                    "parse_error": current_attempt.get("gate_parse_error") or "",
+                },
             )
-            small_retry = _regen_once(
-                SMALL_MODEL,
-                strict_instruction,
-                "small_strict_retry",
+            targeted_retry = _regen_once(
+                regeneration_model,
+                retry_instruction,
+                "targeted_retry",
                 strict_schema=True,
             )
-            if small_retry:
-                attempts.append(small_retry)
+            if targeted_retry:
+                attempts.append(targeted_retry)
+                current_attempt = targeted_retry
 
-        # Last fallback only when 3B retries still keep hard identifier/join-key issues.
-        have_clean_candidate = any(
-            not a.get("hard_identifier_errors") and int(a.get("join_risk_count", 0)) == 0
-            for a in attempts
-        )
-        if not have_clean_candidate and regeneration_model == SMALL_MODEL:
-            large_retry = _regen_once(LARGE_MODEL, extra_instruction, "fallback_7b", strict_schema=True)
-            if large_retry:
-                attempts.append(large_retry)
+        # Escalate to 7B only when 3B primary+retry still fail.
+        if (
+            regeneration_model == SMALL_MODEL
+            and (not current_attempt or not current_attempt.get("gate_accepted", False))
+        ):
+            escalation_instruction = _build_gate_retry_instruction(
+                extra_instruction,
+                {
+                    "reasons": (current_attempt or {}).get("gate_reasons") if current_attempt else [],
+                    "hard_identifier_errors": (current_attempt or {}).get("hard_identifier_errors") if current_attempt else [],
+                    "identifier_errors": (current_attempt or {}).get("identifier_errors") if current_attempt else [],
+                    "ambiguous_unqualified_columns": (current_attempt or {}).get("ambiguous_unqualified_columns") if current_attempt else [],
+                    "group_projection_violations": (current_attempt or {}).get("group_projection_violations") if current_attempt else [],
+                    "join_risk_warnings": (current_attempt or {}).get("join_risk_warnings") if current_attempt else [],
+                    "parse_error": (current_attempt or {}).get("gate_parse_error") if current_attempt else "",
+                },
+            )
+            fallback_7b = _regen_once(
+                LARGE_MODEL,
+                escalation_instruction,
+                "fallback_7b",
+                strict_schema=True,
+            )
+            if fallback_7b:
+                attempts.append(fallback_7b)
+                current_attempt = fallback_7b
 
         if attempts:
-            attempts_sorted = sorted(
-                attempts,
-                key=lambda a: (
-                    len(a.get("hard_identifier_errors") or []),
-                    int(a.get("join_risk_count", 0)),
-                    len(a.get("identifier_errors") or []),
-                ),
+            accepted_attempt = next(
+                (a for a in attempts if bool(a.get("gate_accepted", False))),
+                None,
             )
-            best = attempts_sorted[0]
+            if accepted_attempt is not None:
+                best = accepted_attempt
+            else:
+                best = min(
+                    attempts,
+                    key=lambda a: (
+                        len(a.get("hard_identifier_errors") or []),
+                        len(a.get("gate_reasons") or []),
+                        int(a.get("join_risk_count", 0)),
+                        len(a.get("identifier_errors") or []),
+                    ),
+                )
+
             final_sql = str(best.get("sql") or final_sql)
             final_model = str(best.get("model") or final_model)
             best_label = "7B" if final_model == LARGE_MODEL else "3B"
-            corrections.append(
-                f"Regenerated ({best_label}) [{best.get('tag')}] & Re-Normalized"
-            )
-            if best.get("early_rejected"):
-                corrections.append("Candidate precheck rejected for schema/join risk before heavy normalization")
+            corrections.append(f"Regenerated ({best_label}) [{best.get('tag')}]")
+
+            if best.get("gate_reasons"):
+                corrections.append(f"Residual acceptance warnings: {best.get('gate_reasons')}")
             if best.get("hard_identifier_errors"):
-                corrections.append(
-                    f"Residual identifier warnings: {best.get('hard_identifier_errors')}"
-                )
+                corrections.append(f"Residual identifier warnings: {best.get('hard_identifier_errors')}")
             if best.get("join_risk_warnings"):
-                corrections.append(
-                    f"Join-key warnings: {best.get('join_risk_warnings')}"
-                )
+                corrections.append(f"Join-key warnings: {best.get('join_risk_warnings')}")
         else:
             corrections.append("Regeneration failed: no candidate SQL returned")
 
-    final_sql = final_sql.strip()
-    if not final_sql.endswith(";"): final_sql += ";"
+    final_gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
+    final_sql = str(final_gate.get("sql") or final_sql).strip()
+    if not final_sql.endswith(";"):
+        final_sql += ";"
 
     # Final validation snapshot for observability in benchmark output.
-    final_validation_errors = validate_identifiers(final_sql, ctx)
+    final_validation_errors = list(final_gate.get("identifier_errors") or validate_identifiers(final_sql, ctx))
+    if not final_gate.get("accepted", False):
+        corrections.append(f"Final acceptance warnings: {final_gate.get('reasons')}")
 
     # END TIMER: Calculate processing time (Model ready → Final SQL complete)
     # This is the core text-to-SQL processing latency for thesis benchmark
