@@ -11,7 +11,7 @@
 # ====================== STANDARD LIBRARY IMPORT =======================
 # ======================================================================
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
@@ -30,6 +30,8 @@ from .config import (
     AGENT_IR_ALLOW_MULTI_TABLE,
     AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE,
     AGENT_IR_MAX_TABLES,
+    AGENT_AST_GUARDS_ENABLED,
+    AGENT_AST_GUARDS_DEBUG,
     AGENT_INSTANT_REJECT_PATTERNS,
     AGENT_DEFINITE_SQL_PATTERNS,
     AGENT_GIBBERISH_KEYBOARD_PATTERNS,
@@ -197,6 +199,7 @@ from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_
     _find_tables_with_implicit_columns, _extract_fk_from_context)
 from .helpers_core import (
     has_join,
+    _ast_guardrails,
     _question_requires_word_boundary_regex,
     _question_requires_inner_join,
     _question_wants_include_zero,
@@ -1941,6 +1944,15 @@ import time as _time  # For inference timing
 # Track last warmup time per model
 _last_model_warmup = {}
 
+
+def _collect_hard_identifier_errors(errors: List[str]) -> List[str]:
+    if not errors:
+        return []
+    return [
+        e for e in errors
+        if "not in ALLOWED" in e or "invalid column" in e or "invalid columns" in e
+    ]
+
 def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM_MAX_RETRIES) -> bool:
         global _last_model_warmup
         # Get keep_alive in seconds
@@ -1999,6 +2011,13 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 
     question = state.get("question", "")
     ctx = state.get("context", "")
+    # Route telemetry defaults
+    state["ir_used"] = False
+    state["ir_confidence"] = 0.0
+    state["ir_plannable"] = False
+    state["ir_gate_reasons"] = []
+    state["ir_table_count"] = 0
+    state["ir_context_table_count"] = 0
 
     # ------------------------------------------------------------------
     # IR-FIRST deterministic planning (schema-agnostic)
@@ -2019,6 +2038,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         table_count = max(len(mentioned_tables), len(router_tables), ctx_table_count)
         dynamic_min_conf = float(AGENT_IR_MIN_CONFIDENCE)
         ir_gate_reasons: List[str] = []
+        ir_confidence = float(intent_ir.get("confidence", 0.0) or 0.0)
 
         if table_count > AGENT_IR_MAX_TABLES:
             ir_gate_reasons.append(
@@ -2060,11 +2080,16 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 
         base_plannable = is_ir_plannable(intent_ir, dynamic_min_conf)
         ir_plannable = base_plannable and not ir_gate_reasons
+        state["ir_confidence"] = ir_confidence
+        state["ir_plannable"] = bool(ir_plannable)
+        state["ir_gate_reasons"] = list(ir_gate_reasons)
+        state["ir_table_count"] = int(table_count)
+        state["ir_context_table_count"] = int(ctx_table_count)
 
         if AGENT_IR_DEBUG:
             print(
                 "[IR] confidence="
-                f"{float(intent_ir.get('confidence', 0.0) or 0.0):.2f}, "
+                f"{ir_confidence:.2f}, "
                 f"plannable={ir_plannable}, "
                 f"table_count={table_count}, "
                 f"context_table_count={ctx_table_count}, "
@@ -2085,6 +2110,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
                     "processing_start_time": _time.perf_counter(),
                     "draft_inference_time": 0.0,
                     "draft_source": "ir_planner",
+                    "ir_used": True,
                     "join_plan": plan_meta.get("join_plan", {}),
                     "draft_sql": normalized_sql,
                     "agent_notes": (
@@ -2240,8 +2266,25 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     
     # 1. HEURISTIC PIPELINE (Versi Bersih/Safe Mode)
     final_sql = normalize_sql_pipeline(draft_sql, question, ctx)
-    sql_up = final_sql.upper()
     corrections = ["Applied Heuristic Pipeline"]
+
+    # 1b. AST guardrails (sqlglot) for structural safety checks/fixes.
+    # This pass is conservative: if AST parse fails, we keep legacy behavior.
+    if AGENT_AST_GUARDS_ENABLED:
+        ast_sql, ast_meta = _ast_guardrails(final_sql, ctx=ctx, question=question)
+        if ast_meta.get("parse_ok", False):
+            ast_fixes = ast_meta.get("fixes") or []
+            ast_warnings = ast_meta.get("warnings") or []
+            if ast_fixes:
+                final_sql = ast_sql
+                corrections.append(f"AST guardrails fixes: {ast_fixes}")
+            if AGENT_AST_GUARDS_DEBUG and ast_warnings:
+                _dbg_print_two("[AST] warnings", f"{ast_warnings}")
+                corrections.append(f"AST guardrails warnings: {ast_warnings}")
+        elif AGENT_AST_GUARDS_DEBUG and ast_meta.get("error"):
+            _dbg_print_two("[AST] parse skipped", f"{ast_meta.get('error')}")
+
+    sql_up = final_sql.upper()
 
     # 2. PREPARE CHECKS (FULL PROTECTION)
     sql_for_tokenizing = final_sql
@@ -2348,10 +2391,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # Static identifier validation catches undefined aliases/tables early
     # (e.g., SUM(p.amount) without joining alias `p`).
     identifier_errors = validate_identifiers(final_sql, ctx)
-    hard_identifier_errors = [
-        e for e in identifier_errors
-        if "not in ALLOWED" in e or "invalid column" in e or "invalid columns" in e
-    ]
+    hard_identifier_errors = _collect_hard_identifier_errors(identifier_errors)
 
     # 3. DECISION MATRIX
     needs_regeneration = False
@@ -2778,13 +2818,29 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                          break
                 if needs_regeneration: break
 
-    # 4. EXECUTE REGENERATION (dengan dynamic model selection)
+    # 4. EXECUTE REGENERATION (validation-aware, AST-stabilized)
     final_model = state.get("target_model", "")  # Default to initial model
     if needs_regeneration:
-        def _regen_once(model_name: str, instruction: str) -> Optional[str]:
+        def _allowed_identifiers_hint(max_tables: int = 3, max_cols: int = 10) -> str:
+            allowed_map = _parse_allowed_identifiers(ctx)
+            if not allowed_map:
+                return ""
+            chunks: List[str] = []
+            for i, (tbl, cols) in enumerate(allowed_map.items()):
+                if i >= max_tables:
+                    break
+                cols_sorted = sorted(str(c) for c in (cols or set()) if str(c).strip())
+                if len(cols_sorted) > max_cols:
+                    cols_sorted = cols_sorted[:max_cols]
+                chunks.append(f"{tbl}: {', '.join(cols_sorted)}")
+            if not chunks:
+                return ""
+            return "ALLOWED IDENTIFIERS SNAPSHOT:\n- " + "\n- ".join(chunks)
+
+        def _regen_once(model_name: str, instruction: str, tag: str) -> Optional[Dict[str, Any]]:
             llm_regen_local = build_llm_repair(model=model_name)
             model_label_local = "7B" if model_name == LARGE_MODEL else "3B"
-            _dbg_print_two("[Agent3] Regenerating with", model_label_local)
+            _dbg_print_two("[Agent3] Regenerating with", f"{model_label_local} ({tag})")
             new_sql_local, _ = regenerate_with_extra_constraint(
                 llm_regen_local,
                 make_generation_prompt,
@@ -2794,17 +2850,93 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             )
             if not new_sql_local:
                 return None
-            normalized_local = normalize_sql_pipeline(new_sql_local, question, ctx)
-            corrections.append(f"Regenerated ({model_label_local}) & Re-Normalized")
-            return normalized_local
 
-        regenerated_sql = _regen_once(regeneration_model, extra_instruction)
-        if regenerated_sql:
-            final_sql = regenerated_sql
-            final_model = regeneration_model
+            candidate_sql = normalize_sql_pipeline(new_sql_local, question, ctx)
+            ast_meta_local: Dict[str, Any] = {}
+            if AGENT_AST_GUARDS_ENABLED:
+                ast_sql_local, ast_meta_local = _ast_guardrails(
+                    candidate_sql,
+                    ctx=ctx,
+                    question=question,
+                )
+                if ast_meta_local.get("parse_ok", False):
+                    if ast_meta_local.get("fixes"):
+                        candidate_sql = ast_sql_local
+                    if AGENT_AST_GUARDS_DEBUG and ast_meta_local.get("warnings"):
+                        _dbg_print_two("[AST] warnings", f"{ast_meta_local.get('warnings')}")
+                elif AGENT_AST_GUARDS_DEBUG and ast_meta_local.get("error"):
+                    _dbg_print_two("[AST] parse skipped", f"{ast_meta_local.get('error')}")
+
+            candidate_sql = candidate_sql.strip()
+            if not candidate_sql.endswith(";"):
+                candidate_sql += ";"
+
+            id_errors_local = validate_identifiers(candidate_sql, ctx)
+            hard_errors_local = _collect_hard_identifier_errors(id_errors_local)
+            return {
+                "sql": candidate_sql,
+                "model": model_name,
+                "tag": tag,
+                "identifier_errors": id_errors_local,
+                "hard_identifier_errors": hard_errors_local,
+            }
+
+        attempts: List[Dict[str, Any]] = []
+        primary_attempt = _regen_once(regeneration_model, extra_instruction, "primary")
+        if primary_attempt:
+            attempts.append(primary_attempt)
+
+        primary_hard_errors = (
+            primary_attempt.get("hard_identifier_errors", [])
+            if primary_attempt
+            else ["regen_failed"]
+        )
+        if regeneration_model == SMALL_MODEL and primary_hard_errors:
+            strict_instruction = (
+                f"{extra_instruction}\n"
+                "STRICT REQUIREMENT: Use EXACT schema identifiers only. "
+                "Do NOT invent aliases or column names. "
+                "If table is single-source, avoid unnecessary aliasing.\n"
+                f"{_allowed_identifiers_hint()}"
+            )
+            small_retry = _regen_once(SMALL_MODEL, strict_instruction, "small_strict_retry")
+            if small_retry:
+                attempts.append(small_retry)
+
+        # Last fallback only when 3B retries still keep hard identifier issues.
+        have_clean_candidate = any(not a.get("hard_identifier_errors") for a in attempts)
+        if not have_clean_candidate and regeneration_model == SMALL_MODEL:
+            large_retry = _regen_once(LARGE_MODEL, extra_instruction, "fallback_7b")
+            if large_retry:
+                attempts.append(large_retry)
+
+        if attempts:
+            attempts_sorted = sorted(
+                attempts,
+                key=lambda a: (
+                    len(a.get("hard_identifier_errors") or []),
+                    len(a.get("identifier_errors") or []),
+                ),
+            )
+            best = attempts_sorted[0]
+            final_sql = str(best.get("sql") or final_sql)
+            final_model = str(best.get("model") or final_model)
+            best_label = "7B" if final_model == LARGE_MODEL else "3B"
+            corrections.append(
+                f"Regenerated ({best_label}) [{best.get('tag')}] & Re-Normalized"
+            )
+            if best.get("hard_identifier_errors"):
+                corrections.append(
+                    f"Residual identifier warnings: {best.get('hard_identifier_errors')}"
+                )
+        else:
+            corrections.append("Regeneration failed: no candidate SQL returned")
 
     final_sql = final_sql.strip()
     if not final_sql.endswith(";"): final_sql += ";"
+
+    # Final validation snapshot for observability in benchmark output.
+    final_validation_errors = validate_identifiers(final_sql, ctx)
 
     # END TIMER: Calculate processing time (Model ready → Final SQL complete)
     # This is the core text-to-SQL processing latency for thesis benchmark
@@ -2816,6 +2948,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     return {
         **state,
+        "validation_errors": final_validation_errors,
         "final_sql": final_sql,
         "answer": final_sql,
         "critic_feedback": " | ".join(corrections),

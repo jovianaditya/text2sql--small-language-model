@@ -143,6 +143,10 @@ AGENT_IR_DEBUG = bool(int(os.getenv("AGENT_IR_DEBUG", "1")))
 AGENT_IR_ALLOW_MULTI_TABLE = bool(int(os.getenv("AGENT_IR_ALLOW_MULTI_TABLE", "0")))
 AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE = float(os.getenv("AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE", "0.85"))
 AGENT_IR_MAX_TABLES = int(os.getenv("AGENT_IR_MAX_TABLES", "1"))
+
+# AST guardrails (sqlglot-based safety checks in refine phase)
+AGENT_AST_GUARDS_ENABLED = bool(int(os.getenv("AGENT_AST_GUARDS_ENABLED", "1")))
+AGENT_AST_GUARDS_DEBUG = bool(int(os.getenv("AGENT_AST_GUARDS_DEBUG", "0")))
 # ======================================================================
 # ============================= DEBUG ==================================
 # ======================================================================

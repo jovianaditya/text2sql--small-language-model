@@ -506,7 +506,9 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     col_widths = {
         "id": 8, "difficulty": 10, "question": 50,
         "groundtruth_sql": 40, "predicted_sql": 40,
+        "draft_source": 14, "ir_used": 10, "ir_confidence": 12, "ir_plannable": 12, "ir_gate_reasons": 28,
         "initial_model_used": 12, "final_model_used": 12,  # Model tracking
+        "va_success": 12, "va_error": 30,
         "exec_success": 12, "result_match": 12, "match_reason": 25,
         "pred_row_count": 12, "gt_row_count": 12,
         "latency_s": 12, "error": 30
@@ -589,6 +591,11 @@ async def run_single_case(
         "question": question,
         "groundtruth_sql": groundtruth_sql,
         "predicted_sql": "",
+        "draft_source": "",
+        "ir_used": False,
+        "ir_confidence": 0.0,
+        "ir_plannable": False,
+        "ir_gate_reasons": "",
         "initial_model_used": "",  # Initial model chosen by router (3b/7b)
         "final_model_used": "",    # Final model used (may differ if regeneration occurred)
         "va_success": False,       # Valid SQL (EXPLAIN)
@@ -618,6 +625,12 @@ async def run_single_case(
         predicted_sql = _preexecute_sql_safety_pass(predicted_sql, question)
         
         result["predicted_sql"] = predicted_sql
+        result["draft_source"] = str(state.get("draft_source", "") or "")
+        result["ir_used"] = bool(state.get("ir_used", False))
+        result["ir_confidence"] = round(float(state.get("ir_confidence", 0.0) or 0.0), 3)
+        result["ir_plannable"] = bool(state.get("ir_plannable", False))
+        gate_reasons = state.get("ir_gate_reasons", []) or []
+        result["ir_gate_reasons"] = "|".join(str(x) for x in gate_reasons if str(x).strip())
         
         # Use inference time from agent (excludes cold start/model loading)
         # Fallback to total time if not available
@@ -646,6 +659,10 @@ async def run_single_case(
             result["final_model_used"] = final_model or result["initial_model_used"]
 
         print(f"[MODEL] Initial: {result['initial_model_used']} → Final: {result['final_model_used']}")
+        print(
+            f"[ROUTE] draft_source={result['draft_source'] or 'unknown'}, "
+            f"ir_used={result['ir_used']}, ir_conf={result['ir_confidence']:.3f}"
+        )
         
         print(f"[PREDICTED] {predicted_sql}")
         
@@ -902,6 +919,8 @@ async def run_batch_eval(
     va_success = sum(1 for r in results if r["va_success"])
     exec_success = sum(1 for r in results if r["exec_success"])
     result_match = sum(1 for r in results if r["result_match"])
+    ir_used_count = sum(1 for r in results if bool(r.get("ir_used", False)))
+    llm_fallback_count = total - ir_used_count
 
     # Metrics by difficulty
     by_difficulty = {}
@@ -925,6 +944,10 @@ async def run_batch_eval(
     print(f"Total cases: {total}")
     print(f"Valid SQL (VA): {va_success}/{total} ({100*va_success/total:.1f}%)")
     print(f"Execution Summary (EX): {result_match}/{total} ({100*result_match/total:.1f}%)")
+    print(
+        f"Route Split: IR={ir_used_count}/{total} ({100*ir_used_count/total:.1f}%), "
+        f"LLM fallback={llm_fallback_count}/{total} ({100*llm_fallback_count/total:.1f}%)"
+    )
 
     print("\nBy Difficulty:")
     for d, stats in sorted(by_difficulty.items()):
@@ -946,6 +969,7 @@ async def run_batch_eval(
         fieldnames = [
             "id", "difficulty", "question",
             "groundtruth_sql", "predicted_sql",
+            "draft_source", "ir_used", "ir_confidence", "ir_plannable", "ir_gate_reasons",
             "initial_model_used", "final_model_used",  # Model tracking
             "va_success", "va_error",
             "exec_success", "result_match", "match_reason",

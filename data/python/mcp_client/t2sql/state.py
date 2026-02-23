@@ -29,11 +29,19 @@ class RAGState(TypedDict, total=False):
     answer: str
     draft_sql: str
     draft_source: str  # llm|ir_planner
+    draft_inference_time: float
     ranked_cols: List[tuple[str, str]]
     final_sql: str
     # Agnostic pipeline artifacts
     intent_ir: Dict[str, Any]
     join_plan: Dict[str, Any]
+    # Route telemetry
+    ir_used: bool
+    ir_confidence: float
+    ir_plannable: bool
+    ir_gate_reasons: List[str]
+    ir_table_count: int
+    ir_context_table_count: int
     # Jenis query hasil classifier ('lookup', 'aggregate', 'rank', dst.)
     qtype: str
     # Flag apakah pertanyaan ini butuh REGEXP/pattern handling
@@ -68,10 +76,17 @@ def make_state(paths, question: str) -> RAGState:
         "answer": "",
         "draft_sql": "",
         "draft_source": "",
+        "draft_inference_time": 0.0,
         "ranked_cols": [],
         "final_sql": "",
         "intent_ir": {},
         "join_plan": {},
+        "ir_used": False,
+        "ir_confidence": 0.0,
+        "ir_plannable": False,
+        "ir_gate_reasons": [],
+        "ir_table_count": 0,
+        "ir_context_table_count": 0,
         "qtype": "",
         "requires_regex": False,
         "agent_notes": "",

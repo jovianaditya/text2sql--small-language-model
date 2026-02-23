@@ -23,7 +23,8 @@ RUN pip install --no-cache-dir \
     scikit-learn \
     chromadb \
     langgraph \
-    langchain-ollama
+    langchain-ollama \
+    sqlglot
 
 # Install Jupyter
 RUN pip install --no-cache-dir notebook ipykernel

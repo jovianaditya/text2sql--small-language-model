@@ -9,7 +9,7 @@
 # ====================== STANDARD LIBRARY IMPORT =======================
 # ======================================================================
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
@@ -8702,15 +8702,50 @@ def _rewrite_row_level_nonnull_to_group_existence(sql: str, question: str) -> st
 
     nonnull_conds: List[str] = []
     keep_conds: List[str] = []
+
+    colref = r"`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?"
     nonnull_pat = re.compile(
-        r"""(?is)^\s*\(?\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s+IS\s+NOT\s+NULL\s*\)?\s*$"""
+        rf"""(?is)^\s*\(?\s*(?P<col>{colref})\s+IS\s+NOT\s+NULL\s*\)?\s*$"""
     )
+    not_isnull_pat = re.compile(
+        rf"""(?is)^\s*\(?\s*NOT\s+(?P<col>{colref})\s+IS\s+NULL\s*\)?\s*$"""
+    )
+    not_null_or_empty_pat = re.compile(
+        rf"""(?is)^\s*\(?\s*NOT\s*\(\s*(?P<c1>{colref})\s+IS\s+NULL\s+OR\s*(?P<c2>{colref})\s*=\s*''\s*\)\s*\)?\s*$"""
+    )
+
+    def _norm_colref(ref: str) -> str:
+        return re.sub(r"[\s`]+", "", str(ref or "")).lower()
+
+    def _extract_nonnull_condition(cond: str) -> Optional[str]:
+        c = (cond or "").strip()
+        if not c:
+            return None
+
+        m1 = nonnull_pat.match(c)
+        if m1:
+            return f"{m1.group('col').strip()} IS NOT NULL"
+
+        m2 = not_isnull_pat.match(c)
+        if m2:
+            return f"{m2.group('col').strip()} IS NOT NULL"
+
+        m3 = not_null_or_empty_pat.match(c)
+        if m3:
+            c1 = (m3.group("c1") or "").strip()
+            c2 = (m3.group("c2") or "").strip()
+            if c1 and c2 and _norm_colref(c1) == _norm_colref(c2):
+                return f"NOT ({c1} IS NULL OR {c1} = '')"
+
+        return None
+
     for c in conds:
         c0 = c.strip()
         if not c0:
             continue
-        if nonnull_pat.match(c0):
-            nonnull_conds.append(c0.strip("() ").strip())
+        nonnull_expr = _extract_nonnull_condition(c0)
+        if nonnull_expr:
+            nonnull_conds.append(nonnull_expr)
         else:
             keep_conds.append(c0)
 
@@ -9129,7 +9164,8 @@ def _question_wants_missing_value(question: str) -> bool:
     return any(s in q for s in [
         "missing", "is missing", "missing information",
         "empty", "blank", "not provided", "unknown",
-        "kosong", "tidak ada", "belum diisi", "null"
+        "null or empty", "null/empty",
+        "kosong", "tidak ada", "belum diisi"
     ])
 
 def _expand_missing_null_to_null_or_empty(sql: str, question: str) -> str:
@@ -9229,6 +9265,325 @@ def _parse_from_join_aliases(sql: str) -> Dict[str, str]:
         out[alias] = tbl
         out[alias.lower()] = tbl  # convenience
     return out
+
+
+def _ast_guardrails(sql: str, ctx: str = "", question: str = "") -> Tuple[str, Dict[str, Any]]:
+    """
+    SQL AST guardrails (sqlglot-first).
+
+    Goals:
+    - Resolve easy alias/reference issues safely.
+    - Auto-qualify ambiguous ORDER BY columns when a deterministic target exists.
+    - Surface join-key sanity warnings without destructive rewrites.
+
+    Returns:
+      (possibly_rewritten_sql, meta)
+      meta = {
+        "parse_ok": bool,
+        "fixes": List[str],
+        "warnings": List[str],
+        "error": str,
+      }
+    """
+    meta: Dict[str, Any] = {"parse_ok": False, "fixes": [], "warnings": [], "error": ""}
+    if not sql:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(sql, read="mysql")
+        meta["parse_ok"] = True
+    except Exception as e:
+        meta["error"] = f"parse_error:{e}"
+        return sql, meta
+
+    sel = ast.find(exp.Select)
+    if sel is None:
+        return sql, meta
+
+    # -----------------------------
+    # Top-level alias -> table map
+    # -----------------------------
+    alias_to_table: Dict[str, str] = {}
+    alias_order: List[str] = []
+
+    def _register_source(src: "exp.Expression") -> None:
+        # Base table source
+        if isinstance(src, exp.Table):
+            table_name = (src.name or "").strip("`")
+            if not table_name:
+                return
+            table_l = table_name.lower()
+            alias_raw = (src.alias_or_name or table_name).strip("`")
+            alias_l = alias_raw.lower()
+            if alias_l and alias_l not in alias_to_table:
+                alias_to_table[alias_l] = table_l
+                alias_order.append(alias_l)
+            if table_l and table_l not in alias_to_table:
+                # Allow table-name qualifiers as valid references.
+                alias_to_table[table_l] = table_l
+            return
+
+        # Derived table source: keep alias as known qualifier, but never try to
+        # map its columns to base schema columns in this pass.
+        if isinstance(src, exp.Subquery):
+            alias_raw = (src.alias_or_name or "").strip("`")
+            alias_l = alias_raw.lower()
+            if alias_l and alias_l not in alias_to_table:
+                alias_to_table[alias_l] = f"__derived__:{alias_l}"
+                alias_order.append(alias_l)
+            return
+
+    from_arg = sel.args.get("from") or sel.args.get("from_")
+    if from_arg is not None and getattr(from_arg, "this", None) is not None:
+        _register_source(from_arg.this)
+    for j in sel.args.get("joins") or []:
+        _register_source(getattr(j, "this", None))
+
+    # Fallback when top-level extraction misses cases.
+    if not alias_to_table:
+        alias_raw = _parse_from_join_aliases(sql)
+        for a, t in alias_raw.items():
+            al = str(a or "").strip().lower()
+            tl = str(t or "").strip().lower()
+            if not al or not tl:
+                continue
+            if al not in alias_to_table:
+                alias_to_table[al] = tl
+                alias_order.append(al)
+            if tl not in alias_to_table:
+                alias_to_table[tl] = tl
+
+    if not alias_to_table:
+        return sql, meta
+
+    # -----------------------------
+    # Build table column map (ctx + schema fallback)
+    # -----------------------------
+    allowed = _parse_allowed_identifiers(ctx or "")
+    allowed_l: Dict[str, Set[str]] = {}
+    for t, cols in (allowed or {}).items():
+        tl = str(t or "").strip("`").lower()
+        if not tl:
+            continue
+        allowed_l.setdefault(tl, set()).update(
+            str(c or "").strip("`").lower() for c in (cols or set()) if str(c or "").strip()
+        )
+
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    alias_cols: Dict[str, Set[str]] = {}
+    for alias, table in alias_to_table.items():
+        if str(table).startswith("__derived__:"):
+            alias_cols[alias] = set()
+            continue
+        cols = set(allowed_l.get(table, set()))
+        if analyzer is not None:
+            try:
+                cols.update(str(c).strip("`").lower() for c in analyzer.get_table_columns(table))
+            except Exception:
+                pass
+        alias_cols[alias] = cols
+
+    # Map: column_name -> aliases that contain it
+    col_to_aliases: Dict[str, List[str]] = {}
+    for alias, cols in alias_cols.items():
+        for c in cols:
+            col_to_aliases.setdefault(c, []).append(alias)
+
+    # Prefer dimension-like aliases over transaction aliases for ambiguous refs.
+    try:
+        txn_tables = {str(t or "").strip().lower() for t in (get_transaction_tables() or [])}
+    except Exception:
+        txn_tables = set()
+
+    def _preferred_alias(col_name: str, candidates: List[str]) -> Optional[str]:
+        uniq = []
+        seen = set()
+        for c in candidates:
+            cl = str(c or "").strip().lower()
+            if cl and cl not in seen:
+                uniq.append(cl)
+                seen.add(cl)
+        if not uniq:
+            return None
+        if len(uniq) == 1:
+            return uniq[0]
+
+        non_tx = [a for a in uniq if alias_to_table.get(a, "") not in txn_tables]
+        if len(non_tx) == 1:
+            return non_tx[0]
+
+        for a in alias_order:
+            if a in uniq:
+                return a
+        return uniq[0]
+
+    # -----------------------------
+    # Projection map for ORDER BY disambiguation
+    # -----------------------------
+    projection_col_map: Dict[str, List["exp.Column"]] = {}
+    for item in sel.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        if not isinstance(base, exp.Column):
+            continue
+        out_name = str(item.alias_or_name or "").strip("`").lower()
+        if out_name:
+            projection_col_map.setdefault(out_name, []).append(base.copy())
+        base_name = str(base.name or "").strip("`").lower()
+        if base_name:
+            projection_col_map.setdefault(base_name, []).append(base.copy())
+
+    def _is_nested_subquery_column(col_expr: "exp.Column") -> bool:
+        """
+        Return True when the column belongs to a nested subquery scope.
+        We keep unknown-qualifier rewrites strictly at top-level SELECT scope
+        to avoid corrupting derived-table internals.
+        """
+        anc = getattr(col_expr, "parent", None)
+        while anc is not None:
+            if anc is sel:
+                return False
+            if isinstance(anc, exp.Subquery):
+                return True
+            anc = getattr(anc, "parent", None)
+        return False
+
+    # -----------------------------
+    # 1) Unknown qualifier fix/warn
+    # -----------------------------
+    known_qualifiers = set(alias_to_table.keys())
+    for col in sel.find_all(exp.Column):
+        if _is_nested_subquery_column(col):
+            # Never rewrite nested scopes in this pass.
+            continue
+        table_q = str(col.table or "").strip("`").lower()
+        col_name = str(col.name or "").strip("`").lower()
+        if not table_q:
+            continue
+        if table_q in known_qualifiers:
+            continue
+
+        owners = col_to_aliases.get(col_name, [])
+        best = _preferred_alias(col_name, owners)
+        if best:
+            col.set("table", exp.to_identifier(best))
+            meta["fixes"].append(f"unknown_qualifier_fixed:{table_q}->{best}.{col_name}")
+        else:
+            meta["warnings"].append(f"unknown_qualifier:{table_q}.{col_name}")
+
+    # -----------------------------
+    # 2) Ambiguous ORDER BY disambiguation
+    # -----------------------------
+    order = sel.args.get("order")
+    if order is not None:
+        for ord_item in order.expressions or []:
+            this_expr = getattr(ord_item, "this", None)
+            if not isinstance(this_expr, exp.Column):
+                continue
+            if str(this_expr.table or "").strip():
+                continue
+
+            c_name = str(this_expr.name or "").strip("`")
+            c_low = c_name.lower()
+            if not c_low:
+                continue
+
+            proj_candidates = projection_col_map.get(c_low, [])
+            proj_norm = {}
+            for p in proj_candidates:
+                key = p.sql(dialect="mysql")
+                proj_norm[key] = p
+
+            replacement = None
+            if len(proj_norm) == 1:
+                replacement = list(proj_norm.values())[0].copy()
+                meta["fixes"].append(f"order_by_qualified_from_projection:{c_low}")
+            else:
+                owners = col_to_aliases.get(c_low, [])
+                if owners:
+                    best = _preferred_alias(c_low, owners)
+                    if best:
+                        replacement = exp.column(c_name, table=best)
+                        if len(set(owners)) > 1:
+                            meta["fixes"].append(f"order_by_ambiguous_qualified:{best}.{c_low}")
+                elif len(set(proj_norm.keys())) > 1:
+                    meta["warnings"].append(f"order_by_projection_ambiguous:{c_low}")
+
+            if replacement is not None:
+                ord_item.set("this", replacement)
+
+    # -----------------------------
+    # 3) Join key sanity warning
+    # -----------------------------
+    fk_map = {}
+    try:
+        fk_map = get_fk_relationships() or {}
+    except Exception:
+        fk_map = {}
+
+    joins = sel.args.get("joins") or []
+    for j in joins:
+        on_expr = j.args.get("on")
+        if on_expr is None:
+            continue
+        for eq in on_expr.find_all(exp.EQ):
+            left = getattr(eq, "left", None)
+            right = getattr(eq, "right", None)
+            if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+                continue
+            lt_alias = str(left.table or "").strip("`").lower()
+            rt_alias = str(right.table or "").strip("`").lower()
+            lc = str(left.name or "").strip("`").lower()
+            rc = str(right.name or "").strip("`").lower()
+            if not lt_alias or not rt_alias or not lc or not rc:
+                continue
+
+            lt = alias_to_table.get(lt_alias, lt_alias)
+            rt = alias_to_table.get(rt_alias, rt_alias)
+
+            # Skip derived-table aliases in FK sanity checks.
+            if str(lt).startswith("__derived__:") or str(rt).startswith("__derived__:"):
+                continue
+
+            plausible = False
+            # direct fk metadata check
+            if lt in fk_map and lc in {str(k).lower() for k in (fk_map.get(lt) or {}).keys()}:
+                for fk_col, tgt in (fk_map.get(lt) or {}).items():
+                    if str(fk_col).lower() == lc and str(tgt).lower() == rt:
+                        plausible = True
+                        break
+            if not plausible and rt in fk_map and rc in {str(k).lower() for k in (fk_map.get(rt) or {}).keys()}:
+                for fk_col, tgt in (fk_map.get(rt) or {}).items():
+                    if str(fk_col).lower() == rc and str(tgt).lower() == lt:
+                        plausible = True
+                        break
+
+            # fallback heuristic for shared id-like fields
+            if not plausible and lc == rc and (lc.endswith("id") or lc.endswith("number") or lc.endswith("code")):
+                plausible = True
+
+            if not plausible:
+                meta["warnings"].append(f"suspicious_join_key:{lt_alias}.{lc}={rt_alias}.{rc}")
+
+    # Return rewritten SQL only when we made deterministic fixes.
+    if not meta["fixes"]:
+        return sql, meta
+
+    out_sql = ast.sql(dialect="mysql")
+    if sql.strip().endswith(";"):
+        out_sql = out_sql.rstrip(";").strip() + ";"
+    return out_sql, meta
 
 def _strip_unneeded_count_distinct(sql: str) -> str:
     """
@@ -9639,6 +9994,12 @@ def _fix_raw_column_where_to_having(sql: str, question: str = "") -> str:
     if "WHERE" not in sql_up:
         return sql
 
+    # Conservative gate:
+    # - if query already has HAVING, avoid risky surgery.
+    # - this fixer is intended for simple WHERE-only aggregate thresholds.
+    if "HAVING" in sql_up:
+        return sql
+
     # Detect aggregate intent in question
     question_lower = question.lower()
     agg_intent_patterns = [
@@ -9665,6 +10026,12 @@ def _fix_raw_column_where_to_having(sql: str, question: str = "") -> str:
         return sql
 
     where_body = where_match.group(1).strip()
+
+    # Guard against complex WHERE (subquery / OR) that naive split cannot handle safely.
+    if re.search(r"\bSELECT\b", where_body, flags=re.IGNORECASE):
+        return sql
+    if _has_top_level_or(where_body):
+        return sql
 
     # Get columns used in aggregate functions in SELECT
     select_match = re.search(r"\bSELECT\b(.*?)\bFROM\b", sql, flags=re.IGNORECASE | re.DOTALL)
