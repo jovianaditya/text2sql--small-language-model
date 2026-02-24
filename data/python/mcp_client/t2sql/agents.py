@@ -2231,6 +2231,101 @@ def _build_gate_retry_instruction(base_instruction: str, gate: Dict[str, Any]) -
     return "\n".join(lines)
 
 
+def _is_critical_gate_failure(gate: Dict[str, Any]) -> bool:
+    reasons = {str(r) for r in (gate.get("reasons") or [])}
+    critical_reasons = {
+        "parse_error",
+        "hard_identifier",
+        "ambiguous_unqualified",
+        "group_projection_mismatch",
+    }
+    if reasons.intersection(critical_reasons):
+        return True
+    return bool(gate.get("parse_error"))
+
+
+def _allowed_identifiers_snapshot(ctx: str, max_tables: int = 4, max_cols: int = 12) -> str:
+    allowed_map = _parse_allowed_identifiers(ctx)
+    if not allowed_map:
+        return ""
+    lines: List[str] = []
+    for i, (tbl, cols) in enumerate(allowed_map.items()):
+        if i >= max_tables:
+            break
+        cols_sorted = sorted(str(c) for c in (cols or set()) if str(c).strip())
+        if len(cols_sorted) > max_cols:
+            cols_sorted = cols_sorted[:max_cols]
+        lines.append(f"- {tbl}: {', '.join(cols_sorted)}")
+    if not lines:
+        return ""
+    return "ALLOWED IDENTIFIERS SNAPSHOT:\n" + "\n".join(lines)
+
+
+def _attempt_last_chance_rescue_7b(
+    *,
+    question: str,
+    ctx: str,
+    current_sql: str,
+    gate: Dict[str, Any],
+    strict_join_key: bool = False,
+) -> Dict[str, Any]:
+    """
+    One-shot rescue with 7B when final gate fails critically.
+    Returns a payload with the rescued SQL and gate verdict.
+    """
+    result: Dict[str, Any] = {
+        "used": False,
+        "accepted": False,
+        "sql": (current_sql or "").strip(),
+        "gate": gate,
+        "error": "",
+    }
+
+    if not _is_critical_gate_failure(gate):
+        return result
+
+    result["used"] = True
+    llm_rescue = build_llm_repair(model=LARGE_MODEL)
+    _dbg_print_two("[Agent3] Last-chance rescue", "Regenerating with 7B")
+
+    rescue_instruction = _build_gate_retry_instruction(
+        "LAST-CHANCE RESCUE: Rewrite SQL to satisfy deterministic acceptance gate. Return one valid MySQL SELECT only.",
+        gate,
+    )
+    allowed_snapshot = _allowed_identifiers_snapshot(ctx)
+    if allowed_snapshot:
+        rescue_instruction = f"{rescue_instruction}\n\n{allowed_snapshot}"
+
+    rescued_sql, _ = regenerate_with_extra_constraint(
+        llm_rescue,
+        make_generation_prompt,
+        ctx,
+        question,
+        rescue_instruction,
+    )
+    if not rescued_sql:
+        result["error"] = "rescue_empty_sql"
+        return result
+
+    candidate_sql = normalize_sql_pipeline(str(rescued_sql).strip(), question, ctx)
+    rescue_gate = _deterministic_sql_acceptance_gate(
+        candidate_sql,
+        ctx=ctx,
+        question=question,
+        strict_join_key=strict_join_key,
+    )
+    candidate_sql = str(rescue_gate.get("sql") or candidate_sql).strip()
+    if candidate_sql and not candidate_sql.endswith(";"):
+        candidate_sql += ";"
+
+    result["sql"] = candidate_sql
+    result["gate"] = rescue_gate
+    result["accepted"] = bool(rescue_gate.get("accepted", False))
+    if not result["accepted"]:
+        result["error"] = "rescue_gate_failed"
+    return result
+
+
 def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM_MAX_RETRIES) -> bool:
         global _last_model_warmup
         # Get keep_alive in seconds
@@ -2507,6 +2602,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         final_sql, warnings = safety_normalize_sql(draft_sql)
         corrections = ["Deterministic IR planner output"]
         gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
+        current_gate = gate
         final_sql = str(gate.get("sql") or final_sql)
         validation_errors = list(gate.get("identifier_errors") or [])
         if warnings:
@@ -2521,12 +2617,43 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             # Last-resort fallback to legacy normalizer for recovery.
             final_sql = normalize_sql_pipeline(final_sql, question, ctx)
             gate_after_fallback = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
+            current_gate = gate_after_fallback
             final_sql = str(gate_after_fallback.get("sql") or final_sql)
             validation_errors = list(gate_after_fallback.get("identifier_errors") or validation_errors)
             if not gate_after_fallback.get("accepted", False):
                 corrections.append(
                     f"Post-fallback acceptance warnings: {gate_after_fallback.get('reasons')}"
                 )
+
+        rescue_7b_used = False
+        ir_final_model = "ir_planner"
+        if not current_gate.get("accepted", False) and _is_critical_gate_failure(current_gate):
+            _dbg_print_two("[IR] FINAL GATE FAIL-CLOSED", f"{current_gate.get('reasons')}")
+            rescue = _attempt_last_chance_rescue_7b(
+                question=question,
+                ctx=ctx,
+                current_sql=final_sql,
+                gate=current_gate,
+                strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+            )
+            rescue_7b_used = bool(rescue.get("used", False))
+            if rescue_7b_used:
+                final_sql = str(rescue.get("sql") or final_sql)
+                current_gate = rescue.get("gate") or current_gate
+                if rescue.get("accepted", False):
+                    ir_final_model = LARGE_MODEL
+                    corrections.append("Last-chance rescue succeeded (7B)")
+                else:
+                    corrections.append(
+                        f"Last-chance rescue failed: {rescue.get('error')} | reasons={current_gate.get('reasons')}"
+                    )
+
+        if not current_gate.get("accepted", False) and _is_critical_gate_failure(current_gate):
+            final_sql = "SELECT 'FINAL_GATE_BLOCKED' AS error_message;"
+            ir_final_model = "gate_blocked"
+            corrections.append(f"Fail-closed: blocked unsafe SQL ({current_gate.get('reasons')})")
+
+        validation_errors = list(current_gate.get("identifier_errors") or validation_errors)
         if not final_sql.endswith(";"):
             final_sql += ";"
 
@@ -2542,7 +2669,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             "final_sql": final_sql,
             "answer": final_sql,
             "critic_feedback": " | ".join(corrections),
-            "final_model": "ir_planner",
+            "final_model": ir_final_model,
+            "final_gate_pass": bool(current_gate.get("accepted", False)),
+            "final_gate_reasons": list(current_gate.get("reasons") or []),
+            "rescue_7b_used": bool(rescue_7b_used),
         }
 
     # DYNAMIC MODEL SELECTION berdasarkan draft quality
@@ -3379,13 +3509,43 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     final_gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
     final_sql = str(final_gate.get("sql") or final_sql).strip()
+
+    rescue_7b_used = False
+    if not final_gate.get("accepted", False) and _is_critical_gate_failure(final_gate):
+        _dbg_print_two("[Agent3] FINAL GATE FAIL-CLOSED", f"{final_gate.get('reasons')}")
+        rescue = _attempt_last_chance_rescue_7b(
+            question=question,
+            ctx=ctx,
+            current_sql=final_sql,
+            gate=final_gate,
+            strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+        )
+        rescue_7b_used = bool(rescue.get("used", False))
+        if rescue_7b_used:
+            final_sql = str(rescue.get("sql") or final_sql).strip()
+            final_gate = rescue.get("gate") or final_gate
+            if rescue.get("accepted", False):
+                final_model = LARGE_MODEL
+                corrections.append("Last-chance rescue succeeded (7B)")
+            else:
+                corrections.append(
+                    f"Last-chance rescue failed: {rescue.get('error')} | reasons={final_gate.get('reasons')}"
+                )
+
+    if not final_gate.get("accepted", False) and _is_critical_gate_failure(final_gate):
+        final_sql = "SELECT 'FINAL_GATE_BLOCKED' AS error_message;"
+        final_model = "gate_blocked"
+        corrections.append(f"Fail-closed: blocked unsafe SQL ({final_gate.get('reasons')})")
+    elif not final_gate.get("accepted", False):
+        corrections.append(f"Final acceptance warnings: {final_gate.get('reasons')}")
+
     if not final_sql.endswith(";"):
         final_sql += ";"
 
     # Final validation snapshot for observability in benchmark output.
     final_validation_errors = list(final_gate.get("identifier_errors") or validate_identifiers(final_sql, ctx))
-    if not final_gate.get("accepted", False):
-        corrections.append(f"Final acceptance warnings: {final_gate.get('reasons')}")
+    final_gate_pass = bool(final_gate.get("accepted", False))
+    final_gate_reasons = list(final_gate.get("reasons") or [])
 
     # END TIMER: Calculate processing time (Model ready → Final SQL complete)
     # This is the core text-to-SQL processing latency for thesis benchmark
@@ -3402,4 +3562,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         "answer": final_sql,
         "critic_feedback": " | ".join(corrections),
         "final_model": final_model,
+        "final_gate_pass": final_gate_pass,
+        "final_gate_reasons": final_gate_reasons,
+        "rescue_7b_used": bool(rescue_7b_used),
     }

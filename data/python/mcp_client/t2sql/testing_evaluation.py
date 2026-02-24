@@ -504,7 +504,8 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     
     # Adjust column widths
     col_widths = {
-        "id": 8, "difficulty": 10, "question": 50,
+        "id": 8, "difficulty": 10,
+        "question": 50,
         "groundtruth_sql": 40, "predicted_sql": 40,
         "draft_source": 14, "ir_used": 10, "ir_confidence": 12, "ir_plannable": 12, "ir_gate_reasons": 28,
         "initial_model_used": 12, "final_model_used": 12,  # Model tracking
@@ -967,12 +968,14 @@ async def run_batch_eval(
 
     if output_path:
         fieldnames = [
-            "id", "difficulty", "question",
+            # Put final result verdict early to avoid horizontal scrolling.
+            "id", "difficulty", "result_match", "match_reason",
+            "question",
             "groundtruth_sql", "predicted_sql",
             "draft_source", "ir_used", "ir_confidence", "ir_plannable", "ir_gate_reasons",
             "initial_model_used", "final_model_used",  # Model tracking
             "va_success", "va_error",
-            "exec_success", "result_match", "match_reason",
+            "exec_success",
             "pred_row_count", "gt_row_count",
             "latency_s", "error"
         ]
