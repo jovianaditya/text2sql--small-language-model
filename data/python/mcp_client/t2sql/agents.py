@@ -194,7 +194,14 @@ from .utils import _dbg_print_two, try_llm_json, build_router_schema
 from .generation import regenerate_with_extra_constraint
 from .intent_ir import build_intent_ir, is_ir_plannable
 from .sql_planner import build_sql_from_intent, safety_normalize_sql
-from .schema_analyzer import get_all_tables, get_singular_form, get_schema_analyzer, get_id_column, get_fk_relationships
+from .schema_analyzer import (
+    get_all_tables,
+    get_singular_form,
+    get_schema_analyzer,
+    get_id_column,
+    get_fk_relationships,
+    get_transaction_tables,
+)
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
     _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline,
     _find_tables_with_implicit_columns, _extract_fk_from_context)
@@ -1979,6 +1986,8 @@ def _deterministic_sql_acceptance_gate(
         "hard_identifier_errors": [],
         "ambiguous_unqualified_columns": [],
         "group_projection_violations": [],
+        "invalid_join_edges": [],
+        "fanout_risk_tables": [],
         "join_risk_warnings": [],
         "ast_fixes": [],
         "ast_warnings": [],
@@ -2043,6 +2052,7 @@ def _deterministic_sql_acceptance_gate(
 
         # Build top-level table scope
         alias_to_table: Dict[str, str] = {}
+        explicit_alias_to_table: Dict[str, str] = {}
 
         def _register_src(src: Optional["exp.Expression"]) -> None:
             if src is None:
@@ -2054,11 +2064,13 @@ def _deterministic_sql_acceptance_gate(
                 alias_name = str(src.alias_or_name or table_name).strip("`").lower()
                 if alias_name:
                     alias_to_table.setdefault(alias_name, table_name)
+                    explicit_alias_to_table.setdefault(alias_name, table_name)
                 alias_to_table.setdefault(table_name, table_name)
             elif isinstance(src, exp.Subquery):
                 alias_name = str(src.alias_or_name or "").strip("`").lower()
                 if alias_name:
                     alias_to_table.setdefault(alias_name, f"__derived__:{alias_name}")
+                    explicit_alias_to_table.setdefault(alias_name, f"__derived__:{alias_name}")
 
         from_arg = sel.args.get("from") or sel.args.get("from_")
         if from_arg is not None:
@@ -2098,6 +2110,143 @@ def _deterministic_sql_acceptance_gate(
                 except Exception:
                     pass
             table_cols[table_lower] = cols
+
+        # FK graph-backed JOIN path validation (hard check).
+        fk_map_raw = {}
+        try:
+            fk_map_raw = get_fk_relationships() or {}
+        except Exception:
+            fk_map_raw = {}
+
+        fk_map: Dict[str, Dict[str, str]] = {}
+        for src, rels in fk_map_raw.items():
+            src_l = str(src or "").strip("`").lower()
+            if not src_l:
+                continue
+            fk_map.setdefault(src_l, {})
+            for fk_col, tgt in (rels or {}).items():
+                fk_l = str(fk_col or "").strip("`").lower()
+                tgt_l = str(tgt or "").strip("`").lower()
+                if fk_l and tgt_l:
+                    fk_map[src_l][fk_l] = tgt_l
+
+        def _is_id_like(col_name: str) -> bool:
+            c = (col_name or "").lower()
+            return bool(c) and (c.endswith("id") or c.endswith("number") or c.endswith("code"))
+
+        def _is_plausible_join_edge(lt: str, lc: str, rt: str, rc: str) -> bool:
+            lt_l = (lt or "").lower()
+            rt_l = (rt or "").lower()
+            lc_l = (lc or "").lower()
+            rc_l = (rc or "").lower()
+            if not lt_l or not rt_l or not lc_l or not rc_l:
+                return False
+
+            # Direct FK edge: lt.lc -> rt.<id>
+            if fk_map.get(lt_l, {}).get(lc_l) == rt_l:
+                rt_id = (get_id_column(rt_l) or "").strip("`").lower()
+                if not rt_id or rc_l == rt_id or rc_l == lc_l:
+                    return True
+
+            # Reverse FK edge: rt.rc -> lt.<id>
+            if fk_map.get(rt_l, {}).get(rc_l) == lt_l:
+                lt_id = (get_id_column(lt_l) or "").strip("`").lower()
+                if not lt_id or lc_l == lt_id or lc_l == rc_l:
+                    return True
+
+            # Heuristic fallback: same key-like column on both sides.
+            if lc_l == rc_l and _is_id_like(lc_l):
+                if lc_l in table_cols.get(lt_l, set()) and rc_l in table_cols.get(rt_l, set()):
+                    return True
+
+            return False
+
+        invalid_join_edges: List[str] = []
+        joins = sel.args.get("joins") or []
+        for j in joins:
+            on_expr = j.args.get("on")
+            if on_expr is None:
+                continue
+            eq_pairs: List[Tuple[str, str, str, str, str, str]] = []
+            for eq in on_expr.find_all(exp.EQ):
+                left = getattr(eq, "left", None)
+                right = getattr(eq, "right", None)
+                if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+                    continue
+                lt_alias = str(left.table or "").strip("`").lower()
+                rt_alias = str(right.table or "").strip("`").lower()
+                lc = str(left.name or "").strip("`").lower()
+                rc = str(right.name or "").strip("`").lower()
+                if not lt_alias or not rt_alias or not lc or not rc:
+                    continue
+                lt = str(alias_to_table.get(lt_alias, lt_alias))
+                rt = str(alias_to_table.get(rt_alias, rt_alias))
+                if lt.startswith("__derived__:") or rt.startswith("__derived__:"):
+                    continue
+                eq_pairs.append((lt_alias, lc, rt_alias, rc, lt.lower(), rt.lower()))
+
+            if not eq_pairs:
+                continue
+
+            if not any(_is_plausible_join_edge(lt, lc, rt, rc) for _, lc, _, rc, lt, rt in eq_pairs):
+                p0 = eq_pairs[0]
+                invalid_join_edges.append(f"{p0[0]}.{p0[1]} = {p0[2]}.{p0[3]}")
+
+        if invalid_join_edges:
+            verdict["invalid_join_edges"] = sorted(set(invalid_join_edges))
+            verdict["reasons"].append("invalid_join_path")
+
+        # Dual-fact fanout hard check:
+        # If >1 direct transaction table contributes top-level aggregates,
+        # require pre-aggregation via derived subqueries.
+        txn_tables = set()
+        try:
+            txn_tables = {
+                str(t or "").strip("`").lower()
+                for t in (get_transaction_tables() or [])
+                if str(t or "").strip()
+            }
+        except Exception:
+            txn_tables = set()
+
+        if txn_tables:
+            direct_txn_alias_to_table = {
+                a: t
+                for a, t in explicit_alias_to_table.items()
+                if not str(t).startswith("__derived__:") and str(t).lower() in txn_tables
+            }
+            if len(set(direct_txn_alias_to_table.values())) >= 2:
+                group_arg = sel.args.get("group")
+                top_level_aggs: List["exp.AggFunc"] = []
+                for agg in sel.find_all(exp.AggFunc):
+                    anc = getattr(agg, "parent", None)
+                    inside_subquery = False
+                    while anc is not None:
+                        if anc is sel:
+                            break
+                        if isinstance(anc, exp.Subquery):
+                            inside_subquery = True
+                            break
+                        anc = getattr(anc, "parent", None)
+                    if not inside_subquery:
+                        top_level_aggs.append(agg)
+
+                txn_tables_in_metrics: Set[str] = set()
+                for agg in top_level_aggs:
+                    for col in agg.find_all(exp.Column):
+                        if _is_nested_subquery_column(col):
+                            continue
+                        c_alias = str(col.table or "").strip("`").lower()
+                        if not c_alias:
+                            continue
+                        c_table = str(alias_to_table.get(c_alias, c_alias)).lower()
+                        if c_alias in direct_txn_alias_to_table and c_table in txn_tables:
+                            txn_tables_in_metrics.add(c_table)
+
+                has_group_or_agg = bool(group_arg is not None or top_level_aggs)
+                if has_group_or_agg and len(txn_tables_in_metrics) >= 2:
+                    verdict["fanout_risk_tables"] = sorted(txn_tables_in_metrics)
+                    verdict["reasons"].append("fanout_risk_dual_fact")
 
         # Detect ambiguous unqualified columns only when >1 base table
         base_tables = [t for t in table_cols.keys() if t and not t.startswith("__derived__:")]
@@ -2224,6 +2373,20 @@ def _build_gate_retry_instruction(base_instruction: str, gate: Dict[str, Any]) -
     if join_warnings:
         lines.append(f"- Suspicious join keys: {join_warnings}")
 
+    invalid_join_edges = gate.get("invalid_join_edges") or []
+    if invalid_join_edges:
+        lines.append(
+            "- Invalid join path detected: "
+            f"{invalid_join_edges}. Use FK-consistent join keys only."
+        )
+
+    fanout_tables = gate.get("fanout_risk_tables") or []
+    if fanout_tables:
+        lines.append(
+            "- Dual-fact fanout risk across transaction tables: "
+            f"{fanout_tables}. Pre-aggregate each fact per key before joining."
+        )
+
     parse_error = gate.get("parse_error") or ""
     if parse_error:
         lines.append(f"- Parse error: {parse_error}")
@@ -2238,6 +2401,8 @@ def _is_critical_gate_failure(gate: Dict[str, Any]) -> bool:
         "hard_identifier",
         "ambiguous_unqualified",
         "group_projection_mismatch",
+        "invalid_join_path",
+        "fanout_risk_dual_fact",
     }
     if reasons.intersection(critical_reasons):
         return True
@@ -3412,6 +3577,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "gate_parse_error": str(gate_local.get("parse_error") or ""),
                 "group_projection_violations": list(gate_local.get("group_projection_violations") or []),
                 "ambiguous_unqualified_columns": list(gate_local.get("ambiguous_unqualified_columns") or []),
+                "invalid_join_edges": list(gate_local.get("invalid_join_edges") or []),
+                "fanout_risk_tables": list(gate_local.get("fanout_risk_tables") or []),
                 "early_rejected": bool(
                     AGENT_REGEN_PRECHECK_ENABLED and not bool(gate_local.get("accepted", False))
                 ),
@@ -3435,6 +3602,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     "ambiguous_unqualified_columns": current_attempt.get("ambiguous_unqualified_columns") or [],
                     "group_projection_violations": current_attempt.get("group_projection_violations") or [],
                     "join_risk_warnings": current_attempt.get("join_risk_warnings") or [],
+                    "invalid_join_edges": current_attempt.get("invalid_join_edges") or [],
+                    "fanout_risk_tables": current_attempt.get("fanout_risk_tables") or [],
                     "parse_error": current_attempt.get("gate_parse_error") or "",
                 },
             )
@@ -3462,6 +3631,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     "ambiguous_unqualified_columns": (current_attempt or {}).get("ambiguous_unqualified_columns") if current_attempt else [],
                     "group_projection_violations": (current_attempt or {}).get("group_projection_violations") if current_attempt else [],
                     "join_risk_warnings": (current_attempt or {}).get("join_risk_warnings") if current_attempt else [],
+                    "invalid_join_edges": (current_attempt or {}).get("invalid_join_edges") if current_attempt else [],
+                    "fanout_risk_tables": (current_attempt or {}).get("fanout_risk_tables") if current_attempt else [],
                     "parse_error": (current_attempt or {}).get("gate_parse_error") if current_attempt else "",
                 },
             )
@@ -3504,6 +3675,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 corrections.append(f"Residual identifier warnings: {best.get('hard_identifier_errors')}")
             if best.get("join_risk_warnings"):
                 corrections.append(f"Join-key warnings: {best.get('join_risk_warnings')}")
+            if best.get("invalid_join_edges"):
+                corrections.append(f"Invalid join edges: {best.get('invalid_join_edges')}")
+            if best.get("fanout_risk_tables"):
+                corrections.append(f"Dual-fact fanout risk: {best.get('fanout_risk_tables')}")
         else:
             corrections.append("Regeneration failed: no candidate SQL returned")
 
