@@ -210,6 +210,7 @@ from .helpers_core import (
     _ast_guardrails,
     _question_requires_word_boundary_regex,
     _question_requires_inner_join,
+    _question_requests_ordering,
     _question_wants_include_zero,
     _parse_allowed_identifiers,
     _remove_top_level_order_by_if_not_requested,
@@ -1961,6 +1962,153 @@ def _collect_hard_identifier_errors(errors: List[str]) -> List[str]:
         if "not in ALLOWED" in e or "invalid column" in e or "invalid columns" in e
     ]
 
+
+def _extract_semantic_contract(question: str) -> Dict[str, Any]:
+    """
+    Build a conservative semantic contract directly from the NL question.
+    Contract is intentionally minimal to avoid false positives:
+    - Explicit ORDER BY intent
+    - Explicit Top-N/LIMIT intent
+    - Explicit aggregate intent (COUNT / SUM / AVG)
+    """
+    q = str(question or "").strip().lower()
+    contract: Dict[str, Any] = {
+        "requires_order_by": False,
+        "required_limit": None,
+        "required_aggs": [],
+    }
+    if not q:
+        return contract
+
+    explicit_sort_phrase = bool(
+        re.search(
+            r"\b(order(?:ed)?\s+by|sort(?:ed)?\s+by|ascending|descending|asc|desc)\b",
+            q,
+        )
+    )
+
+    # IMPORTANT:
+    # For acceptance-gate semantics we only enforce ORDER BY on explicit
+    # sorting cues. Heuristic sort detectors may misfire on projection phrases
+    # such as "first names, last names" (not sorting intent).
+    contract["requires_order_by"] = explicit_sort_phrase
+
+    # Ordinal per-group winner pattern (e.g. "second highest per customer")
+    # naturally relies on window ranking + rn filter, and does not require
+    # top-level ORDER BY unless user explicitly asks sorting.
+    ordinal_per_group_pattern = bool(
+        re.search(
+            r"\b(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+"
+            r"(?:highest|lowest|largest|smallest|newest|oldest|earliest|latest)\b",
+            q,
+        )
+        and re.search(r"\b(for\s+each|per|within\s+each|for\s+every)\b", q)
+    )
+    if ordinal_per_group_pattern and not explicit_sort_phrase:
+        contract["requires_order_by"] = False
+
+    required_limit: Optional[int] = None
+    for pat in (
+        r"\btop\s+(\d+)\b",
+        r"\b(?:first|last)\s+(\d+)\b",
+        r"\b(\d+)\s+(?:highest|lowest|largest|smallest|most|least)\b",
+    ):
+        m = re.search(pat, q)
+        if not m:
+            continue
+        try:
+            v = int(m.group(1))
+        except Exception:
+            v = 0
+        if v > 0:
+            required_limit = v
+            break
+    contract["required_limit"] = required_limit
+
+    required_aggs: Set[str] = set()
+    if re.search(r"\b(how\s+many|number\s+of|count(?:\s+of)?)\b", q):
+        required_aggs.add("COUNT")
+    if re.search(r"\b(average|avg|mean)\b", q):
+        required_aggs.add("AVG")
+    has_total_or_sum = bool(re.search(r"\b(total|sum)\b", q))
+    looks_like_count_phrase = bool(
+        re.search(
+            r"\b(total\s+(number|count|orders?|customers?|items?|rows?|records?))\b",
+            q,
+        )
+        or re.search(r"\btotal\s+number\s+of\b", q)
+    )
+    if has_total_or_sum and not looks_like_count_phrase:
+        required_aggs.add("SUM")
+
+    contract["required_aggs"] = sorted(required_aggs)
+    return contract
+
+
+def _extract_limit_value_from_clause_sql(limit_sql: str) -> Optional[int]:
+    if not limit_sql:
+        return None
+    ls = str(limit_sql).strip().lower()
+    try:
+        # LIMIT offset, count
+        m = re.search(r"\blimit\s+\d+\s*,\s*(\d+)\b", ls)
+        if m:
+            return int(m.group(1))
+        # LIMIT count [OFFSET n]
+        m = re.search(r"\blimit\s+(\d+)\b", ls)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        return None
+    return None
+
+
+def _evaluate_semantic_contract(
+    parsed: Any,
+    sel: Any,
+    exp_mod: Any,
+    contract: Dict[str, Any],
+) -> List[str]:
+    failures: List[str] = []
+    if not contract:
+        return failures
+
+    requires_order = bool(contract.get("requires_order_by"))
+    required_limit = contract.get("required_limit")
+    required_aggs = {str(a).upper() for a in (contract.get("required_aggs") or []) if str(a).strip()}
+
+    if requires_order:
+        order_arg = sel.args.get("order")
+        has_order = bool(order_arg is not None and (order_arg.expressions or []))
+        if not has_order:
+            failures.append("missing_order_by")
+
+    if required_limit is not None:
+        limit_arg = sel.args.get("limit")
+        if limit_arg is None:
+            failures.append("missing_limit")
+        else:
+            parsed_limit = _extract_limit_value_from_clause_sql(limit_arg.sql(dialect="mysql"))
+            if parsed_limit is None:
+                failures.append("unparsed_limit")
+            elif int(parsed_limit) != int(required_limit):
+                failures.append(f"limit_mismatch:{parsed_limit}!={required_limit}")
+
+    if required_aggs:
+        present_aggs: Set[str] = set()
+        for agg in parsed.find_all(exp_mod.AggFunc):
+            if isinstance(agg, exp_mod.Count):
+                present_aggs.add("COUNT")
+            elif isinstance(agg, exp_mod.Sum):
+                present_aggs.add("SUM")
+            elif isinstance(agg, exp_mod.Avg):
+                present_aggs.add("AVG")
+        for req in sorted(required_aggs):
+            if req not in present_aggs:
+                failures.append(f"missing_agg_{req.lower()}")
+
+    return failures
+
 def _deterministic_sql_acceptance_gate(
     sql: str,
     ctx: str,
@@ -1975,6 +2123,7 @@ def _deterministic_sql_acceptance_gate(
     - Identifier validity (table/column/alias scope)
     - Ambiguous unqualified columns (multi-table)
     - GROUP BY projection consistency (obvious 1055 risks)
+    - Conservative semantic contract (ORDER/LIMIT/aggregate intent)
     - Optional join-key sanity strictness (from AST warnings)
     """
     verdict: Dict[str, Any] = {
@@ -1989,6 +2138,8 @@ def _deterministic_sql_acceptance_gate(
         "invalid_join_edges": [],
         "fanout_risk_tables": [],
         "join_risk_warnings": [],
+        "semantic_contract": _extract_semantic_contract(question),
+        "semantic_failures": [],
         "ast_fixes": [],
         "ast_warnings": [],
     }
@@ -2248,6 +2399,59 @@ def _deterministic_sql_acceptance_gate(
                     verdict["fanout_risk_tables"] = sorted(txn_tables_in_metrics)
                     verdict["reasons"].append("fanout_risk_dual_fact")
 
+        # Fallback dual-fact heuristic when transaction metadata is incomplete:
+        # if top-level aggregates reference >=2 joined base tables with mixed
+        # COUNT and SUM/AVG, this is highly likely fanout-prone.
+        group_arg = sel.args.get("group")
+        top_level_aggs_fb: List["exp.AggFunc"] = []
+        for agg in sel.find_all(exp.AggFunc):
+            anc = getattr(agg, "parent", None)
+            inside_subquery = False
+            while anc is not None:
+                if anc is sel:
+                    break
+                if isinstance(anc, exp.Subquery):
+                    inside_subquery = True
+                    break
+                anc = getattr(anc, "parent", None)
+            if not inside_subquery:
+                top_level_aggs_fb.append(agg)
+
+        has_group_or_agg_fb = bool(group_arg is not None or top_level_aggs_fb)
+        has_multi_join_fb = len(sel.args.get("joins") or []) >= 2
+        if has_group_or_agg_fb and has_multi_join_fb:
+            agg_kinds_by_table: Dict[str, Set[str]] = {}
+            for agg in top_level_aggs_fb:
+                if isinstance(agg, exp.Count):
+                    agg_kind = "COUNT"
+                elif isinstance(agg, exp.Sum):
+                    agg_kind = "SUM"
+                elif isinstance(agg, exp.Avg):
+                    agg_kind = "AVG"
+                else:
+                    agg_kind = "OTHER"
+
+                for col in agg.find_all(exp.Column):
+                    if _is_nested_subquery_column(col):
+                        continue
+                    c_alias = str(col.table or "").strip("`").lower()
+                    if not c_alias:
+                        continue
+                    c_table = str(alias_to_table.get(c_alias, c_alias)).lower()
+                    if c_table.startswith("__derived__:"):
+                        continue
+                    agg_kinds_by_table.setdefault(c_table, set()).add(agg_kind)
+
+            if len(agg_kinds_by_table) >= 2:
+                has_count = any("COUNT" in ks for ks in agg_kinds_by_table.values())
+                has_sum_like = any(bool({"SUM", "AVG"} & ks) for ks in agg_kinds_by_table.values())
+                if has_count and has_sum_like:
+                    existing = set(verdict.get("fanout_risk_tables") or [])
+                    existing.update(agg_kinds_by_table.keys())
+                    verdict["fanout_risk_tables"] = sorted(existing)
+                    if "fanout_risk_dual_fact" not in verdict["reasons"]:
+                        verdict["reasons"].append("fanout_risk_dual_fact")
+
         # Detect ambiguous unqualified columns only when >1 base table
         base_tables = [t for t in table_cols.keys() if t and not t.startswith("__derived__:")]
         if len(base_tables) > 1:
@@ -2325,10 +2529,21 @@ def _deterministic_sql_acceptance_gate(
                 verdict["group_projection_violations"] = sorted(projection_violations)
                 verdict["reasons"].append("group_projection_mismatch")
 
+        semantic_failures = _evaluate_semantic_contract(
+            parsed=parsed,
+            sel=sel,
+            exp_mod=exp,
+            contract=dict(verdict.get("semantic_contract") or {}),
+        )
+        if semantic_failures:
+            verdict["semantic_failures"] = semantic_failures
+            verdict["reasons"].append("semantic_contract_mismatch")
+
     except Exception as e:
         verdict["parse_error"] = f"acceptance_gate_error:{e}"
         verdict["reasons"].append("acceptance_gate_internal_error")
 
+    verdict["reasons"] = list(dict.fromkeys(str(r) for r in (verdict.get("reasons") or [])))
     verdict["sql"] = candidate_sql
     verdict["accepted"] = len(verdict["reasons"]) == 0
     return verdict
@@ -2386,6 +2601,25 @@ def _build_gate_retry_instruction(base_instruction: str, gate: Dict[str, Any]) -
             "- Dual-fact fanout risk across transaction tables: "
             f"{fanout_tables}. Pre-aggregate each fact per key before joining."
         )
+
+    semantic_failures = gate.get("semantic_failures") or []
+    if semantic_failures:
+        lines.append(
+            "- Semantic contract mismatch: "
+            f"{semantic_failures}. Match ORDER/LIMIT/aggregate requirements from the question."
+        )
+    semantic_contract = gate.get("semantic_contract") or {}
+    if semantic_contract:
+        semantic_parts: List[str] = []
+        if semantic_contract.get("requires_order_by"):
+            semantic_parts.append("ORDER BY is required")
+        if semantic_contract.get("required_limit") is not None:
+            semantic_parts.append(f"LIMIT {semantic_contract.get('required_limit')} is required")
+        req_aggs = semantic_contract.get("required_aggs") or []
+        if req_aggs:
+            semantic_parts.append(f"Required aggregates: {req_aggs}")
+        if semantic_parts:
+            lines.append("- Semantic requirements: " + "; ".join(semantic_parts))
 
     parse_error = gate.get("parse_error") or ""
     if parse_error:
@@ -3413,10 +3647,16 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         corrections.append("Deterministic acceptance gate rewrites applied")
 
     if not needs_regeneration and not pre_gate.get("accepted", False):
-        _dbg_print_two("[Agent3] HARD ERROR - Acceptance Gate", f"{pre_gate.get('reasons')}")
-        extra_instruction = _build_gate_retry_instruction("", pre_gate)
-        needs_regeneration = True
-        regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
+        pre_reasons = {str(r) for r in (pre_gate.get("reasons") or [])}
+        # Soft semantic mismatch only: keep original SQL, avoid risky regen churn.
+        # We still surface warning for observability and allow final execution.
+        if pre_reasons and pre_reasons.issubset({"semantic_contract_mismatch"}):
+            corrections.append(f"Soft semantic warning: {sorted(pre_reasons)}")
+        else:
+            _dbg_print_two("[Agent3] HARD ERROR - Acceptance Gate", f"{pre_gate.get('reasons')}")
+            extra_instruction = _build_gate_retry_instruction("", pre_gate)
+            needs_regeneration = True
+            regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
 
     # 4. EXECUTE REGENERATION (validation-aware, AST-stabilized)
     final_model = state.get("target_model", "")  # Default to initial model
@@ -3579,6 +3819,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "ambiguous_unqualified_columns": list(gate_local.get("ambiguous_unqualified_columns") or []),
                 "invalid_join_edges": list(gate_local.get("invalid_join_edges") or []),
                 "fanout_risk_tables": list(gate_local.get("fanout_risk_tables") or []),
+                "semantic_contract": dict(gate_local.get("semantic_contract") or {}),
+                "semantic_failures": list(gate_local.get("semantic_failures") or []),
                 "early_rejected": bool(
                     AGENT_REGEN_PRECHECK_ENABLED and not bool(gate_local.get("accepted", False))
                 ),
@@ -3604,6 +3846,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     "join_risk_warnings": current_attempt.get("join_risk_warnings") or [],
                     "invalid_join_edges": current_attempt.get("invalid_join_edges") or [],
                     "fanout_risk_tables": current_attempt.get("fanout_risk_tables") or [],
+                    "semantic_contract": current_attempt.get("semantic_contract") or {},
+                    "semantic_failures": current_attempt.get("semantic_failures") or [],
                     "parse_error": current_attempt.get("gate_parse_error") or "",
                 },
             )
@@ -3633,6 +3877,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     "join_risk_warnings": (current_attempt or {}).get("join_risk_warnings") if current_attempt else [],
                     "invalid_join_edges": (current_attempt or {}).get("invalid_join_edges") if current_attempt else [],
                     "fanout_risk_tables": (current_attempt or {}).get("fanout_risk_tables") if current_attempt else [],
+                    "semantic_contract": (current_attempt or {}).get("semantic_contract") if current_attempt else {},
+                    "semantic_failures": (current_attempt or {}).get("semantic_failures") if current_attempt else [],
                     "parse_error": (current_attempt or {}).get("gate_parse_error") if current_attempt else "",
                 },
             )
@@ -3679,6 +3925,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 corrections.append(f"Invalid join edges: {best.get('invalid_join_edges')}")
             if best.get("fanout_risk_tables"):
                 corrections.append(f"Dual-fact fanout risk: {best.get('fanout_risk_tables')}")
+            if best.get("semantic_failures"):
+                corrections.append(f"Semantic contract warnings: {best.get('semantic_failures')}")
         else:
             corrections.append("Regeneration failed: no candidate SQL returned")
 

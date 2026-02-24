@@ -6302,6 +6302,17 @@ def _rewrite_employee_customer_payment_rollup(sql: str, question: str, ctx: str 
         if al not in alias_to_table:
             alias_to_table[al] = tl
 
+    # Aliasless fallback: map table name -> table name from FROM/JOIN clauses.
+    if not alias_to_table:
+        for m_tbl in re.finditer(
+            r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\b""",
+            f"FROM {from_core}",
+        ):
+            raw_tbl = (m_tbl.group(1) or "").replace("`", "").strip()
+            tbl = raw_tbl.split(".")[-1].lower()
+            if tbl and tbl not in alias_to_table:
+                alias_to_table[tbl] = tbl
+
     has_employees = any(t == "employees" for t in alias_to_table.values())
     has_customers = any(t == "customers" for t in alias_to_table.values())
     if not (has_employees and has_customers):
@@ -6400,6 +6411,17 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
         if al not in alias_to_table:
             alias_to_table[al] = tl
 
+    # Aliasless fallback: map table name -> table name from FROM/JOIN clauses.
+    if not alias_to_table:
+        for m_tbl in re.finditer(
+            r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\b""",
+            f"FROM {from_core}",
+        ):
+            raw_tbl = (m_tbl.group(1) or "").replace("`", "").strip()
+            tbl = raw_tbl.split(".")[-1].lower()
+            if tbl and tbl not in alias_to_table:
+                alias_to_table[tbl] = tbl
+
     order_aliases = [a for a, t in alias_to_table.items() if t == "orders"]
     payment_aliases = [a for a, t in alias_to_table.items() if t == "payments"]
     if not order_aliases or not payment_aliases:
@@ -6418,7 +6440,16 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
     base_table = base_table_expr.replace("`", "").split(".")[-1]
     if not base_table:
         return sql
-    base_alias = (m_base.group(2) or base_table).strip()
+    base_alias_raw = (m_base.group(2) or "").strip()
+    # Guard: do not treat JOIN keywords as aliases in aliasless SQL.
+    reserved_alias_tokens = {
+        "left", "right", "inner", "outer", "full", "cross", "join",
+        "on", "where", "group", "order", "having", "limit",
+    }
+    if base_alias_raw.lower() in reserved_alias_tokens:
+        base_alias_raw = ""
+
+    base_alias = (base_alias_raw or base_table).strip()
     base_alias_l = base_alias.lower()
 
     # Parse SELECT list.
@@ -7088,12 +7119,20 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
             for cond in _split_top_level_and(existing_pred):
                 c0 = (cond or "").strip()
                 low_c0 = c0.lower()
+                norm_c0 = re.sub(r"[\s`]+", "", low_c0)
                 is_correlated_max_date = bool(
                     re.search(r"\b(?:in|=)\s*\(\s*select\s+max\s*\(", low_c0)
                     and "year(" in low_c0
                     and date_col_name.lower() in low_c0
                 )
-                if is_correlated_max_date:
+                self_max_forms = {
+                    f"year({measure_alias.lower()}.{date_col_name.lower()})=year(max({measure_alias.lower()}.{date_col_name.lower()}))",
+                    f"year(max({measure_alias.lower()}.{date_col_name.lower()}))=year({measure_alias.lower()}.{date_col_name.lower()})",
+                    f"year({date_col_name.lower()})=year(max({date_col_name.lower()}))",
+                    f"year(max({date_col_name.lower()}))=year({date_col_name.lower()})",
+                }
+                is_self_max_year_pred = norm_c0 in self_max_forms
+                if is_correlated_max_date or is_self_max_year_pred:
                     continue
                 kept_predicates.append(c0)
             existing_pred = " AND ".join(p for p in kept_predicates if p)

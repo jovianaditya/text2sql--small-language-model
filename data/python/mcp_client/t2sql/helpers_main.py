@@ -1721,6 +1721,107 @@ def _build_dynamic_join_context(
     return "\n".join(lines)
 
 
+def _build_join_key_hints_for_prompt(
+    state: "RAGState",
+    *,
+    max_edges: int = 8,
+) -> List[str]:
+    """
+    Build FK-consistent JOIN key hints for first-pass prompt generation.
+
+    This is intentionally conservative:
+    - Scope to routed/allowed tables only.
+    - Prefer edges inferred from retrieval-aware join chain.
+    - Fall back to schema FK graph when needed.
+    """
+    if not state or max_edges <= 0:
+        return []
+
+    question = state.get("question", "") or ""
+    ctx = state.get("context", "") or ""
+    ranked_cols = state.get("ranked_cols", []) or []
+    router_tables = [str(t).strip().lower() for t in (state.get("router_tables", []) or []) if str(t).strip()]
+    primary_table = str(state.get("primary_table", "") or "").strip().lower()
+
+    if not router_tables:
+        return []
+
+    allowed = _parse_allowed_identifiers(ctx)
+    allowed_tables = {str(t).strip().lower() for t in (allowed or {}).keys() if str(t).strip()}
+    table_scope = set(router_tables)
+    if allowed_tables:
+        table_scope = table_scope.intersection(allowed_tables) or table_scope
+    if not table_scope:
+        return []
+
+    fk_map_ctx = _extract_fk_from_context(ctx) or {}
+    join_chain = _build_fk_join_chain(
+        question=question,
+        ranked_cols=ranked_cols,
+        router_tables=[t for t in router_tables if t in table_scope],
+        fk_map=fk_map_ctx,
+        primary_table=primary_table,
+    )
+
+    edges: List[str] = []
+    seen: Set[str] = set()
+
+    for join in join_chain:
+        on_expr = str(join.get("on", "")).strip()
+        if not on_expr:
+            continue
+        if on_expr not in seen:
+            seen.add(on_expr)
+            edges.append(on_expr)
+        if len(edges) >= max_edges:
+            return edges
+
+    try:
+        schema_fk = get_fk_relationships() or {}
+    except Exception:
+        schema_fk = {}
+
+    ordered_scope = []
+    if primary_table and primary_table in table_scope:
+        ordered_scope.append(primary_table)
+    ordered_scope.extend([t for t in router_tables if t in table_scope and t not in ordered_scope])
+
+    def _append_edge(src: str, fk_col: str, tgt: str) -> None:
+        tgt_id = (get_id_column(tgt) or "").strip("`")
+        edge = f"{src}.{fk_col} = {tgt}.{tgt_id}" if tgt_id else f"{src}.{fk_col} = {tgt}.{fk_col}"
+        if edge not in seen:
+            seen.add(edge)
+            edges.append(edge)
+
+    for src in ordered_scope:
+        for fk_col, tgt in (schema_fk.get(src, {}) or {}).items():
+            src_l = str(src).strip().lower()
+            fk_l = str(fk_col).strip()
+            tgt_l = str(tgt).strip().lower()
+            if not src_l or not fk_l or not tgt_l:
+                continue
+            if tgt_l not in table_scope:
+                continue
+            _append_edge(src_l, fk_l, tgt_l)
+            if len(edges) >= max_edges:
+                return edges
+
+    for src, rels in (fk_map_ctx or {}).items():
+        src_l = str(src).strip().lower()
+        if not src_l or src_l not in table_scope:
+            continue
+        for fk_col, tgt in (rels or {}).items():
+            fk_l = str(fk_col).strip()
+            tgt_l = str(tgt).strip().lower()
+            if not fk_l or not tgt_l or tgt_l not in table_scope:
+                continue
+            _append_edge(src_l, fk_l, tgt_l)
+            if len(edges) >= max_edges:
+                return edges
+
+    return edges
+
+
 def _order_tables_by_fk_distance(primary_table: str, tables: List[str]) -> List[str]:
     """
     Order tables by shortest FK-graph distance from primary_table.
@@ -2260,6 +2361,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     if complexity != "simple" and state:
         primary_table = state.get("primary_table")
         primary_reason = state.get("primary_table_reason")
+        join_key_hints = _build_join_key_hints_for_prompt(state, max_edges=8)
 
         print(f"[PROMPT DEBUG] complexity={complexity}, state provided, primary_table={primary_table}")
 
@@ -2324,6 +2426,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 constraints.append(
                     "FILTER RULE (CRITICAL): If using LEFT JOIN, filters for the JOINED table MUST be in the **ON** clause, NOT WHERE."
                 )
+
+        if join_key_hints:
+            constraints.append(
+                "JOIN KEY HINTS (CRITICAL): Use only FK-consistent JOIN predicates from this list: "
+                + "; ".join(join_key_hints)
+                + "."
+            )
 
     # [E] REPORTING/AGGREGATION RULES
     # Skip aggregation rules for winner-row queries (they use ROW_NUMBER, not GROUP BY)
