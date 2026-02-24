@@ -1,98 +1,214 @@
 # Routing Policy
 
-This document defines the production routing policy for the Text-to-SQL system.
-Goal: keep the system stable when new questions are added, without frequent manual patching.
+This document defines the production routing policy for the Text-to-SQL pipeline.
+Primary target: keep behavior stable when new questions are added, without patch-per-question drift.
 
-## 1. Objective
+## 1. Scope and Goal
 
-1. Maximize correctness and stability.
-2. Keep inference efficient (use deterministic IR when safe).
-3. Escalate to stronger model only for clearly hard patterns.
-4. Make behavior auditable and reproducible.
+1. Maximize VA/EX stability first, speed second.
+2. Use deterministic IR only in clearly safe scope.
+3. Use 3B as default LLM lane for non-hard cases.
+4. Use 7B only for hard semantic shapes.
+5. Keep decisions auditable from logs.
 
-## 2. End-to-End Decision Flow
+Assumption for this document:
 
-1. Question Guard checks whether question is SQL-relevant.
-2. Retrieval builds context (`ALLOWED IDENTIFIERS` + cards).
-3. Router classifies complexity and chooses initial model lane.
-4. IR gate evaluates whether deterministic planner can safely handle the query.
-5. If IR passes gate, system uses deterministic planner SQL.
-6. If IR fails gate, system uses LLM drafting (3B or 7B based on router policy).
-7. Refiner validates SQL and may regenerate with stricter constraints.
+1. This policy describes current behavior with default env values in `config.py`.
+2. If env knobs are overridden, runtime behavior can differ from this document.
 
-## 3. IR Policy (Deterministic Lane)
+## 2. Key Terms
 
-IR is enabled only when confidence and scope are safe.
+1. `IR`: Intermediate Representation lane (`intent_ir` + `sql_planner`) without free-form SQL drafting.
+2. `IR confidence`: score from intent extraction completeness and grounding quality.
+3. `context_table_count`: number of tables present in retrieval context cards.
+4. `table_count`: routed/mentioned table scope used by planner gate.
+5. `hard pattern`: query intent with high error risk for small model or deterministic lane.
+6. `critical gate failure`: parse/identifier/join/fanout failure that must not be executed.
 
-Default policy:
+## 3. Routing Algorithm (Deterministic Order)
+
+1. Question Guard rejects non-SQL questions.
+2. Retrieval builds context and allowed identifiers.
+3. Router detects tables and hard-pattern signals.
+4. IR gate runs first.
+5. If IR is eligible, plannable, and planner can build SQL, use IR SQL.
+6. If IR is not eligible or planner fails to build SQL, use LLM lane.
+7. LLM lane selection:
+   - 3B for non-hard patterns.
+   - 7B for hard patterns.
+8. Refiner + acceptance gate always run before execution.
+9. If gate has critical failure, do bounded rescue.
+10. If still critical, fail-closed (`FINAL_GATE_BLOCKED`), do not run unsafe SQL.
+
+## 4. IR Eligibility Policy
+
+Default operational settings:
 
 1. `AGENT_IR_ENABLED=1`
 2. `AGENT_IR_MIN_CONFIDENCE=0.80`
 3. `AGENT_IR_MAX_TABLES=1`
 4. `AGENT_IR_ALLOW_MULTI_TABLE=0`
 
-IR is gated off if any of these hold:
+IR is allowed only when all conditions pass:
 
-1. Table count exceeds IR max table policy.
-2. Context table count exceeds IR max table policy.
-3. Router detects hard flags:
-   - winner-row
-   - cross-table exclusion
-   - window aggregate
-   - explicit rank function
-   - ordinal ranking
-   - subquery intent (complex)
-4. Percentage intent is detected but IR has no supported percent metric.
+1. `confidence >= AGENT_IR_MIN_CONFIDENCE`
+2. `table_count <= AGENT_IR_MAX_TABLES`
+3. `context_table_count <= AGENT_IR_MAX_TABLES`
+4. No hard router flags.
 
-## 4. LLM Routing Policy
+Implementation notes:
 
-### 4.1 3B Lane (default fallback lane)
+1. `table_count = max(len(mentioned_tables), len(router_tables), context_table_count)`.
+2. If `table_count > 1`, minimum confidence is tightened with:
+   - `dynamic_min_conf = max(AGENT_IR_MIN_CONFIDENCE, AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE)`.
+3. With default `AGENT_IR_ALLOW_MULTI_TABLE=0`, any multi-table scope adds gate reason `multi_table_ir_disabled`.
+4. IR hard router flags are:
+   - `is_winner_row`
+   - `has_exclusion`
+   - `is_window_aggregate`
+   - `is_explicit_rank_function`
+   - `is_ordinal_ranking`
+   - `is_subquery_intent`
+5. Percentage intent (`percent|percentage|ratio|rate`) is gated unless IR metric supports it (`pct_non_null`).
 
-Use 3B when:
+IR is gated off when any condition fails.
 
-1. IR is gated off and query is not hard-pattern.
-2. Query is single-table (lookup/aggregate/filter/pattern).
-3. Query is simple multi-table join and router sees no hard pattern.
-4. Query is simple scalar subquery on single table.
-5. Query is simple EXISTS/NOT EXISTS pattern with limited table fanout.
+Important interpretation:
 
-### 4.2 7B Hard Gate
+1. If retrieval context contains more than 1 table, IR is off even if question text looks single-table.
+2. In that case system falls back to LLM lane, usually 3B if no hard flags.
 
-Escalate directly to 7B when any hard condition appears:
+## 5. 3B vs 7B Policy
 
-1. Winner-row subquery pattern in multi-table scenario.
-2. Cross-table exclusion semantics (`never`, `no X`, `without any`, etc.).
-3. Window aggregate across multi-table context.
-4. Explicit rank/window function intent across multi-table context.
+### 5.1 Use 3B
+
+Use 3B when all below are true:
+
+1. IR not selected.
+2. No hard flags.
+3. Query is one of:
+   - single-table lookup/filter/aggregate/pattern
+   - simple join up to `AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES`
+   - simple single-table scalar subquery
+   - simple EXISTS/NOT EXISTS without nested complexity and table scope `<= 2`
+
+### 5.2 Use 7B
+
+Use 7B when any hard flag is true (with corresponding `AGENT_ROUTER_ESCALATE_ON_*` knob enabled, default `1`):
+
+1. Winner-row + multi-table.
+2. Cross-table exclusion semantics.
+3. Window aggregate/rank in multi-table context.
+4. Explicit ranking intent in multi-table context.
 5. Complex subquery intent.
-6. Multi-fact rollup fanout risk:
-   - customers + orders + payments
-   - order count + payment total/payment status in one output.
+6. Dual-fact rollup fanout risk (`orders` + `payments` style metrics mixed in one grouped output).
 
-## 5. Refine/Recovery Policy
+## 6. Decision Matrix
 
-1. Always run identifier validation before execution.
-2. If identifier errors occur:
-   - stay in 3B regeneration for simple multi-table candidate;
-   - escalate regeneration to 7B for complex/hard candidate.
-3. Keep deterministic rewrites for known high-risk semantic shapes:
-   - fanout-safe rollups;
-   - missing join alias on child metric usage.
+| Condition | Lane |
+|---|---|
+| Guard reject | reject |
+| IR eligible + plannable + planner returns SQL | IR |
+| IR eligible but planner fails | LLM fallback |
+| IR not eligible + no hard flag | 3B |
+| IR not eligible + hard flag | 7B |
+| Gate critical fail after draft/refine | rescue then fail-closed |
 
-## 6. Canonical Examples
+## 7. Canonical Examples
 
-1. H5-like question (employee -> customer -> payments total):
-   - Router: 3B lane.
-   - Recovery: deterministic rollup rewrite ensures missing payment join alias is fixed.
-2. H11-like question (customers paid but never ordered):
-   - Router: 3B lane (simple exclusion aggregate pattern).
-   - Validation: must avoid false invalid-column from sparse context.
-3. H14-like question (customer + total orders + total payments + payment_status):
-   - Router: direct 7B via `multi_fact_rollup_fanout_risk`.
+### Example A: IR path
 
-## 7. Config Knobs (Operational)
+Question:
+`Find employees whose extension starts with x and has exactly three digits.`
 
-IR:
+Expected route:
+
+1. Single table (`employees`)
+2. High IR confidence
+3. IR selected
+
+Expected SQL shape:
+
+```sql
+SELECT employeeNumber, firstName, lastName, extension
+FROM employees
+WHERE extension REGEXP '^x[0-9]{3}$';
+```
+
+### Example B: 3B path (simple multi-table)
+
+Question:
+`Show each customer and their total number of orders.`
+
+Expected route:
+
+1. Multi-table but simple join + aggregate
+2. No window rank, no complex subquery
+3. 3B lane
+
+Expected SQL shape:
+
+```sql
+SELECT c.customerNumber, COUNT(o.orderNumber) AS total_orders
+FROM customers c
+LEFT JOIN orders o ON c.customerNumber = o.customerNumber
+GROUP BY c.customerNumber;
+```
+
+### Example C: 7B path (hard pattern)
+
+Question:
+`For each customer, return the order with the highest total order amount.`
+
+Expected route:
+
+1. Multi-table join (`orders -> orderdetails`)
+2. Winner-row + window ranking intent
+3. 7B lane (or 3B only if policy explicitly allows this pattern)
+
+Expected SQL shape:
+
+```sql
+SELECT customerNumber, orderNumber, order_total
+FROM (
+  SELECT o.customerNumber, o.orderNumber,
+         SUM(od.quantityOrdered * od.priceEach) AS order_total,
+         ROW_NUMBER() OVER (
+           PARTITION BY o.customerNumber
+           ORDER BY SUM(od.quantityOrdered * od.priceEach) DESC
+         ) AS rn
+  FROM orders o
+  JOIN orderdetails od ON o.orderNumber = od.orderNumber
+  GROUP BY o.customerNumber, o.orderNumber
+) t
+WHERE rn = 1;
+```
+
+## 8. Acceptance Gate Policy
+
+Acceptance gate runs for both IR and LLM outputs.
+
+Critical reasons (must block or rescue):
+
+1. `parse_error`
+2. `hard_identifier`
+3. `ambiguous_unqualified`
+4. `group_projection_mismatch`
+5. `invalid_join_path`
+6. `fanout_risk_dual_fact`
+
+Non-critical reasons (warning only):
+
+1. `semantic_contract_mismatch`
+
+Policy:
+
+1. Critical failure triggers retry/rescue logic.
+2. Non-critical-only failure can continue with warning.
+
+## 9. Operational Knobs
+
+IR knobs:
 
 1. `AGENT_IR_ENABLED`
 2. `AGENT_IR_MIN_CONFIDENCE`
@@ -101,37 +217,104 @@ IR:
 5. `AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE`
 6. `AGENT_IR_DEBUG`
 
-Router:
+Router knobs:
 
 1. `AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B`
 2. `AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES`
-3. `AGENT_ROUTER_ESCALATE_ON_WINNER_ROW`
-4. `AGENT_ROUTER_ESCALATE_ON_EXCLUSION`
-5. `AGENT_ROUTER_ESCALATE_ON_WINDOW_AGGREGATE`
-6. `AGENT_ROUTER_ESCALATE_ON_EXPLICIT_RANK`
-7. `AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT`
+3. `AGENT_ROUTER_ESCALATE_ON_MULTI_TABLE`
+4. `AGENT_ROUTER_ESCALATE_ON_WINNER_ROW`
+5. `AGENT_ROUTER_ESCALATE_ON_EXCLUSION`
+6. `AGENT_ROUTER_ESCALATE_ON_WINDOW_AGGREGATE`
+7. `AGENT_ROUTER_ESCALATE_ON_EXPLICIT_RANK`
+8. `AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT`
+9. `AGENT_ROUTER_ALLOW_SIMPLE_SINGLE_TABLE_SUBQUERY_3B`
 
-## 8. Stability Rules for Future Changes
+## 10. Route Map 39Q&A (Baseline)
 
-When adding/changing routing rules:
+This map is the expected primary lane for the current baseline configuration.
+Source baseline: `run_easy.log`, `run_medium.log`, `run_hard.log` with 100% VA/EX.
 
-1. Add rule in this policy file first.
-2. Add targeted test cases for the rule.
-3. Run at least:
-   - easy
-   - medium
-   - hard subset covering the changed path
-4. Record route stats:
-   - IR coverage
-   - 3B usage
-   - 7B usage
-   - regeneration rate
-   - validator hard-error rate
+Notes:
 
-## 9. Success Criteria
+1. This is an operational expectation, not a strict guarantee for every paraphrase.
+2. If retrieval scope or env knobs change, route may shift.
 
-A routing change is accepted only if:
+### 10.1 Easy (E1-E10)
 
-1. Existing benchmark does not regress.
-2. New questions increase coverage without brittle rule explosion.
-3. Hard-error regeneration frequency decreases over time.
+| ID  | Expected lane |                  Note                        |
+|-----|---------------|----------------------------------------------|
+| E1  |      IR       | Single-table, IR-safe filter + sort          |
+| E2  |      3B       | Top-N pattern; IR confidence below threshold |
+| E3  |      IR       | Single-table date filter + sort              |
+| E4  |      3B       | Routed as non-IR in current baseline context |
+| E5  |      IR       | Single-table null/missing filter             |
+| E6  |      IR       | Single-table prefix pattern                  |
+| E7  |      3B       | Context scope multi-table; IR gated off      |
+| E8  |      IR       | Single-table regex pattern                   |
+| E9  |      IR       | Single-table categorical filter              |
+| E10 |      IR       | Single-table range filter                    |
+
+### 10.2 Medium (M1-M15)
+
+| ID  | Expected lane |                  Note                    |
+|-----|---------------|------------------------------------------|
+| M1  |      3B       | Aggregation + month transformation       |
+| M2  |      3B       | CASE-band aggregation                    |
+| M3  |      3B       | Winner-row single-table (payments)       |
+| M4  |      3B       | Group + min/count aggregation            |
+| M5  |      3B       | Group + HAVING aggregate filter          |
+| M6  |      3B       | Simple scalar subquery single-table      |
+| M7  |      IR       | Supported percentage metric pattern      |
+| M8  |      3B       | Group + HAVING count                     |
+| M9  |      3B       | Group + order-by aggregate               |
+| M10 |      3B       | Window rank single-table                 |
+| M11 |      3B       | Second-highest single-table winner-row   |
+| M12 |      3B       | Window cumulative single-table           |
+| M13 |      3B       | Window count partition single-table      |
+| M14 |      3B       | Window avg partition single-table        |
+| M15 |      3B       | Window percentage-over-total single-table|
+
+### 10.3 Hard (H1-H14)
+
+| ID  | Expected lane |                  Note                             |
+|-----|---------------|---------------------------------------------------|
+| H1  |      3B       | Multi-table aggregate, non-hard pattern           |
+| H2  |      3B       | Simple existence join + grouped count             |
+| H3  |      3B       | Simple join + grouped sum                         |
+| H4  |      3B       | Simple multi-join + grouped sum                   |
+| H5  |      3B       | Left-join rollup with null-preserving intent      |
+| H6  |      7B       | Explicit ranking in multi-table context           |
+| H7  |      7B       | Latest-year per-group + re-aggregate              |
+| H8  |      7B       | Multi-table latest-year derived subquery          |
+| H9  |      7B       | Complex subquery + grouped ordering               |
+| H10 |      7B       | Multi-table + subquery/exists + having            |
+| H11 |      3B       | Exclusion aggregate pattern solved in 3B lane     |
+| H12 |      7B       | Multi-table aggregate + scalar subquery in HAVING |
+| H13 |      7B       | Multi-table winner-row with tie-break ordering    |
+| H14 |      7B       | Dual-fact rollup fanout-risk pattern              |
+
+### 10.4 Baseline Route Split
+
+1. IR: 8/39
+2. 3B: 23/39
+3. 7B: 8/39
+
+## 11. Benchmark and Change Protocol
+
+When changing routing behavior:
+
+1. Update this file first.
+2. Add targeted regression cases for changed rule.
+3. Run `easy`, `medium`, `hard`, then full set.
+4. Report:
+   - VA and EX
+   - route split (IR vs fallback)
+   - 3B vs 7B final model usage
+   - gate hard-error rate
+   - average latency
+
+Acceptance criteria for a routing patch:
+
+1. No regression on existing benchmark.
+2. Reduced hard-error frequency on new questions.
+3. No uncontrolled increase in 7B usage or latency.
