@@ -18,8 +18,38 @@ import chromadb
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .config import CHROMA_DIR, COLLECTION_NAME, OLLAMA_URL, EXPORT_JSONL_OUTPUT
+from .config import CHROMA_DIR, COLLECTION_NAME, OLLAMA_URL, EXPORT_JSONL_OUTPUT, JSON_INPUT
+from .utils import resolve_jsonl_paths
 _CHROMA_COL = None
+
+
+def _resolve_ingest_jsonl_paths() -> List[str]:
+    """
+    Resolve JSONL inputs safely for file/dir/glob configurations.
+    Priority:
+    1) dense files (*_dense.jsonl) when available
+    2) otherwise any resolved .jsonl files
+    """
+    specs = []
+    for raw in (EXPORT_JSONL_OUTPUT, JSON_INPUT):
+        s = str(raw or "").strip()
+        if s:
+            specs.append(s)
+
+    seen = set()
+    resolved: List[str] = []
+    for spec in specs:
+        for p in resolve_jsonl_paths(spec):
+            if p not in seen:
+                seen.add(p)
+                resolved.append(p)
+
+    if not resolved:
+        return []
+
+    dense = [p for p in resolved if p.lower().endswith("_dense.jsonl")]
+    return dense if dense else resolved
+
 # ==============================================================================
 #  1. MODIFIED BUILD_VECTOR_STORE (AUTO-INGEST LOGIC)
 # ==============================================================================
@@ -52,9 +82,17 @@ def build_vector_store():
     
     if current_count == 0:
         print(f"[Chroma] Collection '{COLLECTION_NAME}' is EMPTY.")
-        print(f"[Chroma] Triggering AUTO-INGEST from: {EXPORT_JSONL_OUTPUT}")
-        
-        ingest_dense_data(jsonl_dir=EXPORT_JSONL_OUTPUT)
+        ingest_paths = _resolve_ingest_jsonl_paths()
+        if not ingest_paths:
+            print(
+                f"[Chroma] No JSONL files found for ingestion. "
+                f"Checked specs: EXPORT_JSONL_OUTPUT='{EXPORT_JSONL_OUTPUT}', JSON_INPUT='{JSON_INPUT}'"
+            )
+        else:
+            print(f"[Chroma] Triggering AUTO-INGEST from {len(ingest_paths)} file(s):")
+            for p in ingest_paths:
+                print(f"  - {p}")
+            ingest_dense_data(jsonl_paths=ingest_paths)
         
         # Refresh object collection
         _CHROMA_COL = client.get_collection(
@@ -70,7 +108,7 @@ def build_vector_store():
 # ==============================================================================
 # 2. INGESTION LOGIC (SAMA SEPERTI SEBELUMNYA)
 # ==============================================================================
-def ingest_dense_data(jsonl_dir: str, batch_size: int = 50):
+def ingest_dense_data(jsonl_paths: List[str], batch_size: int = 50):
     # Kita panggil client langsung disini agar tidak rekursif loop dengan build_vector_store
     client = chromadb.PersistentClient(path=CHROMA_DIR)
     emb_fn = OllamaEmbeddingFunction(base_url=OLLAMA_URL)
@@ -79,16 +117,16 @@ def ingest_dense_data(jsonl_dir: str, batch_size: int = 50):
     collection = client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=emb_fn)
     
     print(f"[Chroma] Starting ingestion...")
-    
-    files = [f for f in os.listdir(jsonl_dir) if f.endswith(".jsonl")]
     total_docs = 0
 
-    for filename in files:
-        # FILTER PENTING: Hanya baca _dense.jsonl
-        if not filename.endswith("_dense.jsonl"):
+    for filepath in jsonl_paths:
+        filepath = str(filepath or "").strip()
+        if not filepath or not os.path.isfile(filepath):
             continue
-            
-        filepath = os.path.join(jsonl_dir, filename)
+        if not filepath.lower().endswith(".jsonl"):
+            continue
+
+        filename = os.path.basename(filepath)
         print(f"[Chroma] Processing: {filename}...")
 
         batch_ids = []

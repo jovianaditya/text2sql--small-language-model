@@ -99,6 +99,16 @@ MAX_TOP_TABLES = int(os.getenv("MAX_TOP_TABLES", "3"))
 # >>> Batasi berapa banyak dokumen yang masuk ke context LLM
 MAX_CTX_DOCS = int(os.getenv("MAX_CTX_DOCS", "12"))
 SPARSE_MAX_HITS  = int(os.getenv("SPARSE_MAX_HITS", "20"))
+# Single-table lock confidence (4C)
+RETRIEVAL_SINGLE_LOCK_MIN_SCORE_GAP = float(
+    os.getenv("RETRIEVAL_SINGLE_LOCK_MIN_SCORE_GAP", "0.9")
+)
+RETRIEVAL_SINGLE_LOCK_MAX_NON_PRIMARY_SPARSE_HITS = int(
+    os.getenv("RETRIEVAL_SINGLE_LOCK_MAX_NON_PRIMARY_SPARSE_HITS", "2")
+)
+RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK = int(
+    os.getenv("RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK", "2")
+)
 # >>> Bisa dimatiin kalau mau lebih silent
 SPARSE_DEBUG   = bool(int(os.getenv("SPARSE_DEBUG", "0")))
 RETRIEVE_DEBUG = bool(int(os.getenv("RETRIEVE_DEBUG", "1")))

@@ -121,6 +121,9 @@ from .config import (
     RETRIEVAL_TABLE_VARIANT_MIN_TAIL_LEN,
     RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS,
     RETRIEVAL_FK_REFERENCE_PATTERN,
+    RETRIEVAL_SINGLE_LOCK_MIN_SCORE_GAP,
+    RETRIEVAL_SINGLE_LOCK_MAX_NON_PRIMARY_SPARSE_HITS,
+    RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK,
     AGENT_ROUTER_QTYPE_LOOKUP,
     AGENT_ROUTER_QTYPE_AGGREGATE,
     AGENT_ROUTER_QTYPE_RANK,
@@ -1304,6 +1307,52 @@ def _should_lock_single_table_ctx(question: str, qtype: str) -> bool:
     if _has_join_intent(question): return False
     return _detect_primary_entity_table(question) is not None
 
+
+def _single_table_lock_is_high_confidence(
+    primary_table: str,
+    table_scores: Dict[str, float],
+    reranked: List[Dict[str, Any]],
+) -> bool:
+    """
+    Decide whether single-table lock should be strict.
+    High confidence when:
+    - primary table score clearly leads table #2 by configured gap, and
+    - sparse evidence from non-primary tables is limited.
+    """
+    primary = str(primary_table or "").strip().lower()
+    if not primary:
+        return False
+
+    # No score signal available: preserve previous behavior (strict lock).
+    if not table_scores:
+        return True
+
+    scores_norm = {
+        str(t or "").strip().lower(): float(s)
+        for t, s in (table_scores or {}).items()
+        if str(t or "").strip()
+    }
+    if primary not in scores_norm:
+        return False
+
+    primary_score = scores_norm.get(primary, 0.0)
+    second_best = max((s for t, s in scores_norm.items() if t != primary), default=None)
+    score_gap = primary_score if second_best is None else (primary_score - second_best)
+
+    non_primary_sparse_hits = 0
+    for item in (reranked or [])[:MAX_CTX_DOCS]:
+        md = item.get("meta") or {}
+        tbl = (_meta_table(md) or "").strip().lower()
+        if not tbl or tbl == primary:
+            continue
+        if bool(item.get("sparse", False)):
+            non_primary_sparse_hits += 1
+
+    return bool(
+        score_gap >= float(RETRIEVAL_SINGLE_LOCK_MIN_SCORE_GAP)
+        and non_primary_sparse_hits <= int(RETRIEVAL_SINGLE_LOCK_MAX_NON_PRIMARY_SPARSE_HITS)
+    )
+
 def retrieve_node(state: RAGState) -> RAGState:
     # -----------------------------
     # 0) Build vector store (DENSE)
@@ -1601,14 +1650,41 @@ def retrieve_node(state: RAGState) -> RAGState:
     else:
         if lock_single:
             primary = primary_for_lock
-            only_primary = {t: cols for t, cols in allowed.items() if t.lower() == (primary or "")}
-            if only_primary: filtered_allowed = only_primary
+            lock_high_conf = _single_table_lock_is_high_confidence(
+                primary_table=primary,
+                table_scores=table_scores,
+                reranked=reranked,
+            )
+            if lock_high_conf:
+                only_primary = {t: cols for t, cols in allowed.items() if t.lower() == (primary or "")}
+                if only_primary:
+                    filtered_allowed = only_primary
+                else:
+                    if table_scores:
+                        sorted_tbls = sorted(table_scores.items(), key=lambda x: x[1], reverse=True)
+                        top1 = sorted_tbls[0][0]
+                        filtered_allowed = {t: cols for t, cols in allowed.items() if t == top1}
+                    else:
+                        filtered_allowed = dict(allowed)
             else:
-                if table_scores:
-                    sorted_tbls = sorted(table_scores.items(), key=lambda x: x[1], reverse=True)
-                    top1 = sorted_tbls[0][0]
-                    filtered_allowed = {t: cols for t, cols in allowed.items() if t == top1}
-                else: filtered_allowed = dict(allowed)
+                fallback_k = max(1, int(RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK))
+                sorted_tbls = sorted(table_scores.items(), key=lambda x: x[1], reverse=True) if table_scores else []
+                fallback_tables = {str(t).strip().lower() for t, _ in sorted_tbls[:fallback_k] if str(t).strip()}
+                if primary:
+                    fallback_tables.add(primary.lower())
+
+                filtered_allowed = {
+                    t: cols for t, cols in allowed.items()
+                    if t.lower() in fallback_tables
+                }
+                if not filtered_allowed:
+                    filtered_allowed = dict(allowed)
+
+                if RETRIEVE_DEBUG:
+                    print(
+                        "[LOCK] Low-confidence single-table lock -> fallback "
+                        f"to top-{fallback_k} tables: {sorted(fallback_tables)}"
+                    )
         else:
             # -----------------------------
             # ENHANCED: Column-driven table selection
