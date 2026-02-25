@@ -671,6 +671,18 @@ async def run_single_case(
         result["error"] = f"Pipeline error: {e}"
         print(f"[ERROR] Pipeline failed: {e}")
         return result
+
+    # Fail-closed outputs must be treated as failed evaluation cases.
+    if "FINAL_GATE_BLOCKED" in (predicted_sql or "").upper():
+        result["va_success"] = False
+        result["va_error"] = "FINAL_GATE_BLOCKED"
+        result["exec_success"] = False
+        result["result_match"] = False
+        result["match_reason"] = "Predicted SQL blocked by deterministic acceptance gate"
+        result["error"] = "Predicted SQL blocked by deterministic acceptance gate"
+        print("[VA] Invalid SQL: FINAL_GATE_BLOCKED")
+        print("[EX] Skipped execution: blocked by acceptance gate")
+        return result
     
 
     # 2a. Valid SQL (VA) check using EXPLAIN

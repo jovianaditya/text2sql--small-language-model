@@ -2025,12 +2025,62 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
             break
     contract["required_limit"] = required_limit
 
+    # Aggregate intent extraction (conservative to avoid lookup false positives).
     required_aggs: Set[str] = set()
-    if re.search(r"\b(how\s+many|number\s+of|count(?:\s+of)?)\b", q):
+
+    # COUNT intent:
+    # - strong cues: "how many", "count"
+    # - phrase cue: "number of <entity>", excluding identifier-like projections
+    #   such as "employee numbers", "office codes", "customer ids".
+    has_how_many = bool(re.search(r"\bhow\s+many\b", q))
+    has_count_word = bool(re.search(r"\bcount(?:\s+of)?\b", q))
+
+    number_of_target = ""
+    m_number_of = re.search(r"\bnumber\s+of\s+([a-z][a-z0-9_]*)\b", q)
+    if m_number_of:
+        number_of_target = str(m_number_of.group(1) or "").strip().lower()
+
+    identifier_like_targets = {
+        "id",
+        "ids",
+        "identifier",
+        "identifiers",
+        "number",
+        "numbers",
+        "code",
+        "codes",
+        "name",
+        "names",
+        "date",
+        "dates",
+        "status",
+        "statuses",
+    }
+    has_number_of_entity = bool(
+        number_of_target and number_of_target not in identifier_like_targets
+    )
+    has_total_number_of_entity = bool(
+        re.search(r"\btotal\s+number\s+of\s+([a-z][a-z0-9_]*)\b", q)
+    )
+    if has_how_many or has_count_word or has_number_of_entity or has_total_number_of_entity:
         required_aggs.add("COUNT")
+
+    # AVG intent.
     if re.search(r"\b(average|avg|mean)\b", q):
         required_aggs.add("AVG")
-    has_total_or_sum = bool(re.search(r"\b(total|sum)\b", q))
+
+    # SUM intent:
+    # - explicit "sum"/"sum of"
+    # - "total" only when attached to quantity/value-like metrics.
+    has_explicit_sum = bool(re.search(r"\bsum(?:\s+of)?\b", q))
+    has_total_metric = bool(
+        re.search(
+            r"\btotal\s+"
+            r"(?:amount|payment(?:\s+amount)?|order(?:\s+amount)?|sales?|revenue|"
+            r"quantity|stock|value|cost|price|credit(?:\s+limit)?)\b",
+            q,
+        )
+    )
     looks_like_count_phrase = bool(
         re.search(
             r"\b(total\s+(number|count|orders?|customers?|items?|rows?|records?))\b",
@@ -2038,7 +2088,7 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
         )
         or re.search(r"\btotal\s+number\s+of\b", q)
     )
-    if has_total_or_sum and not looks_like_count_phrase:
+    if (has_explicit_sum or has_total_metric) and not looks_like_count_phrase:
         required_aggs.add("SUM")
 
     contract["required_aggs"] = sorted(required_aggs)
