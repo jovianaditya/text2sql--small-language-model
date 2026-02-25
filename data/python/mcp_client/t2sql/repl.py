@@ -8,6 +8,7 @@
 # ======================================================================
 # ====================== STANDARD LIBRARY IMPORT =======================
 # ======================================================================
+import asyncio
 from pathlib import Path
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport

@@ -5164,7 +5164,7 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
 
     agg_pat = re.compile(
         r"^(?P<prefix>.*?)\b(?P<fn>MAX|MIN)\s*\(\s*(?P<expr>.*?)\s*\)"
-        r"\s*(?P<alias>\bAS\s+[A-Za-z_][A-Za-z0-9_]*\s*)?$",
+        r"\s*(?P<alias>\bAS\s+(?:`[^`]+`|\"[^\"]+\"|'[^']+'|[A-Za-z_][A-Za-z0-9_]*)\s*)?$",
         flags=re.I | re.S
     )
 
@@ -5472,8 +5472,12 @@ def _winner_row_final_sanity(sql: str, question: str) -> str:
     except Exception:
         return sql
 
-    sel = ast.find(exp.Select)
-    if not sel:
+    sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return sql
+
+    from_expr = sel.args.get("from") or sel.args.get("from_")
+    if not from_expr:
         return sql
 
     grp = sel.args.get("group")
@@ -5598,7 +5602,10 @@ def _winner_row_final_sanity(sql: str, question: str) -> str:
     inner_select_exprs.append(exp.alias_(rn, "rn", quoted=False))
 
     # Rebuild query: SELECT outer FROM (SELECT inner FROM ... WHERE ...) t WHERE rn=1
-    inner = exp.Select(expressions=inner_select_exprs).from_(sel.args["from"].copy())
+    inner = exp.Select(expressions=inner_select_exprs).from_(from_expr.copy())
+    joins = sel.args.get("joins")
+    if joins:
+        inner.set("joins", [j.copy() for j in joins])
     if sel.args.get("where"):
         inner.set("where", sel.args["where"].copy())
 
@@ -5750,10 +5757,10 @@ def _force_restore_groupby_if_aggregate_without_groupby(sql_before, sql_after):
 
     return sql_after
 
-def _rewrite_winner_row_aggregate_misuse(sql: str, question: str) -> str:
+def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "") -> str:
     """
-    Catch winner-row questions where the SQL still uses MAX/MIN (often with HAVING hacks)
-    and rewrite to ROW_NUMBER winner-row selection.
+    Catch winner-row questions where the SQL still uses MAX/MIN (often with
+    HAVING/subquery hacks) and rewrite to ROW_NUMBER winner-row selection.
 
     This handles cases WITHOUT GROUP BY (your current guardrail requires GROUP BY).
     Very conservative:
@@ -5828,6 +5835,7 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str) -> str:
         return sql
 
     q_low = (question or "").lower()
+    include_zero_intent = _question_wants_include_zero(question, ctx)
 
     def norm_name(e: exp.Expression) -> str:
         try:
@@ -5847,12 +5855,19 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str) -> str:
     q_tokens -= stop_tokens
 
     partition_exprs = []
+    partition_candidates: List[Tuple[int, exp.Expression]] = []
     for item in nonagg_items:
         base = item.this if isinstance(item, exp.Alias) else item
         s = norm_name(base)
         expr_tokens = set(re.findall(r"[a-z0-9]+", s)) - stop_tokens
         if expr_tokens and (expr_tokens & q_tokens):
-            partition_exprs.append(base)
+            score = len(expr_tokens & q_tokens)
+            if any(k in s for k in ["id", "number", "code"]):
+                score += 2
+            partition_candidates.append((score, base))
+
+    if partition_candidates:
+        partition_exprs = [max(partition_candidates, key=lambda x: x[0])[1]]
 
     # Fallback: id/number/code-like
     if not partition_exprs:
@@ -5880,11 +5895,38 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str) -> str:
 
     # ORDER BY for window
     metric_desc = (agg_kind == "MAX")
-    order_exprs = [
-        exp.Ordered(this=metric_expr.copy(), desc=metric_desc)
-    ]
-    for te in tie_exprs[:2]:  # keep it short/conservative
-        order_exprs.append(exp.Ordered(this=te.copy(), desc=False))
+    wants_latest_date = bool(
+        re.search(r"\b(?:latest|most\s+recent|newest)\b", q_low, flags=re.I)
+        and re.search(r"\b(?:date|time|payment\s+date|order\s+date)\b", q_low, flags=re.I)
+    )
+    wants_amount_tiebreak = bool(
+        re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|same|tie)\b", q_low, flags=re.I)
+        and re.search(r"\bdate\b", q_low, flags=re.I)
+        and re.search(r"\b(?:largest|highest|max(?:imum)?)\b", q_low, flags=re.I)
+        and re.search(r"\b(?:amount|payment)\b", q_low, flags=re.I)
+    )
+
+    order_exprs = []
+    if wants_latest_date and tie_exprs:
+        date_expr = tie_exprs[0]
+        order_exprs.append(exp.Ordered(this=date_expr.copy(), desc=True))
+        if wants_amount_tiebreak:
+            order_exprs.append(exp.Ordered(this=metric_expr.copy(), desc=True))
+            # Stable deterministic tie-break when same date and amount.
+            for item in nonagg_items:
+                base = item.this if isinstance(item, exp.Alias) else item
+                s = norm_name(base)
+                if norm_name(base) in {norm_name(partition_exprs[0]), norm_name(date_expr)}:
+                    continue
+                if any(k in s for k in ["id", "number", "code"]):
+                    order_exprs.append(exp.Ordered(this=base.copy(), desc=False))
+                    break
+        else:
+            order_exprs.append(exp.Ordered(this=metric_expr.copy(), desc=metric_desc))
+    else:
+        order_exprs = [exp.Ordered(this=metric_expr.copy(), desc=metric_desc)]
+        for te in tie_exprs[:2]:  # keep it short/conservative
+            order_exprs.append(exp.Ordered(this=te.copy(), desc=False))
 
     rn = exp.Window(
         this=exp.RowNumber(),
@@ -5903,11 +5945,15 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str) -> str:
     # Build inner select with stable aliases
     inner_exprs = []
     outer_exprs = []
+    alias_by_norm: Dict[str, str] = {}
 
     for item in nonagg_items:
         if isinstance(item, exp.Alias):
             inner_exprs.append(item.copy())
             outer_exprs.append(exp.column(item.alias, table="t"))
+            base_norm = norm_name(item.this if isinstance(item.this, exp.Expression) else item)
+            if base_norm:
+                alias_by_norm[base_norm] = item.alias
         else:
             # Require it to be a Column for safety; otherwise abort
             if not isinstance(item, exp.Column):
@@ -5915,27 +5961,64 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str) -> str:
             name = item.name
             inner_exprs.append(exp.alias_(item.copy(), name, quoted=False))
             outer_exprs.append(exp.column(name, table="t"))
+            base_norm = norm_name(item)
+            if base_norm:
+                alias_by_norm[base_norm] = name
 
     # Add metric
     inner_exprs.append(exp.alias_(metric_expr.copy(), metric_alias, quoted=False))
     outer_exprs.append(exp.column(metric_alias, table="t"))
+    metric_norm = norm_name(metric_expr)
+    if metric_norm:
+        alias_by_norm[metric_norm] = metric_alias
 
     # Add rn
     inner_exprs.append(exp.alias_(rn, "rn", quoted=False))
 
     # Rebuild inner FROM/WHERE from original query
-    if not sel.args.get("from"):
+    from_expr = sel.args.get("from") or sel.args.get("from_")
+    if not from_expr:
         return sql
     inner = exp.Select(expressions=inner_exprs)
-    inner.set("from", sel.args["from"].copy())
+    inner.set("from_", from_expr.copy())
+    joins = sel.args.get("joins")
+    if joins:
+        inner.set("joins", [j.copy() for j in joins])
 
-    if sel.args.get("where"):
-        inner.set("where", sel.args["where"].copy())
+    where_expr = sel.args.get("where")
+    if where_expr is not None and include_zero_intent:
+        where_sql = where_expr.sql(dialect="mysql").lower()
+        ranking_like_filter = bool(
+            re.search(r"\bselect\s+max\s*\(", where_sql, flags=re.I)
+            and re.search(
+                r"\b(paymentdate|orderdate|amount|quantity|price|year\s*\()",
+                where_sql,
+                flags=re.I,
+            )
+        )
+        if ranking_like_filter:
+            where_expr = None
+
+    if where_expr is not None:
+        inner.set("where", where_expr.copy())
 
     # Outer query
     outer = exp.Select(expressions=outer_exprs).from_(
         exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier("t")))
     ).where(exp.EQ(this=exp.column("rn", table="t"), expression=exp.Literal.number(1)))
+
+    # Re-introduce deterministic outer ordering when the question explicitly asks sorting.
+    if re.search(r"\b(?:sort(?:ed)?\s+by|order\s+by)\b", q_low, flags=re.I):
+        outer_order_exprs = []
+        if tie_exprs:
+            tie_alias = alias_by_norm.get(norm_name(tie_exprs[0]))
+            if tie_alias:
+                outer_order_exprs.append(exp.Ordered(this=exp.column(tie_alias, table="t"), desc=True))
+        part_alias = alias_by_norm.get(norm_name(partition_exprs[0]))
+        if part_alias:
+            outer_order_exprs.append(exp.Ordered(this=exp.column(part_alias, table="t"), desc=False))
+        if outer_order_exprs:
+            outer.set("order", exp.Order(expressions=outer_order_exprs))
 
     return outer.sql(dialect="mysql")
 
@@ -8321,6 +8404,51 @@ def _canonicalize_latest_year_same_year_pattern(sql: str, question: str, ctx: st
             return m2.group(2), m2.group(3), m2.group(1).strip()
         return None
 
+    groupby_aliases: Set[str] = set()
+    for g in _split_top_level_commas(parsed.get("groupby", "")):
+        q = _split_qualified_ref(g)
+        if q and q[0]:
+            groupby_aliases.add(q[0].lower())
+
+    def _infer_bridge_entity_link(
+        bridge_alias: str,
+        avoid_aliases: Set[str],
+    ) -> Optional[tuple]:
+        """
+        Infer outer-entity join link from FROM/JOIN ON predicates.
+        Returns: (outer_entity_alias, outer_entity_col, bridge_entity_col)
+        """
+        b = (bridge_alias or "").lower().strip()
+        if not b:
+            return None
+
+        eq_iter = re.finditer(
+            r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*"
+            r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            from_core,
+            flags=re.I,
+        )
+
+        candidates: List[tuple] = []
+        for m in eq_iter:
+            a1, c1, a2, c2 = m.group(1), m.group(2), m.group(3), m.group(4)
+            a1l, a2l = a1.lower(), a2.lower()
+            if a1l == b and a2l in alias_map and a2l not in avoid_aliases:
+                candidates.append((a2, c2, c1))
+            elif a2l == b and a1l in alias_map and a1l not in avoid_aliases:
+                candidates.append((a1, c1, c2))
+
+        if not candidates:
+            return None
+
+        # Prefer aliases explicitly present in GROUP BY (typical entity key owner).
+        for outer_alias, outer_col, bridge_col in candidates:
+            if groupby_aliases and outer_alias.lower() in groupby_aliases:
+                return outer_alias, outer_col, bridge_col
+
+        # Fallback: first viable candidate.
+        return candidates[0]
+
     where_body = re.sub(r"^\s*WHERE\s+", "", parsed["where"].strip(), flags=re.I).strip()
     if not where_body or _has_top_level_or(where_body):
         return sql
@@ -8356,70 +8484,123 @@ def _canonicalize_latest_year_same_year_pattern(sql: str, question: str, ctx: st
         if len(inner_conj) != 1:
             continue
 
-        m_in = re.match(
-            r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s+IN\s*\((SELECT.+)\)\s*$""",
-            inner_conj[0].strip(),
-        )
-        if not m_in:
-            continue
-        inner_join_qual = (m_in.group(1) or "").strip()
-        inner_join_col = m_in.group(2).strip()
-        sub2 = (m_in.group(3) or "").strip()
-        if inner_join_qual and inner_join_qual.lower() not in {inner_date_alias.lower(), _plain_table_name(inner_date_table).lower()}:
-            continue
-
-        m_sub2 = re.match(
-            r"""(?is)^\s*SELECT\s+(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s+FROM\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?\s+WHERE\s+(.+?)\s*$""",
-            sub2,
-        )
-        if not m_sub2:
-            continue
-
-        bridge_link_qual = (m_sub2.group(1) or "").strip()
-        bridge_link_col = m_sub2.group(2).strip()
-        bridge_table = m_sub2.group(3).strip()
-        bridge_alias = (m_sub2.group(4) or "").strip() or _plain_table_name(bridge_table)
-        bridge_where = (m_sub2.group(5) or "").strip()
-        if not bridge_where or _has_top_level_or(bridge_where):
-            continue
-        bridge_conj = _split_top_level_and(bridge_where)
-        if len(bridge_conj) != 1:
-            continue
-
-        m_eq = re.match(
-            r"""(?is)^\s*(.+?)\s*=\s*(.+?)\s*$""",
-            bridge_conj[0].strip(),
-        )
-        if not m_eq:
-            continue
-        left_ref = _split_qualified_ref(m_eq.group(1))
-        right_ref = _split_qualified_ref(m_eq.group(2))
-        if not left_ref or not right_ref:
-            continue
-
-        lq, lc = left_ref
-        rq, rc = right_ref
-        bridge_aliases = {bridge_alias.lower(), _plain_table_name(bridge_table).lower()}
-
+        inner_pred = inner_conj[0].strip()
+        inner_join_col = ""
+        bridge_link_col = ""
+        bridge_table = ""
+        bridge_alias = ""
         outer_entity_alias = None
         outer_entity_col = None
         bridge_entity_col = None
 
-        if rq and rq.lower() in alias_map and (not lq or lq.lower() in bridge_aliases):
-            outer_entity_alias = rq
-            outer_entity_col = rc
-            bridge_entity_col = lc
-        elif lq and lq.lower() in alias_map and (not rq or rq.lower() in bridge_aliases):
-            outer_entity_alias = lq
-            outer_entity_col = lc
-            bridge_entity_col = rc
-        else:
-            continue
+        m_in = re.match(
+            r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s+IN\s*\((SELECT.+)\)\s*$""",
+            inner_pred,
+        )
 
-        if bridge_link_qual and bridge_link_qual.lower() not in bridge_aliases:
-            continue
-        if inner_date_qual and inner_date_qual.lower() not in {inner_date_alias.lower(), _plain_table_name(inner_date_table).lower()}:
-            continue
+        if m_in:
+            inner_join_qual = (m_in.group(1) or "").strip()
+            inner_join_col = m_in.group(2).strip()
+            sub2 = (m_in.group(3) or "").strip()
+            if inner_join_qual and inner_join_qual.lower() not in {inner_date_alias.lower(), _plain_table_name(inner_date_table).lower()}:
+                continue
+
+            m_sub2 = re.match(
+                r"""(?is)^\s*SELECT\s+(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s+FROM\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?\s+WHERE\s+(.+?)\s*$""",
+                sub2,
+            )
+            if not m_sub2:
+                continue
+
+            bridge_link_qual = (m_sub2.group(1) or "").strip()
+            bridge_link_col = m_sub2.group(2).strip()
+            bridge_table = m_sub2.group(3).strip()
+            bridge_alias = (m_sub2.group(4) or "").strip() or _plain_table_name(bridge_table)
+            bridge_where = (m_sub2.group(5) or "").strip()
+            if not bridge_where or _has_top_level_or(bridge_where):
+                continue
+            bridge_conj = _split_top_level_and(bridge_where)
+            if len(bridge_conj) != 1:
+                continue
+
+            m_eq = re.match(
+                r"""(?is)^\s*(.+?)\s*=\s*(.+?)\s*$""",
+                bridge_conj[0].strip(),
+            )
+            if not m_eq:
+                continue
+            left_ref = _split_qualified_ref(m_eq.group(1))
+            right_ref = _split_qualified_ref(m_eq.group(2))
+            if not left_ref or not right_ref:
+                continue
+
+            lq, lc = left_ref
+            rq, rc = right_ref
+            bridge_aliases = {bridge_alias.lower(), _plain_table_name(bridge_table).lower()}
+
+            if rq and rq.lower() in alias_map and (not lq or lq.lower() in bridge_aliases):
+                outer_entity_alias = rq
+                outer_entity_col = rc
+                bridge_entity_col = lc
+            elif lq and lq.lower() in alias_map and (not rq or rq.lower() in bridge_aliases):
+                outer_entity_alias = lq
+                outer_entity_col = lc
+                bridge_entity_col = rc
+            else:
+                continue
+
+            if bridge_link_qual and bridge_link_qual.lower() not in bridge_aliases:
+                continue
+            if inner_date_qual and inner_date_qual.lower() not in {inner_date_alias.lower(), _plain_table_name(inner_date_table).lower()}:
+                continue
+
+        else:
+            # Also support direct equality correlation:
+            #   WHERE YEAR(o.dateCol) = (
+            #     SELECT MAX(YEAR(dateCol))
+            #     FROM date_table
+            #     WHERE joinCol = outer_bridge.joinCol
+            #   )
+            # This is a common malformed pattern for latest-year-per-entity.
+            m_eq_direct = re.match(
+                r"""(?is)^\s*(.+?)\s*=\s*(.+?)\s*$""",
+                inner_pred,
+            )
+            if not m_eq_direct:
+                continue
+            left_ref = _split_qualified_ref(m_eq_direct.group(1))
+            right_ref = _split_qualified_ref(m_eq_direct.group(2))
+            if not left_ref or not right_ref:
+                continue
+
+            lq, lc = left_ref
+            rq, rc = right_ref
+            inner_date_aliases = {inner_date_alias.lower(), _plain_table_name(inner_date_table).lower()}
+
+            outer_bridge_alias = None
+            if lq and lq.lower() in alias_map and lq.lower() != outer_date_alias.lower() and ((not rq) or (rq.lower() in inner_date_aliases)):
+                outer_bridge_alias = lq
+                bridge_link_col = lc
+                inner_join_col = rc
+            elif rq and rq.lower() in alias_map and rq.lower() != outer_date_alias.lower() and ((not lq) or (lq.lower() in inner_date_aliases)):
+                outer_bridge_alias = rq
+                bridge_link_col = rc
+                inner_join_col = lc
+            else:
+                continue
+
+            if not inner_join_col or not bridge_link_col:
+                continue
+
+            bridge_alias = outer_bridge_alias
+            bridge_table = alias_map.get(bridge_alias) or alias_map.get(bridge_alias.lower()) or bridge_alias
+            inferred = _infer_bridge_entity_link(
+                bridge_alias,
+                avoid_aliases={outer_date_alias.lower(), bridge_alias.lower()},
+            )
+            if not inferred:
+                continue
+            outer_entity_alias, outer_entity_col, bridge_entity_col = inferred
 
         parsed_target = {
             "outer_date_alias": outer_date_alias,
@@ -9674,16 +9855,17 @@ def _ast_guardrails(sql: str, ctx: str = "", question: str = "") -> Tuple[str, D
 
     def _is_nested_subquery_column(col_expr: "exp.Column") -> bool:
         """
-        Return True when the column belongs to a nested subquery scope.
-        We keep unknown-qualifier rewrites strictly at top-level SELECT scope
-        to avoid corrupting derived-table internals.
+        Return True when a column does not belong to the current top-level SELECT.
+
+        Important: nested SELECT inside EXISTS/IN may not be wrapped by exp.Subquery.
+        So we identify scope by the nearest ancestor exp.Select:
+        - nearest Select == current `sel`  -> top-level column (safe)
+        - nearest Select != current `sel`  -> nested subquery column (must skip)
         """
         anc = getattr(col_expr, "parent", None)
         while anc is not None:
-            if anc is sel:
-                return False
-            if isinstance(anc, exp.Subquery):
-                return True
+            if isinstance(anc, exp.Select):
+                return anc is not sel
             anc = getattr(anc, "parent", None)
         return False
 

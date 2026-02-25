@@ -847,6 +847,7 @@ def router_agent(state: RAGState) -> RAGState:
 
         table_singular = get_singular_form(tbl.lower())
         table_pattern = _table_entity_pattern(tbl)
+        table_singular_token = (table_singular or "").strip().lower()
 
         # Buat copy pertanyaan khusus untuk scanning tabel ini
         search_scope = question
@@ -856,8 +857,25 @@ def router_agent(state: RAGState) -> RAGState:
             for pat in patterns:
                 search_scope = re.sub(pat, " ", search_scope)
 
-        # Cek 2: Cari kata tabel di search_scope yang SUDAH BERSIH
-        if re.search(rf"\b{table_pattern}\b", search_scope):
+        # Cek 2: Cari kata tabel di search_scope yang SUDAH BERSIH.
+        # Fallback: allow simple inflected forms (e.g., "ordered", "ordering")
+        # for verb-like entity mentions when direct entity token is absent.
+        direct_entity_match = bool(re.search(rf"\b{table_pattern}\b", search_scope))
+        inflected_entity_match = False
+        if (
+            not direct_entity_match
+            and table_singular_token
+            and table_singular_token.isalpha()
+            and len(table_singular_token) >= 4
+        ):
+            inflected_entity_match = bool(
+                re.search(
+                    rf"\b{re.escape(table_singular_token)}(?:ed|ing)\b",
+                    search_scope,
+                )
+            )
+
+        if direct_entity_match or inflected_entity_match:
 
             # Deteksi referensi ID saja (FK)
             is_just_id_ref = re.search(
@@ -865,7 +883,7 @@ def router_agent(state: RAGState) -> RAGState:
                 search_scope
             )
 
-            if is_just_id_ref:
+            if direct_entity_match and is_just_id_ref:
                 if re.search(
                     rf"\b{table_pattern}\b(?!\s+(?:{id_terms_pattern}))",
                     search_scope
@@ -876,7 +894,10 @@ def router_agent(state: RAGState) -> RAGState:
             else:
                 relevant_tables.append(tbl)
                 if RETRIEVE_DEBUG:
-                    print(f"[Router] ✓ Added {tbl} (direct match)")
+                    if inflected_entity_match and not direct_entity_match:
+                        print(f"[Router] ✓ Added {tbl} (inflected entity match)")
+                    else:
+                        print(f"[Router] ✓ Added {tbl} (direct match)")
         elif RETRIEVE_DEBUG:
             pattern_str = rf"\b{table_pattern}\b"
             print(f"[Router] ✗ Skipped {tbl} (no match in question)")
@@ -1429,10 +1450,25 @@ def router_agent(state: RAGState) -> RAGState:
         return any(_is_temporal_col_name(c) for c in cols)
 
     def _question_mentions_table_entity(question_text: str, tbl_name: str) -> bool:
-        pat = _table_entity_pattern(tbl_name.lower())
+        tbl_lower = (tbl_name or "").lower()
+        pat = _table_entity_pattern(tbl_lower)
         if not pat:
             return False
-        return bool(re.search(rf"\b{pat}\b", question_text))
+
+        table_singular = get_singular_form(tbl_lower)
+        search_scope = question_text
+        for ignore_pat in AGENT_ROUTER_IGNORE_PATTERNS.get((table_singular or "").lower(), []):
+            search_scope = re.sub(ignore_pat, " ", search_scope)
+
+        if re.search(rf"\b{pat}\b", search_scope):
+            return True
+
+        singular_token = (table_singular or "").strip().lower()
+        if singular_token and singular_token.isalpha() and len(singular_token) >= 4:
+            if re.search(rf"\b{re.escape(singular_token)}(?:ed|ing)\b", search_scope):
+                return True
+
+        return False
 
     def _question_mentions_table_temporal_column(question_text: str, tbl_name: str) -> bool:
         tbl_l = (tbl_name or "").lower()

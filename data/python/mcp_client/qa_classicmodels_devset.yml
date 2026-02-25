@@ -538,3 +538,31 @@ cases:
         ORDER BY
           o.total_orders DESC,
           c.customerNumber ASC;
+    - id: H15
+      difficulty: hard
+      question: "Show products that were ordered in 2004 but never ordered in 2005. For each product, return product code, product name, and total quantity ordered in 2004. Sort by total quantity descending, then product code ascending."
+      groundtruth_sql: |
+        SELECT
+          p.productCode,
+          p.productName,
+          SUM(od.quantityOrdered) AS total_quantity_2004
+        FROM products AS p
+        JOIN orderdetails AS od
+          ON od.productCode = p.productCode
+        JOIN orders AS o
+          ON o.orderNumber = od.orderNumber
+        WHERE YEAR(o.orderDate) = 2004
+          AND NOT EXISTS (
+            SELECT 1
+            FROM orderdetails AS od2
+            JOIN orders AS o2
+              ON o2.orderNumber = od2.orderNumber
+            WHERE od2.productCode = p.productCode
+              AND YEAR(o2.orderDate) = 2005
+          )
+        GROUP BY
+          p.productCode,
+          p.productName
+        ORDER BY
+          total_quantity_2004 DESC,
+          p.productCode ASC;

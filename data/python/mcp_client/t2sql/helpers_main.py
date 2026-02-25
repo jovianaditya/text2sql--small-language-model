@@ -13,7 +13,7 @@
 # ======================================================================
 import re
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
@@ -43,6 +43,7 @@ from .schema_analyzer import (
 from .helpers_core import (
     _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
     _question_requires_inner_join,
+    _question_wants_include_zero,
     _SQL_KEYWORDS,  # SQL keywords constant
     # phase 0
     _fix_bad_backticks, _canonicalize_table_names, _escape_reserved_column_aliases,
@@ -775,6 +776,105 @@ def _table_mentioned(q_text: str, table: str, include_synonyms: bool = True) -> 
         pattern = re.escape(cand).replace(r"\ ", r"\s+")
         if re.search(rf"\b{pattern}\b", q):
             return True
+    if _iter_inflected_entity_mentions(q, table):
+        return True
+    return False
+
+
+def _table_inflected_mention_terms(table: str) -> Set[str]:
+    """
+    Build verb-like inflected terms for entity mentions.
+    Example: orders -> ordered/ordering.
+    """
+    t = (table or "").strip().lower()
+    if not t:
+        return set()
+
+    stems: Set[str] = set()
+    singular = get_singular_form(t)
+    if singular and singular.isalpha():
+        stems.add(singular.lower())
+
+    # Include compact single-token candidates/synonyms as optional stems.
+    for cand in _table_mention_candidates(t, include_synonyms=True):
+        token = str(cand or "").strip().lower().replace(" ", "")
+        if not token or not token.isalpha():
+            continue
+        if len(token) >= 3:
+            stems.add(token)
+        if token.endswith("s") and len(token) >= 4:
+            stems.add(token[:-1])
+        if token.endswith("ment") and len(token) >= 6:
+            stems.add(token[:-4])
+
+    terms: Set[str] = set()
+    for stem in list(stems):
+        s = stem.strip().lower()
+        if not s or len(s) < 3:
+            continue
+        if s.endswith("ed") or s.endswith("ing"):
+            terms.add(s)
+        if s.endswith("e"):
+            terms.add(f"{s}d")
+            if len(s) > 1:
+                terms.add(f"{s[:-1]}ing")
+        else:
+            terms.add(f"{s}ed")
+            terms.add(f"{s}ing")
+        if s.endswith("y") and len(s) > 3:
+            terms.add(f"{s[:-1]}ied")
+
+    # Common irregulars from derived verb stems.
+    if "pay" in stems:
+        terms.add("paid")
+
+    return {term for term in terms if term and len(term) >= 4}
+
+
+def _is_locally_negated(q_text: str, start_idx: int, window_chars: int = 56) -> bool:
+    left = (q_text or "")[max(0, start_idx - window_chars):start_idx]
+    if not left:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:no|without|never|not)\b(?:[\s,;:()'\"-]+\w+){0,4}\s*$",
+            left,
+            flags=re.I,
+        )
+    )
+
+
+def _iter_inflected_entity_mentions(q_text: str, table: str) -> List[Tuple[str, bool]]:
+    q = (q_text or "").lower()
+    if not q:
+        return []
+
+    mentions: List[Tuple[str, bool]] = []
+    terms = sorted(_table_inflected_mention_terms(table), key=len, reverse=True)
+    for term in terms:
+        pat = rf"\b{re.escape(term)}\b"
+        for m in re.finditer(pat, q):
+            # Avoid treating ORDER BY grammar as orders-entity mention.
+            if term == "ordered":
+                tail = q[m.end(): m.end() + 12]
+                if re.match(r"\s+by\b", tail):
+                    continue
+            negated = _is_locally_negated(q, m.start())
+            mentions.append((term, negated))
+    return mentions
+
+
+def _has_non_negated_pattern_match(q_text: str, pattern: str) -> bool:
+    q = (q_text or "").lower()
+    if not q or not pattern:
+        return False
+    for m in re.finditer(pattern, q, flags=re.I):
+        frag = m.group(0) or ""
+        if re.search(r"\b(?:no|without|never|not)\b", frag, flags=re.I):
+            continue
+        if _is_locally_negated(q, m.start()):
+            continue
+        return True
     return False
 
 
@@ -815,6 +915,11 @@ def _question_targets_table_exclusion(question: str, table: str) -> bool:
     ):
         return True
 
+    # Verb-like negated mention: "never ordered", "not paid", etc.
+    for _, is_negated in _iter_inflected_entity_mentions(q, table):
+        if is_negated:
+            return True
+
     return False
 
 
@@ -832,25 +937,24 @@ def _question_targets_table_existence(question: str, table: str) -> bool:
     # existence triggers from output aliases/status literals.
     q_sem = re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"", " ", q)
 
-    # Exclusion intent wins for this table (e.g., "never orders").
-    if _question_targets_table_exclusion(q_sem, table):
-        return False
+    has_exclusion = _question_targets_table_exclusion(q_sem, table)
+    inflected_mentions = _iter_inflected_entity_mentions(q_sem, table)
+    has_non_negated_inflected = any(not is_negated for _, is_negated in inflected_mentions)
 
     candidates = _table_mention_candidates(table, include_synonyms=True)
     if not candidates:
-        return False
+        return has_non_negated_inflected
 
     entity_alt = "|".join(
         sorted((re.escape(c).replace(r"\ ", r"\s+") for c in candidates), key=len, reverse=True)
     )
 
     # Quantified existence: "at least one <entity>"
-    if re.search(
-        rf"\b(?:at\s+least\s+one|one\s+or\s+more|any)\b(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b",
-        q_sem,
-        flags=re.I,
-    ):
-        return True
+    quantified_pattern = (
+        rf"\b(?:at\s+least\s+one|one\s+or\s+more|any)\b"
+        rf"(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b"
+    )
+    has_quantified_existence = _has_non_negated_pattern_match(q_sem, quantified_pattern)
 
     # Avoid false positives for metric-request phrasing:
     # "with total payment amount", "having average orders", etc.
@@ -863,23 +967,33 @@ def _question_targets_table_existence(question: str, table: str) -> bool:
     )
 
     # Connector pattern: "with/having <entity>"
-    connector_match = re.search(
-        rf"\b(?:with|having)\b(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+(?:{entity_alt})\b",
-        q_sem,
-        flags=re.I,
+    connector_pattern = (
+        rf"\b(?:with|having)\b"
+        rf"(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+(?:{entity_alt})\b"
     )
-    if connector_match and not metric_connector_match:
-        return True
+    has_connector_existence = bool(
+        not metric_connector_match and _has_non_negated_pattern_match(q_sem, connector_pattern)
+    )
 
     # Verb-based existence mention.
-    if re.search(
-        rf"\b(?:have|has|had|made|placed|paid|ordered|purchased|bought)\b(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b",
-        q_sem,
-        flags=re.I,
-    ):
-        return True
+    verb_pattern = (
+        rf"\b(?:have|has|had|made|placed|paid|ordered|purchased|bought)\b"
+        rf"(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b"
+    )
+    has_verb_existence = _has_non_negated_pattern_match(q_sem, verb_pattern)
 
-    return False
+    has_positive_existence = bool(
+        has_quantified_existence
+        or has_connector_existence
+        or has_verb_existence
+        or has_non_negated_inflected
+    )
+
+    # Pure exclusion query (no positive evidence) should not force INNER JOIN.
+    if has_exclusion and not has_positive_existence:
+        return False
+
+    return has_positive_existence
 
 
 def _is_productline_lookup(question: str) -> bool:
@@ -2370,20 +2484,36 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             other_tables = [t for t in other_tables if t != primary_table]
             other_tables = _order_tables_by_fk_distance(primary_table, other_tables)
             requires_inner_join = _question_requires_inner_join(question, ctx)
+            wants_include_zero = _question_wants_include_zero(question, ctx)
             exclusion_tables = {t for t in other_tables if _question_targets_table_exclusion(question, t)}
             existence_tables = {t for t in other_tables if _question_targets_table_existence(question, t)}
+            if wants_include_zero and exclusion_tables:
+                # Preserve include-zero semantics:
+                # if a table is explicitly in exclusion/no-data intent, do not also
+                # force existence for the same table at table-hint level.
+                existence_tables = {t for t in existence_tables if t not in exclusion_tables}
+            mixed_intent_tables = exclusion_tables.intersection(existence_tables)
 
             # Join type must be decided per table.
             # Global "requires_inner_join" is only a fallback when no table-level
             # existence/exclusion target can be identified.
-            force_inner_all = bool(requires_inner_join and not exclusion_tables and not existence_tables)
+            force_inner_all = bool(
+                requires_inner_join
+                and not wants_include_zero
+                and not exclusion_tables
+                and not existence_tables
+            )
 
             # More explicit guidance - tell LLM exactly which table should be first
             hint_msg = f"TABLE ORDER (CRITICAL): Start your query with FROM {primary_table}"
             if other_tables:
                 join_steps = []
                 for t in other_tables:
-                    if t in exclusion_tables:
+                    if wants_include_zero and t in exclusion_tables:
+                        join_steps.append(f"LEFT JOIN {t}")
+                    elif t in mixed_intent_tables:
+                        join_steps.append(f"INNER JOIN {t}")
+                    elif t in exclusion_tables:
                         join_steps.append(f"LEFT JOIN {t}")
                     elif t in existence_tables:
                         join_steps.append(f"INNER JOIN {t}")
@@ -2400,7 +2530,18 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             constraints.append(hint_msg)
 
             # JOIN TYPE GUIDANCE (CRITICAL)
-            if exclusion_tables and (existence_tables or force_inner_all):
+            if wants_include_zero and exclusion_tables:
+                constraints.append(
+                    "JOIN TYPE (CRITICAL): Include-zero intent detected (e.g., 'including ... with no/without'). "
+                    "Preserve primary rows with LEFT JOIN for optional related tables; do NOT force INNER JOIN on exclusion-target tables."
+                )
+            elif mixed_intent_tables:
+                constraints.append(
+                    "JOIN TYPE (CRITICAL): Same table has mixed intent (both required and excluded in different slices). "
+                    "Use INNER JOIN for the positive slice and enforce exclusion with NOT EXISTS/anti-join logic; "
+                    "do NOT rely on a single LEFT JOIN for both intents."
+                )
+            elif exclusion_tables and (existence_tables or force_inner_all):
                 constraints.append(
                     "JOIN TYPE (CRITICAL): Mixed intent detected. "
                     "Use INNER JOIN for required-existence tables, and LEFT JOIN + IS NULL/NOT EXISTS for exclusion tables (e.g., 'no/never/without')."
@@ -3081,7 +3222,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_winner_row_guardrail(s, question)
         if DEBUG_WR: print("[PH4] after guardrail:", s)
 
-        s = _rewrite_winner_row_aggregate_misuse(s, question)
+        s = _rewrite_winner_row_aggregate_misuse(s, question, ctx)
         if DEBUG_WR: print("[PH4] after agg-misuse:", s)
 
         s = _fix_winner_row_window_order_priority(s, question)
@@ -3151,7 +3292,18 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             elif DEBUG_WR:
                 print("[PH4-FORCE] AST semantic-first enabled: skip regex agg/having surgery")
             s = _add_missing_count_for_group_by(s, question)
-            if DEBUG_WR: print(f"[PH4-FORCE] after add-count fix: {s}")        
+            if DEBUG_WR: print(f"[PH4-FORCE] after add-count fix: {s}")
+
+            # Keep generic winner-row misuse repair active in forced path.
+            # This avoids model-specific aggregate leakage before Agent3 checks.
+            s = _rewrite_winner_row_aggregate_misuse(s, question, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after agg-misuse fix: {s}")
+            s = _fix_winner_row_window_order_priority(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after winner-row window order fix: {s}")
+
+            s = _rewrite_having_alias_to_expr(s)
+            s = _winner_row_final_sanity(s, question)
+            s = _force_restore_groupby_if_aggregate_without_groupby(before_phase4, s)
     # ---------------------------------------------------------------------------
     # Phase 5 — Pattern, REGEXP, and Predicate Normalization
     # ---------------------------------------------------------------------------
