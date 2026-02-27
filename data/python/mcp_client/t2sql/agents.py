@@ -2897,6 +2897,10 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         dynamic_min_conf = float(AGENT_IR_MIN_CONFIDENCE)
         ir_gate_reasons: List[str] = []
         ir_confidence = float(intent_ir.get("confidence", 0.0) or 0.0)
+        qtype = str(decision.get("qtype") or intent_ir.get("qtype") or "").strip().lower()
+
+        if qtype not in {AGENT_ROUTER_QTYPE_LOOKUP, AGENT_ROUTER_QTYPE_AGGREGATE}:
+            ir_gate_reasons.append(f"unsupported_qtype_for_ir:{qtype or 'unknown'}")
 
         if table_count > AGENT_IR_MAX_TABLES:
             ir_gate_reasons.append(
@@ -2912,6 +2916,9 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             if not AGENT_IR_ALLOW_MULTI_TABLE:
                 ir_gate_reasons.append("multi_table_ir_disabled")
 
+        if bool(decision.get("has_dual_fact_rollup", False)):
+            ir_gate_reasons.append("router_hard:dual_fact_rollup")
+
         hard_router_flags = {
             "is_winner_row": "winner_row",
             "has_exclusion": "exclusion",
@@ -2926,6 +2933,26 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 
         # Percentage intent: allow IR only for supported metric patterns.
         q_low = (question or "").lower()
+        # HAVING-like aggregate threshold (e.g., "total ... greater than 50,000")
+        # is still safer on LLM path until deterministic planner supports
+        # robust aggregate-level predicate placement.
+        has_numeric_threshold = bool(
+            re.search(
+                r"\b(?:greater\s+than|more\s+than|over|above|"
+                r"less\s+than|under|below|"
+                r"at\s+least|at\s+most|minimum(?:\s+of)?|maximum(?:\s+of)?)\s+"
+                r"\d[\d,]*(?:\.\d+)?\b",
+                q_low,
+                flags=re.I,
+            )
+        )
+        has_aggregate_keyword = bool(
+            re.search(r"\b(total|sum|avg|average|mean|count|number\s+of)\b", q_low, flags=re.I)
+        )
+        has_metrics = bool(intent_ir.get("metrics") or [])
+        if has_numeric_threshold and has_aggregate_keyword and has_metrics:
+            ir_gate_reasons.append("having_like_threshold_intent_ir_disabled")
+
         if re.search(r"\b(percent|percentage|%\s*of|ratio|rate)\b", q_low):
             ir_metrics = intent_ir.get("metrics") or []
             has_supported_pct_metric = any(
@@ -2935,6 +2962,38 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             )
             if not has_supported_pct_metric:
                 ir_gate_reasons.append("percentage_intent_ir_disabled")
+
+        safe_filter_ops = {
+            "eq",
+            "in",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "between",
+            "year_eq",
+            "like_prefix",
+            "regexp",
+            "is_null_or_empty",
+        }
+        safe_metric_aggs = {"count", "sum", "avg", "min", "max", "pct_non_null"}
+
+        for f in (intent_ir.get("filters") or []):
+            if not isinstance(f, dict):
+                continue
+            op = str(f.get("op") or "").strip().lower()
+            if op and op not in safe_filter_ops:
+                ir_gate_reasons.append(f"unsupported_ir_filter_op:{op}")
+
+        for m in (intent_ir.get("metrics") or []):
+            if not isinstance(m, dict):
+                continue
+            agg = str(m.get("agg") or "").strip().lower()
+            if agg and agg not in safe_metric_aggs:
+                ir_gate_reasons.append(f"unsupported_ir_metric:{agg}")
+
+        if ir_gate_reasons:
+            ir_gate_reasons = list(dict.fromkeys(ir_gate_reasons))
 
         base_plannable = is_ir_plannable(intent_ir, dynamic_min_conf)
         ir_plannable = base_plannable and not ir_gate_reasons

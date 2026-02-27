@@ -5675,6 +5675,23 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
         r"(?is)ROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*(?:PARTITION\s+BY\s+.*?\b)?ORDER\s+BY\s+(?P<ob>[^)]*?)\)"
     )
 
+    # Fallback candidates (used when window ORDER BY misses required fields).
+    date_fallbacks = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:Date|date|Time|time|Timestamp|timestamp))\b",
+        sql or "",
+        flags=re.I,
+    )
+    amount_fallbacks = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:amount|price|quantity|total|sales|revenue))\b",
+        sql or "",
+        flags=re.I,
+    )
+    customer_fallbacks = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*\.(?:customerNumber|customer_id|customerId|customercode|customerCode))\b",
+        sql or "",
+        flags=re.I,
+    )
+
     def _is_date_expr(item: str) -> bool:
         x = (item or "").lower()
         return ("date" in x) or ("time" in x) or ("tanggal" in x)
@@ -5689,20 +5706,37 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
             return item
         return f"{base} {'DESC' if desc else 'ASC'}"
 
+    def _norm_expr(item: str) -> str:
+        x = re.sub(r"(?is)\s+(ASC|DESC)\s*$", "", (item or "").strip())
+        return re.sub(r"[\s`]+", "", x.lower())
+
+    def _pick_fallback(cands: List[str], seen_norm: Set[str]) -> Optional[str]:
+        for c in cands:
+            c0 = (c or "").strip()
+            if not c0:
+                continue
+            if _norm_expr(c0) in seen_norm:
+                continue
+            return c0
+        return None
+
     def _repl(m: re.Match) -> str:
         ob = (m.group("ob") or "").strip()
         if not ob:
             return m.group(0)
 
         items = _split_top_level_commas(ob)
-        if len(items) < 2:
+        if not items:
             return m.group(0)
 
-        first = (items[0] or "").strip()
         has_date_any = any(_is_date_expr(it) for it in items)
         has_amount_any = any(_is_amount_expr(it) for it in items)
-        # Only rewrite the problematic order: amount before date.
-        if not (_is_amount_expr(first) and has_date_any):
+        first = (items[0] or "").strip()
+        # Rewrite when:
+        # 1) amount appears before date, or
+        # 2) date-primary intent but date is missing from window ORDER BY.
+        should_rewrite = bool((_is_amount_expr(first) and has_date_any) or (not has_date_any))
+        if not should_rewrite and not (wants_amount_tiebreak and has_date_any and not has_amount_any):
             return m.group(0)
 
         date_items = []
@@ -5720,11 +5754,43 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
             else:
                 other_items.append(it0)
 
+        seen_norm = {_norm_expr(x) for x in items if (x or "").strip()}
         if not date_items:
-            return m.group(0)
+            fb_date = _pick_fallback(date_fallbacks, seen_norm)
+            if fb_date:
+                date_items.append(_force_dir(fb_date, desc=True))
+                seen_norm.add(_norm_expr(fb_date))
+            else:
+                return m.group(0)
+
+        if wants_amount_tiebreak and not amount_items:
+            fb_amount = _pick_fallback(amount_fallbacks, seen_norm)
+            if fb_amount:
+                amount_items.append(_force_dir(fb_amount, desc=True))
+                seen_norm.add(_norm_expr(fb_amount))
 
         new_items = date_items + amount_items + other_items
-        new_ob = ", ".join(new_items)
+        # Deterministic tertiary tie-break for customer winner-row queries.
+        wants_customer_tiebreak = bool(re.search(r"\bcustomer\s*(?:id|number|code)?\b", q))
+        if wants_customer_tiebreak:
+            fb_customer = _pick_fallback(customer_fallbacks, {_norm_expr(x) for x in new_items})
+            if fb_customer:
+                new_items.append(_force_dir(fb_customer, desc=False))
+
+        dedup_items = []
+        dedup_seen = set()
+        for it in new_items:
+            k = _norm_expr(it)
+            if not k or k in dedup_seen:
+                continue
+            dedup_seen.add(k)
+            dedup_items.append(it)
+        if not dedup_items:
+            return m.group(0)
+
+        if [_norm_expr(x) for x in dedup_items] == [_norm_expr(x) for x in items]:
+            return m.group(0)
+        new_ob = ", ".join(dedup_items)
         full = m.group(0)
         return full.replace(ob, new_ob, 1)
 
@@ -5789,6 +5855,180 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
     sel = ast.find(exp.Select)
     if not sel:
         return sql
+
+    # Special-case rescue:
+    # Winner-row tie-break questions sometimes produce malformed window MAX/MIN SQL
+    # (no ROW_NUMBER filter), returning all rows. Rewrite to canonical rn=1 shape.
+    q_low = (question or "").lower()
+    has_tie_phrase = bool(re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|tie|tied|same)\b", q_low))
+    same_metric_tie = bool(
+        has_tie_phrase
+        and re.search(r"\b(?:same|equal)\s+(?:payment\s+)?(?:amount|price|quantity|value)\b", q_low)
+    )
+    wants_latest_date = bool(
+        re.search(r"\b(?:latest|most\s+recent|newest)\b", q_low)
+        and re.search(r"\b(?:date|time)\b", q_low)
+    )
+    wants_metric_superlative = bool(
+        re.search(r"\b(?:largest|highest|max(?:imum)?|top)\b", q_low)
+        and re.search(r"\b(?:amount|payment|price|quantity|value|total)\b", q_low)
+    )
+    if same_metric_tie and wants_latest_date and wants_metric_superlative and not sel.args.get("group"):
+        def _base_expr(it: exp.Expression) -> exp.Expression:
+            return it.this if isinstance(it, exp.Alias) else it
+
+        def _expr_norm(e: exp.Expression) -> str:
+            try:
+                return re.sub(r"[\s`]+", "", e.sql(dialect="mysql").lower())
+            except Exception:
+                return ""
+
+        window_entries: List[Tuple[exp.Expression, exp.Expression, exp.Window, exp.Expression]] = []
+        for item in sel.expressions:
+            base = _base_expr(item)
+            w = base if isinstance(base, exp.Window) else base.find(exp.Window)
+            if not isinstance(w, exp.Window) or not isinstance(w.this, (exp.Max, exp.Min)):
+                continue
+            window_entries.append((item, base, w, w.this))
+
+        if window_entries:
+            def _window_partition_exprs(win: exp.Window) -> List[exp.Expression]:
+                """
+                sqlglot Window.partition_by can be represented as:
+                - exp.Partition(expressions=[...])
+                - list[Expression]
+                - single Expression
+                Keep extraction tolerant to all forms.
+                """
+                raw = win.args.get("partition_by")
+                if raw is None:
+                    # compatibility: some versions may use different key
+                    raw = win.args.get("partition")
+                if raw is None:
+                    return []
+                if isinstance(raw, list):
+                    return [x for x in raw if isinstance(x, exp.Expression)]
+                if isinstance(raw, exp.Partition):
+                    return [x for x in (raw.expressions or []) if isinstance(x, exp.Expression)]
+                if isinstance(raw, exp.Expression):
+                    exprs = getattr(raw, "expressions", None)
+                    if isinstance(exprs, list) and exprs:
+                        return [x for x in exprs if isinstance(x, exp.Expression)]
+                    return [raw]
+                return []
+
+            partition_expr = None
+            for _item, _base, w, _agg in window_entries:
+                part_exprs = _window_partition_exprs(w)
+                if part_exprs:
+                    partition_expr = part_exprs[0].copy()
+                    break
+
+            # Date expression from MAX/MIN window input (prefer date/time-like column).
+            date_expr = None
+            for _item, _base, _w, agg in window_entries:
+                inner = agg.this
+                inner_sql = (inner.sql(dialect="mysql") if inner is not None else "").lower()
+                if any(k in inner_sql for k in ("date", "time", "timestamp")):
+                    date_expr = inner.copy()
+                    break
+            if date_expr is None and window_entries:
+                date_expr = window_entries[0][3].this.copy()
+
+            # Metric expression from non-window simple columns (amount/price/qty/value).
+            metric_expr = None
+            for item in sel.expressions:
+                base = _base_expr(item)
+                if base.find(exp.Window):
+                    continue
+                col = base if isinstance(base, exp.Column) else (base.this if isinstance(base, exp.Alias) and isinstance(base.this, exp.Column) else None)
+                if not isinstance(col, exp.Column):
+                    continue
+                col_sql = col.sql(dialect="mysql").lower()
+                if any(k in col_sql for k in ("amount", "price", "quantity", "qty", "value", "total")):
+                    metric_expr = col.copy()
+                    break
+
+            if partition_expr is not None and date_expr is not None and metric_expr is not None:
+                def _infer_alias(expr_obj: exp.Expression, fallback: str) -> str:
+                    norm = _expr_norm(expr_obj)
+                    for it in sel.expressions:
+                        b = _base_expr(it)
+                        if _expr_norm(b) == norm:
+                            if isinstance(it, exp.Alias) and it.alias:
+                                return it.alias
+                            if isinstance(b, exp.Column) and b.name:
+                                return b.name
+                    if isinstance(expr_obj, exp.Column) and expr_obj.name:
+                        return expr_obj.name
+                    return fallback
+
+                part_alias = _infer_alias(partition_expr, "group_key")
+                metric_alias = _infer_alias(metric_expr, "value")
+                date_alias = _infer_alias(date_expr, "event_date")
+
+                used_aliases: Set[str] = set()
+                def _uniq_alias(a: str) -> str:
+                    base = re.sub(r"[^A-Za-z0-9_]", "", (a or "").strip()) or "col"
+                    if not re.match(r"[A-Za-z_]", base):
+                        base = f"c_{base}"
+                    cand = base
+                    i = 2
+                    while cand.lower() in used_aliases:
+                        cand = f"{base}_{i}"
+                        i += 1
+                    used_aliases.add(cand.lower())
+                    return cand
+
+                part_alias_u = _uniq_alias(part_alias)
+                metric_alias_u = _uniq_alias(metric_alias)
+                date_alias_u = _uniq_alias(date_alias)
+
+                metric_desc = not bool(re.search(r"\b(?:lowest|smallest|min(?:imum)?)\b", q_low))
+                date_desc = bool(re.search(r"\b(?:latest|most\s+recent|newest)\b", q_low))
+
+                rn = exp.Window(
+                    this=exp.RowNumber(),
+                    partition_by=exp.Partition(expressions=[partition_expr.copy()]),
+                    order=exp.Order(
+                        expressions=[
+                            exp.Ordered(this=metric_expr.copy(), desc=metric_desc),
+                            exp.Ordered(this=date_expr.copy(), desc=date_desc),
+                        ]
+                    ),
+                )
+
+                inner_exprs = [
+                    exp.alias_(partition_expr.copy(), part_alias_u, quoted=False),
+                    exp.alias_(metric_expr.copy(), metric_alias_u, quoted=False),
+                    exp.alias_(date_expr.copy(), date_alias_u, quoted=False),
+                    exp.alias_(rn, "rn", quoted=False),
+                ]
+
+                from_expr = sel.args.get("from") or sel.args.get("from_")
+                if from_expr is None:
+                    return sql
+                inner = exp.Select(expressions=inner_exprs)
+                inner.set("from_", from_expr.copy())
+                joins = sel.args.get("joins")
+                if joins:
+                    inner.set("joins", [j.copy() for j in joins])
+                where_expr = sel.args.get("where")
+                if where_expr is not None:
+                    inner.set("where", where_expr.copy())
+
+                outer = (
+                    exp.Select(
+                        expressions=[
+                            exp.column(part_alias_u, table="t"),
+                            exp.column(metric_alias_u, table="t"),
+                            exp.column(date_alias_u, table="t"),
+                        ]
+                    )
+                    .from_(exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier("t"))))
+                    .where(exp.EQ(this=exp.column("rn", table="t"), expression=exp.Literal.number(1)))
+                )
+                return outer.sql(dialect="mysql")
 
     # Identify exactly one MAX/MIN in SELECT list
     agg_item = None
@@ -7066,11 +7306,16 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
         m_max = re.match(r"(?is)^MAX\s*\(\s*(.+?)\s*\)$", expr)
         if m_max and date_expr_raw is None:
             max_inner = m_max.group(1).strip()
-            parsed_col = _parse_qualified_col(max_inner)
+            # Accept both:
+            #   MAX(o.orderDate)
+            #   MAX(YEAR(o.orderDate))
+            year_wrap = re.match(r"(?is)^YEAR\s*\(\s*(.+?)\s*\)$", max_inner)
+            max_inner_col = year_wrap.group(1).strip() if year_wrap else max_inner
+            parsed_col = _parse_qualified_col(max_inner_col)
             if parsed_col:
                 _, col_name = parsed_col
                 if ("date" in col_name.lower()) or ("time" in col_name.lower()):
-                    date_expr_raw = max_inner
+                    date_expr_raw = max_inner_col
                     continue
 
         m_sum = re.match(r"(?is)^SUM\s*\(\s*(.+?)\s*\)$", expr)
@@ -7087,42 +7332,74 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
     date_alias, date_col_name = date_col
 
     sum_alias_refs = _extract_alias_refs(sum_expr_raw)
+    date_owner_alias: Optional[str] = date_alias
     measure_alias: Optional[str] = None
     if date_alias:
-        if sum_alias_refs and all(a.lower() != date_alias.lower() for a in sum_alias_refs):
+        if not sum_alias_refs:
+            measure_alias = date_alias
+        elif all(a.lower() == date_alias.lower() for a in sum_alias_refs):
+            measure_alias = date_alias
+        elif len(sum_alias_refs) == 1:
+            # Cross-alias pattern:
+            # SUM on bridge/fact alias (e.g., od.quantityOrdered),
+            # DATE on joined temporal alias (e.g., o.orderDate).
+            measure_alias = sum_alias_refs[0]
+        else:
             return sql
-        measure_alias = date_alias
     else:
         if len(sum_alias_refs) == 1:
             measure_alias = sum_alias_refs[0]
+            date_owner_alias = measure_alias
         else:
             return sql
 
     if not measure_alias:
         return sql
+    if not date_owner_alias:
+        date_owner_alias = measure_alias
 
     alias_map = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
-    measure_table = alias_map.get(measure_alias) or alias_map.get(measure_alias.lower())
-    if not measure_table:
-        # allow table name to be used directly as qualifier
-        measure_table = measure_alias
 
-    # Safety: date column must exist on the inferred metric table.
-    # If not, skip rewrite to avoid inventing invalid subqueries like:
-    #   FROM orderdetails ... MAX(YEAR(orderDate))
-    measure_cols: Set[str] = set()
+    def _resolve_table_from_alias(alias_name: Optional[str]) -> Optional[str]:
+        if not alias_name:
+            return None
+        tbl = alias_map.get(alias_name) or alias_map.get(alias_name.lower())
+        return tbl or alias_name
+
+    measure_table = _resolve_table_from_alias(measure_alias)
+    date_owner_table = _resolve_table_from_alias(date_owner_alias)
+    if not measure_table or not date_owner_table:
+        return sql
+
+    # Schema-aware column checks.
     try:
         analyzer = get_schema_analyzer()
-        measure_cols = {c.lower() for c in analyzer.get_table_columns(measure_table)}
     except Exception:
-        measure_cols = set()
-    if not measure_cols and ctx:
+        analyzer = None
+    allowed_cols: Dict[str, Set[str]] = {}
+    if not analyzer and ctx:
         try:
             allowed = _parse_allowed_identifiers(ctx)
-            measure_cols = {c.lower() for c in allowed.get(measure_table, set())}
+            allowed_cols = {
+                str(t).strip().lower(): {str(c).strip().lower() for c in cols}
+                for t, cols in (allowed or {}).items()
+            }
         except Exception:
-            measure_cols = set()
-    if measure_cols and date_col_name.lower() not in measure_cols:
+            allowed_cols = {}
+
+    def _table_cols(table_name: str) -> Set[str]:
+        t = (table_name or "").replace("`", "").split(".")[-1].strip().lower()
+        if not t:
+            return set()
+        if analyzer:
+            try:
+                return {c.lower() for c in analyzer.get_table_columns(t)}
+            except Exception:
+                return set()
+        return set(allowed_cols.get(t, set()))
+
+    date_owner_cols = _table_cols(date_owner_table)
+    if date_owner_cols and date_col_name.lower() not in date_owner_cols:
         return sql
 
     existing_aliases = {k.lower() for k in alias_map.keys() if k and not k.startswith("__")}
@@ -7134,12 +7411,17 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
         flags=re.I,
     )
     key_candidates: List[str] = []
+    measure_date_links: List[Tuple[str, str]] = []
     for m in eq_pat.finditer(from_core):
         a1, c1, a2, c2 = m.group(1), m.group(2), m.group(3), m.group(4)
         if a1.lower() == measure_alias.lower():
             key_candidates.append(c1)
         if a2.lower() == measure_alias.lower():
             key_candidates.append(c2)
+        if a1.lower() == measure_alias.lower() and a2.lower() == date_owner_alias.lower():
+            measure_date_links.append((c1, c2))
+        elif a2.lower() == measure_alias.lower() and a1.lower() == date_owner_alias.lower():
+            measure_date_links.append((c2, c1))
 
     # Fallback: metric alias appears in GROUP BY.
     if not key_candidates:
@@ -7151,16 +7433,49 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
             if g_alias and g_alias.lower() == measure_alias.lower():
                 key_candidates.append(g_col)
 
-    measure_key_col = _pick_best_key(key_candidates, avoid_cols={date_col_name.lower()})
+    measure_date_key_col: Optional[str] = None
+    date_join_col: Optional[str] = None
+    if date_owner_alias.lower() != measure_alias.lower():
+        if not measure_date_links:
+            return sql
+        # Prefer symmetric key names (e.g., orderNumber=orderNumber), then id/code-like.
+        scored = []
+        for mk, dk in measure_date_links:
+            s = 0
+            if mk.lower() == dk.lower():
+                s += 5
+            mk_l = mk.lower()
+            if mk_l.endswith("id") or mk_l.endswith("number") or mk_l.endswith("code"):
+                s += 3
+            elif ("id" in mk_l) or ("number" in mk_l) or ("code" in mk_l):
+                s += 1
+            scored.append((s, mk, dk))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        measure_date_key_col, date_join_col = scored[0][1], scored[0][2]
+
+    avoid_cols = {date_col_name.lower()}
+    if measure_date_key_col:
+        avoid_cols.add(measure_date_key_col.lower())
+    measure_key_col = _pick_best_key(key_candidates, avoid_cols=avoid_cols)
     if not measure_key_col:
         return sql
 
     # If query already has this year filter, do nothing (alias-agnostic).
-    date_ref = f"{measure_alias}.{date_col_name}"
-    year_filter_pat = re.compile(
-        rf"\bYEAR\s*\(\s*`?{re.escape(measure_alias)}`?\s*\.\s*`?{re.escape(date_col_name)}`?\s*\)\s*=\s*[A-Za-z_][A-Za-z0-9_]*\.latest_year",
-        flags=re.I,
+    date_ref = (
+        f"{date_owner_alias}.{date_col_name}"
+        if date_owner_alias
+        else f"{date_col_name}"
     )
+    if date_owner_alias:
+        year_filter_pat = re.compile(
+            rf"\bYEAR\s*\(\s*`?{re.escape(date_owner_alias)}`?\s*\.\s*`?{re.escape(date_col_name)}`?\s*\)\s*=\s*[A-Za-z_][A-Za-z0-9_]*\.latest_year",
+            flags=re.I,
+        )
+    else:
+        year_filter_pat = re.compile(
+            rf"\bYEAR\s*\(\s*`?{re.escape(date_col_name)}`?\s*\)\s*=\s*[A-Za-z_][A-Za-z0-9_]*\.latest_year",
+            flags=re.I,
+        )
     if year_filter_pat.search(sql):
         return sql
 
@@ -7173,20 +7488,39 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
         while cand.lower() in existing_aliases:
             cand = f"{base}_{i}"
             i += 1
+        existing_aliases.add(cand.lower())
         return cand
 
     year_alias = _pick_subquery_alias(f"{measure_alias}_latest_years")
 
-    ly_join = (
-        "JOIN (\n"
-        "  SELECT\n"
-        f"    {measure_key_col},\n"
-        f"    MAX(YEAR({date_col_name})) AS latest_year\n"
-        f"  FROM {measure_table}\n"
-        f"  GROUP BY {measure_key_col}\n"
-        f") AS {year_alias}\n"
-        f"  ON {year_alias}.{measure_key_col} = {measure_alias}.{measure_key_col}"
-    )
+    if date_owner_alias.lower() == measure_alias.lower():
+        ly_join = (
+            "JOIN (\n"
+            "  SELECT\n"
+            f"    {measure_key_col},\n"
+            f"    MAX(YEAR({date_col_name})) AS latest_year\n"
+            f"  FROM {measure_table}\n"
+            f"  GROUP BY {measure_key_col}\n"
+            f") AS {year_alias}\n"
+            f"  ON {year_alias}.{measure_key_col} = {measure_alias}.{measure_key_col}"
+        )
+    else:
+        if not measure_date_key_col or not date_join_col:
+            return sql
+        ly_measure_alias = _pick_subquery_alias(f"{measure_alias}_ly")
+        ly_date_alias = _pick_subquery_alias(f"{date_owner_alias}_ly")
+        ly_join = (
+            "JOIN (\n"
+            "  SELECT\n"
+            f"    {ly_measure_alias}.{measure_key_col},\n"
+            f"    MAX(YEAR({ly_date_alias}.{date_col_name})) AS latest_year\n"
+            f"  FROM {measure_table} AS {ly_measure_alias}\n"
+            f"  JOIN {date_owner_table} AS {ly_date_alias}\n"
+            f"    ON {ly_date_alias}.{date_join_col} = {ly_measure_alias}.{measure_date_key_col}\n"
+            f"  GROUP BY {ly_measure_alias}.{measure_key_col}\n"
+            f") AS {year_alias}\n"
+            f"  ON {year_alias}.{measure_key_col} = {measure_alias}.{measure_key_col}"
+        )
 
     from_with_ly = f"{from_core}\n{ly_join}"
     year_cond = f"YEAR({date_ref}) = {year_alias}.latest_year"
@@ -7208,12 +7542,22 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
                     and "year(" in low_c0
                     and date_col_name.lower() in low_c0
                 )
+                date_alias_forms = {
+                    a.lower()
+                    for a in [measure_alias, date_owner_alias]
+                    if a
+                }
                 self_max_forms = {
-                    f"year({measure_alias.lower()}.{date_col_name.lower()})=year(max({measure_alias.lower()}.{date_col_name.lower()}))",
-                    f"year(max({measure_alias.lower()}.{date_col_name.lower()}))=year({measure_alias.lower()}.{date_col_name.lower()})",
                     f"year({date_col_name.lower()})=year(max({date_col_name.lower()}))",
                     f"year(max({date_col_name.lower()}))=year({date_col_name.lower()})",
                 }
+                for da in date_alias_forms:
+                    self_max_forms.add(
+                        f"year({da}.{date_col_name.lower()})=year(max({da}.{date_col_name.lower()}))"
+                    )
+                    self_max_forms.add(
+                        f"year(max({da}.{date_col_name.lower()}))=year({da}.{date_col_name.lower()})"
+                    )
                 is_self_max_year_pred = norm_c0 in self_max_forms
                 if is_correlated_max_date or is_self_max_year_pred:
                     continue

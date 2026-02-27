@@ -1116,32 +1116,10 @@ def _infer_bridge_tables(
     # Convert selected_tables to lowercase for comparison
     selected_lower = {t.lower() for t in selected_tables}
 
-    # NEW: Also consider tables with numeric columns in reranked results
-    # Uses metadata-driven approach: check datatype field + column patterns as fallback
-    tables_with_numeric_cols = set()
-    for item in reranked[:MAX_CTX_DOCS]:
-        md = item.get("meta") or {}
-        tbl = _meta_table(md)
-        col = _meta_column(md)
-        if tbl and col:
-            # Primary: Check datatype field for numeric types
-            datatype = (md.get("datatype") or md.get("data_type") or "").strip().lower()
-            col_lower = col.lower()
-            is_numeric = False
-
-            if datatype:
-                base_type = datatype.split('(')[0].strip()
-                is_numeric = base_type in _NUMERIC_SQL_TYPES
-            else:
-                # Fallback: Check column name pattern
-                is_numeric = any(kw in col_lower for kw in RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS)
-
-            # Exclude ID columns from numeric consideration
-            if is_numeric and not any(kw in col_lower for kw in RETRIEVAL_NUMERIC_EXCLUDE_COLUMN_KEYWORDS):
-                tables_with_numeric_cols.add(tbl.lower())
-
-    # Expand selection to include tables with numeric columns
-    expanded_tables = set(selected_lower) | tables_with_numeric_cols
+    # Keep bridge inference anchored to currently selected tables.
+    # This prevents low-score "numeric" tails in reranked docs from
+    # inflating table fanout and blocking IR on otherwise simple joins.
+    expanded_tables = set(selected_lower)
 
     # For each pair of expanded tables, check if we need a bridge
     table_list = list(expanded_tables)
@@ -1223,9 +1201,14 @@ def _find_fk_path(
 # ======================================================================
 # =========================== RETRIEVE NODE ============================
 # ======================================================================
-def _has_join_intent(question: str) -> bool:
+def _has_join_intent(question: str, primary_table: str = "") -> bool:
     q = (question or "").lower()
-    if any(s in q for s in RETRIEVAL_JOIN_SIGNALS):
+    weak_join_signals = {"for each", "per", "setiap"}
+    matched_join_signals = [
+        s for s in RETRIEVAL_JOIN_SIGNALS
+        if s and s in q
+    ]
+    if any(str(s).strip().lower() not in weak_join_signals for s in matched_join_signals):
         return True
 
     # Generic multi-entity signal: 2+ explicit table mentions.
@@ -1235,6 +1218,18 @@ def _has_join_intent(question: str) -> bool:
     ]
     if len(mentioned_tables) >= RETRIEVAL_MULTI_ENTITY_MIN_TABLES:
         return True
+
+    # Relation-like cue from inflected entity terms (e.g., "ordered", "shipping")
+    # should be treated as join intent when it points to a non-primary table.
+    primary_l = str(primary_table or "").strip().lower()
+    for tbl in get_all_tables():
+        tbl_l = str(tbl or "").strip().lower()
+        if not tbl_l or (primary_l and tbl_l == primary_l):
+            continue
+        singular = str(get_singular_form(tbl_l) or tbl_l).strip().lower().replace("_", "")
+        if singular.isalpha() and len(singular) >= 4:
+            if re.search(rf"\b{re.escape(singular)}(?:ed|ing)\b", q):
+                return True
 
     return False
 
@@ -1303,9 +1298,12 @@ def _is_table_mentioned(question: str, table: str) -> bool:
 
 
 def _should_lock_single_table_ctx(question: str, qtype: str) -> bool:
-    if qtype not in {AGENT_ROUTER_QTYPE_LOOKUP, AGENT_ROUTER_QTYPE_AGGREGATE, AGENT_ROUTER_QTYPE_RANK}: return False
-    if _has_join_intent(question): return False
-    return _detect_primary_entity_table(question) is not None
+    primary = _detect_primary_entity_table(question)
+    if qtype not in {AGENT_ROUTER_QTYPE_LOOKUP, AGENT_ROUTER_QTYPE_AGGREGATE}:
+        return False
+    if _has_join_intent(question, primary_table=primary):
+        return False
+    return primary is not None
 
 
 def _single_table_lock_is_high_confidence(
@@ -1644,6 +1642,24 @@ def retrieve_node(state: RAGState) -> RAGState:
     token_for_score = _tokenize_bm25_query(sparse_query_clean)
     table_scores = score_tables_from_reranked(reranked, token_for_score)
 
+    # Aggregate override:
+    # if join-intent heuristic is noisy but one primary table dominates strongly,
+    # force single-table lock to keep IR scope stable for simple grouped aggregates.
+    force_single_lock = False
+    if not lock_single and qtype == AGENT_ROUTER_QTYPE_AGGREGATE:
+        primary_aggregate = _detect_primary_entity_table(q)
+        has_join_intent = _has_join_intent(q, primary_table=primary_aggregate or "")
+        if primary_aggregate and not has_join_intent:
+            lock_high_conf = _single_table_lock_is_high_confidence(
+                primary_table=primary_aggregate,
+                table_scores=table_scores,
+                reranked=reranked,
+            )
+            if lock_high_conf:
+                lock_single = True
+                primary_for_lock = primary_aggregate
+                force_single_lock = True
+
     if qtype == AGENT_ROUTER_QTYPE_LOOKUP and prefer_name_table:
         only_preferred = {t: cols for t, cols in allowed.items() if t.lower() == prefer_name_table}
         filtered_allowed = only_preferred if only_preferred else dict(allowed)
@@ -1685,6 +1701,11 @@ def retrieve_node(state: RAGState) -> RAGState:
                         "[LOCK] Low-confidence single-table lock -> fallback "
                         f"to top-{fallback_k} tables: {sorted(fallback_tables)}"
                     )
+            if RETRIEVE_DEBUG and force_single_lock:
+                print(
+                    "[LOCK] Aggregate override -> forced single-table lock "
+                    f"to primary table: {primary_for_lock}"
+                )
         else:
             # -----------------------------
             # ENHANCED: Column-driven table selection
@@ -1696,6 +1717,7 @@ def retrieve_node(state: RAGState) -> RAGState:
 
             if table_scores:
                 sorted_tbls = sorted(table_scores.items(), key=lambda x: x[1], reverse=True)
+                table_score_map = {str(t).strip().lower(): float(s) for t, s in sorted_tbls if str(t).strip()}
 
                 # DEBUG: Print table scores
                 if RETRIEVE_DEBUG:
@@ -1705,20 +1727,81 @@ def retrieve_node(state: RAGState) -> RAGState:
 
                 # Base: Top 3 tables by score (increased from 2)
                 max_top_tables = MAX_TOP_TABLES
+                score_floor = float(RETRIEVAL_TOP_TABLE_MIN_SCORE)
+                # Aggregate-specific floor tuning:
+                # - count-only intents stay conservative (avoid noisy extra tables),
+                # - metric intents (quantity/amount/sum/avg/...) allow detail tables.
+                if qtype == AGENT_ROUTER_QTYPE_AGGREGATE:
+                    is_count_like = bool(
+                        re.search(r"\b(how\s+many|number\s+of|count|total\s+number)\b", q_l, flags=re.I)
+                    )
+                    has_metric_intent = bool(
+                        re.search(
+                            r"\b(sum|avg|average|mean|min|max|minimum|maximum|"
+                            r"quantity|amount|price|cost|value|revenue|sales|"
+                            r"multiply|multiplied|times)\b",
+                            q_l,
+                            flags=re.I,
+                        )
+                    )
+                    if is_count_like and not has_metric_intent:
+                        score_floor = max(score_floor, 1.0)
+                    elif has_metric_intent:
+                        score_floor = max(score_floor, 0.5)
                 top_tables = {
                     name
                     for name, score in sorted_tbls[:max_top_tables]
-                    if score > RETRIEVAL_TOP_TABLE_MIN_SCORE
+                    if score > score_floor
                 }
 
                 # Addition: Include tables with any column in reranked results
                 # This captures tables that may not be mentioned but have needed columns
                 tables_with_reranked_cols = set()
+                tables_with_temporal_cols = set()
+                table_first_rank: Dict[str, int] = {}
                 for item in reranked[:MAX_CTX_DOCS]:
                     md = item.get("meta") or {}
                     tbl = _meta_table(md)
                     if tbl:
-                        tables_with_reranked_cols.add(tbl.lower())
+                        tbl_l = tbl.lower()
+                        tables_with_reranked_cols.add(tbl_l)
+                        table_first_rank.setdefault(tbl_l, len(table_first_rank))
+
+                        # Temporal-capable table detection from metadata and column name.
+                        col = (_meta_column(md) or "").strip().lower()
+                        datatype = str(md.get("datatype") or md.get("data_type") or "").strip().lower()
+                        base_type = datatype.split("(")[0].strip() if datatype else ""
+                        is_temporal = base_type in {"date", "datetime", "timestamp", "time", "year"}
+                        if not is_temporal and col:
+                            is_temporal = any(k in col for k in ("date", "time", "timestamp", "year", "month", "day"))
+                        if is_temporal:
+                            tables_with_temporal_cols.add(tbl_l)
+
+                # Temporal-intent safeguard:
+                # if question asks a year/date condition but selected tables contain no
+                # temporal-capable table, force-add the best temporal table candidate.
+                has_temporal_intent = bool(
+                    re.search(
+                        r"\b((?:19|20)\d{2}|year|month|day|date|time|latest|earliest|newest|oldest|recent)\b",
+                        q_l,
+                        flags=re.I,
+                    )
+                )
+                if (
+                    qtype == AGENT_ROUTER_QTYPE_AGGREGATE
+                    and has_temporal_intent
+                    and tables_with_temporal_cols
+                    and not top_tables.intersection(tables_with_temporal_cols)
+                ):
+                    best_temporal = sorted(
+                        tables_with_temporal_cols,
+                        key=lambda t: (
+                            -float(table_score_map.get(t, 0.0)),
+                            int(table_first_rank.get(t, 10**9)),
+                            t,
+                        ),
+                    )[0]
+                    top_tables.add(best_temporal)
 
                 # Merge: top scoring + tables with reranked columns
                 # Use all available table keys (from original allowed, not filtered)
@@ -1729,10 +1812,24 @@ def retrieve_node(state: RAGState) -> RAGState:
                     print(f"\n[COLUMN-DRIVEN SELECTION]")
                     print(f"  tables_with_reranked_cols: {tables_with_reranked_cols}")
                     print(f"  all_table_keys_lower: {list(all_table_keys_lower.keys())}")
-                    to_add = [t for t in tables_with_reranked_cols if t in all_table_keys_lower]
+                    to_add = [
+                        t
+                        for t in tables_with_reranked_cols
+                        if t in all_table_keys_lower and table_score_map.get(t, 0.0) > score_floor
+                    ]
                     print(f"  adding to top_tables: {to_add}")
+                    if (
+                        qtype == AGENT_ROUTER_QTYPE_AGGREGATE
+                        and has_temporal_intent
+                        and tables_with_temporal_cols
+                    ):
+                        print(f"  temporal_tables: {sorted(tables_with_temporal_cols)}")
 
-                top_tables.update(t for t in tables_with_reranked_cols if t in all_table_keys_lower)
+                top_tables.update(
+                    t
+                    for t in tables_with_reranked_cols
+                    if t in all_table_keys_lower and table_score_map.get(t, 0.0) > score_floor
+                )
 
                 # Addition: Bridge table inference
                 # If we have multiple tables, check if we need bridge tables

@@ -56,6 +56,12 @@ _NUMBER_WORDS = {
     "eleven": 11,
     "twelve": 12,
 }
+_FUNCTION_WORD_TOKENS = {
+    "the", "a", "an",
+    "that", "this", "those", "these",
+    "their", "its", "his", "her", "our", "your",
+    "of", "to", "for", "with", "without", "and", "or",
+}
 
 
 def _fallback_singular(table: str) -> str:
@@ -566,11 +572,40 @@ def _detect_metrics(
     metrics: List[IRMetric] = []
 
     wants_count = bool(re.search(r"\b(how\s+many|number\s+of|count|total\s+number)\b", q))
-    wants_sum = bool(re.search(r"\b(sum|total\s+amount|total\s+paid|jumlah)\b", q))
+    wants_sum = bool(
+        re.search(
+            r"\b(sum|total\s+(?:amount|paid|payment|payments|quantity|value|sales?|revenue|cost|price|stock)|jumlah)\b",
+            q,
+        )
+    )
     wants_avg = bool(re.search(r"\b(avg|average|mean|rata)\b", q))
     wants_max = bool(re.search(r"\b(max(?:imum)?|highest|largest)\b", q))
     wants_min = bool(re.search(r"\b(min(?:imum)?|lowest|smallest)\b", q))
     wants_percentage = bool(re.search(r"\b(percent|percentage|ratio|rate)\b|%\s*of", q))
+
+    temporal_direction_only = bool(
+        re.search(
+            r"\b(?:ordered|sorted?)\b[^.]{0,80}\b(?:latest|newest|earliest|oldest)\b",
+            q,
+            flags=re.I,
+        )
+        or re.search(r"\b(?:latest|newest)\b[^.]{0,24}\b(?:earliest|oldest)\b", q, flags=re.I)
+        or re.search(r"\b(?:earliest|oldest)\b[^.]{0,24}\b(?:latest|newest)\b", q, flags=re.I)
+    )
+    has_temporal_metric_phrase = bool(
+        re.search(
+            r"\b(?:earliest|oldest|latest|newest|most\s+recent)\s+"
+            r"(?:[a-z][a-z0-9_]*\s+){0,3}"
+            r"(?:date|time|timestamp|day|month|year)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    if has_temporal_metric_phrase and not temporal_direction_only:
+        if re.search(r"\b(?:earliest|oldest)\b", q, flags=re.I):
+            wants_min = True
+        if re.search(r"\b(?:latest|newest|most\s+recent)\b", q, flags=re.I):
+            wants_max = True
 
     # Rank-style queries are handled by legacy pipeline; keep IR conservative.
     if (qtype or "").lower() == "rank":
@@ -578,6 +613,36 @@ def _detect_metrics(
 
     mentioned_tables = [t for t, _ in table_mentions]
     first_mentioned = mentioned_tables[0] if mentioned_tables else subject
+
+    def _resolve_table_from_phrase(phrase: str) -> Optional[str]:
+        p = (phrase or "").lower().strip()
+        if not p:
+            return None
+        phrase_tokens = set(re.findall(r"[a-z0-9]+", p))
+        if not phrase_tokens:
+            return None
+
+        best_table: Optional[str] = None
+        best_score = 0
+        candidates = list(dict.fromkeys(mentioned_tables + list(allowed.keys())))
+        for t in candidates:
+            variants = _table_variants(t) or {t}
+            table_best = 0
+            for v in variants:
+                vv = str(v or "").strip().lower()
+                if not vv:
+                    continue
+                pat = re.escape(vv).replace(r"\ ", r"\s+")
+                if re.search(rf"\b{pat}\b", p, flags=re.I):
+                    return t
+                v_tokens = set(re.findall(r"[a-z0-9]+", vv))
+                if not v_tokens:
+                    continue
+                table_best = max(table_best, len(v_tokens.intersection(phrase_tokens)))
+            if table_best > best_score:
+                best_score = table_best
+                best_table = t
+        return best_table if best_score > 0 else None
 
     # Candidate numeric/date mentions from question.
     mentioned_numeric_cols = [
@@ -640,6 +705,15 @@ def _detect_metrics(
     # COUNT
     if wants_count:
         count_table = first_mentioned or subject
+        m_count_of = re.search(
+            r"\b(?:number|count|total\s+number)\s+of\s+([a-z][a-z0-9_ ]{1,40})\b",
+            q,
+            flags=re.I,
+        )
+        if m_count_of:
+            resolved = _resolve_table_from_phrase(m_count_of.group(1))
+            if resolved:
+                count_table = resolved
         id_col = _best_id_column(count_table, allowed) or "*"
         alias = _safe_alias(f"{_safe_get_singular_form(count_table)}_count", "row_count")
         add_metric(IRMetric(agg="count", table=count_table, column=id_col, alias=alias))
@@ -935,7 +1009,12 @@ def _detect_filters(
 
     # Country/city style location filter:
     # "customers in Japan", "customers from USA".
-    location_match = re.search(r"\b(?:in|from)\s+([A-Za-z][A-Za-z\s-]{1,40})\b", q_raw, flags=re.I)
+    location_match = re.search(
+        r"\b(?:in|from)\s+([A-Za-z][A-Za-z\s-]{1,40}?)"
+        r"(?=\s+(?:ordered|sorted|grouped|having|where|with|without|show|return|list)\b|[.,;:!?]|\s*$)",
+        q_raw,
+        flags=re.I,
+    )
     if location_match:
         loc = location_match.group(1).strip().strip(".,;:!?")
         loc_low = loc.lower()
@@ -944,7 +1023,26 @@ def _detect_filters(
             "latest", "earliest", "highest", "lowest",
             "year", "month", "week", "day",
         }
-        if loc_low and loc_low not in stop_loc and not re.search(r"\d", loc_low):
+        is_deictic_ref = bool(re.search(r"^(?:that|this|those|these|their|its)\b", loc_low))
+        loc_tokens = [t for t in re.findall(r"[a-z0-9]+", loc_low) if t]
+        content_tokens = [t for t in loc_tokens if t not in _FUNCTION_WORD_TOKENS]
+
+        # Schema-aware check: phrases composed only of schema terms
+        # (e.g., "that territory", "this status") are references, not literal values.
+        schema_terms: Set[str] = set()
+        for c in allowed.get(subject, set()):
+            c_words = [w for w in re.findall(r"[a-z0-9]+", _camel_to_words(c)) if w]
+            schema_terms.update(c_words)
+            for syn in _safe_get_column_synonyms(subject, c):
+                schema_terms.update(w for w in re.findall(r"[a-z0-9]+", str(syn).lower()) if w)
+        is_schema_reference_phrase = bool(content_tokens) and all(t in schema_terms for t in content_tokens)
+        if (
+            loc_low
+            and loc_low not in stop_loc
+            and not re.search(r"\d", loc_low)
+            and not is_deictic_ref
+            and not is_schema_reference_phrase
+        ):
             # Prefer country column, fallback city.
             target_col = None
             for c in allowed.get(subject, set()):
@@ -1117,7 +1215,12 @@ def _detect_filters(
     return filters
 
 
-def _detect_existence(question: str, subject: str, table_mentions: List[Tuple[str, int]]) -> List[IRExistence]:
+def _detect_existence(
+    question: str,
+    subject: str,
+    table_mentions: List[Tuple[str, int]],
+    metrics: Optional[List[IRMetric]] = None,
+) -> List[IRExistence]:
     q = (question or "").lower()
     ex: List[IRExistence] = []
     seen = set()
@@ -1142,6 +1245,24 @@ def _detect_existence(question: str, subject: str, table_mentions: List[Tuple[st
         elif has_some and (table, "at_least_one") not in seen:
             ex.append(IRExistence(table=table, mode="at_least_one"))
             seen.add((table, "at_least_one"))
+
+    # Fallback for implicit existence phrasing where the related table is not
+    # explicitly named in the question (e.g., "products that have been ordered
+    # at least once").
+    has_implicit_positive_existence = bool(
+        re.search(r"\bat\s+least\s+once\b", q, flags=re.I)
+        or re.search(r"\b(?:have|has|had)\s+been\s+[a-z]+(?:ed|en)\b", q, flags=re.I)
+    )
+    if has_implicit_positive_existence:
+        metric_tables = []
+        for m in (metrics or []):
+            t = str(getattr(m, "table", "") or "").strip().lower()
+            if t and t != subject:
+                metric_tables.append(t)
+        for t in dict.fromkeys(metric_tables):
+            if (t, "at_least_one") not in seen:
+                ex.append(IRExistence(table=t, mode="at_least_one"))
+                seen.add((t, "at_least_one"))
 
     return ex
 
@@ -1295,6 +1416,28 @@ def _compute_confidence(
     if any(str(m.agg or "").lower() == "pct_non_null" for m in metrics):
         score += 0.1
 
+    # Structured aggregate shape bonus:
+    # grouped aggregate with explicit dimension+metric is usually planner-safe
+    # even without literal filters (e.g., count per territory).
+    metric_aggs = {str(m.agg or "").lower() for m in metrics}
+    if (
+        (qtype or "").lower() == "aggregate"
+        and dimensions
+        and metrics
+        and metric_aggs.issubset({"count", "sum", "avg", "min", "max", "pct_non_null"})
+    ):
+        score += 0.1
+
+    # Reward simple grouped earliest/latest style aggregates:
+    # e.g., "for each status, count orders and earliest order date".
+    if (
+        (qtype or "").lower() == "aggregate"
+        and dimensions
+        and metrics
+        and bool(metric_aggs.intersection({"min", "max"}))
+    ):
+        score += 0.1
+
     planner_compatible = True
     if (qtype or "").lower() == "rank":
         planner_compatible = False
@@ -1384,6 +1527,7 @@ def build_intent_ir(
         question=question,
         subject=subject,
         table_mentions=table_mentions,
+        metrics=metrics,
     )
     ordering, limit = _detect_ordering_and_limit(
         question=question,

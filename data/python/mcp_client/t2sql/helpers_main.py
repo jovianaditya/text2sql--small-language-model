@@ -2503,6 +2503,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 and not exclusion_tables
                 and not existence_tables
             )
+            qtype_l = str(qtype or "").strip().lower()
+            exclusion_aggregate_prefers_inner_non_target = bool(
+                has_exclusion
+                and (qtype_l == "aggregate")
+                and not wants_include_zero
+            )
 
             # More explicit guidance - tell LLM exactly which table should be first
             hint_msg = f"TABLE ORDER (CRITICAL): Start your query with FROM {primary_table}"
@@ -2518,6 +2524,10 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     elif t in existence_tables:
                         join_steps.append(f"INNER JOIN {t}")
                     elif force_inner_all:
+                        join_steps.append(f"INNER JOIN {t}")
+                    elif exclusion_aggregate_prefers_inner_non_target:
+                        # In exclusion+aggregate questions, non-target supporting tables
+                        # are usually part of required positive slice (e.g., metric fact tables).
                         join_steps.append(f"INNER JOIN {t}")
                     else:
                         join_steps.append(f"LEFT JOIN {t}")
@@ -2559,6 +2569,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     "Use **INNER JOIN** to exclude entities without matching data. "
                     "This takes precedence over 'for each' phrasing."
                 )
+            elif exclusion_aggregate_prefers_inner_non_target:
+                constraints.append(
+                    "JOIN TYPE (CRITICAL): Exclusion + aggregate intent detected. "
+                    "Use INNER JOIN for positive-slice supporting tables (non-exclusion targets), "
+                    "and keep exclusion logic with NOT EXISTS / anti-join pattern."
+                )
             else:
                 # Default: use LEFT JOIN to preserve all entities from primary table
                 constraints.append(
@@ -2598,6 +2614,14 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "   - For year filtering: Use `YEAR(date_column) = YYYY` (NOT SUBSTR).\n"
         "   - For month filtering: Use `MONTH(date_column) = M`.\n"
         "   - For range filtering: Use `date_column BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`."
+    )
+    constraints.append(
+        "JOIN ALIAS RULE (CRITICAL): In each JOIN ... ON clause, only reference aliases that are already introduced "
+        "(current table alias + previously joined aliases). NEVER reference a future alias."
+    )
+    constraints.append(
+        "DATE COLUMN VALIDATION RULE (CRITICAL): Apply YEAR()/DATE filters only on columns that exist in the schema cards. "
+        "Do NOT invent date columns on non-date tables."
     )
 
     # [F.1] LATEST-YEAR + SAME-YEAR SUM RULE
