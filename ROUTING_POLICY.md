@@ -277,7 +277,7 @@ Notes:
 | M5  |      3B       | Group + HAVING aggregate filter          |
 | M6  |      3B       | Simple scalar subquery single-table      |
 | M7  |      IR       | Supported percentage metric pattern      |
-| M8  |      3B       | Group + HAVING count                     |
+| M8  |      IR       | Group + HAVING count                     |
 | M9  |      IR       | Single-table group + order-by aggregate  |
 | M10 |      3B       | Window rank single-table                 |
 | M11 |      3B       | Second-highest single-table winner-row   |
@@ -290,7 +290,7 @@ Notes:
 
 | ID  | Expected lane |                  Note                             |
 |-----|---------------|---------------------------------------------------|
-| H1  |      3B       | Multi-table aggregate, non-hard pattern           |
+| H1  |      IR       | Multi-table aggregate, non-hard pattern           |
 | H2  |      IR       | Simple 2-table existence + grouped count          |
 | H3  |      IR       | Simple 2-table join + grouped sum                 |
 | H4  |      3B       | Simple multi-join + grouped sum                   |

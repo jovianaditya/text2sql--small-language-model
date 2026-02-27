@@ -30,6 +30,8 @@ from .config import (
     AGENT_IR_ALLOW_MULTI_TABLE,
     AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE,
     AGENT_IR_MAX_TABLES,
+    AGENT_IR_ALLOW_SIMPLE_HAVING,
+    AGENT_IR_SIMPLE_HAVING_MAX_FILTERS,
     AGENT_AST_GUARDS_ENABLED,
     AGENT_AST_GUARDS_DEBUG,
     AGENT_REGEN_PRECHECK_ENABLED,
@@ -2860,6 +2862,129 @@ def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM
         return False
 
 
+_IR_HAVING_THRESHOLD_OPS = {"eq", "gt", "gte", "lt", "lte", "between"}
+_IR_HAVING_ALLOWED_AGGS = {"count", "sum", "avg", "min", "max"}
+
+
+def _is_numeric_literal(v: Any) -> bool:
+    if isinstance(v, (int, float)):
+        return True
+    s = str(v or "").strip().replace(",", "")
+    if not s:
+        return False
+    try:
+        float(s)
+        return True
+    except Exception:
+        return False
+
+
+def _is_ir_metric_threshold_filter(f: Dict[str, Any], m: Dict[str, Any]) -> bool:
+    if not isinstance(f, dict) or not isinstance(m, dict):
+        return False
+
+    op = str(f.get("op") or "").strip().lower()
+    if op not in _IR_HAVING_THRESHOLD_OPS:
+        return False
+
+    agg = str(m.get("agg") or "").strip().lower()
+    if agg not in _IR_HAVING_ALLOWED_AGGS:
+        return False
+
+    if op == "between":
+        if not (_is_numeric_literal(f.get("value")) and _is_numeric_literal(f.get("value2"))):
+            return False
+    elif not _is_numeric_literal(f.get("value")):
+        return False
+
+    f_table = str(f.get("table") or "").strip().lower()
+    m_table = str(m.get("table") or "").strip().lower()
+    if not f_table or not m_table or f_table != m_table:
+        return False
+
+    f_col = str(f.get("column") or "").strip().lower()
+    m_col = str(m.get("column") or "").strip().lower()
+    if not f_col or not m_col:
+        return False
+    if m_col == "*":
+        return f_col == "*"
+    return f_col == m_col
+
+
+def _collect_ir_metric_threshold_pairs(intent_ir: Dict[str, Any]) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    metrics = [m for m in (intent_ir.get("metrics") or []) if isinstance(m, dict)]
+    filters = [f for f in (intent_ir.get("filters") or []) if isinstance(f, dict)]
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    seen: Set[Tuple[str, str, str, str, str, str, str, str, str]] = set()
+    for f in filters:
+        for m in metrics:
+            if not _is_ir_metric_threshold_filter(f, m):
+                continue
+            key = (
+                str(f.get("table") or "").strip().lower(),
+                str(f.get("column") or "").strip().lower(),
+                str(f.get("op") or "").strip().lower(),
+                str(f.get("value")),
+                str(f.get("value2")),
+                str(m.get("agg") or "").strip().lower(),
+                str(m.get("table") or "").strip().lower(),
+                str(m.get("column") or "").strip().lower(),
+                str(bool(m.get("distinct"))),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((f, m))
+    return pairs
+
+
+def _is_simple_having_shape(
+    intent_ir: Dict[str, Any],
+    decision: Dict[str, Any],
+    threshold_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+) -> Tuple[bool, str]:
+    metrics = [m for m in (intent_ir.get("metrics") or []) if isinstance(m, dict)]
+    dims = [d for d in (intent_ir.get("dimensions") or []) if isinstance(d, dict)]
+    existence = [e for e in (intent_ir.get("existence") or []) if isinstance(e, dict)]
+
+    if str(intent_ir.get("qtype") or "").strip().lower() != AGENT_ROUTER_QTYPE_AGGREGATE:
+        return False, "simple_having_requires_aggregate_qtype"
+    if len(metrics) != 1:
+        return False, "simple_having_requires_single_metric"
+    if not dims:
+        return False, "simple_having_requires_group_dimension"
+    if existence:
+        return False, "simple_having_with_existence_not_supported"
+    if len(threshold_pairs) == 0:
+        return False, "simple_having_no_metric_threshold"
+
+    max_filters = max(1, int(AGENT_IR_SIMPLE_HAVING_MAX_FILTERS))
+    if len(threshold_pairs) > max_filters:
+        return False, f"simple_having_too_many_threshold_filters:{len(threshold_pairs)}>{max_filters}"
+
+    m0 = metrics[0]
+    m0_sig = (
+        str(m0.get("agg") or "").strip().lower(),
+        str(m0.get("table") or "").strip().lower(),
+        str(m0.get("column") or "").strip().lower(),
+        bool(m0.get("distinct")),
+    )
+    for _, m in threshold_pairs:
+        sig = (
+            str(m.get("agg") or "").strip().lower(),
+            str(m.get("table") or "").strip().lower(),
+            str(m.get("column") or "").strip().lower(),
+            bool(m.get("distinct")),
+        )
+        if sig != m0_sig:
+            return False, "simple_having_multiple_metric_targets"
+
+    if bool(decision.get("has_dual_fact_rollup", False)):
+        return False, "simple_having_dual_fact_rollup"
+
+    return True, ""
+
+
 def draft_sql_agent(state: RAGState) -> RAGState:
     # --- Guard: Skip if question was rejected by router ---
     decision = state.get("router_decision", {})
@@ -2881,6 +3006,8 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # IR-FIRST deterministic planning (schema-agnostic)
     # ------------------------------------------------------------------
     if AGENT_IR_ENABLED:
+        # Start timing for IR lane from draft construction to final SQL output.
+        ir_processing_start = _time.perf_counter()
         intent_ir = build_intent_ir(
             question=question,
             ctx=ctx,
@@ -2933,9 +3060,8 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 
         # Percentage intent: allow IR only for supported metric patterns.
         q_low = (question or "").lower()
-        # HAVING-like aggregate threshold (e.g., "total ... greater than 50,000")
-        # is still safer on LLM path until deterministic planner supports
-        # robust aggregate-level predicate placement.
+        # HAVING-like aggregate threshold (e.g., "average ... above 50,000").
+        # Allow only a conservative, metric-aligned subset.
         has_numeric_threshold = bool(
             re.search(
                 r"\b(?:greater\s+than|more\s+than|over|above|"
@@ -2950,8 +3076,16 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             re.search(r"\b(total|sum|avg|average|mean|count|number\s+of)\b", q_low, flags=re.I)
         )
         has_metrics = bool(intent_ir.get("metrics") or [])
+        threshold_pairs = _collect_ir_metric_threshold_pairs(intent_ir)
         if has_numeric_threshold and has_aggregate_keyword and has_metrics:
-            ir_gate_reasons.append("having_like_threshold_intent_ir_disabled")
+            if not threshold_pairs:
+                ir_gate_reasons.append("having_like_threshold_unresolved")
+            elif not AGENT_IR_ALLOW_SIMPLE_HAVING:
+                ir_gate_reasons.append("having_like_threshold_intent_ir_disabled")
+            else:
+                having_ok, having_reason = _is_simple_having_shape(intent_ir, decision, threshold_pairs)
+                if not having_ok:
+                    ir_gate_reasons.append(having_reason or "unsupported_simple_having_shape")
 
         if re.search(r"\b(percent|percentage|%\s*of|ratio|rate)\b", q_low):
             ir_metrics = intent_ir.get("metrics") or []
@@ -3024,7 +3158,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
                     normalized_sql += ";"
                 return {
                     **state,
-                    "processing_start_time": _time.perf_counter(),
+                    "processing_start_time": ir_processing_start,
                     "draft_inference_time": 0.0,
                     "draft_source": "ir_planner",
                     "ir_used": True,
@@ -3070,8 +3204,14 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     obj = try_llm_json(llm, prompt, max_attempts=AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS, oom_retry_wait=OOM_WAIT_TIME)
     _inference_time = _time.perf_counter() - _t0
 
+    # Refresh warmup heartbeat after real inference.
+    # Without this, long generations (e.g., 7B > keep_alive seconds) make
+    # the next request look "cold" even when the model has just been used.
+    _last_model_warmup[target_model] = _time.time()
+
     # Store inference time in state for debugging (not logged to reduce noise)
     state["draft_inference_time"] = _inference_time
+    print(f"[DEBUG] Draft inference time: {_inference_time:.2f}s")
 
     if obj is None:
         return {**state, "draft_source": "llm", "draft_sql": "SELECT 'Error: LLM failed';"}
@@ -3206,6 +3346,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             processing_time = _time.perf_counter() - processing_start
             state["processing_time"] = processing_time
             print(f"[DEBUG] Processing time: {processing_time:.2f}s")
+            draft_inf = float(state.get("draft_inference_time", 0.0) or 0.0)
+            postproc_time = max(0.0, processing_time - draft_inf)
+            print(
+                f"[DEBUG] Time breakdown: draft={draft_inf:.2f}s, "
+                f"postprocess={postproc_time:.2f}s"
+            )
 
         return {
             **state,
@@ -3520,7 +3666,41 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             select_clause_match = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, sql_up, re.DOTALL)
             if select_clause_match:
                 select_clause = select_clause_match.group(1)
-                if part_col not in select_clause.upper():
+                select_clause_up = select_clause.upper()
+
+                def _partition_key_present_semantically(part_col_up: str, outer_select_up: str, full_sql: str) -> bool:
+                    # Direct presence in outer SELECT.
+                    if part_col_up in outer_select_up:
+                        return True
+
+                    outer_select_tokens = set(
+                        re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, outer_select_up.lower())
+                    )
+
+                    # Support alias projection from inner query:
+                    # PARTITION BY customerNumber, inner SELECT customerNumber AS customer_id,
+                    # outer SELECT customer_id ...
+                    alias_matches = re.findall(
+                        rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\.)?{re.escape(part_col_up)}\b\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
+                        full_sql,
+                        flags=re.IGNORECASE,
+                    )
+                    for alias_name in alias_matches:
+                        if alias_name.lower() in outer_select_tokens:
+                            return True
+
+                    # Semantic equivalence: customerNumber ~ customer_id / customerCode.
+                    part_low = part_col_up.lower()
+                    part_stem = re.sub(r"(?:_)?(?:number|id|code|key)$", "", part_low).strip("_")
+                    if part_stem:
+                        for tok in outer_select_tokens:
+                            tok_stem = re.sub(r"(?:_)?(?:number|id|code|key)$", "", tok).strip("_")
+                            if tok_stem == part_stem and re.search(r"(?:number|id|code|key)$", tok):
+                                return True
+
+                    return False
+
+                if not _partition_key_present_semantically(part_col, select_clause_up, final_sql):
                     _dbg_print_two("[Agent3] HARD ERROR - Missing Partition Key", f"'{part_col}' missing from SELECT")
                     extra_instruction = (
                         f"STRICT REQUIREMENT: The query partitions by '{part_col}', but it is MISSING from the final SELECT list. "
@@ -4122,6 +4302,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         processing_time = _time.perf_counter() - processing_start
         state["processing_time"] = processing_time
         print(f"[DEBUG] Processing time: {processing_time:.2f}s")
+        draft_inf = float(state.get("draft_inference_time", 0.0) or 0.0)
+        postproc_time = max(0.0, processing_time - draft_inf)
+        print(
+            f"[DEBUG] Time breakdown: draft={draft_inf:.2f}s, "
+            f"postprocess={postproc_time:.2f}s"
+        )
 
     return {
         **state,

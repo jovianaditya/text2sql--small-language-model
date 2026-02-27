@@ -12,7 +12,15 @@ from langchain_ollama import ChatOllama
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .config import LARGE_MODEL, OLLAMA_URL, OLLAMA_KEEP_ALIVE
+from .config import (
+    LARGE_MODEL,
+    OLLAMA_URL,
+    OLLAMA_KEEP_ALIVE,
+    LLM_JSON_NUM_PREDICT,
+    LLM_REPAIR_NUM_PREDICT,
+    LLM_JSON_TIMEOUT,
+    LLM_REPAIR_TIMEOUT,
+)
 
 def build_llm_json(model: str | None = None) -> ChatOllama:
     """
@@ -31,9 +39,9 @@ def build_llm_json(model: str | None = None) -> ChatOllama:
         format="json",
         keep_alive=OLLAMA_KEEP_ALIVE,
         num_ctx=4096,
-        num_predict=512,
+        num_predict=LLM_JSON_NUM_PREDICT,
         stop=None,
-        timeout=120,  # 2 menit untuk model switching
+        timeout=LLM_JSON_TIMEOUT,
     )
 
 def build_llm_repair(model: str | None = None) -> ChatOllama:
@@ -48,7 +56,7 @@ def build_llm_repair(model: str | None = None) -> ChatOllama:
         temperature=0.0,
         keep_alive=OLLAMA_KEEP_ALIVE,
         num_ctx=4096,
-        num_predict=512,
+        num_predict=LLM_REPAIR_NUM_PREDICT,
         stop=None,
-        timeout=120,  # 2 menit untuk model switching
+        timeout=LLM_REPAIR_TIMEOUT,
     )

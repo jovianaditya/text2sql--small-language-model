@@ -606,7 +606,7 @@ async def run_single_case(
         "match_reason": "",        # Alasan match/mismatch
         "pred_row_count": 0,
         "gt_row_count": 0,
-        "latency_s": 0,            # Latency dalam detik
+        "latency_s": 0,            # Primary: warm prompt->final SQL latency (seconds)
         "error": None,
     }
     
@@ -633,13 +633,24 @@ async def run_single_case(
         gate_reasons = state.get("ir_gate_reasons", []) or []
         result["ir_gate_reasons"] = "|".join(str(x) for x in gate_reasons if str(x).strip())
         
-        # Use inference time from agent (excludes cold start/model loading)
-        # Fallback to total time if not available
-        inference_time = state.get("draft_inference_time", 0)
-        if inference_time > 0:
+        # Primary latency metric for thesis:
+        # Warm prompt->final SQL (model receives prompt -> final SQL ready).
+        # Fallback to warm inference-only if processing_time is unavailable.
+        processing_time = float(state.get("processing_time", 0.0) or 0.0)
+        inference_time = float(state.get("draft_inference_time", 0.0) or 0.0)
+        latency_source = "unavailable"
+        if processing_time > 0:
+            result["latency_s"] = round(processing_time, 2)
+            latency_source = "warm_prompt_to_final_sql"
+        elif inference_time > 0:
             result["latency_s"] = round(inference_time, 2)
+            latency_source = "warm_inference_only"
         else:
-            result["latency_s"] = round((time.perf_counter() - t0), 2)
+            # IR path (no LLM call) or missing telemetry -> keep 0.0
+            result["latency_s"] = 0.0
+            if result["ir_used"]:
+                latency_source = "no_llm_ir_path"
+        print(f"[LATENCY] source={latency_source}, latency_s={result['latency_s']:.2f}")
 
         # Get initial model used (extract short name: 3b/7b)
         target_model = state.get("target_model", "")

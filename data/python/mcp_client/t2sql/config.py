@@ -73,6 +73,12 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "180s")  # keep_alive 90s, mo
 ROUTING_MODEL     = os.getenv("ROUTING_MODEL", "qwen2.5:1.5b-instruct").strip()
 SMALL_MODEL       = os.getenv("SMALL_MODEL", "qwen2.5:3b-instruct").strip()
 LARGE_MODEL       = os.getenv("LARGE_MODEL", "qwen2.5:7b-instruct").strip()
+# LLM generation budget knobs (speed vs robustness tuning)
+# Keep defaults identical to previous behavior.
+LLM_JSON_NUM_PREDICT = int(os.getenv("LLM_JSON_NUM_PREDICT", "512"))
+LLM_REPAIR_NUM_PREDICT = int(os.getenv("LLM_REPAIR_NUM_PREDICT", "512"))
+LLM_JSON_TIMEOUT = int(os.getenv("LLM_JSON_TIMEOUT", "120"))
+LLM_REPAIR_TIMEOUT = int(os.getenv("LLM_REPAIR_TIMEOUT", "120"))
 # ======================================================================
 # ============================ RETRIEVAL ===============================
 # ======================================================================
@@ -153,6 +159,8 @@ AGENT_IR_DEBUG = bool(int(os.getenv("AGENT_IR_DEBUG", "1")))
 AGENT_IR_ALLOW_MULTI_TABLE = bool(int(os.getenv("AGENT_IR_ALLOW_MULTI_TABLE", "1")))
 AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE = float(os.getenv("AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE", "0.90"))
 AGENT_IR_MAX_TABLES = int(os.getenv("AGENT_IR_MAX_TABLES", "2"))
+AGENT_IR_ALLOW_SIMPLE_HAVING = bool(int(os.getenv("AGENT_IR_ALLOW_SIMPLE_HAVING", "1")))
+AGENT_IR_SIMPLE_HAVING_MAX_FILTERS = int(os.getenv("AGENT_IR_SIMPLE_HAVING_MAX_FILTERS", "1"))
 
 # AST guardrails (sqlglot-based safety checks in refine phase)
 AGENT_AST_GUARDS_ENABLED = bool(int(os.getenv("AGENT_AST_GUARDS_ENABLED", "1")))

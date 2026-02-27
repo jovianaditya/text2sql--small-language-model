@@ -813,8 +813,25 @@ def _detect_dimensions(
 
     # Entity id/name intent.
     subj_pat = _table_entity_pattern(subject) if subject else ""
+    subject_id_requested = False
     if subject and subj_pat:
-        if re.search(rf"\b(?:{subj_pat})\s+(?:id|ids|number|numbers|code|codes)\b", q):
+        id_like_token = r"(?:id|ids|code|codes|number(?!\s+of\b)|numbers(?!\s+of\b))"
+        direct_subject_id = bool(
+            re.search(
+                rf"\b(?:{subj_pat})\b(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+"
+                rf"{id_like_token}\b",
+                q,
+            )
+        )
+        reverse_subject_id = bool(
+            re.search(
+                rf"\b{id_like_token}\b(?:[\s,;:()'\"-]+\w+){{0,6}}"
+                rf"[\s,;:()'\"-]+(?:of|for)\s+(?:{subj_pat})\b",
+                q,
+            )
+        )
+        if direct_subject_id or reverse_subject_id:
+            subject_id_requested = True
             id_col = _best_id_column(subject, allowed)
             if id_col:
                 add_dim(IRDimension(table=subject, column=id_col))
@@ -848,6 +865,10 @@ def _detect_dimensions(
                 if col.lower() in nonnull_cols:
                     continue
                 if _is_numeric_column(col):
+                    continue
+                cl = col.lower()
+                is_id_like = cl.endswith("id") or cl.endswith("number") or cl.endswith("code")
+                if is_id_like and not subject_id_requested:
                     continue
                 if _is_date_column(col) and not date_day_group_requested:
                     continue
@@ -947,7 +968,8 @@ def _detect_filters(
 
     if not numeric_col and metrics:
         m0 = metrics[0]
-        if m0.column != "*" and _is_numeric_column(m0.column):
+        m0_agg = str(m0.agg or "").strip().lower()
+        if m0.column != "*" and (_is_numeric_column(m0.column) or m0_agg == "count"):
             numeric_col = (m0.table, m0.column)
     if not numeric_col:
         c0 = _find_best_numeric_column(subject, allowed)
@@ -1004,6 +1026,20 @@ def _detect_filters(
                 break
         if not date_col:
             date_col = _find_best_date_column(subject, allowed)
+        if not date_col:
+            # Fallback: use metric table date when subject table has no date column
+            # (e.g., subject customers, metric from payments, filter year 2004).
+            metric_tables: List[str] = []
+            for m in metrics or []:
+                t = str(getattr(m, "table", "") or "").strip().lower()
+                if t and t not in metric_tables:
+                    metric_tables.append(t)
+            for mt in metric_tables:
+                mt_date_col = _find_best_date_column(mt, allowed)
+                if mt_date_col:
+                    date_table = mt
+                    date_col = mt_date_col
+                    break
         if date_col:
             add_filter(IRFilter(table=date_table, column=date_col, op="year_eq", value=int(years[0])))
 

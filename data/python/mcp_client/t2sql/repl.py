@@ -23,6 +23,35 @@ from .mcp_execution import query_db
 from .helpers_core import _preexecute_sql_safety_pass
 from .utils import _now, _log_total, _print_banner, display_table_from_json
 
+def _print_latency_debug(state: dict):
+    """
+    Unified latency debug for CLI/REPL runs.
+    Primary metric:
+    - processing_time -> warm prompt->final SQL
+      (model receives prompt -> final SQL ready)
+    """
+    processing_time = float(state.get("processing_time", 0.0) or 0.0)
+    draft_inference_time = float(state.get("draft_inference_time", 0.0) or 0.0)
+
+    latency_source = "unavailable"
+    latency_s = 0.0
+    if processing_time > 0:
+        latency_source = "warm_prompt_to_final_sql"
+        latency_s = processing_time
+    elif draft_inference_time > 0:
+        latency_source = "warm_inference_only"
+        latency_s = draft_inference_time
+    elif bool(state.get("ir_used", False)):
+        latency_source = "no_llm_ir_path"
+
+    print(f"[LATENCY] source={latency_source}, latency_s={latency_s:.3f}")
+    if processing_time > 0:
+        postproc_time = max(0.0, processing_time - draft_inference_time)
+        print(
+            f"[LATENCY] breakdown: draft={draft_inference_time:.3f}s, "
+            f"postprocess={postproc_time:.3f}s"
+        )
+
 async def _exec_via_mcp(
     mcp: Client,
     sql_block: str,
@@ -78,11 +107,7 @@ async def repl(paths):
         )
 
         _log_total("End-to-end total time (first run)", t0_total)
-
-        # Log processing time (Model ready → Final SQL) for thesis benchmark
-        processing_time = state.get("processing_time")
-        if processing_time:
-            print(f"[BENCHMARK] Processing latency (Model ready → Final SQL): {processing_time:.3f}s")
+        _print_latency_debug(state)
 
         print("\nAsk me more questions! (type 'exit' to quit')")
 
@@ -106,8 +131,4 @@ async def repl(paths):
             )
 
             _log_total("End-to-end total time (this question)", t0_total)
-
-            # Log processing time (Model ready → Final SQL) for thesis benchmark
-            processing_time = out.get("processing_time")
-            if processing_time:
-                print(f"[BENCHMARK] Processing latency (Model ready → Final SQL): {processing_time:.3f}s")
+            _print_latency_debug(out)

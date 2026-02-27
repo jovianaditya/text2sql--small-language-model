@@ -239,6 +239,85 @@ def _render_filter_sql(f: Dict[str, Any], alias: str) -> Optional[str]:
     return None
 
 
+_METRIC_THRESHOLD_OPS = {"eq", "gt", "gte", "lt", "lte", "between"}
+_METRIC_THRESHOLD_AGGS = {"count", "sum", "avg", "min", "max"}
+
+
+def _is_numeric_literal(v: Any) -> bool:
+    if isinstance(v, (int, float)):
+        return True
+    s = str(v or "").strip().replace(",", "")
+    if not s:
+        return False
+    try:
+        float(s)
+        return True
+    except Exception:
+        return False
+
+
+def _filter_targets_metric_threshold(f: Dict[str, Any], metric: Dict[str, Any]) -> bool:
+    if not isinstance(f, dict) or not isinstance(metric, dict):
+        return False
+
+    op = str(f.get("op") or "").strip().lower()
+    if op not in _METRIC_THRESHOLD_OPS:
+        return False
+
+    agg = str(metric.get("agg") or "").strip().lower()
+    if agg not in _METRIC_THRESHOLD_AGGS:
+        return False
+
+    if op == "between":
+        if not (_is_numeric_literal(f.get("value")) and _is_numeric_literal(f.get("value2"))):
+            return False
+    elif not _is_numeric_literal(f.get("value")):
+        return False
+
+    f_table = str(f.get("table") or "").strip().lower()
+    m_table = str(metric.get("table") or "").strip().lower()
+    if not f_table or not m_table or f_table != m_table:
+        return False
+
+    f_col = str(f.get("column") or "").strip().lower()
+    m_col = str(metric.get("column") or "").strip().lower()
+    if not f_col or not m_col:
+        return False
+    if m_col == "*":
+        return f_col == "*"
+    return f_col == m_col
+
+
+def _render_metric_having_sql(f: Dict[str, Any], metric: Dict[str, Any], source_alias: str) -> Optional[str]:
+    if not _filter_targets_metric_threshold(f, metric):
+        return None
+
+    agg = str(metric.get("agg") or "").strip().lower()
+    col = str(metric.get("column") or "*").strip()
+    distinct = bool(metric.get("distinct"))
+    col_sql = "*" if col == "*" else f"{source_alias}.{_quote_ident(col)}"
+    agg_sql = _agg_expr(agg, col_sql, distinct=distinct)
+    if not agg_sql:
+        return None
+
+    op = str(f.get("op") or "").strip().lower()
+    v = f.get("value")
+    v2 = f.get("value2")
+    if op == "eq":
+        return f"{agg_sql} = {_quote_literal(v)}"
+    if op == "gt":
+        return f"{agg_sql} > {_quote_literal(v)}"
+    if op == "gte":
+        return f"{agg_sql} >= {_quote_literal(v)}"
+    if op == "lt":
+        return f"{agg_sql} < {_quote_literal(v)}"
+    if op == "lte":
+        return f"{agg_sql} <= {_quote_literal(v)}"
+    if op == "between":
+        return f"{agg_sql} BETWEEN {_quote_literal(v)} AND {_quote_literal(v2)}"
+    return None
+
+
 def _agg_expr(agg: str, col_sql: str, distinct: bool = False) -> str:
     a = (agg or "").lower()
     if a == "count":
@@ -298,10 +377,16 @@ def _build_path_subquery(
     subject_key_sql = f"{subject_alias}.{_quote_ident(subject_id_col)}"
 
     where_parts: List[str] = []
+    having_parts: List[str] = []
     for f in filters:
         if str(f.get("table") or "").lower() not in alias_by_table:
             continue
         fa = alias_by_table[str(f.get("table")).lower()]
+        if metric and str(f.get("table") or "").strip().lower() == src:
+            having_pred = _render_metric_having_sql(f, metric, fa)
+            if having_pred:
+                having_parts.append(having_pred)
+                continue
         pred = _render_filter_sql(f, fa)
         if pred:
             where_parts.append(pred)
@@ -319,6 +404,7 @@ def _build_path_subquery(
         if not agg_sql:
             return None, {"error": "unsupported_aggregate"}
 
+        having_parts = list(dict.fromkeys(having_parts))
         query = (
             "SELECT\n"
             f"  {subject_key_sql} AS __subject_key,\n"
@@ -327,8 +413,9 @@ def _build_path_subquery(
             + ("\n".join(joins) + "\n" if joins else "")
             + (f"{where_sql}\n" if where_sql else "")
             + f"GROUP BY {subject_key_sql}"
+            + (f"\nHAVING {' AND '.join(having_parts)}" if having_parts else "")
         )
-        return query, {"path": path}
+        return query, {"path": path, "has_metric_having": bool(having_parts)}
 
     # Existence/filter subquery.
     query = (
@@ -440,6 +527,13 @@ def _validate_generated_sql(sql: str, intent_ir: Dict[str, Any]) -> Tuple[bool, 
         str(e.get("mode") or "").lower() == "at_least_one"
         for e in (intent_ir.get("existence", []) or [])
     )
+    metric_specs = [m for m in (intent_ir.get("metrics", []) or []) if isinstance(m, dict)]
+    filter_specs = [f for f in (intent_ir.get("filters", []) or []) if isinstance(f, dict)]
+    has_metric_threshold = any(
+        _filter_targets_metric_threshold(f, m)
+        for f in filter_specs
+        for m in metric_specs
+    )
     metric_tables = {
         str(m.get("table") or "").lower()
         for m in (intent_ir.get("metrics", []) or [])
@@ -449,7 +543,7 @@ def _validate_generated_sql(sql: str, intent_ir: Dict[str, Any]) -> Tuple[bool, 
     child_metric_tables = {t for t in metric_tables if t and t != subject}
 
     # include_zero semantics should preserve outer subject rows.
-    if include_zero and child_metric_tables and not has_exists_requirement:
+    if include_zero and child_metric_tables and not has_exists_requirement and not has_metric_threshold:
         if not re.search(r"\bleft\s+join\b", low, flags=re.I):
             errors.append("include_zero_without_left_join")
 
@@ -517,6 +611,7 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
     base_alias = "s"
     select_items: List[str] = []
     where_items: List[str] = []
+    having_items: List[str] = []
     group_items: List[str] = []
     join_items: List[str] = []
 
@@ -575,6 +670,23 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
                 meta["errors"].append(f"unsupported_metric:{m}")
                 return None, meta
             select_items.append(f"{expr} AS {_quote_ident(alias)}")
+
+        # Promote aggregate-threshold predicates to HAVING.
+        # Example: AVG(amount) > 50000 should not remain as row-level WHERE amount > 50000.
+        where_drop: Set[str] = set()
+        for m in metrics:
+            for f in filters_by_table.get(subject, []):
+                having_pred = _render_metric_having_sql(f, m, base_alias)
+                if not having_pred:
+                    continue
+                having_items.append(having_pred)
+                row_pred = _render_filter_sql(f, base_alias)
+                if row_pred:
+                    where_drop.add(row_pred)
+        if where_drop:
+            where_items = [w for w in where_items if w not in where_drop]
+        if having_items:
+            having_items = list(dict.fromkeys(having_items))
         query_from = f"FROM {_quote_ident(subject)} AS {base_alias}"
 
     else:
@@ -584,6 +696,98 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
             id_col = _id_like_column(subject, allowed)
             if id_col:
                 select_items.append(f"{base_alias}.{_quote_ident(id_col)}")
+
+        # Flat grouped-join mode for simple aggregate-threshold intents.
+        # This keeps SQL shape closer to canonical LEFT JOIN + GROUP BY + HAVING.
+        child_metric_tables = sorted(
+            {
+                str(m.get("table") or "").strip().lower()
+                for m in metrics
+                if str(m.get("table") or "").strip() and str(m.get("table") or "").strip().lower() != subject
+            }
+        )
+        non_subject_filter_tables = {
+            str(t or "").strip().lower()
+            for t in filters_by_table.keys()
+            if str(t or "").strip().lower() and str(t or "").strip().lower() != subject
+        }
+        if (
+            len(metrics) == 1
+            and len(child_metric_tables) == 1
+            and not existence
+            and not ordering
+            and not isinstance(limit, int)
+            and non_subject_filter_tables.issubset(set(child_metric_tables))
+        ):
+            m0 = metrics[0]
+            mt = child_metric_tables[0]
+            if str(m0.get("table") or "").strip().lower() == mt:
+                metric_alias = "m0"
+                join_cond = _join_cond_between(mt, metric_alias, subject, base_alias, fk_map, allowed)
+                if join_cond:
+                    on_filters: List[str] = []
+                    local_having: List[str] = []
+                    for f in filters_by_table.get(mt, []):
+                        hp = _render_metric_having_sql(f, m0, metric_alias)
+                        if hp:
+                            local_having.append(hp)
+                            continue
+                        rp = _render_filter_sql(f, metric_alias)
+                        if rp:
+                            on_filters.append(rp)
+
+                    local_having = list(dict.fromkeys(local_having))
+                    on_filters = list(dict.fromkeys(on_filters))
+
+                    if local_having:
+                        agg = str(m0.get("agg") or "").lower()
+                        col = str(m0.get("column") or "*").strip()
+                        distinct = bool(m0.get("distinct"))
+                        alias = str(m0.get("alias") or "metric_value").strip()
+                        col_sql = "*" if col == "*" else f"{metric_alias}.{_quote_ident(col)}"
+                        metric_expr = _agg_expr(agg, col_sql, distinct=distinct)
+                        if metric_expr:
+                            if on_filters:
+                                join_cond = join_cond + " AND " + " AND ".join(on_filters)
+                            join_items.append(
+                                f"LEFT JOIN {_quote_ident(mt)} AS {metric_alias}\n"
+                                f"  ON {join_cond}"
+                            )
+                            select_items.append(f"{metric_expr} AS {_quote_ident(alias)}")
+                            group_by_items = list(group_items) or [f"{base_alias}.{_quote_ident(subject_id_col)}"]
+
+                            sql = (
+                                "SELECT\n"
+                                "  " + ",\n  ".join(select_items) + "\n"
+                                f"{query_from}\n"
+                                + "\n".join(join_items)
+                                + "\n"
+                            )
+                            if where_items:
+                                sql += "WHERE " + " AND ".join(where_items) + "\n"
+                            sql += "GROUP BY " + ", ".join(group_by_items) + "\n"
+                            sql += "HAVING " + " AND ".join(local_having) + "\n"
+
+                            sql = _format_with_sqlglot(sql.strip())
+                            if not sql.endswith(";"):
+                                sql += ";"
+
+                            ok, val_errs = _validate_generated_sql(sql, intent_ir)
+                            if ok:
+                                meta["join_plan"] = {
+                                    "subject": subject,
+                                    "subject_id": subject_id_col,
+                                    "metric_tables": [mt],
+                                    "existence_tables": [],
+                                    "single_table_agg_mode": False,
+                                    "flat_metric_having_mode": True,
+                                    "include_zero": include_zero,
+                                    "limit": limit,
+                                }
+                                return sql, meta
+                            meta["warnings"].append(
+                                f"flat_metric_having_mode_rejected:{'|'.join(val_errs)}"
+                            )
 
         # Existence constraints first.
         ex_index = 1
@@ -661,11 +865,9 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
 
             m_alias = f"m_{metric_index}"
             metric_index += 1
-            join_type = "LEFT JOIN"
-            if not include_zero:
-                # include_zero=False still prefers LEFT JOIN unless explicit existence requires inner.
-                # Keeping LEFT JOIN avoids accidental row loss from optional metrics.
-                join_type = "LEFT JOIN"
+            has_metric_having = bool((m_meta or {}).get("has_metric_having", False))
+            # Aggregate-threshold metric should filter subject rows, so always prefer INNER JOIN.
+            join_type = "JOIN" if has_metric_having else "LEFT JOIN"
             join_items.append(
                 f"{join_type} (\n{m_sql}\n) AS {m_alias}\n"
                 f"  ON {m_alias}.__subject_key = {base_alias}.{_quote_ident(subject_id_col)}"
@@ -673,7 +875,7 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
 
             alias = str(m.get("alias") or "metric_value").strip()
             agg = str(m.get("agg") or "").lower()
-            if include_zero and agg in {"count", "sum"}:
+            if include_zero and agg in {"count", "sum"} and not has_metric_having:
                 select_items.append(f"COALESCE({m_alias}.{_quote_ident(alias)}, 0) AS {_quote_ident(alias)}")
             else:
                 select_items.append(f"{m_alias}.{_quote_ident(alias)} AS {_quote_ident(alias)}")
@@ -746,6 +948,8 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
         sql += "WHERE " + " AND ".join(where_items) + "\n"
     if metrics and group_items and single_table_agg_mode:
         sql += "GROUP BY " + ", ".join(group_items) + "\n"
+        if having_items:
+            sql += "HAVING " + " AND ".join(having_items) + "\n"
     if order_items:
         sql += "ORDER BY " + ", ".join(order_items) + "\n"
     if isinstance(limit, int) and limit > 0:

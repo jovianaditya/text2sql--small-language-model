@@ -3464,6 +3464,60 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
         if not grp or not grp.expressions:
             return sql
 
+        def _normalize_table_name(name: str) -> str:
+            t = (name or "").strip("`").lower()
+            if not t:
+                return ""
+            if t.endswith("ies") and len(t) > 3:
+                return t[:-3] + "y"
+            if t.endswith("s") and len(t) > 1:
+                return t[:-1]
+            return t
+
+        def _column_entity_stem(col_name: str) -> str:
+            c = (col_name or "").strip("`").lower()
+            if not c:
+                return ""
+            c = re.sub(r"(?:_)?(?:number|id|code|key)$", "", c).strip("_")
+            return c
+
+        def _looks_like_entity_identifier(col_name: str, table_name: str) -> bool:
+            c = (col_name or "").strip("`").lower()
+            if not c or not re.search(r"(?:number|id|code|key)$", c):
+                return False
+            col_stem = _column_entity_stem(c)
+            if not col_stem:
+                return False
+            table_norm = _normalize_table_name(table_name)
+            return bool(table_norm) and col_stem == table_norm
+
+        alias_to_table: Dict[str, str] = {}
+        table_names: Set[str] = set()
+        for src in ast.find_all(exp.Table):
+            table_name = str(src.name or "").strip("`").lower()
+            alias_name = str(src.alias_or_name or table_name).strip("`").lower()
+            if not table_name:
+                continue
+            table_names.add(table_name)
+            if alias_name:
+                alias_to_table[alias_name] = table_name
+            alias_to_table[table_name] = table_name
+
+        # Keep descriptive columns from the same table when GROUP BY already uses
+        # that table's own entity key (e.g., offices.officeCode -> offices.city).
+        entity_key_sources: Set[str] = set()
+        for gexpr in grp.expressions:
+            if not isinstance(gexpr, exp.Column):
+                continue
+            g_table = str(gexpr.table or "").strip("`").lower()
+            g_name = str(gexpr.name or "").strip("`").lower()
+            resolved_table = alias_to_table.get(g_table, g_table)
+            if _looks_like_entity_identifier(g_name, resolved_table):
+                if g_table:
+                    entity_key_sources.add(g_table)
+                if resolved_table:
+                    entity_key_sources.add(resolved_table)
+
         # Get GROUP BY columns
         group_sql = grp.sql(dialect="mysql")
         group_set = {g.strip().lower() for g in re.findall(r'(\w+(?:\.\w+)?)', group_sql, re.IGNORECASE)}
@@ -3494,7 +3548,23 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
                 alias_sql = alias.sql(dialect="mysql").strip().lower()
                 alias_in_groupby = alias_sql in group_set
 
-            if base_sql not in group_set and not alias_in_groupby:
+            preserve_via_entity_key = False
+            if isinstance(base, exp.Column):
+                base_table = str(base.table or "").strip("`").lower()
+                resolved_base_table = alias_to_table.get(base_table, base_table)
+                if base_table and (
+                    base_table in entity_key_sources or resolved_base_table in entity_key_sources
+                ):
+                    preserve_via_entity_key = True
+                elif (
+                    not base_table
+                    and len(table_names) == 1
+                    and entity_key_sources
+                ):
+                    # Conservative support for unqualified columns in single-table queries.
+                    preserve_via_entity_key = True
+
+            if base_sql not in group_set and not alias_in_groupby and not preserve_via_entity_key:
                 expressions_to_remove.append(item)
 
         if expressions_to_remove:
@@ -5079,6 +5149,49 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
 
     s0 = sql.strip()
 
+    def _has_top_level_group_by(text: str) -> bool:
+        up = text.upper()
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and up[i:i + 8] == "GROUP BY":
+                left_ok = (i == 0 or not text[i - 1].isalnum())
+                right_ok = (i + 8 >= len(text) or not text[i + 8].isalnum())
+                if left_ok and right_ok:
+                    return True
+            i += 1
+        return False
+
+    # This guardrail is only for GROUP BY winner-row misuse patterns.
+    # If GROUP BY exists only inside subqueries, skip and let other rewrites handle it.
+    if not _has_top_level_group_by(s0):
+        return sql
+
     # CRITICAL: Detect truly malformed queries (not false positives from subqueries)
     # Pattern: ROW_NUMBER appears BEFORE GROUP BY (malformed window)
     if re.search(r"\bROW_NUMBER\s*\([^)]*\)\s+[^;]*\bGROUP\s+BY\b", s0, flags=re.I):
@@ -5948,6 +6061,17 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
                 if any(k in col_sql for k in ("amount", "price", "quantity", "qty", "value", "total")):
                     metric_expr = col.copy()
                     break
+
+            # Fallback: derive metric directly from window MAX/MIN inputs.
+            if metric_expr is None:
+                for _item, _base, _w, agg in window_entries:
+                    inner = agg.this
+                    inner_sql = (inner.sql(dialect="mysql") if inner is not None else "").lower()
+                    if any(k in inner_sql for k in ("amount", "price", "quantity", "qty", "value", "total", "score", "revenue", "sales")):
+                        metric_expr = inner.copy()
+                        break
+            if metric_expr is None and window_entries:
+                metric_expr = window_entries[0][3].this.copy()
 
             if partition_expr is not None and date_expr is not None and metric_expr is not None:
                 def _infer_alias(expr_obj: exp.Expression, fallback: str) -> str:
@@ -9453,6 +9577,122 @@ def _drop_unrequested_exists_filters(sql: str, question: str, ctx: str = "") -> 
     rest = (rest_after_where or "").strip()
     fixed = f"{head}{where_part} {rest}".strip() if rest else f"{head}{where_part}".strip()
     if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _drop_unrequested_temporal_filters(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Remove hallucinated temporal WHERE predicates when question has no temporal intent.
+
+    Scope is intentionally conservative:
+    - only runs for winner-row/ranking shaped SQL (ROW_NUMBER / RANK),
+    - skips questions that explicitly mention temporal constraints.
+    """
+    if not sql:
+        return sql
+
+    q = (question or "").lower().strip()
+    if not q:
+        return sql
+
+    low_sql = sql.lower()
+    if "row_number(" not in low_sql and "rank(" not in low_sql and "dense_rank(" not in low_sql:
+        return sql
+
+    # Keep temporal predicates when question clearly asks for temporal scope/filter.
+    temporal_terms = (
+        "latest", "most recent", "newest", "earliest", "oldest", "recent",
+        "year", "month", "day", "date", "time", "today", "yesterday",
+        "current", "tahun", "bulan", "hari", "tanggal", "waktu",
+    )
+    has_temporal_intent = any(t in q for t in temporal_terms) or bool(
+        re.search(r"\b(?:19|20)\d{2}\b", q) or
+        re.search(r"\b\d{4}-\d{2}-\d{2}\b", q)
+    )
+    if has_temporal_intent:
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    def _flatten_and(expr_node):
+        if isinstance(expr_node, exp.And):
+            return _flatten_and(expr_node.this) + _flatten_and(expr_node.expression)
+        return [expr_node]
+
+    def _combine_and(exprs):
+        if not exprs:
+            return None
+        cur = exprs[0]
+        for nxt in exprs[1:]:
+            cur = exp.And(this=cur, expression=nxt)
+        return cur
+
+    def _is_temporal_predicate(expr_node) -> bool:
+        if expr_node is None:
+            return False
+
+        s = expr_node.sql(dialect="mysql").lower()
+        # Date literals or explicit temporal functions
+        if re.search(r"'(?:19|20)\d{2}-\d{2}-\d{2}'", s):
+            return True
+        if re.search(r"\b(?:year|month|day|date|timestamp|curdate|current_date|now)\s*\(", s):
+            return True
+
+        # Date/time-like column references
+        for col in expr_node.find_all(exp.Column):
+            col_name = (col.name or "").lower()
+            if any(k in col_name for k in ("date", "time", "year", "month", "day")):
+                return True
+        return False
+
+    try:
+        parsed = sqlglot.parse_one(sql, read="mysql")
+    except Exception:
+        return sql
+
+    removed_any = False
+    for where in list(parsed.find_all(exp.Where)):
+        cond = where.this
+        if cond is None:
+            continue
+        # Keep conservative behavior when OR is present.
+        if any(isinstance(n, exp.Or) for n in cond.walk()):
+            continue
+
+        conjuncts = _flatten_and(cond)
+        keep = []
+        removed_local = False
+        for c in conjuncts:
+            if _is_temporal_predicate(c):
+                removed_local = True
+            else:
+                keep.append(c)
+
+        if not removed_local:
+            continue
+
+        removed_any = True
+        if keep:
+            new_cond = _combine_and(keep)
+            where.set("this", new_cond)
+        else:
+            parent = where.parent
+            if parent is not None:
+                for key, val in list(parent.args.items()):
+                    if val is where:
+                        parent.set(key, None)
+                        break
+
+    if not removed_any:
+        return sql
+
+    fixed = parsed.sql(dialect="mysql")
+    if sql.strip().endswith(";") and not fixed.endswith(";"):
         fixed += ";"
     return fixed
 # =======================================================================

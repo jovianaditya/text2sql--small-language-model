@@ -72,6 +72,7 @@ from .helpers_core import (
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
     _drop_unrequested_exists_filters,
+    _drop_unrequested_temporal_filters,
     _question_wants_latest_year_scope_with_aggregate,
     # phase 4b - Aggregate in WHERE fix
     _fix_aggregate_in_where,
@@ -2809,7 +2810,7 @@ If Context lists aliases, use the canonical column name.
 
 Output:
 Return EXACTLY one JSON object:
-{{"sql":"<final MySQL query>","notes":"<brief rationale>"}}
+{{"sql":"<final MySQL query>","notes":"<brief rationale, max 12 words>"}}
 No Markdown. End SQL with a semicolon.
 If NO JOINs, notes MUST be exactly: "No joins used."
 
@@ -3133,13 +3134,51 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     s_upper = s.upper()
 
+    def _has_top_level_group_by(text: str) -> bool:
+        up = text.upper()
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and up[i:i + 8] == "GROUP BY":
+                left_ok = (i == 0 or not text[i - 1].isalnum())
+                right_ok = (i + 8 >= len(text) or not text[i + 8].isalnum())
+                if left_ok and right_ok:
+                    return True
+            i += 1
+        return False
+
     # Skip if query uses window functions that REQUIRE OVER clause
     window_funcs_requiring_over = ["ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD",
                                     "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE",
                                     "NTILE", "PERCENT_RANK", "CUME_DIST"]
     has_window_func = any(f"{wf}()" in s_upper or f"{wf} (" in s_upper for wf in window_funcs_requiring_over)
 
-    if "GROUP BY" in s_upper and "OVER" in s_upper and "PARTITION" in s_upper and not has_window_func:
+    if _has_top_level_group_by(s) and "OVER" in s_upper and "PARTITION" in s_upper and not has_window_func:
         # Only fix if OVER is used with aggregate functions (MIN, MAX, COUNT, SUM, AVG)
         # Pattern: AGG(...) OVER (PARTITION BY ...) [ORDER BY ...]
         # We want: AGG(...)
@@ -3221,19 +3260,34 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             if DEBUG_WR: print("[PH4] detected max-date tie-breaker + winner-row intent -> forcing guardrail")
             # CRITICAL: Check if query is already corrupted
             s_forced = _rewrite_winner_row_guardrail(s, question, force=True)
-            # SANITY: If forced rewrite produced garbage, rollback to original
-            if not s_forced or ("GROUP BY" in s_forced.upper() and "ROW_NUMBER" in s_forced.upper()):
-                if DEBUG_WR: print("[PH4] ABORT: forced rewrite produced malformed SQL, keeping original")
+            forced_rewrite_ok = False
+            if (
+                s_forced
+                and "ROW_NUMBER" in s_forced.upper()
+                and not ("GROUP BY" in s_forced.upper() and "ROW_NUMBER" in s_forced.upper())
+            ):
+                try:
+                    import sqlglot
+                    sqlglot.parse_one(s_forced, read="mysql")
+                    forced_rewrite_ok = True
+                except Exception:
+                    forced_rewrite_ok = False
+
+            # SANITY: Only accept forced rewrite when structurally parseable.
+            # Otherwise fall back to normal winner-row heuristic flow.
+            if not forced_rewrite_ok:
+                if DEBUG_WR: print("[PH4] ABORT: forced rewrite malformed/unparseable, fallback to normal winner-row flow")
                 s = before_phase4
+                goto_phase5 = False
             else:
                 s = s_forced
-            if DEBUG_WR: print("[PH4] FINAL after forced guardrail:", s)            
-            #  Skip normal heuristic flow - we've made our choice
-            s = _rewrite_having_alias_to_expr(s)
-            s = _force_restore_groupby_if_aggregate_without_groupby(before_phase4, s)
-            if DEBUG_WR: print("[PH4] end ----", s, "\n")           
-            #  DON'T return early - continue to Phase 5-7
-            goto_phase5 = True
+                if DEBUG_WR: print("[PH4] FINAL after forced guardrail:", s)
+                # Skip normal heuristic flow - forced rewrite is valid.
+                s = _rewrite_having_alias_to_expr(s)
+                s = _force_restore_groupby_if_aggregate_without_groupby(before_phase4, s)
+                if DEBUG_WR: print("[PH4] end ----", s, "\n")
+                # DON'T return early - continue to Phase 5-7
+                goto_phase5 = True
         else:
             if DEBUG_WR: print("[PH4] max-date pattern detected BUT question wants true aggregation -> skip force")
             goto_phase5 = False
@@ -3298,6 +3352,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _drop_unrequested_exists_filters(s, question, ctx)
         if DEBUG_WR: print(f"[PH4] after unrequested EXISTS-drop fix: {s}")
+
+        s = _drop_unrequested_temporal_filters(s, question, ctx)
+        if DEBUG_WR: print(f"[PH4] after unrequested temporal-filter drop fix: {s}")
 
         s = _rewrite_having_alias_to_expr(s)
         s = _winner_row_final_sanity(s, question)
