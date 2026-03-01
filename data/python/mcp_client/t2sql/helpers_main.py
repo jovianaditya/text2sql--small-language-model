@@ -73,6 +73,7 @@ from .helpers_core import (
     _rewrite_row_level_nonnull_to_group_existence,
     _drop_unrequested_exists_filters,
     _drop_unrequested_temporal_filters,
+    _prefer_not_exists_for_simple_exclusion,
     _question_wants_latest_year_scope_with_aggregate,
     # phase 4b - Aggregate in WHERE fix
     _fix_aggregate_in_where,
@@ -2557,6 +2558,10 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     "JOIN TYPE (CRITICAL): Mixed intent detected. "
                     "Use INNER JOIN for required-existence tables, and LEFT JOIN + IS NULL/NOT EXISTS for exclusion tables (e.g., 'no/never/without')."
                 )
+                constraints.append(
+                    "ANTI-JOIN (CRITICAL): For exclusion intent, prefer NOT EXISTS over NOT IN. "
+                    "Correlate the excluded table by key."
+                )
             elif existence_tables:
                 constraints.append(
                     "JOIN TYPE (CRITICAL): Use INNER JOIN only for tables explicitly required by existence intent "
@@ -3355,6 +3360,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _drop_unrequested_temporal_filters(s, question, ctx)
         if DEBUG_WR: print(f"[PH4] after unrequested temporal-filter drop fix: {s}")
+
+        s = _prefer_not_exists_for_simple_exclusion(s, question, ctx)
+        if DEBUG_WR: print(f"[PH4] after NOT EXISTS anti-join preference: {s}")
 
         s = _rewrite_having_alias_to_expr(s)
         s = _winner_row_final_sanity(s, question)

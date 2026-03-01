@@ -9695,6 +9695,109 @@ def _drop_unrequested_temporal_filters(sql: str, question: str, ctx: str = "") -
     if sql.strip().endswith(";") and not fixed.endswith(";"):
         fixed += ";"
     return fixed
+
+
+def _prefer_not_exists_for_simple_exclusion(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Canonicalize simple `NOT IN (SELECT key FROM table ...)` anti-joins into
+    correlated `NOT EXISTS (...)` for better NULL-safety.
+
+    This is intentionally conservative:
+    - only runs when the question has clear exclusion wording,
+    - only rewrites simple subquery forms,
+    - skips grouped/distinct/limited/ordered subqueries.
+    """
+    if not sql:
+        return sql
+
+    low_sql = sql.lower()
+    if not re.search(r"\bnot\b[\s`\"A-Za-z0-9_.]*\bin\s*\(", low_sql, flags=re.I):
+        return sql
+
+    q = (question or "").lower()
+    if not q:
+        return sql
+
+    has_exclusion_intent = bool(
+        re.search(
+            r"\b(?:no|without(?:\s+any)?|never|have\s+never|has\s+never)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    if not has_exclusion_intent:
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        parsed = sqlglot.parse_one(sql, read="mysql")
+    except Exception:
+        return sql
+
+    changed = False
+
+    def _transform(node):
+        nonlocal changed
+
+        if not isinstance(node, exp.Not):
+            return node
+
+        in_node = node.this
+        if not isinstance(in_node, exp.In):
+            return node
+
+        lhs = in_node.this
+        subq = in_node.args.get("query")
+
+        if not isinstance(lhs, exp.Column):
+            return node
+        if not isinstance(subq, exp.Subquery):
+            return node
+        if not isinstance(subq.this, exp.Select):
+            return node
+
+        sel = subq.this
+
+        # Only rewrite simple anti-join subqueries.
+        if len(sel.expressions or []) != 1:
+            return node
+        if sel.args.get("group") or sel.args.get("having") or sel.args.get("distinct"):
+            return node
+        if sel.args.get("limit") or sel.args.get("order") or sel.args.get("union"):
+            return node
+
+        rhs_expr = sel.expressions[0]
+        rhs_base = rhs_expr.this if isinstance(rhs_expr, exp.Alias) else rhs_expr
+        if not isinstance(rhs_base, exp.Column):
+            return node
+
+        new_sel = sel.copy()
+        new_sel.set("expressions", [exp.Literal.number(1)])
+
+        corr_eq = exp.EQ(this=rhs_base.copy(), expression=lhs.copy())
+        existing_where = new_sel.args.get("where")
+        if isinstance(existing_where, exp.Where) and existing_where.this is not None:
+            new_where_cond = exp.And(this=existing_where.this.copy(), expression=corr_eq)
+        else:
+            new_where_cond = corr_eq
+        new_sel.set("where", exp.Where(this=new_where_cond))
+
+        changed = True
+        return exp.Not(this=exp.Exists(this=new_sel))
+
+    rewritten = parsed.transform(_transform)
+    if not changed:
+        return sql
+
+    fixed = rewritten.sql(dialect="mysql")
+    if sql.strip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
 # =======================================================================
 # ========= Phase 5 — Pattern, REGEXP, and Predicate Normalization ======
 # ========================= Guardrail for Regex =========================
