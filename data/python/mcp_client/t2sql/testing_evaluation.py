@@ -441,10 +441,10 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     diff_header = [
         "Difficulty",
         "Total",
-        "EX Success",
+        "EX Match",
         "Percentage VA Success (%)",
         "VA Success",
-        "Percentage EX Success (%)",
+        "Percentage EX Match (%)",
         "Avg Latency (s)"
     ]
     for col_idx, h in enumerate(diff_header, start=1):
@@ -455,14 +455,14 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
 
     for row_idx, (d, stats) in enumerate(sorted(by_difficulty.items()), start=12):
         t = stats["total"]
-        es = stats["exec_success"]
+        ex_match = stats["result_match"]
         va = stats.get("va_success", 0)
         # Calculate avg latency for this difficulty
         diff_latencies = latency_by_diff.get(d, [])
         avg_lat = f"{sum(diff_latencies)/len(diff_latencies):.2f}" if diff_latencies else "N/A"
         pct_va = f"{100*va/t:.1f}%" if t else "N/A"
-        pct_ex = f"{100*es/t:.1f}%" if t else "N/A"
-        row_data = [d, t, es, pct_va, va, pct_ex, avg_lat]
+        pct_ex = f"{100*ex_match/t:.1f}%" if t else "N/A"
+        row_data = [d, t, ex_match, pct_va, va, pct_ex, avg_lat]
         for col_idx, value in enumerate(row_data, start=1):
             cell = ws_summary.cell(row=row_idx, column=col_idx, value=value)
             cell.border = border

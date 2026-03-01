@@ -73,6 +73,40 @@ cases:
         SELECT productCode, productName, quantityInStock 
         FROM products 
         WHERE quantityInStock BETWEEN 500 AND 1000;
+    - id: E11
+      difficulty: easy
+      question: "What countries do we currently have customers in? Return one row per country, sorted alphabetically."
+      groundtruth_sql: |
+        SELECT DISTINCT
+          country
+        FROM customers
+        ORDER BY
+          country ASC;
+    - id: E12
+      difficulty: easy
+      question: "Show all offices and display the state as 'N/A' whenever the state information is missing. Return office code, city, country, and the displayed state value. Sort by office code ascending."
+      groundtruth_sql: |
+        SELECT
+          officeCode,
+          city,
+          country,
+          COALESCE(state, 'N/A') AS state_display
+        FROM offices
+        ORDER BY
+          officeCode ASC;
+    - id: E13
+      difficulty: easy
+      question: "Show orders that were shipped after their required date. Return order number, required date, and shipped date. Sort by shipped date descending, then order number ascending."
+      groundtruth_sql: |
+        SELECT
+          orderNumber,
+          requiredDate,
+          shippedDate
+        FROM orders
+        WHERE shippedDate > requiredDate
+        ORDER BY
+          shippedDate DESC,
+          orderNumber ASC;
     - id: M1
       difficulty: medium
       question: "For each month in 2004, show the month name and the number of orders placed in that month, ordered from the latest month to the earliest."
@@ -248,6 +282,82 @@ cases:
           quantityInStock,
           (quantityInStock * 100.0 / SUM(quantityInStock) OVER ()) AS stock_percentage
         FROM products;
+    - id: M16
+      difficulty: medium
+      question: "Show orders from 2003 and 2004 in one result. Return order number and a year label ('2003' or '2004'). Remove duplicate rows and sort by year label ascending, then order number ascending."
+      groundtruth_sql: |
+        SELECT
+          orderNumber,
+          '2003' AS year_label
+        FROM orders
+        WHERE YEAR(orderDate) = 2003
+        UNION
+        SELECT
+          orderNumber,
+          '2004' AS year_label
+        FROM orders
+        WHERE YEAR(orderDate) = 2004
+        ORDER BY
+          year_label ASC,
+          orderNumber ASC;
+    - id: M17
+      difficulty: medium
+      question: "For each order year, show how many distinct order statuses appear in that year. Return the year and the distinct status count, ordered by year ascending."
+      groundtruth_sql: |
+        SELECT
+          YEAR(orderDate) AS order_year,
+          COUNT(DISTINCT status) AS distinct_status_count
+        FROM orders
+        GROUP BY
+          YEAR(orderDate)
+        ORDER BY
+          order_year ASC;
+    - id: M18
+      difficulty: medium
+      question: "For each payment record, return the customer number, payment date, amount, and the previous payment amount for the same customer ordered by payment date. Sort by customer number ascending, then payment date ascending."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          paymentDate,
+          amount,
+          LAG(amount) OVER (
+            PARTITION BY customerNumber
+            ORDER BY paymentDate
+          ) AS previous_payment_amount
+        FROM payments
+        ORDER BY
+          customerNumber ASC,
+          paymentDate ASC;
+    - id: M19
+      difficulty: medium
+      question: "Show all orders placed on the most recent order date in the dataset. Return order number, order date, and status. Sort by order number ascending."
+      groundtruth_sql: |
+        SELECT
+          orderNumber,
+          orderDate,
+          status
+        FROM orders
+        WHERE orderDate = (
+          SELECT MAX(orderDate)
+          FROM orders
+        )
+        ORDER BY
+          orderNumber ASC;
+    - id: M20
+      difficulty: medium
+      question: "For each country, show how many different customer cities we have in that country. Return only countries that have customers in more than 3 distinct cities. Show the country and distinct city count, ordered by distinct city count descending, then country ascending."
+      groundtruth_sql: |
+        SELECT
+          country,
+          COUNT(DISTINCT city) AS distinct_city_count
+        FROM customers
+        GROUP BY
+          country
+        HAVING
+          COUNT(DISTINCT city) > 3
+        ORDER BY
+          distinct_city_count DESC,
+          country ASC;
     - id: H1
       difficulty: hard
       question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."
@@ -566,3 +676,59 @@ cases:
         ORDER BY
           total_quantity_2004 DESC,
           p.productCode ASC;
+    - id: H16
+      difficulty: hard
+      question: "Show customers who have ordered more than 20 distinct products. Return customer id, customer name, and the number of distinct products they have ordered. Sort by distinct product count descending, then customer id ascending."
+      groundtruth_sql: |
+        SELECT
+          c.customerNumber,
+          c.customerName,
+          COUNT(DISTINCT od.productCode) AS distinct_product_count
+        FROM customers AS c
+        JOIN orders AS o
+          ON o.customerNumber = c.customerNumber
+        JOIN orderdetails AS od
+          ON od.orderNumber = o.orderNumber
+        GROUP BY
+          c.customerNumber,
+          c.customerName
+        HAVING
+          COUNT(DISTINCT od.productCode) > 20
+        ORDER BY
+          distinct_product_count DESC,
+          c.customerNumber ASC;
+    - id: H17
+      difficulty: hard
+      question: "For each product line, show the best-selling product based on total quantity ordered. If multiple products tie on quantity, choose the one with the higher total sales value; if there is still a tie, choose the product with the smaller product code. Return product line, product code, product name, total quantity ordered, and total sales value. Sort by product line ascending."
+      groundtruth_sql: |
+        SELECT
+          ranked.productLine,
+          ranked.productCode,
+          ranked.productName,
+          ranked.total_quantity_ordered,
+          ranked.total_sales_value
+        FROM (
+          SELECT
+            p.productLine,
+            p.productCode,
+            p.productName,
+            SUM(od.quantityOrdered) AS total_quantity_ordered,
+            SUM(od.quantityOrdered * od.priceEach) AS total_sales_value,
+            ROW_NUMBER() OVER (
+              PARTITION BY p.productLine
+              ORDER BY
+                SUM(od.quantityOrdered) DESC,
+                SUM(od.quantityOrdered * od.priceEach) DESC,
+                p.productCode ASC
+            ) AS rn
+          FROM products AS p
+          JOIN orderdetails AS od
+            ON od.productCode = p.productCode
+          GROUP BY
+            p.productLine,
+            p.productCode,
+            p.productName
+        ) AS ranked
+        WHERE ranked.rn = 1
+        ORDER BY
+          ranked.productLine ASC;
