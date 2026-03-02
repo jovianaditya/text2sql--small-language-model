@@ -12165,6 +12165,7 @@ def _enforce_requested_order_direction(sql: str, question: str) -> str:
     def _extract_sort_clause(text: str) -> str:
         patterns = [
             r"\b(?:sort(?:ed)?\s+by|arrange\s+by|order\s+by)\b",
+            r"\border\s+the\s+(?:result|results|output|rows?)\s+by\b",
             r"\bordered\s+by\b",
         ]
         for pat in patterns:
@@ -12231,9 +12232,15 @@ def _enforce_requested_order_direction(sql: str, question: str) -> str:
     if not explicit_dirs:
         if has_window_context:
             return sql
-        if re.search(r"\b(?:ascending|asc|alphabetical|alphabetically)\b", q):
+        has_asc = bool(re.search(r"\b(?:ascending|asc|alphabetical|alphabetically)\b", q))
+        has_desc = bool(re.search(r"\b(?:descending|desc)\b", q))
+        # If both directions appear but we failed to parse a concrete sort clause,
+        # do not guess a single direction by fallback.
+        if has_asc and has_desc:
+            return sql
+        if has_asc:
             explicit_dirs = ["ASC"]
-        elif re.search(r"\b(?:descending|desc)\b", q):
+        elif has_desc:
             explicit_dirs = ["DESC"]
         else:
             return sql

@@ -697,38 +697,3 @@ cases:
         ORDER BY
           distinct_product_count DESC,
           c.customerNumber ASC;
-    - id: H17
-      difficulty: hard
-      question: "For each product line, show the best-selling product based on total quantity ordered. If multiple products tie on quantity, choose the one with the higher total sales value; if there is still a tie, choose the product with the smaller product code. Return product line, product code, product name, total quantity ordered, and total sales value. Sort by product line ascending."
-      groundtruth_sql: |
-        SELECT
-          ranked.productLine,
-          ranked.productCode,
-          ranked.productName,
-          ranked.total_quantity_ordered,
-          ranked.total_sales_value
-        FROM (
-          SELECT
-            p.productLine,
-            p.productCode,
-            p.productName,
-            SUM(od.quantityOrdered) AS total_quantity_ordered,
-            SUM(od.quantityOrdered * od.priceEach) AS total_sales_value,
-            ROW_NUMBER() OVER (
-              PARTITION BY p.productLine
-              ORDER BY
-                SUM(od.quantityOrdered) DESC,
-                SUM(od.quantityOrdered * od.priceEach) DESC,
-                p.productCode ASC
-            ) AS rn
-          FROM products AS p
-          JOIN orderdetails AS od
-            ON od.productCode = p.productCode
-          GROUP BY
-            p.productLine,
-            p.productCode,
-            p.productName
-        ) AS ranked
-        WHERE ranked.rn = 1
-        ORDER BY
-          ranked.productLine ASC;

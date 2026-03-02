@@ -296,25 +296,26 @@ Notes:
 | M19 |      3B       | Scalar extrema-date subquery single-table                     |
 | M20 |      IR       | Single-table `COUNT(DISTINCT ...)` + HAVING                   |
 
-### 10.3 Hard (H1-H15)
+### 10.3 Hard (H1-H16)
 
-| ID  | Expected lane |                  Note                             |
-|-----|---------------|---------------------------------------------------|
-| H1  |      IR       | Multi-table aggregate, non-hard pattern           |
-| H2  |      IR       | Simple 2-table existence + grouped count          |
-| H3  |      IR       | Simple 2-table join + grouped sum                 |
-| H4  |      3B       | Simple multi-join + grouped sum                   |
-| H5  |      3B       | Left-join rollup with null-preserving intent      |
-| H6  |      7B       | Explicit ranking in multi-table context           |
-| H7  |      7B       | Latest-year per-group + re-aggregate              |
-| H8  |      7B       | Multi-table latest-year derived subquery          |
-| H9  |      7B       | Complex subquery + grouped ordering               |
-| H10 |      7B       | Multi-table + subquery/exists + having            |
-| H11 |      3B       | Exclusion aggregate pattern solved in 3B lane     |
-| H12 |      7B       | Multi-table aggregate + scalar subquery in HAVING |
-| H13 |      7B       | Multi-table winner-row with tie-break ordering    |
-| H14 |      7B       | Dual-fact rollup fanout-risk pattern              |
-| H15 |      7B       | Cross-year exclusion + grouped ordering           |
+| ID  | Expected lane |                            Note                          |
+|-----|---------------|----------------------------------------------------------|
+| H1  |      IR       | Multi-table aggregate, non-hard pattern                  |
+| H2  |      IR       | Simple 2-table existence + grouped count                 |
+| H3  |      IR       | Simple 2-table join + grouped sum                        |
+| H4  |      3B       | Simple multi-join + grouped sum                          |
+| H5  |      3B       | Left-join rollup with null-preserving intent             |
+| H6  |      7B       | Explicit ranking in multi-table context                  |
+| H7  |      7B       | Latest-year per-group + re-aggregate                     |
+| H8  |      7B       | Multi-table latest-year derived subquery                 |
+| H9  |      7B       | Complex subquery + grouped ordering                      |
+| H10 |      7B       | Multi-table + subquery/exists + having                   |
+| H11 |      3B       | Exclusion aggregate pattern solved in 3B lane            |
+| H12 |      7B       | Multi-table aggregate + scalar subquery in HAVING        |
+| H13 |      7B       | Multi-table winner-row with tie-break ordering           |
+| H14 |      7B       | Dual-fact rollup fanout-risk pattern                     |
+| H15 |      7B       | Cross-year exclusion + grouped ordering                  |
+| H16 |      7B       | Multi-table `COUNT(DISTINCT ...)` with numeric threshold |
 
 ### 10.4 Legacy Route Split Reference (40-case baseline)
 

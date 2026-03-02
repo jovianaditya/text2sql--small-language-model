@@ -750,6 +750,7 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
     # Guardrail: avoid false positives like customerName matching just "customer id".
     # For semantic suffix columns, require suffix intent in question unless full phrase matched.
     semantic_suffix_keywords = AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS
+    stop_tokens = AGENT_COLUMN_STOP_TOKENS
     col_tokens = re.findall(AGENT_COLUMN_TOKEN_PATTERN, spaced)
     if len(col_tokens) >= 2:
         suffix = col_tokens[-1]
@@ -761,9 +762,49 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
             )
             if not has_suffix_intent:
                 return False
+            # For semantic columns like productName/customerNumber, do not allow
+            # a loose global match such as "customer name ... products".
+            # Require at least one informative prefix token to appear locally
+            # near a suffix term (e.g., "product name", "customer id").
+            informative_prefix_tokens = [
+                tok for tok in col_tokens[:-1]
+                if len(tok) >= 4 and tok not in stop_tokens
+            ]
+            for token in informative_prefix_tokens:
+                token_forms = {token}
+                if (
+                    AGENT_COLUMN_TOKEN_SUFFIX_Y
+                    and token.endswith(AGENT_COLUMN_TOKEN_SUFFIX_Y)
+                    and len(token) >= AGENT_COLUMN_TOKEN_SUFFIX_Y_MIN_LEN
+                ):
+                    token_forms.add(token[:-len(AGENT_COLUMN_TOKEN_SUFFIX_Y)] + AGENT_COLUMN_TOKEN_SUFFIX_IES)
+                elif (
+                    AGENT_COLUMN_TOKEN_SUFFIX_IES
+                    and token.endswith(AGENT_COLUMN_TOKEN_SUFFIX_IES)
+                    and len(token) >= AGENT_COLUMN_TOKEN_SUFFIX_IES_MIN_LEN
+                ):
+                    token_forms.add(token[:-len(AGENT_COLUMN_TOKEN_SUFFIX_IES)] + AGENT_COLUMN_TOKEN_SUFFIX_Y)
+                elif (
+                    AGENT_COLUMN_TOKEN_SUFFIX_S
+                    and token.endswith(AGENT_COLUMN_TOKEN_SUFFIX_S)
+                    and len(token) >= AGENT_COLUMN_TOKEN_SUFFIX_S_MIN_LEN
+                ):
+                    token_forms.add(token[:-1])
+                else:
+                    token_forms.add(token + AGENT_COLUMN_TOKEN_SUFFIX_S)
+
+                for tok in token_forms:
+                    if not tok:
+                        continue
+                    for term in suffix_terms:
+                        if re.search(
+                            rf"\b{re.escape(tok)}\b(?:\s+\w+){{0,2}}\s+\b{re.escape(term)}\b",
+                            question_lower,
+                        ):
+                            return True
+            return False
 
     # Token-level fallback (skip weak generic tokens)
-    stop_tokens = AGENT_COLUMN_STOP_TOKENS
     for token in re.findall(AGENT_COLUMN_TOKEN_PATTERN, spaced):
         if len(token) < 4 or token in stop_tokens:
             continue
@@ -1054,11 +1095,9 @@ def router_agent(state: RAGState) -> RAGState:
         schema_fk = {}
     for source_table, fk_map in schema_fk.items():
         src = (source_table or "").lower()
-        if src not in whitelisted_lower:
-            continue
         for source_col, target_table in (fk_map or {}).items():
             tgt = (target_table or "").lower()
-            if tgt not in whitelisted_lower:
+            if not src or not tgt:
                 continue
 
             if src not in fk_columns_by_table:
@@ -1193,6 +1232,8 @@ def router_agent(state: RAGState) -> RAGState:
     tables_to_remove = []
     for tbl_lower in list(evidence_tables):
         evidence_list = evidence_details.get(tbl_lower, [])
+        weak_evidence = AGENT_ROUTER_WEAK_EVIDENCE_TAGS
+        aggregate_or_weak_evidence = set(weak_evidence) | {AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT}
 
         # Preserve weak-evidence parent table when it is explicitly the
         # output subject in the question (e.g., "Show product lines ...")
@@ -1232,6 +1273,38 @@ def router_agent(state: RAGState) -> RAGState:
         )
         is_multi_hop_bridge = neighbor_count_in_relevant >= 2
 
+        table_singular = get_singular_form(tbl_lower)
+        table_id_col = (get_id_column(tbl_lower) or "").lower()
+        fk_exists_in_other_table = False
+        for other_tbl in relevant_tables:
+            if other_tbl.lower() == tbl_lower:
+                continue
+            other_cols = _get_table_cols(other_tbl)
+            for col in other_cols:
+                col_lower = str(col).lower()
+                if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(table_singular, col_lower):
+                    fk_exists_in_other_table = True
+                    break
+            if fk_exists_in_other_table:
+                break
+
+        tbl_cols = sorted(_get_table_cols(tbl_lower))
+        fk_cols = set()
+        for col in tbl_cols:
+            col_lower = str(col).lower()
+            if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(table_singular, col_lower):
+                fk_cols.add(col_lower)
+
+        non_fk_mentioned = False
+        for col in tbl_cols:
+            col_low = str(col).lower()
+            if col_low in fk_cols:
+                continue
+            spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r'\1 \2', str(col)).lower()
+            if col_low in question_lower or spaced in question_lower:
+                non_fk_mentioned = True
+                break
+
         # If the entity is explicitly mentioned in non-ID form and evidence comes
         # from FK columns, keep it only when it is a true bridge node between
         # at least two relevant tables (prevents unnecessary joins in single-table
@@ -1241,48 +1314,32 @@ def router_agent(state: RAGState) -> RAGState:
                 print(f"[Router] Keeping {tbl_lower}: explicit entity mention + FK evidence")
             continue
 
+        # Aggregate/count mentions of a leaf parent entity (e.g., "distinct products")
+        # can often be satisfied via a child FK table without joining the parent table,
+        # as long as no non-key parent attributes are requested.
+        is_aggregate_like_only = (
+            AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT in evidence_list
+            and all(
+                e in aggregate_or_weak_evidence or e.startswith(AGENT_ROUTER_FK_EVIDENCE_PREFIX)
+                for e in evidence_list
+            )
+        )
+        if (
+            is_aggregate_like_only
+            and fk_exists_in_other_table
+            and not non_fk_mentioned
+            and neighbor_count_in_relevant <= 1
+        ):
+            tables_to_remove.append(tbl_lower)
+            if RETRIEVE_DEBUG:
+                print(
+                    f"[Router] Skipping {tbl_lower}: aggregate-only leaf entity "
+                    f"covered by child FK table"
+                )
+            continue
+
         if is_only_weak and evidence_list:  # Has evidence, but all are weak
-            table_singular = get_singular_form(tbl_lower)
-            table_id_col = (get_id_column(tbl_lower) or "").lower()
-
-            # Check if any other table has FK column linking to this table
-            fk_exists_in_other_table = False
-            for other_tbl in relevant_tables:
-                if other_tbl.lower() == tbl_lower:
-                    continue
-                other_cols = _get_table_cols(other_tbl)
-                for col in other_cols:
-                    # Check if this is an FK column (e.g., customerNumber → customers)
-                    col_lower = str(col).lower()
-                    # Pattern: <table_singular>(Number|Code|Id|ID)
-                    if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(table_singular, col_lower):
-                        fk_exists_in_other_table = True
-                        break
-                if fk_exists_in_other_table:
-                    break
-
             if fk_exists_in_other_table:
-                # Check if question mentions any non-FK columns from this table
-                tbl_cols = sorted(_get_table_cols(tbl_lower))
-                # Get FK columns
-                fk_cols = set()
-                for col in tbl_cols:
-                    col_lower = str(col).lower()
-                    if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(table_singular, col_lower):
-                        fk_cols.add(col_lower)
-
-                # Check if any non-FK column is mentioned in question
-                non_fk_mentioned = False
-                for col in tbl_cols:
-                    col_low = str(col).lower()
-                    if col_low in fk_cols:
-                        continue
-                    # Check if column is mentioned (including spaced variant)
-                    spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r'\1 \2', str(col)).lower()
-                    if col_low in question_lower or spaced in question_lower:
-                        non_fk_mentioned = True
-                        break
-
                 if not non_fk_mentioned:
                     # Safe to remove - only referenced via "for each" and FK exists elsewhere
                     tables_to_remove.append(tbl_lower)
@@ -1381,6 +1438,25 @@ def router_agent(state: RAGState) -> RAGState:
                 if path:
                     tables_in_subgraph.update(path)
                 # Path removed: not passed to LLM, only internal use
+
+    # Add missing connector tables from the minimal FK subgraph.
+    # Only add true connectors (degree >= 2 within the subgraph), not leaves.
+    if tables_in_subgraph:
+        relevant_lowers = {t.lower() for t in relevant_tables}
+        original_tables = list(allowed_identifiers.keys())
+        for tbl_lower in sorted(tables_in_subgraph):
+            if tbl_lower in relevant_lowers:
+                continue
+            degree_in_subgraph = sum(
+                1 for n in fk_graph.get(tbl_lower, {}) if n in tables_in_subgraph and n != tbl_lower
+            )
+            if degree_in_subgraph < 2:
+                continue
+            tbl_original = next((t for t in original_tables if t.lower() == tbl_lower), tbl_lower)
+            relevant_tables.append(tbl_original)
+            relevant_lowers.add(tbl_lower)
+            if RETRIEVE_DEBUG:
+                print(f"[Router] Including {tbl_original}: connector in minimal subgraph")
 
     # --- STEP 3.4: Remove Tables Not in Connecting Subgraph ---
     # Keep tables that are:
@@ -1580,6 +1656,100 @@ def router_agent(state: RAGState) -> RAGState:
                     if RETRIEVE_DEBUG:
                         print(f"[Router] Keeping {original}: bridge table for FK connectivity")
 
+    # FINAL NORMALIZATION: drop redundant aggregate-only leaf entities that are
+    # covered by child FK tables, then restore any missing bridge connectors.
+    if len(relevant_tables) >= 2:
+        final_drop: List[str] = []
+        weak_evidence = AGENT_ROUTER_WEAK_EVIDENCE_TAGS
+        aggregate_or_weak_evidence = set(weak_evidence) | {AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT}
+        lower_to_original = {t.lower(): t for t in allowed_identifiers.keys()}
+
+        for tbl in list(relevant_tables):
+            tbl_lower = tbl.lower()
+            evidence_list = evidence_details.get(tbl_lower, [])
+            if not evidence_list:
+                continue
+
+            is_aggregate_like_only = (
+                AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT in evidence_list
+                and all(
+                    e in aggregate_or_weak_evidence or e.startswith(AGENT_ROUTER_FK_EVIDENCE_PREFIX)
+                    for e in evidence_list
+                )
+            )
+            if not is_aggregate_like_only:
+                continue
+
+            table_singular = get_singular_form(tbl_lower)
+            table_id_col = (get_id_column(tbl_lower) or "").lower()
+            fk_exists_in_other_table = False
+            for other_tbl in relevant_tables:
+                if other_tbl.lower() == tbl_lower:
+                    continue
+                for col in _get_table_cols(other_tbl):
+                    col_lower = str(col).lower()
+                    if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(table_singular, col_lower):
+                        fk_exists_in_other_table = True
+                        break
+                if fk_exists_in_other_table:
+                    break
+            if not fk_exists_in_other_table:
+                continue
+
+            tbl_cols = sorted(_get_table_cols(tbl_lower))
+            fk_cols = set()
+            for col in tbl_cols:
+                col_lower = str(col).lower()
+                if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(table_singular, col_lower):
+                    fk_cols.add(col_lower)
+
+            non_fk_mentioned = False
+            for col in tbl_cols:
+                col_low = str(col).lower()
+                if col_low in fk_cols:
+                    continue
+                spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r'\1 \2', str(col)).lower()
+                if col_low in question_lower or spaced in question_lower:
+                    non_fk_mentioned = True
+                    break
+            if non_fk_mentioned:
+                continue
+
+            relevant_lowers_now = {t.lower() for t in relevant_tables}
+            degree_now = sum(
+                1 for n in fk_graph.get(tbl_lower, {}) if n in relevant_lowers_now and n != tbl_lower
+            )
+            if degree_now > 1:
+                continue
+
+            final_drop.append(tbl)
+
+        if final_drop:
+            for tbl in final_drop:
+                if tbl in relevant_tables:
+                    relevant_tables.remove(tbl)
+                    if RETRIEVE_DEBUG:
+                        print(f"[Router] Final cleanup: removing {tbl} (redundant aggregate-only leaf)")
+
+            if len(relevant_tables) >= 2:
+                relevant_lower_now = [t.lower() for t in relevant_tables]
+                bridge_lowers = set()
+                for i, start in enumerate(relevant_lower_now):
+                    for end in relevant_lower_now[i + 1:]:
+                        path = bfs_shortest_path(start, end, fk_graph)
+                        if not path:
+                            continue
+                        for node in path:
+                            if node not in relevant_lower_now:
+                                bridge_lowers.add(node)
+
+                for node in sorted(bridge_lowers):
+                    original = lower_to_original.get(node, node)
+                    if original not in relevant_tables:
+                        relevant_tables.append(original)
+                        if RETRIEVE_DEBUG:
+                            print(f"[Router] Final cleanup: adding {original} (bridge table)")
+
     # ═══════════════════════════════════════════════════════════════════
     # STEP 4: DETEKSI SINYAL (Complete Detection)
     # ═══════════════════════════════════════════════════════════════════
@@ -1762,6 +1932,25 @@ def router_agent(state: RAGState) -> RAGState:
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
     # ═══════════════════════════════════════════════════════════════════
     is_multi_table = len(relevant_tables) > 1
+    has_numeric_threshold = bool(
+        re.search(
+            r"\b(?:greater\s+than|more\s+than|over|above|"
+            r"less\s+than|under|below|"
+            r"at\s+least|at\s+most|minimum(?:\s+of)?|maximum(?:\s+of)?)\s+"
+            r"\d[\d,]*(?:\.\d+)?\b",
+            question_lower,
+            flags=re.I,
+        )
+    )
+    has_distinct_term = bool(
+        re.search(r"\b(?:distinct|unique|different)\b", question_lower, flags=re.I)
+    )
+    is_multi_table_distinct_threshold = bool(
+        is_multi_table
+        and has_math
+        and has_numeric_threshold
+        and has_distinct_term
+    )
     
     # Winner-row detection: needs ROW_NUMBER/RANK subquery pattern
     # Case 1: Multi-table + ranking + grouping (e.g., "customer with highest total payment")
@@ -1952,6 +2141,8 @@ def router_agent(state: RAGState) -> RAGState:
     if AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT and is_complex_subquery_intent:
         if is_multi_table or has_complex_subquery_cue:
             escalation_reasons.append("subquery_intent_complex")
+    if is_multi_table_distinct_threshold:
+        escalation_reasons.append("multi_table_distinct_threshold")
     if is_set_operation_intent and not is_simple_set_operation:
         escalation_reasons.append("set_operation")
     if has_dual_fact_rollup:
@@ -3755,6 +3946,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             draft_model == SMALL_MODEL
             and complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE
             and is_simple_multi_table_candidate
+            and qtype == AGENT_ROUTER_QTYPE_LOOKUP
+            and len(detected_tables) <= 2
         ):
             regeneration_model = SMALL_MODEL
         else:
