@@ -314,7 +314,7 @@ cases:
           order_year ASC;
     - id: M18
       difficulty: medium
-      question: "For each payment record, return the customer number, payment date, amount, and the previous payment amount for the same customer ordered by payment date. Sort by customer number ascending, then payment date ascending."
+      question: "For each payment record, return the customer number, payment date, amount, and the previous payment amount for the same customer ordered by payment date. Sort by customer number ascending, then payment date descending."
       groundtruth_sql: |
         SELECT
           customerNumber,
@@ -327,7 +327,7 @@ cases:
         FROM payments
         ORDER BY
           customerNumber ASC,
-          paymentDate ASC;
+          paymentDate DESC;
     - id: M19
       difficulty: medium
       question: "Show all orders placed on the most recent order date in the dataset. Return order number, order date, and status. Sort by order number ascending."

@@ -240,9 +240,9 @@ Router knobs:
 8. `AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT`
 9. `AGENT_ROUTER_ALLOW_SIMPLE_SINGLE_TABLE_SUBQUERY_3B`
 
-## 10. Route Map 40Q&A (Target)
+## 10. Route Map (Working Target)
 
-This map is the expected lane allocation for `IR Safe Subset v1`.
+This map is the expected lane allocation for the current working benchmark.
 It is a policy target map used to keep IR/LLM balance explicit and auditable.
 
 Notes:
@@ -250,41 +250,51 @@ Notes:
 1. This is a policy expectation, not a strict guarantee for every paraphrase.
 2. If retrieval scope or env knobs change, route may shift.
 3. IR target coverage is intentionally moderate to preserve measurable LLM contribution.
+4. The easy section below is aligned to the current `E1-E13` set in the 50-case dev benchmark.
+5. The medium table below is aligned to the current `M1-M20` set in the 50-case dev benchmark. The hard table still reflects the earlier baseline and should be refreshed separately if route policy changes there.
 
-### 10.1 Easy (E1-E10)
+### 10.1 Easy (E1-E13)
 
-| ID  | Expected lane |                  Note                        |
-|-----|---------------|----------------------------------------------|
-| E1  |      IR       | Single-table, IR-safe filter + sort          |
-| E2  |      3B       | Top-N pattern; IR confidence below threshold |
-| E3  |      IR       | Single-table date filter + sort              |
-| E4  |      3B       | Routed as non-IR in current baseline context |
-| E5  |      IR       | Single-table null/missing filter             |
-| E6  |      IR       | Single-table prefix pattern                  |
-| E7  |      3B       | Context scope multi-table; IR gated off      |
-| E8  |      IR       | Single-table regex pattern                   |
-| E9  |      IR       | Single-table categorical filter              |
-| E10 |      IR       | Single-table range filter                    |
+| ID  | Expected lane | Note                                                       |
+|-----|---------------|------------------------------------------------------------|
+| E1  | IR            | Single-table equality filter + simple sort                 |
+| E2  | 3B            | Top-N lookup is possible, but synonym grounding is brittle |
+| E3  | IR            | Single-table year filter + descending date sort            |
+| E4  | IR            | Single-table numeric threshold + explicit sort             |
+| E5  | IR            | Single-table null / empty filter                           |
+| E6  | IR            | Single-table prefix pattern (`LIKE 'prefix%'`)             |
+| E7  | IR            | Single-table `IN (...)` filter on FK-like code column      |
+| E8  | IR            | Single-table deterministic regex pattern                   |
+| E9  | IR            | Single-table categorical `IN (...)` filter                 |
+| E10 | IR            | Single-table `BETWEEN` numeric filter                      |
+| E11 | IR            | Single-table lookup with top-level `SELECT DISTINCT`       |
+| E12 | 3B            | Projection null-fill (`COALESCE`) not in current IR shape  |
+| E13 | 3B            | Column-to-column compare not in current IR filter model    |
 
-### 10.2 Medium (M1-M15)
+### 10.2 Medium (M1-M20)
 
-| ID  | Expected lane |                  Note                    |
-|-----|---------------|------------------------------------------|
-| M1  |      IR       | Single-table aggregate + month grouping  |
-| M2  |      3B       | CASE-band aggregation                    |
-| M3  |      3B       | Winner-row single-table (payments)       |
-| M4  |      IR       | Single-table group + min/count           |
-| M5  |      3B       | Group + HAVING aggregate filter          |
-| M6  |      3B       | Simple scalar subquery single-table      |
-| M7  |      IR       | Supported percentage metric pattern      |
-| M8  |      IR       | Group + HAVING count                     |
-| M9  |      IR       | Single-table group + order-by aggregate  |
-| M10 |      3B       | Window rank single-table                 |
-| M11 |      3B       | Second-highest single-table winner-row   |
-| M12 |      3B       | Window cumulative single-table           |
-| M13 |      3B       | Window count partition single-table      |
-| M14 |      3B       | Window avg partition single-table        |
-| M15 |      3B       | Window percentage-over-total single-table|
+| ID  | Expected lane |                               Note                            |
+|-----|---------------|---------------------------------------------------------------|
+| M1  |      IR       | Single-table aggregate + month grouping                       |
+| M2  |      3B       | CASE-band aggregation                                         |
+| M3  |      3B       | Winner-row single-table (payments)                            |
+| M4  |      IR       | Single-table group + min/count                                |
+| M5  |      3B       | Group + HAVING aggregate filter                               |
+| M6  |      3B       | Simple scalar subquery single-table                           |
+| M7  |      IR       | Supported percentage metric pattern                           |
+| M8  |      IR       | Group + HAVING count                                          |
+| M9  |      IR       | Single-table group + order-by aggregate                       |
+| M10 |      3B       | Window rank single-table                                      |
+| M11 |      3B       | Second-highest single-table winner-row                        |
+| M12 |      3B       | Window cumulative single-table                                |
+| M13 |      3B       | Window count partition single-table                           |
+| M14 |      3B       | Window avg partition single-table                             |
+| M15 |      3B       | Window percentage-over-total single-table                     |
+| M16 |      3B       | Simple single-table set operation (`UNION`) stays in LLM lane |
+| M17 |      IR       | Single-table aggregate vs average aggregate                   |
+| M18 |      3B       | Offset window (`LAG`) single-table                            |
+| M19 |      3B       | Scalar extrema-date subquery single-table                     |
+| M20 |      IR       | Single-table `COUNT(DISTINCT ...)` + HAVING                   |
 
 ### 10.3 Hard (H1-H15)
 
@@ -306,7 +316,7 @@ Notes:
 | H14 |      7B       | Dual-fact rollup fanout-risk pattern              |
 | H15 |      7B       | Cross-year exclusion + grouped ordering           |
 
-### 10.4 Target Route Split
+### 10.4 Legacy Route Split Reference (40-case baseline)
 
 1. IR: 13/40
 2. 3B: 18/40

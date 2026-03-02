@@ -53,7 +53,7 @@ from .helpers_core import (
     _rewrite_inner_join_filter_to_exists, _rewrite_inner_join_existence_to_exists,
     _remove_redundant_and_ornamental_joins, _rewrite_invalid_fk_join_conditions, has_non_inner_join, join_count,
     # phase 2
-    _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns,
+    _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns, _repair_simple_single_table_column_names,
     # phase 3
     _wants_customer_name_only, _wants_product_name_only, _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
@@ -82,10 +82,10 @@ from .helpers_core import (
     # phase 5 — Pattern, REGEXP, and Predicate Normalization
     _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _guardrail_fix_mysql_regexp_literals,
     # phase 6
-    _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _strip_unneeded_count_distinct, _parse_from_join_aliases,
+    _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _parse_from_join_aliases,
     _ast_guardrails,
     # phase 7
-    _simplify_default_window_frame, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
+    _simplify_default_window_frame, _enforce_window_sequence_direction, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -2289,6 +2289,8 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     partition_hint = router_decision.get("partition_hint", None)
     is_explicit_rank_function = router_decision.get("is_explicit_rank_function", False)
     is_winner_row = router_decision.get("is_winner_row", False)
+    is_set_operation_intent = router_decision.get("is_set_operation_intent", False)
+    is_simple_set_operation = router_decision.get("is_simple_set_operation", False)
     
     # Detect tiebreaker pattern: "if multiple...choose the one with latest/earliest"
     has_tiebreaker = bool(re.search(
@@ -2330,6 +2332,46 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "unless the user EXPLICITLY requests them in the question. "
         "NEVER add filters based on STATS or sample values - only use what the user asks for."
     )
+    if _question_wants_count_distinct(question):
+        constraints.append(
+            "COUNT DISTINCT RULE (CRITICAL): When the question asks how many distinct, unique, or different values appear, "
+            "use COUNT(DISTINCT target_column). "
+            "Do NOT use plain COUNT(*) or COUNT(id) for that metric. "
+            "Do NOT GROUP BY the distinct target column unless the question explicitly asks to display that column."
+        )
+    if is_set_operation_intent:
+        union_keyword = "UNION" if re.search(
+            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
+            question.lower(),
+        ) else "UNION ALL"
+        constraints.append(
+            f"SET OPERATION RULE (CRITICAL): This question requires a set operation. "
+            f"Use {union_keyword} to combine branch queries into one result. "
+            "Each branch MUST return the same number of columns in the same order and compatible types."
+        )
+        constraints.append(
+            "SET OPERATION RULE (CRITICAL): If the question asks for an identifier plus a label, "
+            "return them as TWO SEPARATE columns. "
+            "Do NOT pack them into one CONCAT(...) column. "
+            "Example pattern: `SELECT orderNumber, '2003' AS year_label ... UNION SELECT orderNumber, '2004' AS year_label ...`"
+        )
+        constraints.append(
+            "SET OPERATION RULE (CRITICAL): Do NOT emulate UNION by using multiple CASE WHEN columns in one SELECT. "
+            "Wrong: `SELECT CASE WHEN ... THEN id END AS label1, CASE WHEN ... THEN id END AS label2 FROM ...`. "
+            "Correct: one SELECT branch per label, then combine branches with UNION or UNION ALL."
+        )
+        constraints.append(
+            "SET OPERATION RULE (CRITICAL): If each UNION branch represents one specific label or year, "
+            "assign that branch label as a constant literal in the SELECT list. "
+            "Do NOT reuse the same CASE WHEN label expression in every branch. "
+            "Wrong: both branches use `CASE WHEN YEAR(orderDate)=2003 THEN '2003' ELSE '2004' END`. "
+            "Correct: first branch selects `'2003' AS year_label`, second branch selects `'2004' AS year_label`."
+        )
+        if is_simple_set_operation:
+            constraints.append(
+                "SIMPLE SET OPERATION RULE: Keep each branch as a simple single-table SELECT with its own WHERE filter. "
+                "Do NOT use subqueries, window functions, GROUP BY, or extra joins unless the question explicitly requires them."
+            )
     # === [NEW] FOR EACH = ALL VALUES, NO WHERE FILTER ===
     for_each_triggers = ["for each", "each ", "per ", "every "]
     if any(t in question.lower() for t in for_each_triggers):
@@ -2369,6 +2411,18 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             f"WRONG: `COUNT(*) OVER ()` without PARTITION BY. "
             f"WRONG: Using GROUP BY with window functions.{partition_col_hint} "
             f"IMPORTANT: Do NOT add GROUP BY clause when using window functions for this pattern."
+        )
+
+    has_offset_window_intent = bool(
+        re.search(r"\b(?:previous|prior|next|following)\b", question.lower())
+        and re.search(r"\bordered\s+by\b", question.lower())
+    )
+    if has_offset_window_intent:
+        constraints.append(
+            "OFFSET WINDOW RULE (CRITICAL): When the question asks for a previous/prior value, use LAG(...). "
+            "When it asks for a next/following value, use LEAD(...). "
+            "Use a window function with PARTITION BY the entity group (for example the same customer) and ORDER BY the sequence column named in the question. "
+            "If the question says 'ordered by X' without saying descending, use ascending order for the window sequence."
         )
 
     # [A] STATS UTILIZATION (profiling statistics)
@@ -2906,6 +2960,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _fix_bad_backticks(s)
     s = _canonicalize_table_names(s, ctx)
     s = _repair_invalid_qualified_columns(s, ctx)
+    s = _repair_simple_single_table_column_names(s, ctx)
     # s = ensure_join_aliases(s)  # DISABLED: Let LLM handle its own alias consistency
     s = _escape_reserved_column_aliases(s)  # Escape reserved words used as column aliases (e.g., AS rank -> AS `rank`)
     # ---------------------------------------------------------------------------
@@ -3404,6 +3459,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     s = _expand_missing_null_to_null_or_empty(s, question)
     s = _ensure_reasonable_distinct(s, question)
+    s = _ensure_reasonable_count_distinct(s, question)
+    s = _drop_redundant_group_by_for_distinct_lookup(s)
+    s = _rewrite_case_split_to_union(s, question)
+    s = _normalize_simple_set_operation_branches(s, question)
+    s = _rewrite_union_case_label_to_literal_branches(s, question)
+    s = _rewrite_concat_label_union(s, question)
     s = _strip_unneeded_count_distinct(s)
     # ---------------------------------------------------------------------------
     # Phase 6.5 — Strip Hallucinated WHERE on GROUP BY Column for "For Each" Queries
@@ -3508,6 +3569,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Cosmetic and execution-safety adjustments only
     # ---------------------------------------------------------------------------
     s = _simplify_default_window_frame(s, question)
+    s = _enforce_window_sequence_direction(s, question)
+    s = _enforce_requested_order_direction(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
     s = _maybe_add_limit(question, s)    
     # s = _collapse_spaces_outside_quotes(s)

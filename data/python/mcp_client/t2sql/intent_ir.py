@@ -166,6 +166,7 @@ class IntentIR:
     ordering: List[IROrder] = field(default_factory=list)
     limit: Optional[int] = None
     include_zero: bool = False
+    select_distinct: bool = False
     qtype: str = ""
     notes: List[str] = field(default_factory=list)
     confidence: float = 0.0
@@ -328,8 +329,13 @@ def _phrase_pos(text: str, phrase: str) -> int:
 
 
 def _is_numeric_column(col: str) -> bool:
-    c = (col or "").lower()
-    return any(k in c for k in _NUMERIC_HINTS)
+    words = _camel_to_words(col or "")
+    tokens = {t for t in re.findall(r"[a-z0-9]+", words) if t}
+    if any(k in tokens for k in _NUMERIC_HINTS):
+        return True
+    if "credit limit" in words:
+        return True
+    return False
 
 
 def _is_date_column(col: str) -> bool:
@@ -560,6 +566,44 @@ def _question_mentions_entity(question: str, table: str) -> bool:
     return bool(re.search(rf"\b(?:{pat})\b", q, flags=re.I))
 
 
+def _wants_distinct_projection(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+
+    hard_signals = (
+        "distinct",
+        "no duplicate",
+        "without duplicates",
+        "tanpa duplikat",
+        "tanpa duplicate",
+        "hanya yang unik",
+        "dedup",
+        "de-dup",
+    )
+    if any(s in q for s in hard_signals):
+        return True
+
+    if "unique" in q and any(tok in q for tok in ("row", "rows", "record", "records", "result", "results", "value", "values")):
+        return True
+
+    implicit_patterns = (
+        r"\bone\s+(?:row|record|result)\s+(?:per|for\s+each)\b",
+        r"\beach\s+[a-z0-9_]+\s+only\s+once\b",
+        r"\bonly\s+once\s+per\b",
+    )
+    return any(re.search(pat, q, flags=re.I) for pat in implicit_patterns)
+
+
+def _wants_count_distinct(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+    if not re.search(r"\b(how\s+many|number\s+of|count|total\s+number)\b", q):
+        return False
+    return bool(re.search(r"\b(distinct|unique|different)\b", q))
+
+
 def _detect_metrics(
     question: str,
     qtype: str,
@@ -582,6 +626,7 @@ def _detect_metrics(
     wants_max = bool(re.search(r"\b(max(?:imum)?|highest|largest)\b", q))
     wants_min = bool(re.search(r"\b(min(?:imum)?|lowest|smallest)\b", q))
     wants_percentage = bool(re.search(r"\b(percent|percentage|ratio|rate)\b|%\s*of", q))
+    wants_count_distinct = _wants_count_distinct(q)
 
     temporal_direction_only = bool(
         re.search(
@@ -653,11 +698,77 @@ def _detect_metrics(
     ]
 
     def add_metric(m: IRMetric) -> None:
-        key = (m.agg, m.table.lower(), m.column.lower(), m.alias.lower())
+        key = (m.agg, m.table.lower(), m.column.lower(), m.alias.lower(), bool(m.distinct))
         for ex in metrics:
-            if (ex.agg, ex.table.lower(), ex.column.lower(), ex.alias.lower()) == key:
+            if (ex.agg, ex.table.lower(), ex.column.lower(), ex.alias.lower(), bool(ex.distinct)) == key:
                 return
         metrics.append(m)
+
+    def _resolve_column_from_phrase(phrase: str) -> Optional[Tuple[str, str]]:
+        p = (phrase or "").lower().strip()
+        if not p:
+            return None
+        p_tokens = set(re.findall(r"[a-z0-9]+", p))
+        if not p_tokens:
+            return None
+
+        candidates = column_mentions or []
+        if not candidates:
+            for t, cols in allowed.items():
+                for c in cols:
+                    candidates.append((t, c, 10**9))
+
+        best: Optional[Tuple[str, str]] = None
+        best_score = 0
+        best_pos = 10**9
+        for t, c, pos in candidates:
+            score = 0
+            for v in _column_variants(t, c):
+                v_tokens = set(re.findall(r"[a-z0-9]+", v))
+                if not v_tokens:
+                    continue
+                overlap = len(v_tokens.intersection(p_tokens))
+                score = max(score, overlap)
+            if score <= 0:
+                continue
+            prefer = 1 if t == subject else 0
+            if (
+                score > best_score
+                or (score == best_score and prefer and best is not None and best[0] != subject)
+                or (score == best_score and prefer == (1 if best and best[0] == subject else 0) and pos < best_pos)
+            ):
+                best = (t, c)
+                best_score = score
+                best_pos = pos
+        return best if best_score > 0 else None
+
+    def _pick_count_distinct_target() -> Optional[Tuple[str, str]]:
+        if not wants_count_distinct:
+            return None
+
+        for t, c, pos in column_mentions:
+            window_start = max(0, pos - 48)
+            prefix = q[window_start:pos]
+            if re.search(r"\b(distinct|unique|different)\b", prefix, flags=re.I):
+                return (t, c)
+
+        m_phrase = re.search(
+            r"\b(?:how\s+many|number\s+of|count|total\s+number(?:\s+of)?)\s+"
+            r"(?:distinct|unique|different)\s+([a-z][a-z0-9_ ]{1,40})\b",
+            q,
+            flags=re.I,
+        )
+        if m_phrase:
+            phrase = (m_phrase.group(1) or "").strip()
+            resolved_col = _resolve_column_from_phrase(phrase)
+            if resolved_col:
+                return resolved_col
+            resolved_table = _resolve_table_from_phrase(phrase)
+            if resolved_table:
+                id_col = _best_id_column(resolved_table, allowed) or "*"
+                return (resolved_table, id_col)
+
+        return None
 
     def _pick_percentage_nonnull_target() -> Optional[Tuple[str, str]]:
         # Pattern A: "non-null shipped date"
@@ -704,19 +815,34 @@ def _detect_metrics(
 
     # COUNT
     if wants_count:
-        count_table = first_mentioned or subject
-        m_count_of = re.search(
-            r"\b(?:number|count|total\s+number)\s+of\s+([a-z][a-z0-9_ ]{1,40})\b",
-            q,
-            flags=re.I,
-        )
-        if m_count_of:
-            resolved = _resolve_table_from_phrase(m_count_of.group(1))
-            if resolved:
-                count_table = resolved
-        id_col = _best_id_column(count_table, allowed) or "*"
-        alias = _safe_alias(f"{_safe_get_singular_form(count_table)}_count", "row_count")
-        add_metric(IRMetric(agg="count", table=count_table, column=id_col, alias=alias))
+        distinct_target = _pick_count_distinct_target()
+        if distinct_target:
+            count_table, count_col = distinct_target
+            col_words = _camel_to_words(count_col).replace(" ", "_") or "value"
+            alias = _safe_alias(f"distinct_{col_words}_count", "distinct_count")
+            add_metric(
+                IRMetric(
+                    agg="count",
+                    table=count_table,
+                    column=count_col,
+                    alias=alias,
+                    distinct=True,
+                )
+            )
+        else:
+            count_table = first_mentioned or subject
+            m_count_of = re.search(
+                r"\b(?:number|count|total\s+number)\s+of\s+([a-z][a-z0-9_ ]{1,40})\b",
+                q,
+                flags=re.I,
+            )
+            if m_count_of:
+                resolved = _resolve_table_from_phrase(m_count_of.group(1))
+                if resolved:
+                    count_table = resolved
+            id_col = _best_id_column(count_table, allowed) or "*"
+            alias = _safe_alias(f"{_safe_get_singular_form(count_table)}_count", "row_count")
+            add_metric(IRMetric(agg="count", table=count_table, column=id_col, alias=alias))
 
     # Percentage of non-null values within each group (single-table aggregate).
     # Example: percentage of orders with non-null shippedDate per status.
@@ -779,18 +905,29 @@ def _detect_dimensions(
     subject: str,
     allowed: Dict[str, Set[str]],
     column_mentions: List[Tuple[str, str, int]],
+    metrics: Optional[List[IRMetric]] = None,
 ) -> List[IRDimension]:
     q = (question or "").lower()
     dims: List[IRDimension] = []
     seen: Set[Tuple[str, str, str, str]] = set()
+    dedupe_row_request = bool(
+        re.search(r"\bone\s+(?:row|record|result)\s+(?:per|for\s+each)\b", q)
+    )
     aggregate_like = bool(
         re.search(
-            r"\b(for\s+each|per|group\s+by|count|number\s+of|sum|avg|average|percentage|percent|ratio|rate)\b",
+            r"\b(group\s+by|count|number\s+of|sum|avg|average|percentage|percent|ratio|rate)\b",
             q,
         )
+        or (re.search(r"\bfor\s+each\b", q) and not dedupe_row_request)
+        or (re.search(r"\bper\b", q) and not dedupe_row_request)
     )
     date_day_group_requested = bool(re.search(r"\b(for\s+each|per|by)\s+(?:date|day)\b", q))
     nonnull_cols: Set[str] = set()
+    distinct_metric_targets = {
+        (str(m.table or "").lower(), str(m.column or "").lower())
+        for m in (metrics or [])
+        if str(m.agg or "").lower() == "count" and bool(m.distinct)
+    }
 
     def add_dim(d: IRDimension) -> None:
         k = (d.table.lower(), d.column.lower(), d.transform.lower(), d.alias.lower())
@@ -798,6 +935,13 @@ def _detect_dimensions(
             return
         seen.add(k)
         dims.append(d)
+
+    def _explicit_group_dim_requested(table: str, col: str) -> bool:
+        for v in _column_variants(table, col):
+            pat = re.escape(v).replace(r"\ ", r"\s+")
+            if re.search(rf"\b(?:for\s+each|per|by|group\s+by)\s+{pat}\b", q, flags=re.I):
+                return True
+        return False
 
     # Time bucket dimensions.
     if re.search(r"\b(for\s+each|per|by)\s+month\b", q):
@@ -863,6 +1007,11 @@ def _detect_dimensions(
             if aggregate_like:
                 # In aggregate-like intents, keep grouping columns only.
                 if col.lower() in nonnull_cols:
+                    continue
+                if (
+                    (table.lower(), col.lower()) in distinct_metric_targets
+                    and not _explicit_group_dim_requested(table, col)
+                ):
                     continue
                 if _is_numeric_column(col):
                     continue
@@ -1313,6 +1462,157 @@ def _detect_ordering_and_limit(
     ordering: List[IROrder] = []
     limit: Optional[int] = None
 
+    def add_order(item: IROrder) -> None:
+        for ex in ordering:
+            if (
+                ex.kind == item.kind
+                and ex.by.lower() == item.by.lower()
+                and ex.table.lower() == item.table.lower()
+                and ex.direction.upper() == item.direction.upper()
+            ):
+                return
+        ordering.append(item)
+
+    def _metric_order_terms(m: IRMetric) -> Set[str]:
+        alias = (m.alias or "").lower().strip()
+        terms: Set[str] = set()
+        generic_metric_tokens = {
+            "count", "percentage", "percent", "ratio", "rate", "share",
+            "average", "avg", "mean", "sum", "total",
+            "min", "minimum", "max", "maximum",
+            "distinct", "value", "values", "calculated",
+        }
+
+        def _token_variants(tok: str) -> Set[str]:
+            t = (tok or "").strip().lower()
+            if not t:
+                return set()
+            out = {t}
+            if t.endswith("ies") and len(t) > 3:
+                out.add(t[:-3] + "y")
+            elif t.endswith("es") and len(t) > 2 and not t.endswith(("ses", "xes", "zes")):
+                out.add(t[:-2])
+            elif t.endswith("s") and len(t) > 1 and not t.endswith(("ss", "us")):
+                out.add(t[:-1])
+            return {x for x in out if x}
+
+        def _column_bases(col: str) -> List[str]:
+            words = _camel_to_words(col or "")
+            if not words:
+                return []
+            toks = [t for t in words.split() if t]
+            bases: List[str] = []
+            full = " ".join(toks)
+            if full:
+                bases.append(full)
+            if len(toks) >= 2 and toks[-1] in {"date", "time", "timestamp", "number", "code", "id"}:
+                trimmed = " ".join(toks[:-1]).strip()
+                if trimmed:
+                    bases.append(trimmed)
+            if toks:
+                bases.append(toks[0])
+            # preserve order, drop duplicates
+            seen_bases: Set[str] = set()
+            ordered: List[str] = []
+            for b in bases:
+                if b and b not in seen_bases:
+                    seen_bases.add(b)
+                    ordered.append(b)
+            return ordered
+
+        alias_bases: List[str] = []
+        if alias:
+            alias_words = alias.replace("_", " ").strip()
+            if alias_words:
+                terms.add(alias_words)
+                alias_tokens = [t for t in alias_words.split() if t]
+                for tok in alias_tokens:
+                    if tok in generic_metric_tokens:
+                        terms.add(tok)
+                base_tokens = [t for t in alias_tokens if t not in generic_metric_tokens]
+                if base_tokens:
+                    alias_bases.append(" ".join(base_tokens))
+                    alias_bases.extend(base_tokens)
+
+        column_bases = _column_bases(str(getattr(m, "column", "") or ""))
+        bases: List[str] = []
+        for b in alias_bases + column_bases:
+            for v in _token_variants(b) if " " not in b else {b}:
+                if v and v not in bases:
+                    bases.append(v)
+
+        agg = str(getattr(m, "agg", "") or "").lower()
+        if agg == "pct_non_null":
+            terms.update(
+                {
+                    "percentage", "percent", "ratio", "rate", "share",
+                    "calculated percentage", "calculated percent",
+                    "calculated ratio", "calculated rate", "calculated share",
+                }
+            )
+            for base in bases:
+                terms.update(
+                    {
+                        f"{base} percentage",
+                        f"{base} percent",
+                        f"{base} ratio",
+                        f"{base} rate",
+                        f"{base} share",
+                    }
+                )
+        elif agg == "count":
+            terms.update({"count", "total count"})
+            if bool(getattr(m, "distinct", False)):
+                terms.update({"distinct count", "unique count", "different count"})
+            for base in bases:
+                terms.update(
+                    {
+                        f"{base} count",
+                        f"count of {base}",
+                        f"number of {base}",
+                    }
+                )
+                if bool(getattr(m, "distinct", False)):
+                    terms.update(
+                        {
+                            f"distinct {base} count",
+                            f"unique {base} count",
+                            f"different {base} count",
+                        }
+                    )
+        elif agg == "avg":
+            terms.update({"average", "avg", "mean", "calculated average"})
+            for base in bases:
+                terms.update(
+                    {
+                        f"{base} average",
+                        f"average {base}",
+                        f"{base} avg",
+                        f"avg {base}",
+                        f"mean {base}",
+                    }
+                )
+        elif agg == "sum":
+            terms.update({"sum", "total", "total value"})
+            for base in bases:
+                terms.update(
+                    {
+                        f"{base} total",
+                        f"total {base}",
+                        f"sum of {base}",
+                    }
+                )
+        elif agg == "min":
+            terms.update({"min", "minimum"})
+            for base in bases:
+                terms.update({f"minimum {base}", f"{base} minimum"})
+        elif agg == "max":
+            terms.update({"max", "maximum"})
+            for base in bases:
+                terms.update({f"maximum {base}", f"{base} maximum"})
+
+        return {t for t in terms if t}
+
     m_lim = re.search(r"\b(?:top|bottom|first|last)\s+(\d+)\b", q)
     if m_lim:
         limit = int(m_lim.group(1))
@@ -1356,28 +1656,81 @@ def _detect_ordering_and_limit(
         else:
             direction = "ASC"
 
+    def _segment_direction(seg: str) -> str:
+        if re.search(
+            r"\b(highest|largest|latest|newest|desc|descending)\b",
+            seg,
+            flags=re.I,
+        ):
+            return "DESC"
+        if re.search(
+            r"\b(lowest|smallest|earliest|oldest|asc|ascending|alphabetical(?:ly)?|alphabetic(?:ally)?)\b",
+            seg,
+            flags=re.I,
+        ):
+            return "ASC"
+        return direction
+
     # Explicit ORDER BY phrase.
-    m_order = re.search(r"\b(?:order(?:ed)?\s+by|sorted?\s+by)\s+(.+?)(?:[.;]|$)", q)
+    m_order = re.search(r"\b(?:order(?:ed)?\s+by|sort(?:ed)?\s+by)\s+(.+?)(?:[.;]|$)", q)
     if m_order:
         phrase = m_order.group(1).strip()
-        # Metric aliases first.
-        for m in metrics:
-            alias = (m.alias or "").lower()
-            if alias and any(tok in phrase for tok in alias.replace("_", " ").split()):
-                ordering.append(IROrder(kind="alias", by=m.alias, direction=direction))
-                return ordering, limit
-        # Dimension aliases.
-        for d in dimensions:
-            alias = (d.alias or "").lower()
-            if alias and any(tok in phrase for tok in alias.replace("_", " ").split()):
-                ordering.append(IROrder(kind="alias", by=d.alias, direction=direction))
-                return ordering, limit
-        # Column mentions fallback.
-        for t, c, _ in column_mentions:
-            c_words = _camel_to_words(c)
-            if c_words and c_words in phrase:
-                ordering.append(IROrder(kind="column", by=c, table=t, direction=direction))
-                return ordering, limit
+        segments = [
+            seg.strip(" ,")
+            for seg in re.split(r"\s*,\s*|\s+\bthen\b\s+", phrase, flags=re.I)
+            if seg.strip(" ,")
+        ]
+        if not segments:
+            segments = [phrase]
+
+        for seg in segments:
+            seg_dir = _segment_direction(seg)
+            matched = False
+
+            # Metric aliases first.
+            for m in metrics:
+                order_terms = _metric_order_terms(m)
+                if any(term and re.search(rf"\b{re.escape(term)}\b", seg, flags=re.I) for term in order_terms):
+                    add_order(IROrder(kind="alias", by=m.alias, direction=seg_dir))
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            # Dimension aliases.
+            for d in dimensions:
+                alias = (d.alias or "").lower()
+                alias_words = alias.replace("_", " ").strip()
+                if alias_words and alias_words in seg:
+                    add_order(IROrder(kind="alias", by=d.alias, direction=seg_dir))
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            # Column mentions fallback.
+            for t, c, _ in column_mentions:
+                c_words = _camel_to_words(c)
+                if c_words and c_words in seg:
+                    add_order(IROrder(kind="column", by=c, table=t, direction=seg_dir))
+                    matched = True
+                    break
+
+        if ordering:
+            return ordering, limit
+
+    # "sorted alphabetically" / "in alphabetical order" on simple lookup:
+    # default to the first visible dimension.
+    if (
+        not ordering
+        and not metrics
+        and re.search(r"\b(?:alphabetical(?:ly)?|alphabetic(?:ally)?)\b", q)
+    ):
+        visible_dims = [d for d in dimensions if bool(getattr(d, "visible", True))]
+        if len(visible_dims) == 1:
+            d0 = visible_dims[0]
+            ordering.append(IROrder(kind="column", by=d0.column, table=d0.table, direction="ASC"))
+            return ordering, limit
 
     # Month special ordering.
     if any(d.alias == "__month_num" for d in dimensions):
@@ -1391,16 +1744,16 @@ def _detect_ordering_and_limit(
         numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c)]
         if numeric_mentions:
             t, c, _ = numeric_mentions[0]
-            ordering.append(IROrder(kind="column", by=c, table=t, direction=direction))
+            add_order(IROrder(kind="column", by=c, table=t, direction=direction))
 
     # Top-N fallback by first metric.
     if limit and metrics:
-        ordering.append(IROrder(kind="alias", by=metrics[0].alias, direction="DESC" if "bottom" not in q else "ASC"))
+        add_order(IROrder(kind="alias", by=metrics[0].alias, direction="DESC" if "bottom" not in q else "ASC"))
     elif limit and not ordering:
         numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c)]
         if numeric_mentions:
             t, c, _ = numeric_mentions[0]
-            ordering.append(IROrder(kind="column", by=c, table=t, direction=direction))
+            add_order(IROrder(kind="column", by=c, table=t, direction=direction))
 
     return ordering, limit
 
@@ -1444,6 +1797,16 @@ def _compute_confidence(
         score += 0.2
     else:
         notes.append("projection_missing")
+
+    if (
+        (qtype or "").lower() == "lookup"
+        and subject
+        and dimensions
+        and not metrics
+        and not existence
+        and len(mentioned_tables) <= 1
+    ):
+        score += 0.1
 
     if filters:
         score += 0.1
@@ -1545,12 +1908,15 @@ def build_intent_ir(
         table_mentions=table_mentions,
         column_mentions=column_mentions,
     )
+    if not qtype:
+        qtype = "aggregate" if metrics else "lookup"
     dimensions = _detect_dimensions(
         question=question,
         qtype=qtype,
         subject=subject,
         allowed=allowed,
         column_mentions=column_mentions,
+        metrics=metrics,
     )
     filters = _detect_filters(
         question=question,
@@ -1577,6 +1943,15 @@ def build_intent_ir(
         metrics=metrics,
         existence=existence,
     )
+    select_distinct = _wants_distinct_projection(question)
+    if (
+        qtype != "rank"
+        and select_distinct
+        and dimensions
+        and not metrics
+        and not existence
+    ):
+        qtype = "lookup"
 
     mentioned_tables = [t for t, _ in table_mentions]
     confidence, planner_compatible, notes = _compute_confidence(
@@ -1598,6 +1973,7 @@ def build_intent_ir(
         ordering=ordering,
         limit=limit,
         include_zero=include_zero,
+        select_distinct=select_distinct,
         qtype=qtype,
         notes=notes,
         confidence=confidence,

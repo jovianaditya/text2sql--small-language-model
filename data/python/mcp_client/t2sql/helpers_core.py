@@ -39,7 +39,8 @@ _SQL_KEYWORDS = {
     "select","from","where","group","by","order","limit","join","left","right","inner",
     "on","and","or","not","as","distinct","count","sum","avg","min","max","having",
     "asc","desc","like","in","between","is","null","case","when","then","else","end",
-    "regexp","rlike","over","partition","row_number"
+    "regexp","rlike","over","partition","row_number",
+    "union","all","except","intersect"
 }
 _JOIN_KW = r"(?:inner\s+join|left\s+join|right\s+join|full\s+join|join)"
 # =======================================================================
@@ -1658,6 +1659,7 @@ def _rewrite_invalid_fk_join_conditions(sql: str, ctx: str = "") -> str:
 # - drop_unused_from_table_aliases
 # - strip_alias_if_single_table
 # - repair_invalid_qualified_columns
+# - repair_simple_single_table_column_names
 
 def _repair_invalid_qualified_columns(sql: str, ctx: str = "") -> str:
     """
@@ -1842,6 +1844,147 @@ def _repair_invalid_qualified_columns(sql: str, ctx: str = "") -> str:
             return f"{aq}{replacement}{aq}.{cq}{col}{cq}"
 
         parts[i] = qcol_pat.sub(_repl, seg)
+
+    return "".join(parts)
+
+
+def _repair_simple_single_table_column_names(sql: str, ctx: str = "") -> str:
+    """
+    Schema-aware repair for simple single-table queries where the model uses
+    naturalized snake_case identifiers instead of the actual schema column names.
+
+    Example:
+      customer_number -> customerNumber
+      payment_date    -> paymentDate
+
+    Conservative guardrails:
+    - only for a single base table with no JOIN
+    - only when normalized identifier maps uniquely to one real column
+    - skips aliases after AS and function names
+    """
+    if not sql:
+        return sql
+    if has_join(sql):
+        return sql
+    if re.search(r"\bfrom\s*\(", sql, flags=re.I):
+        return sql
+
+    m_from = re.search(
+        r"""
+        \bFROM\s+
+        (?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+        (?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?
+        """,
+        sql,
+        flags=re.I | re.X,
+    )
+    if not m_from:
+        return sql
+
+    table_raw = (m_from.group("table") or "").replace("`", "")
+    table_l = table_raw.split(".")[-1].strip().lower()
+    alias = (m_from.group("alias") or "").strip()
+    if alias and alias.lower() in _RESERVED_ALIASES:
+        alias = ""
+    if not table_l:
+        return sql
+
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    actual_cols: List[str] = []
+    if analyzer:
+        try:
+            actual_cols = [str(c) for c in analyzer.get_table_columns(table_l) if str(c)]
+        except Exception:
+            actual_cols = []
+    if not actual_cols and ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            actual_cols = [str(c) for c in (allowed.get(table_l, set()) or []) if str(c)]
+        except Exception:
+            actual_cols = []
+    if not actual_cols:
+        return sql
+
+    actual_cols_lower = {c.lower() for c in actual_cols}
+
+    def _norm_ident(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (text or "").strip().lower())
+
+    norm_map: Dict[str, List[str]] = {}
+    for c in actual_cols:
+        norm_map.setdefault(_norm_ident(c), []).append(c)
+
+    def _resolve_col(token: str) -> Optional[str]:
+        tl = (token or "").strip().lower()
+        if not tl:
+            return None
+        if tl in actual_cols_lower:
+            return None
+        cands = norm_map.get(_norm_ident(token), [])
+        if len(cands) == 1:
+            return cands[0]
+        return None
+
+    valid_symbols = {table_l}
+    if alias:
+        valid_symbols.add(alias.lower())
+
+    qcol_pat = re.compile(
+        r"""
+        (?P<aq>`?)
+        (?P<sym>[A-Za-z_][A-Za-z0-9_]*)
+        (?P=aq)\s*\.\s*
+        (?P<cq>`?)
+        (?P<col>[A-Za-z_][A-Za-z0-9_]*)
+        (?P=cq)
+        """,
+        flags=re.X,
+    )
+
+    parts = _split_outside_quotes(sql)
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+
+        def _qual_repl(m: re.Match) -> str:
+            sym = (m.group("sym") or "").lower()
+            col = m.group("col") or ""
+            if sym not in valid_symbols:
+                return m.group(0)
+            replacement = _resolve_col(col)
+            if not replacement:
+                return m.group(0)
+            aq = m.group("aq") or ""
+            cq = m.group("cq") or ""
+            return f"{aq}{m.group('sym')}{aq}.{cq}{replacement}{cq}"
+
+        seg = qcol_pat.sub(_qual_repl, seg)
+
+        token_pat = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+
+        def _unqual_repl(m: re.Match) -> str:
+            token = m.group(1)
+            low = token.lower()
+            if low in _SQL_KEYWORDS or low in valid_symbols or low in actual_cols_lower:
+                return token
+
+            left = seg[:m.start()]
+            right = seg[m.end():]
+            if left.rstrip().endswith("."):
+                return token
+            if re.search(r"\bAS\s*$", left, flags=re.I):
+                return token
+            if right.lstrip().startswith("("):
+                return token
+
+            replacement = _resolve_col(token)
+            return replacement or token
+
+        parts[i] = token_pat.sub(_unqual_repl, seg)
 
     return "".join(parts)
 
@@ -10063,6 +10206,8 @@ def _guardrail_fix_mysql_regexp_literals(sql: str) -> str:
 # - add_distinct
 # - remove_distinct
 # - ensure_reasonable_distinct
+# - question_wants_count_distinct
+# - ensure_reasonable_count_distinct
 # - parse_from_join_aliases
 # - strip_unneeded_count_distinct
 
@@ -10123,7 +10268,14 @@ def _wants_distinct_from_question(question: str) -> bool:
     ]
     if any(s in q for s in hard_signals):
         return True
-    if "unique" in q and ("rows" in q or "records" in q or "result" in q):
+    if "unique" in q and any(tok in q for tok in ("row", "rows", "record", "records", "result", "results", "value", "values")):
+        return True
+    implicit_patterns = (
+        r"\bone\s+(?:row|record|result)\s+(?:per|for\s+each)\b",
+        r"\beach\s+[a-z0-9_]+\s+only\s+once\b",
+        r"\bonly\s+once\s+per\b",
+    )
+    if any(re.search(pat, q, flags=re.I) for pat in implicit_patterns):
         return True
     return False
 
@@ -10141,9 +10293,1106 @@ def _remove_distinct(sql: str) -> str:
 def _ensure_reasonable_distinct(sql: str, question: str) -> str:
     if not sql:
         return sql
+    if _question_wants_count_distinct(question):
+        return _remove_distinct(sql)
     if _wants_distinct_from_question(question):
         return _add_distinct(sql)
     return _remove_distinct(sql)
+
+
+def _question_wants_count_distinct(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+    if not re.search(r"\b(how\s+many|number\s+of|count|total\s+number)\b", q):
+        return False
+    return bool(re.search(r"\b(distinct|unique|different)\b", q))
+
+
+def _ensure_reasonable_count_distinct(sql: str, question: str) -> str:
+    """
+    Repair a common grouped-aggregate mistake for questions that ask for
+    COUNT(DISTINCT ...), where the model instead groups by the distinct target
+    column and uses plain COUNT(...).
+
+    Example bad shape:
+      SELECT YEAR(orderDate) AS year, status, COUNT(orderNumber)
+      FROM orders
+      GROUP BY YEAR(orderDate), status
+
+    Rewrites to:
+      SELECT YEAR(orderDate) AS year, COUNT(DISTINCT status)
+      FROM orders
+      GROUP BY YEAR(orderDate)
+    """
+    s = (sql or "").strip()
+    q = (question or "").lower()
+    if not s or not _question_wants_count_distinct(q):
+        return sql
+    if re.search(r"\bCOUNT\s*\(\s*DISTINCT\b", s, flags=re.I):
+        return sql
+    if "GROUP BY" not in s.upper() or "COUNT(" not in s.upper():
+        return sql
+
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        target = kw.upper()
+        t_up = text.upper()
+        depth = 0
+        quote = ""
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and t_up.startswith(target, i):
+                prev_ok = i == 0 or not (t_up[i - 1].isalnum() or t_up[i - 1] == "_")
+                after = i + len(target)
+                next_ok = after >= len(t_up) or not (t_up[after].isalnum() or t_up[after] == "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        quote = ""
+        for i, ch in enumerate(text):
+            if quote:
+                cur.append(ch)
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                part = "".join(cur).strip()
+                if part:
+                    parts.append(part)
+                cur = []
+                continue
+            cur.append(ch)
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _strip_alias(item: str) -> str:
+        return re.split(r"\s+AS\s+", item, maxsplit=1, flags=re.I)[0].strip()
+
+    def _get_alias(item: str) -> str:
+        parts = re.split(r"\s+AS\s+", item, maxsplit=1, flags=re.I)
+        if len(parts) == 2:
+            return parts[1].strip().strip("`")
+        return ""
+
+    def _norm(text: str) -> str:
+        rendered = text.replace("`", "")
+        rendered = re.sub(r"\s+", "", rendered).lower()
+        return rendered
+
+    def _tokenize_expr(item: str) -> Set[str]:
+        base = _strip_alias(item)
+        alias = _get_alias(item)
+        raw = f"{base} {alias}".lower()
+        tokens = {t for t in re.findall(r"[a-z0-9]+", raw) if t}
+        expanded = set(tokens)
+        for t in list(tokens):
+            if t.endswith("ies") and len(t) > 3:
+                expanded.add(t[:-3] + "y")
+            elif t.endswith("es") and len(t) > 2:
+                expanded.add(t[:-2])
+            elif t.endswith("s") and len(t) > 1 and not t.endswith(("ss", "us")):
+                expanded.add(t[:-1])
+        return expanded
+
+    select_match = re.match(r"^\s*SELECT\s+(DISTINCT\s+)?", s, flags=re.I)
+    if not select_match:
+        return sql
+    has_select_distinct = bool(select_match.group(1))
+
+    from_pos = _find_top_level_kw(s, "FROM", select_match.end())
+    group_pos = _find_top_level_kw(s, "GROUP BY", max(select_match.end(), from_pos))
+    if from_pos < 0 or group_pos < 0:
+        return sql
+
+    having_pos = _find_top_level_kw(s, "HAVING", group_pos + len("GROUP BY"))
+    order_pos = _find_top_level_kw(s, "ORDER BY", group_pos + len("GROUP BY"))
+    limit_pos = _find_top_level_kw(s, "LIMIT", group_pos + len("GROUP BY"))
+
+    group_end_candidates = [p for p in (having_pos, order_pos, limit_pos) if p >= 0]
+    group_end = min(group_end_candidates) if group_end_candidates else len(s)
+
+    select_part = s[select_match.end():from_pos].strip()
+    from_clause = s[from_pos:group_pos].strip()
+    group_part = s[group_pos + len("GROUP BY"):group_end].strip()
+    suffix = s[group_end:].strip()
+
+    select_items = _split_top_level_csv(select_part)
+    group_items = _split_top_level_csv(group_part)
+    if len(select_items) < 2 or not group_items:
+        return sql
+
+    agg_pat = re.compile(r"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", flags=re.I)
+    window_pat = re.compile(r"\bOVER\s*\(", flags=re.I)
+
+    count_idx = -1
+    for idx, item in enumerate(select_items):
+        if re.search(r"\bCOUNT\s*\(", item, flags=re.I) and not window_pat.search(item):
+            count_idx = idx
+            break
+    if count_idx < 0:
+        return sql
+
+    non_agg_indices = [
+        idx for idx, item in enumerate(select_items)
+        if not agg_pat.search(item) and not window_pat.search(item)
+    ]
+    if len(non_agg_indices) < 2:
+        return sql
+
+    hint_tokens: Set[str] = set()
+    m_hint = re.search(
+        r"\b(?:how\s+many|number\s+of|count|total\s+number(?:\s+of)?)\s+"
+        r"(?:distinct|unique|different)\s+([a-z][a-z0-9_ ]{1,40})\b",
+        q,
+        flags=re.I,
+    )
+    if m_hint:
+        hint_tokens = {t for t in re.findall(r"[a-z0-9]+", m_hint.group(1).lower()) if t}
+        expanded = set(hint_tokens)
+        for t in list(hint_tokens):
+            if t.endswith("ies") and len(t) > 3:
+                expanded.add(t[:-3] + "y")
+            elif t.endswith("es") and len(t) > 2:
+                expanded.add(t[:-2])
+            elif t.endswith("s") and len(t) > 1 and not t.endswith(("ss", "us")):
+                expanded.add(t[:-1])
+        hint_tokens = expanded
+
+    candidate_idx = -1
+    best_score = 0
+    for idx in non_agg_indices:
+        score = 0
+        if hint_tokens:
+            score = len(_tokenize_expr(select_items[idx]).intersection(hint_tokens))
+        if score > best_score or (score == best_score and score > 0 and idx > candidate_idx):
+            best_score = score
+            candidate_idx = idx
+    if candidate_idx < 0:
+        candidate_idx = non_agg_indices[-1]
+
+    candidate_item = select_items[candidate_idx]
+    candidate_base = _strip_alias(candidate_item)
+    candidate_alias = _get_alias(candidate_item)
+    candidate_norm = _norm(candidate_base)
+    group_norms = [_norm(item) for item in group_items]
+    if candidate_norm not in group_norms:
+        return sql
+
+    if order_pos >= 0:
+        order_end = limit_pos if limit_pos > order_pos else len(s)
+        order_clause = s[order_pos + len("ORDER BY"):order_end].strip()
+        order_norm = _norm(order_clause)
+        if candidate_alias and re.search(rf"\b{re.escape(candidate_alias.lower())}\b", order_clause.lower()):
+            return sql
+        if candidate_norm and candidate_norm in order_norm:
+            return sql
+
+    count_item = select_items[count_idx]
+    count_alias = ""
+    count_alias_match = re.search(r"\s+AS\s+(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", count_item, flags=re.I)
+    if count_alias_match:
+        count_alias = count_alias_match.group(1)
+    new_count_item = f"COUNT(DISTINCT {candidate_base})"
+    if count_alias:
+        new_count_item += f" AS {count_alias}"
+
+    new_select_items: List[str] = []
+    for idx, item in enumerate(select_items):
+        if idx == candidate_idx:
+            continue
+        if idx == count_idx:
+            new_select_items.append(new_count_item)
+        else:
+            new_select_items.append(item)
+
+    new_group_items = [item for item in group_items if _norm(item) != candidate_norm]
+    if not new_select_items or not new_group_items:
+        return sql
+
+    select_keyword = "SELECT DISTINCT" if has_select_distinct else "SELECT"
+    out = f"{select_keyword} " + ", ".join(new_select_items) + f" {from_clause} GROUP BY " + ", ".join(new_group_items)
+    if suffix:
+        out += " " + suffix
+    return out
+
+
+def _drop_redundant_group_by_for_distinct_lookup(sql: str) -> str:
+    """
+    Drop top-level GROUP BY when it is only acting as a dedupe mechanism for a
+    SELECT DISTINCT lookup query.
+
+    Conservative guardrails:
+    - top-level SELECT must already be DISTINCT
+    - no HAVING, no aggregate functions, no window functions
+    - GROUP BY expressions must match the visible SELECT expressions
+    """
+    s = (sql or "").strip()
+    if not s or "GROUP BY" not in s.upper() or "SELECT DISTINCT" not in s.upper():
+        return sql
+
+    s_up = s.upper()
+    if " HAVING " in f" {s_up} " or " OVER " in f" {s_up} ":
+        return sql
+
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        target = kw.upper()
+        t_up = text.upper()
+        depth = 0
+        quote = ""
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote and text[i - 1] != "\\":
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and t_up.startswith(target, i):
+                prev_ok = i == 0 or not (t_up[i - 1].isalnum() or t_up[i - 1] == "_")
+                after = i + len(target)
+                next_ok = after >= len(t_up) or not (t_up[after].isalnum() or t_up[after] == "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        quote = ""
+        for i, ch in enumerate(text):
+            if quote:
+                cur.append(ch)
+                if ch == quote and text[i - 1] != "\\":
+                    quote = ""
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                part = "".join(cur).strip()
+                if part:
+                    parts.append(part)
+                cur = []
+                continue
+            cur.append(ch)
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    select_match = re.match(r"^\s*SELECT\s+DISTINCT\s+", s, flags=re.I)
+    if not select_match:
+        return sql
+
+    from_pos = _find_top_level_kw(s, "FROM", select_match.end())
+    group_pos = _find_top_level_kw(s, "GROUP BY", max(select_match.end(), from_pos))
+    if from_pos < 0 or group_pos < 0:
+        return sql
+
+    next_positions = [
+        pos for pos in (
+            _find_top_level_kw(s, "HAVING", group_pos + 8),
+            _find_top_level_kw(s, "ORDER BY", group_pos + 8),
+            _find_top_level_kw(s, "LIMIT", group_pos + 8),
+        )
+        if pos >= 0
+    ]
+    group_end = min(next_positions) if next_positions else len(s)
+
+    select_items = _split_top_level_csv(s[select_match.end():from_pos].strip())
+    group_items = _split_top_level_csv(s[group_pos + len("GROUP BY"):group_end].strip())
+    if not select_items or len(select_items) != len(group_items):
+        return sql
+
+    if any(re.search(r"\b(count|sum|avg|min|max)\s*\(", item, flags=re.I) for item in select_items):
+        return sql
+
+    def _strip_select_alias(item: str) -> str:
+        return re.split(r"\s+AS\s+", item, maxsplit=1, flags=re.I)[0].strip()
+
+    def _norm(text: str) -> str:
+        rendered = text.replace("`", "")
+        rendered = re.sub(r"\s+", "", rendered).lower()
+        return rendered
+
+    select_norms = sorted(_norm(_strip_select_alias(item)) for item in select_items)
+    group_norms = sorted(_norm(item) for item in group_items)
+    if select_norms != group_norms:
+        return sql
+
+    prefix = s[:group_pos].rstrip()
+    suffix = s[group_end:].lstrip()
+    if not suffix:
+        return prefix
+    sep = "\n" if "\n" in prefix or "\n" in suffix else " "
+    return prefix + sep + suffix
+
+
+def _normalize_simple_set_operation_branches(sql: str, question: str) -> str:
+    """
+    Normalize simple UNION / UNION ALL chains where each branch returns an
+    identifier plus a label column.
+
+    Supported branch families:
+    - SELECT id, 'label' AS label_alias FROM table WHERE ...
+    - SELECT CONCAT('label-', id) AS bad_alias FROM table WHERE ...
+
+    This is intentionally conservative:
+    - only top-level UNION / UNION ALL chains
+    - only simple single-table branches
+    - all branches must project the same identifier expression
+
+    It supports 2+ branches and canonicalizes the output to:
+      SELECT id, 'label' AS label_alias FROM table WHERE ...
+      UNION [ALL] ...
+      ORDER BY label_alias <dir>, id <dir>
+    """
+    s = (sql or "").strip()
+    q = (question or "").lower()
+    if not s or "UNION" not in s.upper():
+        return sql
+
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        target = kw.upper()
+        t_up = text.upper()
+        depth = 0
+        quote = ""
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and t_up.startswith(target, i):
+                prev_ok = i == 0 or not (t_up[i - 1].isalnum() or t_up[i - 1] == "_")
+                after = i + len(target)
+                next_ok = after >= len(t_up) or not (t_up[after].isalnum() or t_up[after] == "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        quote = ""
+        for i, ch in enumerate(text):
+            if quote:
+                cur.append(ch)
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                part = "".join(cur).strip()
+                if part:
+                    parts.append(part)
+                cur = []
+                continue
+            cur.append(ch)
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _split_union_chain(text: str) -> Tuple[List[str], List[str]]:
+        branches: List[str] = []
+        operators: List[str] = []
+        depth = 0
+        quote = ""
+        start = 0
+        i = 0
+        t_up = text.upper()
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0:
+                token = ""
+                if t_up.startswith("UNION ALL", i):
+                    token = "UNION ALL"
+                elif t_up.startswith("UNION", i):
+                    token = "UNION"
+                if token:
+                    prev_ok = i == 0 or not (t_up[i - 1].isalnum() or t_up[i - 1] == "_")
+                    after = i + len(token)
+                    next_ok = after >= len(t_up) or not (t_up[after].isalnum() or t_up[after] == "_")
+                    if prev_ok and next_ok:
+                        branch = text[start:i].strip()
+                        if not branch:
+                            return [], []
+                        branches.append(branch)
+                        operators.append(token)
+                        start = after
+                        i = after
+                        continue
+            i += 1
+        tail = text[start:].strip()
+        if tail:
+            branches.append(tail)
+        return branches, operators
+
+    def _segment_dir(text: str, target_pat: str, default: str = "ASC") -> str:
+        if not text:
+            return default
+        if re.search(rf"{target_pat}.*\bdescending\b", text, flags=re.I) or re.search(
+            rf"\bdescending\b.*{target_pat}", text, flags=re.I
+        ):
+            return "DESC"
+        if re.search(rf"{target_pat}.*\bascending\b", text, flags=re.I) or re.search(
+            rf"\bascending\b.*{target_pat}", text, flags=re.I
+        ):
+            return "ASC"
+        return default
+
+    body = s[:-1].rstrip() if s.endswith(";") else s
+    order_pos = _find_top_level_kw(body, "ORDER BY")
+    if order_pos >= 0:
+        order_clause = body[order_pos + len("ORDER BY"):].strip()
+        core = body[:order_pos].rstrip()
+    else:
+        order_clause = ""
+        core = body
+
+    branches, operators = _split_union_chain(core)
+    if len(branches) < 2 or len(operators) != len(branches) - 1:
+        return sql
+
+    direct_re = re.compile(
+        r"""
+        ^\s*SELECT\s+
+        (?P<idcol>(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)\s*,\s*
+        '(?P<label>[^']+)'\s+AS\s+`?(?P<label_alias>[A-Za-z_][A-Za-z0-9_]*|\d{4})`?\s+
+        FROM\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)
+        (?:\s+WHERE\s+(?P<where>.+?))?\s*$
+        """,
+        flags=re.I | re.S | re.X,
+    )
+    concat_re = re.compile(
+        r"""
+        ^\s*SELECT\s+
+        CONCAT\(\s*'(?P<label>[^']+)'\s*,\s*(?P<idcol>(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)\s*\)\s+
+        AS\s+`?(?P<bad_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s+
+        FROM\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)
+        (?:\s+WHERE\s+(?P<where>.+?))?\s*$
+        """,
+        flags=re.I | re.S | re.X,
+    )
+
+    branch_infos: List[Dict[str, str]] = []
+    for branch in branches:
+        parsed: Optional[Dict[str, str]] = None
+        m = direct_re.match(branch)
+        if m:
+            parsed = {
+                "idcol": m.group("idcol"),
+                "label": m.group("label"),
+                "label_alias": m.group("label_alias"),
+                "table": m.group("table"),
+                "where": (m.group("where") or "").strip(),
+            }
+        else:
+            m = concat_re.match(branch)
+            if m:
+                label = m.group("label")
+                clean_label = label.rstrip("-: ").strip() or label
+                parsed = {
+                    "idcol": m.group("idcol"),
+                    "label": clean_label,
+                    "label_alias": "",
+                    "table": m.group("table"),
+                    "where": (m.group("where") or "").strip(),
+                }
+        if not parsed:
+            return sql
+        branch_infos.append(parsed)
+
+    def _norm_ident(text: str) -> str:
+        return re.sub(r"\s+", "", (text or "").strip()).lower()
+
+    if any(_norm_ident(info["idcol"]) != _norm_ident(branch_infos[0]["idcol"]) for info in branch_infos[1:]):
+        return sql
+
+    alias_candidates = [info["label_alias"] for info in branch_infos if info["label_alias"]]
+    label_alias = alias_candidates[0] if alias_candidates else ("year_label" if "year label" in q else "label")
+
+    prefer_union = bool(
+        re.search(
+            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    prefer_union_all = bool(re.search(r"\bunion\s+all\b", q, flags=re.I))
+    if prefer_union:
+        out_ops = ["UNION"] * len(operators)
+    elif prefer_union_all:
+        out_ops = ["UNION ALL"] * len(operators)
+    else:
+        out_ops = [op.upper() for op in operators]
+
+    label_dir = "ASC"
+    id_dir = "ASC"
+    if order_clause:
+        order_items = _split_top_level_csv(order_clause)
+        if order_items:
+            label_dir = "DESC" if re.search(r"\bDESC\b", order_items[0], flags=re.I) else "ASC"
+        if len(order_items) >= 2:
+            id_dir = "DESC" if re.search(r"\bDESC\b", order_items[1], flags=re.I) else "ASC"
+    else:
+        label_dir = _segment_dir(q, r"\b(?:year\s+label|label)\b", "ASC")
+        id_leaf = branch_infos[0]["idcol"].split(".")[-1]
+        id_words = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", id_leaf.replace("_", " ")).lower()
+        id_dir = _segment_dir(q, rf"\b{re.escape(id_words)}\b", "ASC")
+
+    branch_sqls: List[str] = []
+    for info in branch_infos:
+        part = f"SELECT {info['idcol']}, '{info['label']}' AS {label_alias} FROM {info['table']}"
+        if info["where"]:
+            part += f" WHERE {info['where']}"
+        branch_sqls.append(part)
+
+    out = branch_sqls[0]
+    for op, branch_sql in zip(out_ops, branch_sqls[1:]):
+        out += f" {op} {branch_sql}"
+
+    if order_clause or re.search(r"\b(?:order|sort|sorted)\b", q, flags=re.I):
+        out += f" ORDER BY {label_alias} {label_dir}, {branch_infos[0]['idcol']} {id_dir}"
+    if s.endswith(";"):
+        out += ";"
+    return out
+
+
+def _rewrite_concat_label_union(sql: str, question: str) -> str:
+    """
+    Repair a common bad set-operation draft where the model packs a label and an
+    identifier into one CONCAT(...) column instead of returning two columns.
+
+    Example bad shape:
+      SELECT CONCAT('2003-', orderNumber) AS year_orderNumber ...
+      UNION
+      SELECT CONCAT('2004-', orderNumber) AS year_orderNumber ...
+
+    Rewrites to:
+      SELECT orderNumber, '2003' AS year_label ...
+      UNION
+      SELECT orderNumber, '2004' AS year_label ...
+      ORDER BY year_label ASC, orderNumber ASC
+    """
+    s = (sql or "").strip()
+    q = (question or "").lower()
+    if not s or "UNION" not in s.upper():
+        return sql
+    if "label" not in q:
+        return sql
+
+    ident = r"(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)"
+    tbl = r"(`?[A-Za-z_][A-Za-z0-9_]*`?)"
+    pat = re.compile(
+        rf"""
+        ^\s*SELECT\s+CONCAT\(\s*'(?P<label1>[^']+)'\s*,\s*{ident}\s*\)\s+AS\s+`?(?P<bad_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s+
+        FROM\s+{tbl}\s+
+        WHERE\s+YEAR\(\s*{ident}\s*\)\s*=\s*(?P<year1>\d{{4}})\s+
+        UNION\s+
+        SELECT\s+CONCAT\(\s*'(?P<label2>[^']+)'\s*,\s*{ident}\s*\)\s+AS\s+`?(?P=bad_alias)`?\s+
+        FROM\s+{tbl}\s+
+        WHERE\s+YEAR\(\s*{ident}\s*\)\s*=\s*(?P<year2>\d{{4}})\s*
+        (?:ORDER\s+BY\s+`?(?P<order_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s+(?P<order_dir>ASC|DESC)\s*)?
+        ;?\s*$
+        """,
+        flags=re.I | re.S | re.X,
+    )
+    m = pat.match(s)
+    if not m:
+        return sql
+
+    groups = m.groups()
+    # Group layout from repeated unnamed captures:
+    # label1, id1, bad_alias, table1, date1, year1, label2, id2, table2, date2, year2, order_alias, order_dir
+    label1 = m.group("label1")
+    label2 = m.group("label2")
+    bad_alias = m.group("bad_alias")
+    year1 = m.group("year1")
+    year2 = m.group("year2")
+    order_alias = m.group("order_alias") or ""
+    order_dir = (m.group("order_dir") or "ASC").upper()
+    # Positional unnamed capture groups for repeated identifier/table parts.
+    # 1=id1, 2=table1, 3=date1, 4=id2, 5=table2, 6=date2
+    id1 = groups[1]
+    table1 = groups[3]
+    date1 = groups[4]
+    id2 = groups[7]
+    table2 = groups[8]
+    date2 = groups[9]
+
+    if not all((id1, id2, table1, table2, date1, date2)):
+        return sql
+    if id1.lower() != id2.lower():
+        return sql
+    if table1.replace("`", "").lower() != table2.replace("`", "").lower():
+        return sql
+    if date1.lower() != date2.lower():
+        return sql
+    if order_alias and order_alias.lower() != bad_alias.lower():
+        return sql
+
+    # Only unwrap the "label-prefix + id" misuse, not arbitrary CONCATs.
+    if not label1.endswith("-") or not label2.endswith("-"):
+        return sql
+
+    clean_label1 = label1[:-1]
+    clean_label2 = label2[:-1]
+    label_alias = "year_label" if "year label" in q else "label"
+    order_dir = "DESC" if order_dir == "DESC" else "ASC"
+
+    out = (
+        f"SELECT {id1}, '{clean_label1}' AS {label_alias} "
+        f"FROM {table1} WHERE YEAR({date1}) = {year1} "
+        "UNION "
+        f"SELECT {id1}, '{clean_label2}' AS {label_alias} "
+        f"FROM {table1} WHERE YEAR({date1}) = {year2} "
+        f"ORDER BY {label_alias} {order_dir}, {id1} ASC"
+    )
+    if s.endswith(";"):
+        out += ";"
+    return out
+
+
+def _rewrite_case_split_to_union(sql: str, question: str) -> str:
+    """
+    Repair a bad set-operation draft where the model emulates UNION with multiple
+    CASE columns in a single SELECT.
+
+    Example bad shape:
+      SELECT
+        CASE WHEN YEAR(orderDate)=2003 THEN orderNumber ELSE NULL END AS `2003`,
+        CASE WHEN YEAR(orderDate)=2004 THEN orderNumber ELSE NULL END
+      FROM orders
+      WHERE YEAR(orderDate) IN (2003, 2004)
+
+    Rewrites to row-wise set operation branches:
+      SELECT orderNumber, '2003' AS year_label ...
+      UNION
+      SELECT orderNumber, '2004' AS year_label ...
+    """
+    s = (sql or "").strip()
+    q = (question or "").lower()
+    if not s or "CASE" not in s.upper() or "UNION" in s.upper():
+        return sql
+    if "label" not in q:
+        return sql
+
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        target = kw.upper()
+        t_up = text.upper()
+        depth = 0
+        quote = ""
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and t_up.startswith(target, i):
+                prev_ok = i == 0 or not (t_up[i - 1].isalnum() or t_up[i - 1] == "_")
+                after = i + len(target)
+                next_ok = after >= len(t_up) or not (t_up[after].isalnum() or t_up[after] == "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        quote = ""
+        for i, ch in enumerate(text):
+            if quote:
+                cur.append(ch)
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                part = "".join(cur).strip()
+                if part:
+                    parts.append(part)
+                cur = []
+                continue
+            cur.append(ch)
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    select_pos = _find_top_level_kw(s, "SELECT")
+    from_pos = _find_top_level_kw(s, "FROM", max(0, select_pos + 6))
+    if select_pos < 0 or from_pos < 0:
+        return sql
+    where_pos = _find_top_level_kw(s, "WHERE", from_pos + 4)
+    order_pos = _find_top_level_kw(s, "ORDER BY", from_pos + 4)
+    limit_pos = _find_top_level_kw(s, "LIMIT", from_pos + 4)
+
+    from_end_candidates = [p for p in (where_pos, order_pos, limit_pos) if p >= 0]
+    from_end = min(from_end_candidates) if from_end_candidates else len(s)
+
+    select_part = s[select_pos + len("SELECT"):from_pos].strip()
+    from_part = s[from_pos + len("FROM"):from_end].strip()
+    where_part = ""
+    if where_pos >= 0:
+        where_end_candidates = [p for p in (order_pos, limit_pos) if p > where_pos]
+        where_end = min(where_end_candidates) if where_end_candidates else len(s)
+        where_part = s[where_pos + len("WHERE"):where_end].strip()
+    order_part = ""
+    if order_pos >= 0:
+        order_end = limit_pos if limit_pos > order_pos else len(s)
+        order_part = s[order_pos + len("ORDER BY"):order_end].strip().rstrip(";")
+
+    if not select_part or not from_part:
+        return sql
+    if any(tok in from_part.upper() for tok in (" JOIN ", ",")):
+        return sql
+
+    case_items = _split_top_level_csv(select_part)
+    if len(case_items) < 2:
+        return sql
+
+    case_re = re.compile(
+        r"""
+        ^CASE\s+WHEN\s+YEAR\(\s*(?P<datecol>[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*=\s*(?P<year>\d{4})\s+
+        THEN\s+(?P<idcol>[A-Za-z_][A-Za-z0-9_]*)\s+ELSE\s+NULL\s+END
+        (?:\s+AS\s+`?(?P<alias>[A-Za-z_][A-Za-z0-9_]*|\d{4})`?)?
+        $""",
+        flags=re.I | re.X,
+    )
+
+    branches: List[Tuple[str, str, str, str]] = []
+    base_date = ""
+    base_id = ""
+    for item in case_items:
+        m = case_re.match(item.strip())
+        if not m:
+            return sql
+        datecol = m.group("datecol")
+        year = m.group("year")
+        idcol = m.group("idcol")
+        alias = (m.group("alias") or year).strip("`")
+        if not base_date:
+            base_date = datecol
+            base_id = idcol
+        elif datecol.lower() != base_date.lower() or idcol.lower() != base_id.lower():
+            return sql
+        branches.append((year, alias, datecol, idcol))
+
+    if not branches:
+        return sql
+
+    if where_part:
+        years_in_where = {
+            y for y in re.findall(r"\b(?:19|20)\d{2}\b", where_part)
+        }
+        branch_years = {y for y, _, _, _ in branches}
+        if years_in_where and branch_years and not branch_years.issubset(years_in_where):
+            return sql
+
+    label_alias = "year_label" if "year label" in q else "label"
+    use_union = bool(
+        re.search(
+            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    union_kw = "UNION" if use_union else "UNION ALL"
+
+    label_dir = "ASC"
+    id_dir = "ASC"
+    if order_part:
+        order_items = _split_top_level_csv(order_part)
+        if order_items:
+            m1 = re.search(r"\b(DESC|ASC)\b", order_items[0], flags=re.I)
+            if m1:
+                label_dir = m1.group(1).upper()
+        if len(order_items) >= 2:
+            m2 = re.search(r"\b(DESC|ASC)\b", order_items[1], flags=re.I)
+            if m2:
+                id_dir = m2.group(1).upper()
+
+    branch_sqls = [
+        f"SELECT {base_id}, '{alias}' AS {label_alias} FROM {from_part} WHERE YEAR({base_date}) = {year}"
+        for year, alias, _, _ in branches
+    ]
+    out = f" {union_kw} ".join(branch_sqls)
+    if order_part or re.search(r"\b(?:order|sort|sorted)\b", q, flags=re.I):
+        out += f" ORDER BY {label_alias} {label_dir}, {base_id} {id_dir}"
+    if s.endswith(";"):
+        out += ";"
+    return out
+
+
+def _rewrite_union_case_label_to_literal_branches(sql: str, question: str) -> str:
+    """
+    Repair a bad UNION draft where each branch still uses the same CASE expression
+    to derive a label, instead of assigning a constant label per branch.
+
+    Example bad shape:
+      SELECT orderNumber,
+             CASE WHEN YEAR(orderDate)=2003 THEN '2003' ELSE '2004' END AS year_label
+      FROM orders
+      WHERE YEAR(orderDate) IN (2003, 2004)
+      UNION
+      SELECT orderNumber,
+             CASE WHEN YEAR(orderDate)=2003 THEN '2003' ELSE '2004' END AS year_label
+      FROM orders
+      WHERE YEAR(orderDate) IN (2003, 2004)
+    """
+    s = (sql or "").strip()
+    q = (question or "").lower()
+    if not s or "UNION" not in s.upper() or "CASE" not in s.upper():
+        return sql
+    if "label" not in q:
+        return sql
+
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        target = kw.upper()
+        t_up = text.upper()
+        depth = 0
+        quote = ""
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and t_up.startswith(target, i):
+                prev_ok = i == 0 or not (t_up[i - 1].isalnum() or t_up[i - 1] == "_")
+                after = i + len(target)
+                next_ok = after >= len(t_up) or not (t_up[after].isalnum() or t_up[after] == "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
+
+    body = s[:-1].rstrip() if s.endswith(";") else s
+    order_pos = _find_top_level_kw(body, "ORDER BY")
+    if order_pos >= 0:
+        order_clause = body[order_pos + len("ORDER BY"):].strip()
+        core = body[:order_pos].rstrip()
+    else:
+        order_clause = ""
+        core = body
+
+    union_pos = _find_top_level_kw(core, "UNION ALL")
+    union_kw_raw = "UNION ALL"
+    if union_pos < 0:
+        union_pos = _find_top_level_kw(core, "UNION")
+        union_kw_raw = "UNION"
+    if union_pos < 0:
+        return sql
+
+    branch1 = core[:union_pos].strip()
+    branch2 = core[union_pos + len(union_kw_raw):].strip()
+    if not branch1 or not branch2 or _find_top_level_kw(branch2, "UNION") >= 0:
+        return sql
+
+    branch_re = re.compile(
+        r"""
+        ^\s*SELECT\s+
+        (?P<idcol>(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)\s*,\s*
+        CASE\s+WHEN\s+YEAR\(\s*(?P<datecol>(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*=\s*(?P<year1>\d{4})\s+
+        THEN\s+'(?P<label1>[^']+)'\s+ELSE\s+'(?P<label2>[^']+)'\s+END\s+AS\s+`?(?P<label_alias>[A-Za-z_][A-Za-z0-9_]*|\d{4})`?\s+
+        FROM\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)\s+
+        WHERE\s+YEAR\(\s*(?P=datecol)\s*\)\s+IN\s*\(\s*(?P<iny1>\d{4})\s*,\s*(?P<iny2>\d{4})\s*\)\s*$
+        """,
+        flags=re.I | re.S | re.X,
+    )
+
+    m1 = branch_re.match(branch1)
+    m2 = branch_re.match(branch2)
+    if not m1 or not m2:
+        return sql
+
+    def _norm_table(v: str) -> str:
+        return (v or "").replace("`", "").strip().lower()
+
+    def _norm_ident(v: str) -> str:
+        return re.sub(r"\s+", "", (v or "").strip()).lower()
+
+    for key in ("idcol", "datecol", "year1", "label1", "label2", "label_alias"):
+        if _norm_ident(m1.group(key)) != _norm_ident(m2.group(key)):
+            return sql
+    if _norm_table(m1.group("table")) != _norm_table(m2.group("table")):
+        return sql
+
+    years_in = {m1.group("iny1"), m1.group("iny2")}
+    if len(years_in) != 2 or m1.group("year1") not in years_in:
+        return sql
+    other_years = [y for y in years_in if y != m1.group("year1")]
+    if len(other_years) != 1:
+        return sql
+
+    idcol = m1.group("idcol")
+    datecol = m1.group("datecol")
+    table = m1.group("table")
+    year1 = m1.group("year1")
+    year2 = other_years[0]
+    label1 = m1.group("label1")
+    label2 = m1.group("label2")
+    label_alias = m1.group("label_alias")
+
+    def _segment_dir(text: str, target_pat: str, default: str = "ASC") -> str:
+        if not text:
+            return default
+        if re.search(rf"{target_pat}.*\bdescending\b", text, flags=re.I) or re.search(
+            rf"\bdescending\b.*{target_pat}", text, flags=re.I
+        ):
+            return "DESC"
+        if re.search(rf"{target_pat}.*\bascending\b", text, flags=re.I) or re.search(
+            rf"\bascending\b.*{target_pat}", text, flags=re.I
+        ):
+            return "ASC"
+        return default
+
+    label_dir = "ASC"
+    id_dir = "ASC"
+    if order_clause:
+        order_items = [x.strip() for x in order_clause.split(",") if x.strip()]
+        if order_items:
+            label_dir = "DESC" if re.search(r"\bDESC\b", order_items[0], flags=re.I) else "ASC"
+        if len(order_items) >= 2:
+            id_dir = "DESC" if re.search(r"\bDESC\b", order_items[1], flags=re.I) else "ASC"
+    else:
+        label_dir = _segment_dir(q, r"\byear\s+label\b", "ASC")
+        id_words = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", idcol.replace("_", " ")).lower()
+        id_dir = _segment_dir(q, rf"\b{re.escape(id_words)}\b", "ASC")
+
+    if re.search(
+        r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
+        q,
+        flags=re.I,
+    ):
+        union_kw = "UNION"
+    else:
+        union_kw = union_kw_raw
+
+    out = (
+        f"SELECT {idcol}, '{label1}' AS {label_alias} "
+        f"FROM {table} WHERE YEAR({datecol}) = {year1} "
+        f"{union_kw} "
+        f"SELECT {idcol}, '{label2}' AS {label_alias} "
+        f"FROM {table} WHERE YEAR({datecol}) = {year2}"
+    )
+    if order_clause or re.search(r"\b(?:order|sort|sorted)\b", q, flags=re.I):
+        out += f" ORDER BY {label_alias} {label_dir}, {idcol} {id_dir}"
+    if s.endswith(";"):
+        out += ";"
+    return out
 
 def _parse_from_join_aliases(sql: str) -> Dict[str, str]:
     """
@@ -10727,6 +11976,8 @@ def _strip_unneeded_count_distinct(sql: str) -> str:
 # ============== UI and execution-safety adjustments only ===============
 # =======================================================================
 # - question_requests_ordering
+# - enforce_window_sequence_direction
+# - enforce_requested_order_direction
 # - remove_top_level_order_by_if_not_requested
 # - explicit_limit_from_question
 # - maybe_add_limit
@@ -10806,6 +12057,256 @@ def _question_requests_ordering(question: str) -> bool:
         return True
     
     return False
+
+
+def _enforce_window_sequence_direction(sql: str, question: str) -> str:
+    """
+    Fix LAG/LEAD window ORDER BY direction for sequence-style questions.
+
+    For natural questions like:
+      "previous payment amount ... ordered by payment date"
+    the sequence should be chronological ascending unless the question
+    explicitly says descending.
+
+    Only rewrites ORDER BY inside LAG/LEAD OVER(...), never top-level ORDER BY.
+    """
+    s = (sql or "").strip()
+    q = (question or "").lower()
+    if not s or not re.search(r"\b(?:LAG|LEAD)\s*\(", s, flags=re.I):
+        return sql
+    if not re.search(r"\b(?:previous|prior|next|following)\b", q, flags=re.I):
+        return sql
+    if "ordered by" not in q:
+        return sql
+
+    ordered_idx = q.find("ordered by")
+    ordered_tail = q[ordered_idx + len("ordered by"):] if ordered_idx >= 0 else q
+    stop = re.search(r"[.;!?]", ordered_tail)
+    if stop:
+        ordered_tail = ordered_tail[:stop.start()]
+
+    if re.search(r"\b(?:descending|desc|reverse)\b", ordered_tail, flags=re.I):
+        desired_dir = "DESC"
+    elif re.search(r"\b(?:ascending|asc|chronological|earliest\s+first|oldest\s+first)\b", ordered_tail, flags=re.I):
+        desired_dir = "ASC"
+    else:
+        desired_dir = "ASC"
+
+    laglead_pat = re.compile(
+        r"""
+        (?P<prefix>\b(?:LAG|LEAD)\s*\([^)]*\)\s+OVER\s*\()
+        (?P<body>[^)]*?)
+        (?P<suffix>\))
+        """,
+        flags=re.I | re.S | re.X,
+    )
+
+    def _rewrite_body(body: str) -> str:
+        m = re.search(r"\bORDER\s+BY\b", body, flags=re.I)
+        if not m:
+            return body
+        before = body[:m.end()]
+        after = body[m.end():]
+        order_items = [x.strip() for x in after.split(",") if x.strip()]
+        if not order_items:
+            return body
+        first = order_items[0]
+        rewritten_first = re.sub(r"\s+\b(?:ASC|DESC)\b\s*$", "", first, flags=re.I).rstrip()
+        rewritten_first = f"{rewritten_first} {desired_dir}"
+        if rewritten_first == first:
+            return body
+        order_items[0] = rewritten_first
+        return before + " " + ", ".join(order_items)
+
+    changed = False
+
+    def _repl(m: re.Match) -> str:
+        nonlocal changed
+        body = m.group("body") or ""
+        new_body = _rewrite_body(body)
+        if new_body != body:
+            changed = True
+        return f"{m.group('prefix')}{new_body}{m.group('suffix')}"
+
+    out = laglead_pat.sub(_repl, s)
+    return out if changed else sql
+
+
+def _enforce_requested_order_direction(sql: str, question: str) -> str:
+    """
+    Enforce explicit final ORDER BY directions from the question on the
+    top-level ORDER BY clause.
+
+    Conservative behavior:
+    - only applies when the question explicitly says ascending/descending
+      (or alphabetical/alphabetically)
+    - only rewrites top-level ORDER BY, never window ORDER BY inside OVER(...)
+    - preserves columns/expressions; only fixes direction tokens
+    - supports multiple ORDER BY items by position when the question provides
+      multiple ordered segments (split by ',' and 'then')
+    """
+    if not sql:
+        return sql
+
+    q = (question or "").lower()
+    if not q:
+        return sql
+
+    window_context_patterns = [
+        r"\brank\b.*\b(ascending|descending)\s+order\b",
+        r"\brow[_\s]?number\b.*\b(ascending|descending)\s+order\b",
+        r"\bdense[_\s]?rank\b.*\b(ascending|descending)\s+order\b",
+        r"\bpartition\s+by\b.*\b(ascending|descending)\b",
+        r"\bbased\s+on\b.*\b(ascending|descending)\s+order\b",
+        r"\b(cumulative|running)\b.*\bordered\s+by\b",
+    ]
+    has_window_context = any(re.search(pat, q) for pat in window_context_patterns)
+
+    def _extract_sort_clause(text: str) -> str:
+        patterns = [
+            r"\b(?:sort(?:ed)?\s+by|arrange\s+by|order\s+by)\b",
+            r"\bordered\s+by\b",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.I)
+            if not m:
+                continue
+            if "ordered by" in m.group(0).lower() and has_window_context:
+                continue
+            tail = text[m.end():]
+            end = len(tail)
+            stop = re.search(r"[.;!?]", tail)
+            if stop:
+                end = stop.start()
+            return tail[:end].strip()
+        return ""
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        quote = ""
+        for i, ch in enumerate(text):
+            if quote:
+                cur.append(ch)
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                part = "".join(cur).strip()
+                if part:
+                    parts.append(part)
+                cur = []
+                continue
+            cur.append(ch)
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    sort_clause = _extract_sort_clause(q)
+    explicit_dirs: List[str] = []
+    if sort_clause:
+        segments = re.split(r"\bthen\b", sort_clause, flags=re.I)
+        for seg in segments:
+            for part in _split_top_level_csv(seg):
+                s = part.strip().lower()
+                if not s:
+                    continue
+                if re.search(r"\b(?:descending|desc|z\s+to\s+a)\b", s):
+                    explicit_dirs.append("DESC")
+                elif re.search(r"\b(?:ascending|asc|alphabetical|alphabetically|a\s+to\s+z)\b", s):
+                    explicit_dirs.append("ASC")
+                else:
+                    explicit_dirs.append("")
+
+    if not explicit_dirs:
+        if has_window_context:
+            return sql
+        if re.search(r"\b(?:ascending|asc|alphabetical|alphabetically)\b", q):
+            explicit_dirs = ["ASC"]
+        elif re.search(r"\b(?:descending|desc)\b", q):
+            explicit_dirs = ["DESC"]
+        else:
+            return sql
+
+    def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
+        target = kw.upper()
+        t_up = text.upper()
+        depth = 0
+        quote = ""
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and t_up.startswith(target, i):
+                prev_ok = i == 0 or not (t_up[i - 1].isalnum() or t_up[i - 1] == "_")
+                after = i + len(target)
+                next_ok = after >= len(t_up) or not (t_up[after].isalnum() or t_up[after] == "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
+
+    s = sql
+    order_pos = _find_top_level_kw(s, "ORDER BY")
+    if order_pos < 0:
+        return sql
+
+    limit_pos = _find_top_level_kw(s, "LIMIT", order_pos + len("ORDER BY"))
+    semi_pos = s.rfind(";")
+    order_end_candidates = [p for p in (limit_pos, semi_pos) if p >= 0 and p > order_pos]
+    order_end = min(order_end_candidates) if order_end_candidates else len(s)
+
+    order_prefix = s[:order_pos + len("ORDER BY")]
+    order_clause = s[order_pos + len("ORDER BY"):order_end].strip()
+    order_suffix = s[order_end:]
+    if not order_clause:
+        return sql
+
+    order_items = _split_top_level_csv(order_clause)
+    if not order_items:
+        return sql
+
+    new_items: List[str] = []
+    changed = False
+    for idx, item in enumerate(order_items):
+        requested = explicit_dirs[idx] if idx < len(explicit_dirs) else ""
+        if not requested:
+            new_items.append(item)
+            continue
+        trimmed = item.strip()
+        rewritten = re.sub(r"\s+\b(?:ASC|DESC)\b\s*$", "", trimmed, flags=re.I).rstrip()
+        rewritten = f"{rewritten} {requested}"
+        if rewritten != trimmed:
+            changed = True
+        new_items.append(rewritten)
+
+    if not changed:
+        return sql
+
+    sep = "\n" if "\n" in order_clause else " "
+    return f"{order_prefix}{sep}{', '.join(new_items)}{order_suffix}"
 
 def _simplify_default_window_frame(sql: str, question: str = "") -> str:
     """

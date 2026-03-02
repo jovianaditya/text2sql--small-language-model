@@ -1868,6 +1868,36 @@ def router_agent(state: RAGState) -> RAGState:
         and not is_simple_exists_subquery
     )
 
+    quoted_literals = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or "")
+    has_set_operation_cue = bool(
+        re.search(r"\bunion\b", question_lower, flags=re.I)
+        or re.search(r"\b(?:combine|combined|merge)\b", question_lower, flags=re.I)
+        or re.search(r"\bin\s+one\s+result\b", question_lower, flags=re.I)
+    )
+    has_set_labeling_shape = bool(
+        len(quoted_literals) >= 2
+        and re.search(r"\bor\b", question_lower, flags=re.I)
+    )
+    has_dedupe_request = bool(
+        re.search(
+            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
+            question_lower,
+            flags=re.I,
+        )
+    )
+    is_set_operation_intent = bool(
+        has_set_operation_cue and (has_set_labeling_shape or has_dedupe_request)
+    )
+    is_simple_set_operation = bool(
+        is_set_operation_intent
+        and not is_multi_table
+        and not is_winner_row
+        and not is_window_aggregate
+        and not is_explicit_rank_function
+        and not is_ordinal_ranking
+        and not is_complex_subquery_intent
+    )
+
     # Multi-fact rollup detector (fanout-risk):
     # customer + orders count + payments total/status in one grouped result.
     # Example: total orders + total payment amount + payment_status.
@@ -1922,6 +1952,8 @@ def router_agent(state: RAGState) -> RAGState:
     if AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT and is_complex_subquery_intent:
         if is_multi_table or has_complex_subquery_cue:
             escalation_reasons.append("subquery_intent_complex")
+    if is_set_operation_intent and not is_simple_set_operation:
+        escalation_reasons.append("set_operation")
     if has_dual_fact_rollup:
         escalation_reasons.append("multi_fact_rollup_fanout_risk")
 
@@ -1951,6 +1983,7 @@ def router_agent(state: RAGState) -> RAGState:
         f"Group:{has_grouping}, WinnerRow:{is_winner_row}, OrdinalRank:{is_ordinal_ranking}, "
         f"Exclusion:{has_exclusion}, WindowAgg:{is_window_aggregate}, "
         f"ExplicitRank:{is_explicit_rank_function}, SubqueryIntent:{is_subquery_intent}, "
+        f"SetOp:{is_set_operation_intent}, "
         f"SimpleScalarSubquery:{is_simple_scalar_subquery_single_table}, "
         f"SimpleExistsSubquery:{is_simple_exists_subquery}, "
         f"DualFactRollup:{has_dual_fact_rollup}"
@@ -1975,6 +2008,8 @@ def router_agent(state: RAGState) -> RAGState:
             "partition_hint": partition_hint,
             "is_explicit_rank_function": is_explicit_rank_function,
             "is_subquery_intent": is_subquery_intent,
+            "is_set_operation_intent": is_set_operation_intent,
+            "is_simple_set_operation": is_simple_set_operation,
             "is_simple_scalar_subquery_single_table": is_simple_scalar_subquery_single_table,
             "is_simple_exists_subquery": is_simple_exists_subquery,
             "is_complex_subquery_intent": is_complex_subquery_intent,
@@ -2985,6 +3020,65 @@ def _is_simple_having_shape(
     return True, ""
 
 
+def _is_ir_low_risk_single_table_lookup(
+    intent_ir: Dict[str, Any],
+    qtype: str,
+    safe_filter_ops: Set[str],
+) -> bool:
+    if str(qtype or "").strip().lower() != AGENT_ROUTER_QTYPE_LOOKUP:
+        return False
+    if not bool(intent_ir.get("planner_compatible", True)):
+        return False
+
+    subject_table = str(intent_ir.get("subject_entity") or "").strip().lower()
+    if not subject_table:
+        return False
+
+    metrics = [m for m in (intent_ir.get("metrics") or []) if isinstance(m, dict)]
+    existence = [e for e in (intent_ir.get("existence") or []) if isinstance(e, dict)]
+    if metrics or existence:
+        return False
+
+    dims = [d for d in (intent_ir.get("dimensions") or []) if isinstance(d, dict)]
+    filters = [f for f in (intent_ir.get("filters") or []) if isinstance(f, dict)]
+    ordering = [o for o in (intent_ir.get("ordering") or []) if isinstance(o, dict)]
+
+    visible_dim_aliases = {
+        str(d.get("alias") or "").strip().lower()
+        for d in dims
+        if bool(d.get("visible", True)) and str(d.get("alias") or "").strip()
+    }
+
+    for d in dims:
+        table = str(d.get("table") or "").strip().lower()
+        if not table or table != subject_table:
+            return False
+
+    for f in filters:
+        table = str(f.get("table") or "").strip().lower()
+        op = str(f.get("op") or "").strip().lower()
+        if not table or table != subject_table:
+            return False
+        if op and op not in safe_filter_ops:
+            return False
+
+    for o in ordering:
+        kind = str(o.get("kind") or "").strip().lower()
+        if kind == "column":
+            table = str(o.get("table") or "").strip().lower()
+            if not table or table != subject_table:
+                return False
+            continue
+        if kind == "alias":
+            by = str(o.get("by") or "").strip().lower()
+            if not by or by not in visible_dim_aliases:
+                return False
+            continue
+        return False
+
+    return True
+
+
 def draft_sql_agent(state: RAGState) -> RAGState:
     # --- Guard: Skip if question was rejected by router ---
     decision = state.get("router_decision", {})
@@ -3020,11 +3114,55 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         router_tables = state.get("router_tables") or []
         ctx_allowed_ids = _parse_allowed_identifiers(ctx)
         ctx_table_count = len(ctx_allowed_ids)
-        table_count = max(len(mentioned_tables), len(router_tables), ctx_table_count)
         dynamic_min_conf = float(AGENT_IR_MIN_CONFIDENCE)
         ir_gate_reasons: List[str] = []
         ir_confidence = float(intent_ir.get("confidence", 0.0) or 0.0)
-        qtype = str(decision.get("qtype") or intent_ir.get("qtype") or "").strip().lower()
+        ir_qtype = str(intent_ir.get("qtype") or "").strip().lower()
+        ir_metrics = list(intent_ir.get("metrics") or [])
+        ir_existence = list(intent_ir.get("existence") or [])
+        ir_dims = list(intent_ir.get("dimensions") or [])
+        safe_filter_ops = {
+            "eq",
+            "in",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "between",
+            "year_eq",
+            "like_prefix",
+            "regexp",
+            "is_null_or_empty",
+        }
+        prefer_ir_lookup_qtype = (
+            ir_qtype == AGENT_ROUTER_QTYPE_LOOKUP
+            and bool(intent_ir.get("select_distinct"))
+            and bool(ir_dims)
+            and not ir_metrics
+            and not ir_existence
+        )
+        qtype = (
+            ir_qtype
+            if prefer_ir_lookup_qtype
+            else str(decision.get("qtype") or ir_qtype or "").strip().lower()
+        )
+        lookup_subject_focused = (
+            qtype == AGENT_ROUTER_QTYPE_LOOKUP
+            and bool(intent_ir.get("subject_entity"))
+            and len(mentioned_tables) <= 1
+            and len(router_tables) <= 1
+        )
+        low_risk_single_table_lookup = _is_ir_low_risk_single_table_lookup(
+            intent_ir=intent_ir,
+            qtype=qtype,
+            safe_filter_ops=safe_filter_ops,
+        )
+        if low_risk_single_table_lookup:
+            table_count = 1
+        elif lookup_subject_focused:
+            table_count = max(len(mentioned_tables), len(router_tables), 1)
+        else:
+            table_count = max(len(mentioned_tables), len(router_tables), ctx_table_count)
 
         if qtype not in {AGENT_ROUTER_QTYPE_LOOKUP, AGENT_ROUTER_QTYPE_AGGREGATE}:
             ir_gate_reasons.append(f"unsupported_qtype_for_ir:{qtype or 'unknown'}")
@@ -3033,7 +3171,11 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             ir_gate_reasons.append(
                 f"table_count_exceeds_ir_max:{table_count}>{AGENT_IR_MAX_TABLES}"
             )
-        if ctx_table_count > AGENT_IR_MAX_TABLES:
+        if (
+            ctx_table_count > AGENT_IR_MAX_TABLES
+            and not lookup_subject_focused
+            and not low_risk_single_table_lookup
+        ):
             ir_gate_reasons.append(
                 f"context_table_count_exceeds_ir_max:{ctx_table_count}>{AGENT_IR_MAX_TABLES}"
             )
@@ -3053,6 +3195,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             "is_explicit_rank_function": "explicit_rank",
             "is_ordinal_ranking": "ordinal_rank",
             "is_subquery_intent": "subquery_intent",
+            "is_simple_scalar_subquery_single_table": "simple_scalar_subquery",
         }
         for flag, label in hard_router_flags.items():
             if bool(decision.get(flag, False)):
@@ -3097,20 +3240,103 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             if not has_supported_pct_metric:
                 ir_gate_reasons.append("percentage_intent_ir_disabled")
 
-        safe_filter_ops = {
-            "eq",
-            "in",
-            "gt",
-            "gte",
-            "lt",
-            "lte",
-            "between",
-            "year_eq",
-            "like_prefix",
-            "regexp",
-            "is_null_or_empty",
-        }
         safe_metric_aggs = {"count", "sum", "avg", "min", "max", "pct_non_null"}
+
+        ir_metrics = list(intent_ir.get("metrics") or [])
+        ir_existence = list(intent_ir.get("existence") or [])
+        ir_dims = list(intent_ir.get("dimensions") or [])
+        visible_dim_cols = [
+            str(d.get("column") or "").strip().lower()
+            for d in ir_dims
+            if isinstance(d, dict) and bool(d.get("visible", True))
+        ]
+        date_like_dim_count = sum(
+            1
+            for col in visible_dim_cols
+            if any(tok in col for tok in ("date", "time", "timestamp", "year", "month", "day"))
+        )
+
+        if (
+            qtype == AGENT_ROUTER_QTYPE_LOOKUP
+            and not ir_metrics
+            and not ir_existence
+            and bool(re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or ""))
+            and bool(re.search(r"\b(?:display|show|return)\b", q_low, flags=re.I))
+            and bool(re.search(r"\b(?:when|whenever)\b", q_low, flags=re.I))
+            and bool(re.search(r"\b(?:missing|null|empty|blank)\b", q_low, flags=re.I))
+        ):
+            ir_gate_reasons.append("projection_null_fill_ir_unsupported")
+
+        if (
+            qtype == AGENT_ROUTER_QTYPE_LOOKUP
+            and not ir_metrics
+            and not ir_existence
+            and date_like_dim_count >= 2
+            and bool(re.search(r"\b(?:after|before|later\s+than|earlier\s+than)\b", q_low, flags=re.I))
+        ):
+            ir_gate_reasons.append("column_to_column_compare_ir_unsupported")
+
+        if (
+            qtype == AGENT_ROUTER_QTYPE_LOOKUP
+            and not ir_metrics
+            and not ir_existence
+            and len(mentioned_tables) <= 1
+            and bool(
+                re.search(
+                    r"\b(?:on|for|with|from)\s+the\s+"
+                    r"(?:most\s+recent|latest|newest|earliest|oldest)\s+"
+                    r"(?:[a-z][a-z0-9_]*\s+){0,3}date\b",
+                    q_low,
+                    flags=re.I,
+                )
+                or re.search(
+                    r"\b(?:equal\s+to|same\s+as)\s+the\s+"
+                    r"(?:most\s+recent|latest|newest|earliest|oldest)\s+"
+                    r"(?:[a-z][a-z0-9_]*\s+){0,3}date\b",
+                    q_low,
+                    flags=re.I,
+                )
+            )
+        ):
+            ir_gate_reasons.append("scalar_extrema_date_subquery_ir_unsupported")
+
+        if (
+            not ir_metrics
+            and not ir_existence
+            and bool(re.search(r"\b(?:previous|prior|next|following)\b", q_low, flags=re.I))
+            and bool(re.search(r"\bordered\s+by\b", q_low, flags=re.I))
+        ):
+            ir_gate_reasons.append("offset_window_ir_unsupported")
+
+        if (
+            qtype == AGENT_ROUTER_QTYPE_LOOKUP
+            and not ir_metrics
+            and not ir_existence
+            and isinstance(intent_ir.get("limit"), int)
+            and int(intent_ir.get("limit") or 0) > 0
+            and bool(re.search(r"\b(?:top|bottom|highest|lowest|largest|smallest)\b", q_low, flags=re.I))
+        ):
+            ir_gate_reasons.append("top_n_lookup_prefers_llm")
+
+        quoted_literals = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or "")
+        has_set_operation_cue = bool(
+            re.search(r"\bunion\b", q_low, flags=re.I)
+            or re.search(r"\b(?:combine|combined|merge)\b", q_low, flags=re.I)
+            or re.search(r"\bin\s+one\s+result\b", q_low, flags=re.I)
+        )
+        has_set_labeling_shape = bool(
+            len(quoted_literals) >= 2
+            and re.search(r"\bor\b", q_low, flags=re.I)
+        )
+        has_dedupe_request = bool(
+            re.search(
+                r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
+                q_low,
+                flags=re.I,
+            )
+        )
+        if has_set_operation_cue and (has_set_labeling_shape or has_dedupe_request):
+            ir_gate_reasons.append("set_operation_ir_unsupported")
 
         for f in (intent_ir.get("filters") or []):
             if not isinstance(f, dict):

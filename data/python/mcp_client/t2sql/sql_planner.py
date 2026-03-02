@@ -591,6 +591,7 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
     existence = list(intent_ir.get("existence", []) or [])
     ordering = list(intent_ir.get("ordering", []) or [])
     include_zero = bool(intent_ir.get("include_zero", False))
+    select_distinct = bool(intent_ir.get("select_distinct", False))
     limit = intent_ir.get("limit")
 
     # Guard: planner currently supports dimensions on subject table only.
@@ -937,8 +938,9 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
         meta["errors"].append("empty_select_projection")
         return None, meta
 
+    select_keyword = "SELECT DISTINCT" if select_distinct and not metrics else "SELECT"
     sql = (
-        "SELECT\n"
+        f"{select_keyword}\n"
         "  " + ",\n  ".join(select_items) + "\n"
         f"{query_from}\n"
     )
@@ -971,6 +973,7 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
         "existence_tables": [str(e.get("table") or "").lower() for e in existence],
         "single_table_agg_mode": single_table_agg_mode,
         "include_zero": include_zero,
+        "select_distinct": select_distinct and not metrics,
         "limit": limit,
     }
     return sql, meta
