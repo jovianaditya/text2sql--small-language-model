@@ -790,6 +790,102 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
                                 f"flat_metric_having_mode_rejected:{'|'.join(val_errs)}"
                             )
 
+        # Flat inner-join mode for simple "has at least one child row" + aggregate-on-same-child intents.
+        # Example:
+        # - show customers who have placed orders, and count their orders
+        # - show products that have been ordered, and sum ordered quantity
+        #
+        # For this narrow family, the aggregate over the child table already enforces existence,
+        # so a single INNER JOIN + GROUP BY is cleaner than separate existence/metric subqueries.
+        if (
+            len(metrics) == 1
+            and len(child_metric_tables) == 1
+            and len(existence) == 1
+            and not include_zero
+            and not ordering
+            and not isinstance(limit, int)
+            and non_subject_filter_tables.issubset(set(child_metric_tables))
+        ):
+            m0 = metrics[0]
+            ex0 = existence[0]
+            mt = child_metric_tables[0]
+            ex_table = str(ex0.get("table") or "").strip().lower()
+            ex_mode = str(ex0.get("mode") or "").strip().lower()
+            if (
+                ex_mode == "at_least_one"
+                and ex_table == mt
+                and str(m0.get("table") or "").strip().lower() == mt
+            ):
+                metric_alias = "m0"
+                join_cond = _join_cond_between(mt, metric_alias, subject, base_alias, fk_map, allowed)
+                if join_cond:
+                    on_filters: List[str] = []
+                    local_having: List[str] = []
+                    for f in filters_by_table.get(mt, []):
+                        hp = _render_metric_having_sql(f, m0, metric_alias)
+                        if hp:
+                            local_having.append(hp)
+                            continue
+                        rp = _render_filter_sql(f, metric_alias)
+                        if rp:
+                            on_filters.append(rp)
+
+                    local_having = list(dict.fromkeys(local_having))
+                    on_filters = list(dict.fromkeys(on_filters))
+
+                    agg = str(m0.get("agg") or "").lower()
+                    col = str(m0.get("column") or "*").strip()
+                    distinct = bool(m0.get("distinct"))
+                    alias = str(m0.get("alias") or "metric_value").strip()
+                    col_sql = "*" if col == "*" else f"{metric_alias}.{_quote_ident(col)}"
+                    metric_expr = _agg_expr(agg, col_sql, distinct=distinct)
+                    if metric_expr:
+                        trial_join_cond = join_cond
+                        if on_filters:
+                            trial_join_cond = trial_join_cond + " AND " + " AND ".join(on_filters)
+                        trial_select_items = list(select_items) + [
+                            f"{metric_expr} AS {_quote_ident(alias)}"
+                        ]
+                        trial_join_items = [
+                            f"JOIN {_quote_ident(mt)} AS {metric_alias}\n"
+                            f"  ON {trial_join_cond}"
+                        ]
+                        group_by_items = list(group_items) or [f"{base_alias}.{_quote_ident(subject_id_col)}"]
+
+                        sql = (
+                            "SELECT\n"
+                            "  " + ",\n  ".join(trial_select_items) + "\n"
+                            f"{query_from}\n"
+                            + "\n".join(trial_join_items)
+                            + "\n"
+                        )
+                        if where_items:
+                            sql += "WHERE " + " AND ".join(where_items) + "\n"
+                        sql += "GROUP BY " + ", ".join(group_by_items) + "\n"
+                        if local_having:
+                            sql += "HAVING " + " AND ".join(local_having) + "\n"
+
+                        sql = _format_with_sqlglot(sql.strip())
+                        if not sql.endswith(";"):
+                            sql += ";"
+
+                        ok, val_errs = _validate_generated_sql(sql, intent_ir)
+                        if ok:
+                            meta["join_plan"] = {
+                                "subject": subject,
+                                "subject_id": subject_id_col,
+                                "metric_tables": [mt],
+                                "existence_tables": [mt],
+                                "single_table_agg_mode": False,
+                                "flat_existence_metric_join_mode": True,
+                                "include_zero": include_zero,
+                                "limit": limit,
+                            }
+                            return sql, meta
+                        meta["warnings"].append(
+                            f"flat_existence_metric_join_mode_rejected:{'|'.join(val_errs)}"
+                        )
+
         # Existence constraints first.
         ex_index = 1
         for ex in existence:

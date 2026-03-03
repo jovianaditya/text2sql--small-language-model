@@ -4910,11 +4910,32 @@ def _fix_outer_order_by_for_derived_alias(sql: str) -> str:
         return re.sub(r"[^a-z0-9]", "", (x or "").lower())
 
     output_names: List[str] = []
+    qualified_simple_outputs: Set[str] = set()
     for it in _split_top_level_commas(outer_select):
         expr, a0 = _split_expr_alias(it)
         out_name = _output_name_from_expr(expr, a0)
         if out_name:
             output_names.append(out_name)
+            m_direct = re.match(
+                r"(?is)^\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+                expr,
+            )
+            src_col = (m_direct.group(2) or "").strip() if m_direct else ""
+            alias_name = (
+                a0.strip("`'\" ").strip()
+                if a0 and a0.strip("`'\" ").strip()
+                else ""
+            )
+            if (
+                m_direct
+                and (m_direct.group(1) or "").strip().lower() == sub_alias.lower()
+                and (
+                    not alias_name
+                    or alias_name.lower() == src_col.lower()
+                )
+                and out_name.lower() == src_col.lower()
+            ):
+                qualified_simple_outputs.add(out_name)
     if not output_names:
         return sql
 
@@ -4927,6 +4948,9 @@ def _fix_outer_order_by_for_derived_alias(sql: str) -> str:
         if not b:
             return None
 
+        keep_sub_alias_qualifier = False
+        qualified_col = ""
+
         # Strip qualifier if any: alias.col -> col
         m_q = re.match(
             r"(?is)^`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?$",
@@ -4935,11 +4959,10 @@ def _fix_outer_order_by_for_derived_alias(sql: str) -> str:
         if m_q:
             q = (m_q.group(1) or "").strip()
             c = (m_q.group(2) or "").strip()
-            # Keep derived alias qualifier only logically; ORDER BY can use bare output name.
-            if q.lower() != sub_alias.lower():
-                b = c
-            else:
-                b = c
+            if q.lower() == sub_alias.lower():
+                keep_sub_alias_qualifier = True
+                qualified_col = c
+            b = c
 
         norm_b = _norm_token(b)
         if not norm_b:
@@ -4948,7 +4971,15 @@ def _fix_outer_order_by_for_derived_alias(sql: str) -> str:
         # Exact/normalized match first.
         norm_hits = out_by_norm.get(norm_b, [])
         if len(norm_hits) == 1:
-            return norm_hits[0]
+            chosen = norm_hits[0]
+            if (
+                keep_sub_alias_qualifier
+                and qualified_col
+                and chosen in qualified_simple_outputs
+                and chosen.lower() == qualified_col.lower()
+            ):
+                return f"{sub_alias}.{chosen}"
+            return chosen
 
         # Heuristic: employeeNumber -> employee_id if projected alias uses *_id.
         if norm_b.endswith("number"):
@@ -4960,6 +4991,13 @@ def _fix_outer_order_by_for_derived_alias(sql: str) -> str:
         # If already an output name (case-insensitive), keep canonical casing from SELECT.
         for name in output_names:
             if name.lower() == b.lower():
+                if (
+                    keep_sub_alias_qualifier
+                    and qualified_col
+                    and name in qualified_simple_outputs
+                    and name.lower() == qualified_col.lower()
+                ):
+                    return f"{sub_alias}.{name}"
                 return name
         return None
 
@@ -6015,7 +6053,24 @@ def _winner_row_final_sanity(sql: str, question: str) -> str:
         exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier("t")))
     ).where(exp.EQ(this=exp.column("rn", table="t"), expression=exp.Literal.number(1)))
 
-    return outer.sql(dialect="mysql")
+    out_sql = outer.sql(dialect="mysql")
+
+    # sqlglot's MySQL serializer expands ascending ORDER BY on plain columns into:
+    #   CASE WHEN alias.col IS NULL THEN 1 ELSE 0 END, alias.col ASC
+    # For this winner-row rewrite, those wrappers are only serializer noise on the
+    # synthetic ranked aliases we just created. Collapse them back to the direct
+    # column ORDER BY form so the final SQL stays readable.
+    ordered_aliases = list(dict.fromkeys([partition_alias] + rank_aliases))
+    for rel_alias in ("c", "t"):
+        for alias in ordered_aliases:
+            pat = re.compile(
+                rf"CASE\s+WHEN\s+{re.escape(rel_alias)}\.`?{re.escape(alias)}`?\s+IS\s+NULL\s+THEN\s+1\s+ELSE\s+0\s+END\s*,\s*"
+                rf"{re.escape(rel_alias)}\.`?{re.escape(alias)}`?\s+ASC",
+                flags=re.IGNORECASE,
+            )
+            out_sql = pat.sub(f"{rel_alias}.{alias} ASC", out_sql)
+
+    return out_sql
 
 
 def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str:
@@ -6138,6 +6193,65 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
         return sql
     candidate_sel.set("order", None)
 
+    # Trim redundant GROUP BY columns in the aggregated candidate layer.
+    #
+    # Common H17-like failure mode:
+    # the model groups by many extra same-table dimension columns
+    # (MSRP, productVendor, productScale, ...) even though the visible grouped
+    # grain is already identified by a key-like column such as productCode.
+    #
+    # We only prune when this is very likely safe:
+    # - GROUP BY contains more columns than the visible non-aggregate projection
+    # - the visible grouped projection includes at least one key-like column
+    # - every extra GROUP BY item is a simple column on the same table alias
+    #   as that key-like column
+    #
+    # If those conditions are not met, keep the original GROUP BY unchanged.
+    candidate_group = candidate_sel.args.get("group")
+    if candidate_group and getattr(candidate_group, "expressions", None):
+        current_group_exprs = list(candidate_group.expressions or [])
+        current_group_norms = {_norm_expr(g) for g in current_group_exprs}
+
+        visible_group_columns: List[exp.Column] = []
+        visible_group_norms: Set[str] = set()
+        for item in candidate_sel.expressions:
+            base = item.this if isinstance(item, exp.Alias) else item
+            base_norm = _norm_expr(base)
+            if base_norm in current_group_norms:
+                visible_group_norms.add(base_norm)
+                if isinstance(base, exp.Column):
+                    visible_group_columns.append(base)
+
+        if len(current_group_exprs) > len(visible_group_norms) and visible_group_columns:
+            key_like_cols = [
+                c for c in visible_group_columns
+                if any(tok in (c.name or "").lower() for tok in ["id", "code", "number", "key"])
+            ]
+            key_tables = {
+                (c.table or "").lower()
+                for c in key_like_cols
+                if (c.table or "").strip()
+            }
+
+            if key_like_cols and key_tables:
+                extras = [
+                    g for g in current_group_exprs
+                    if _norm_expr(g) not in visible_group_norms
+                ]
+                if extras and all(
+                    isinstance(g, exp.Column) and ((g.table or "").lower() in key_tables)
+                    for g in extras
+                ):
+                    trimmed_group_exprs: List[exp.Expression] = []
+                    seen_group_norms: Set[str] = set()
+                    for g in current_group_exprs:
+                        g_norm = _norm_expr(g)
+                        if g_norm in visible_group_norms and g_norm not in seen_group_norms:
+                            trimmed_group_exprs.append(g.copy())
+                            seen_group_norms.add(g_norm)
+                    if trimmed_group_exprs:
+                        candidate_sel.set("group", exp.Group(expressions=trimmed_group_exprs))
+
     candidate_sub = exp.Subquery(
         this=candidate_ast,
         alias=exp.TableAlias(this=exp.to_identifier("c")),
@@ -6182,7 +6296,21 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
         ),
     )
 
-    return outer.sql(dialect="mysql")
+    out_sql = outer.sql(dialect="mysql")
+
+    # Drop sqlglot's null-order wrappers for the synthetic aliases created by
+    # this rewrite; these keys are non-null in the narrowed winner-row shape.
+    ordered_aliases = list(dict.fromkeys([partition_alias] + rank_aliases))
+    for rel_alias in ("c", "t"):
+        for alias in ordered_aliases:
+            pat = re.compile(
+                rf"CASE\s+WHEN\s+{re.escape(rel_alias)}\.`?{re.escape(alias)}`?\s+IS\s+NULL\s+THEN\s+1\s+ELSE\s+0\s+END\s*,\s*"
+                rf"{re.escape(rel_alias)}\.`?{re.escape(alias)}`?\s+ASC",
+                flags=re.IGNORECASE,
+            )
+            out_sql = pat.sub(f"{rel_alias}.{alias} ASC", out_sql)
+
+    return out_sql
 
 
 def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
