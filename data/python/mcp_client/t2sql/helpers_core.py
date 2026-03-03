@@ -1815,9 +1815,28 @@ def _repair_invalid_qualified_columns(sql: str, ctx: str = "") -> str:
             return table_candidates[0]
         return None
 
+    on_clause_pat = re.compile(
+        r"""
+        \bON\b\s+.*?
+        (?=
+            \b(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN)\b
+            |\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b
+            |;|$
+        )
+        """,
+        flags=re.I | re.S | re.X,
+    )
+
     parts = _split_outside_quotes(sql)
     for i in range(0, len(parts), 2):
         seg = parts[i]
+        protected_on_segments: List[str] = []
+
+        def _protect_on(m: re.Match) -> str:
+            protected_on_segments.append(m.group(0))
+            return f" __ON_CLAUSE_PROTECTED_{len(protected_on_segments) - 1}__ "
+
+        seg_masked = on_clause_pat.sub(_protect_on, seg)
 
         def _repl(m: re.Match) -> str:
             alias = m.group("alias")
@@ -1843,7 +1862,10 @@ def _repair_invalid_qualified_columns(sql: str, ctx: str = "") -> str:
 
             return f"{aq}{replacement}{aq}.{cq}{col}{cq}"
 
-        parts[i] = qcol_pat.sub(_repl, seg)
+        seg_rewritten = qcol_pat.sub(_repl, seg_masked)
+        for idx, original_on in enumerate(protected_on_segments):
+            seg_rewritten = seg_rewritten.replace(f" __ON_CLAUSE_PROTECTED_{idx}__ ", original_on)
+        parts[i] = seg_rewritten
 
     return "".join(parts)
 
@@ -2226,6 +2248,193 @@ def _prefer_name_over_id_generic(
     )
 
     return sql
+
+
+def _rewrite_invalid_grouped_existence_subquery_to_join(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Rewrite a narrow invalid grouped-existence pattern into a direct JOIN.
+
+    Target anti-pattern:
+      SELECT group_col, COUNT(DISTINCT outer_id)
+      FROM outer_table
+      WHERE group_col IN (SELECT DISTINCT group_col FROM child_table)
+      GROUP BY group_col
+
+    when `child_table` does NOT actually have `group_col`, but it has a unique
+    direct FK to `outer_table`. In that case, the intended meaning is usually:
+      - keep only outer rows that have at least one child row
+      - aggregate over those qualifying outer rows
+
+    This helper is intentionally conservative:
+    - only for single-table outer queries (no JOIN yet)
+    - only when question asks for COUNT(DISTINCT ...)
+    - only when include-zero is NOT requested
+    - only when the child table has exactly one direct FK path to the outer table
+    - only when the DISTINCT target is the outer table's ID column
+    """
+    if not sql:
+        return sql
+    if has_join(sql):
+        return sql
+    if not _question_wants_count_distinct(question):
+        return sql
+    if _question_wants_include_zero(question, ctx):
+        return sql
+
+    s = (sql or "").strip().rstrip(";").strip()
+    if not s:
+        return sql
+
+    outer_pat = re.compile(
+        r"""
+        (?is)^\s*
+        SELECT\s+(?P<select>.+?)
+        \s+FROM\s+
+        (?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+        (?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?
+        \s+WHERE\s+(?P<where>.+?)
+        \s+GROUP\s+BY\s+(?P<groupby>.+?)
+        (?P<tail>\s+(?:HAVING|ORDER\s+BY|LIMIT)\b.*)?$
+        """,
+        flags=re.X,
+    )
+    m = outer_pat.match(s)
+    if not m:
+        return sql
+
+    select_clause = (m.group("select") or "").strip()
+    outer_table_raw = (m.group("table") or "").replace("`", "")
+    outer_table = outer_table_raw.split(".")[-1].strip()
+    outer_alias = (m.group("alias") or "").strip()
+    where_clause = (m.group("where") or "").strip()
+    group_by_clause = (m.group("groupby") or "").strip()
+    tail = (m.group("tail") or "").strip()
+
+    if not outer_table:
+        return sql
+
+    select_items = _split_top_level_commas(select_clause)
+    group_items = _split_top_level_commas(group_by_clause)
+    if not select_items or not group_items:
+        return sql
+
+    count_distinct_pat = re.compile(
+        r"""(?is)^COUNT\s*\(\s*DISTINCT\s+(?P<expr>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)(?:\s+AS\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?$"""
+    )
+    count_distinct_expr = None
+    for item in select_items:
+        m_count = count_distinct_pat.match(item.strip())
+        if m_count:
+            count_distinct_expr = (m_count.group("expr") or "").strip()
+            break
+    if not count_distinct_expr:
+        return sql
+
+    def _base_col(expr: str) -> str:
+        e = (expr or "").strip().replace("`", "")
+        if "." in e:
+            return e.split(".")[-1].strip()
+        return e.strip()
+
+    group_expr = group_items[0].strip()
+    group_col = _base_col(group_expr)
+    distinct_col = _base_col(count_distinct_expr)
+    outer_id = get_id_column(outer_table)
+    if not outer_id or distinct_col.lower() != str(outer_id).lower():
+        return sql
+
+    where_pat = re.compile(
+        r"""
+        (?is)^\s*
+        (?P<lhs>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)
+        \s+IN\s*\(
+            \s*SELECT\s+DISTINCT\s+
+            (?P<rhs>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)
+            \s+FROM\s+
+            (?P<inner_table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+            (?:\s+(?:AS\s+)?(?P<inner_alias>[A-Za-z_][A-Za-z0-9_]*))?
+            \s*
+        \)\s*$
+        """,
+        flags=re.X,
+    )
+    w = where_pat.match(where_clause)
+    if not w:
+        return sql
+
+    lhs_col = _base_col(w.group("lhs") or "")
+    rhs_col = _base_col(w.group("rhs") or "")
+    inner_table_raw = (w.group("inner_table") or "").replace("`", "")
+    inner_table = inner_table_raw.split(".")[-1].strip()
+    if not inner_table:
+        return sql
+
+    # We only rewrite the clearly invalid case: same logical column name in the
+    # subquery, but the inner table does not actually have that column.
+    if lhs_col.lower() != rhs_col.lower():
+        return sql
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    inner_cols: Set[str] = set()
+    if analyzer is not None:
+        try:
+            inner_cols.update(c.lower() for c in analyzer.get_table_columns(inner_table))
+        except Exception:
+            pass
+    if not inner_cols and ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            inner_cols.update(str(c).strip("`").lower() for c in allowed.get(inner_table, set()))
+        except Exception:
+            pass
+
+    if lhs_col.lower() in inner_cols:
+        return sql
+
+    fk_map = get_fk_relationships() or {}
+    direct_fk_cols = [
+        str(fk_col)
+        for fk_col, tgt in (fk_map.get(inner_table.lower(), {}) or {}).items()
+        if str(tgt or "").lower() == outer_table.lower()
+    ]
+    if len(direct_fk_cols) != 1:
+        return sql
+
+    fk_col = direct_fk_cols[0]
+    outer_ref = outer_alias or outer_table
+    inner_ref = inner_table
+
+    # Qualify COUNT(DISTINCT outer_id) so the new JOIN cannot make it ambiguous.
+    qualified_count_expr = count_distinct_expr
+    if "." not in count_distinct_expr.replace("`", ""):
+        qualified_count_expr = f"{outer_ref}.{outer_id}"
+    new_select_clause = re.sub(
+        r"""(?is)COUNT\s*\(\s*DISTINCT\s+(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?\s*\)""",
+        f"COUNT(DISTINCT {qualified_count_expr})",
+        select_clause,
+        count=1,
+    )
+
+    join_clause = (
+        f"FROM {outer_table_raw}"
+        f"{(' ' + outer_alias) if outer_alias else ''} "
+        f"JOIN {inner_table_raw} ON {inner_ref}.{fk_col} = {outer_ref}.{outer_id}"
+    )
+
+    rebuilt = (
+        f"SELECT {new_select_clause} "
+        f"{join_clause} "
+        f"GROUP BY {group_by_clause}"
+    )
+    if tail:
+        rebuilt += f" {tail}"
+    if sql.strip().endswith(";"):
+        rebuilt += ";"
+    return rebuilt
 
 def _wants_name_only(question: str, entity_words: List[str]) -> bool:
     """
@@ -4588,30 +4797,71 @@ def _fix_inconsistent_subquery_alias(sql: str) -> Optional[str]:
     if "ROW_NUMBER" not in s_upper:
         return None
 
-    # Find the subquery pattern: FROM (SELECT ... FROM table) alias
-    # Extract the actual subquery alias
-    subquery_match = re.search(
-        r'\)\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+WHERE',
-        sql,
-        re.IGNORECASE
-    )
+    def _find_top_level_from_idx(raw: str) -> int:
+        low = raw.lower()
+        depth = 0
+        i = 0
+        in_sq = False
+        in_dq = False
+        while i < len(raw):
+            ch = raw[i]
+            if ch == "'" and not in_dq:
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and low.startswith("from", i):
+                prev_ok = (i == 0) or (not low[i - 1].isalnum() and low[i - 1] != "_")
+                j = i + 4
+                next_ok = (j >= len(low)) or (not low[j].isalnum() and low[j] != "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
 
-    if not subquery_match:
+    from_idx = _find_top_level_from_idx(sql)
+    if from_idx < 0:
+        return None
+    after_from = sql[from_idx + 4:].lstrip()
+    if not after_from.startswith("("):
+        return None
+    lparen_idx = from_idx + 4 + (len(sql[from_idx + 4:]) - len(after_from))
+
+    depth = 0
+    close_idx = -1
+    for i in range(lparen_idx, len(sql)):
+        ch = sql[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_idx = i
+                break
+    if close_idx < 0:
         return None
 
-    correct_alias = subquery_match.group(1)  # e.g., 'pmt' or 't'
-
-    # Find the outer SELECT columns (before the FROM with subquery)
-    select_match = re.search(
-        r'SELECT\s+(.*?)\s+FROM\s*\(',
-        sql,
-        re.IGNORECASE | re.DOTALL
-    )
-
-    if not select_match:
+    alias_tail = sql[close_idx + 1:]
+    alias_match = re.match(r"\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b", alias_tail, re.IGNORECASE)
+    if not alias_match:
         return None
+    correct_alias = alias_match.group(1)
 
-    outer_cols = select_match.group(1)  # e.g., 'p.customerNumber, t.amount'
+    if not re.match(r"(?is)^\s*SELECT\b", sql):
+        return None
+    outer_cols = sql[sql.upper().find("SELECT") + len("SELECT"):from_idx].strip()
+    if not outer_cols:
+        return None
 
     # Find all aliases used in the outer SELECT
     alias_refs = set(re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.\w+', outer_cols))
@@ -4625,12 +4875,15 @@ def _fix_inconsistent_subquery_alias(sql: str) -> Optional[str]:
     # Fix: Replace all inconsistent aliases with the correct one
     fixed = sql
 
+    old_select = sql[:from_idx]
+    new_select = old_select
     for wrong_alias in inconsistent_aliases:
-        # Only replace in the outer SELECT (before FROM with subquery)
-        # Pattern: alias.col in the SELECT clause
-        old_select = select_match.group(0)
-        new_select = old_select.replace(f"{wrong_alias}.", f"{correct_alias}.")
-        fixed = fixed.replace(old_select, new_select, 1)
+        new_select = re.sub(
+            rf'\b{re.escape(wrong_alias)}\.',
+            f"{correct_alias}.",
+            new_select
+        )
+    fixed = new_select + sql[from_idx:]
 
     # Debug output
     # print(f"[ALIAS FIX] Fixed inconsistent alias: {inconsistent_aliases} -> {correct_alias}")
@@ -12372,7 +12625,7 @@ def _ast_guardrails(sql: str, ctx: str = "", question: str = "") -> Tuple[str, D
         out_sql = out_sql.rstrip(";").strip() + ";"
     return out_sql, meta
 
-def _strip_unneeded_count_distinct(sql: str) -> str:
+def _strip_unneeded_count_distinct(sql: str, question: str = "") -> str:
     """
     Remove unnecessary DISTINCT in COUNT(DISTINCT alias.id_col) for single-join queries.
 
@@ -12382,6 +12635,11 @@ def _strip_unneeded_count_distinct(sql: str) -> str:
     - only for DISTINCT on the joined table's inferred ID column
     """
     if not sql:
+        return sql
+    # If the question explicitly asks for distinct counting, preserve the
+    # semantics as written. Let the semantic contract layer reason about it,
+    # but do not erase DISTINCT pre-emptively.
+    if question and _question_wants_count_distinct(question):
         return sql
     if join_count(sql) != 1:
         return sql
@@ -12444,6 +12702,8 @@ def _question_requests_ordering(question: str) -> bool:
         r"\bpartition\s+by\b.*\b(ascending|descending)\b",
         r"\bbased\s+on\b.*\b(ascending|descending)\s+order\b",  # "based on X in descending order" = window context
         r"\b(cumulative|running)\b.*\bordered\s+by\b",  # "cumulative X ordered by Y" = window context
+        r"\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b.*\b(sorted|ordered)\s+by\b",
+        r"\b(sorted|ordered)\s+by\b.*\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b",
     ]
     
     has_window_context = any(re.search(pat, q) for pat in window_context_patterns)
@@ -12452,13 +12712,17 @@ def _question_requests_ordering(question: str) -> bool:
     # These strongly indicate user wants final ORDER BY
     # NOTE: "ordered by" only counts if NOT in window context
     explicit_sort_keywords = [
-        "order by", "sort by", "sorted by", "arrange by",
+        "order by", "arrange by",
         "urut berdasarkan", "urutkan berdasarkan", "diurutkan berdasarkan",
     ]
     
     if any(k in q for k in explicit_sort_keywords):
         return True
     
+    # "sort by" / "sorted by" / "ordered by" can be ranking/window context.
+    if ("sort by" in q or "sorted by" in q or "ordered by" in q) and not has_window_context:
+        return True
+
     # "ordered by" is ambiguous - only treat as final sort if NOT in window context
     if "ordered by" in q and not has_window_context:
         return True

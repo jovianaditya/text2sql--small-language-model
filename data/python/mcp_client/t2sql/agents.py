@@ -212,6 +212,7 @@ from .helpers_core import (
     _ast_guardrails,
     _rewrite_grouped_winner_row_ranked_aggregate,
     _question_wants_winner_row,
+    _question_wants_anti_existence,
     _wants_distinct_from_question,
     _question_wants_count_distinct,
     _ensure_reasonable_distinct,
@@ -220,6 +221,7 @@ from .helpers_core import (
     _question_requires_inner_join,
     _question_requests_ordering,
     _question_wants_include_zero,
+    _enforce_requested_order_direction,
     _parse_allowed_identifiers,
     _remove_top_level_order_by_if_not_requested,
     _SQL_KEYWORDS,
@@ -235,7 +237,7 @@ def _dbg_safety_block(scope: str, detail: str) -> None:
     _dbg_print_two(f"[{label}] Safety Block", detail)
 
 
-def _derive_semantic_contract(question: str) -> Dict[str, bool]:
+def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
     """
     Minimal semantic contract derived from question wording.
 
@@ -246,10 +248,22 @@ def _derive_semantic_contract(question: str) -> Dict[str, bool]:
     wants_count_distinct = _question_wants_count_distinct(question)
     wants_projection_distinct = _wants_distinct_from_question(question) and not wants_count_distinct
     wants_winner_row = _question_wants_winner_row(question)
+    try:
+        allowed_ids = _parse_allowed_identifiers(ctx or "")
+        context_table_count = len(allowed_ids or {})
+    except Exception:
+        context_table_count = 0
+    relational_ctx = context_table_count >= 2
+    wants_include_zero = relational_ctx and _question_wants_include_zero(question, ctx)
+    wants_anti_existence = relational_ctx and _question_wants_anti_existence(question, ctx) and not wants_include_zero
+    wants_final_order = _question_requests_ordering(question)
     return {
         "requires_projection_distinct": wants_projection_distinct,
         "requires_count_distinct": wants_count_distinct,
         "requires_winner_row": wants_winner_row,
+        "requires_anti_existence": wants_anti_existence,
+        "requires_include_zero": wants_include_zero,
+        "requires_final_order": wants_final_order,
     }
 
 
@@ -265,11 +279,50 @@ def _has_winner_row_shape(sql: str) -> bool:
     return has_row_number and has_rn_filter
 
 
-def _apply_semantic_contract(sql: str, question: str) -> Tuple[str, List[str], List[str]]:
+def _has_top_level_order_by(sql: str) -> bool:
+    s = (sql or "").strip()
+    if not s:
+        return False
+    try:
+        import sqlglot
+        parsed = sqlglot.parse_one(s, read="mysql")
+        order = parsed.args.get("order") if parsed is not None else None
+        return order is not None
+    except Exception:
+        return bool(re.search(r"\bORDER\s+BY\b", s, flags=re.I))
+
+
+def _has_anti_existence_shape(sql: str) -> bool:
+    s = (sql or "").strip()
+    if not s:
+        return False
+    if re.search(r"\bNOT\s+EXISTS\s*\(", s, flags=re.I):
+        return True
+    if re.search(r"\bNOT\s+IN\s*\(", s, flags=re.I):
+        return True
+    if re.search(r"\bLEFT\s+JOIN\b", s, flags=re.I) and re.search(r"\bIS\s+NULL\b", s, flags=re.I):
+        return True
+    if re.search(r"\bHAVING\b[^;]*\bCOUNT\s*\([^)]*\)\s*=\s*0\b", s, flags=re.I | re.S):
+        return True
+    return False
+
+
+def _has_include_zero_shape(sql: str) -> bool:
+    s = (sql or "").strip()
+    if not s:
+        return False
+    if has_join(s):
+        return bool(re.search(r"\b(?:LEFT|RIGHT|FULL(?:\s+OUTER)?)\s+JOIN\b", s, flags=re.I))
+    # Keep this conservative: if the query uses no JOIN, do not force a violation.
+    # Some valid include-zero patterns can be expressed with scalar subqueries.
+    return True
+
+
+def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[str, List[str], List[str]]:
     """
     Apply low-risk semantic repairs and report any remaining unmet contracts.
     """
-    contract = _derive_semantic_contract(question)
+    contract = _derive_semantic_contract(question, ctx)
     if not sql:
         return sql, [], []
 
@@ -301,6 +354,22 @@ def _apply_semantic_contract(sql: str, question: str) -> Tuple[str, List[str], L
         if not _has_winner_row_shape(out_sql):
             violations.append("missing_winner_row")
 
+    if contract["requires_anti_existence"]:
+        if not _has_anti_existence_shape(out_sql):
+            violations.append("missing_anti_existence")
+
+    if contract["requires_include_zero"]:
+        if not _has_include_zero_shape(out_sql):
+            violations.append("missing_include_zero")
+
+    if contract["requires_final_order"]:
+        fixed = _enforce_requested_order_direction(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: enforced final ORDER BY direction")
+        if not _has_top_level_order_by(out_sql):
+            violations.append("missing_final_order")
+
     active_contracts: List[str] = []
     if contract["requires_projection_distinct"]:
         active_contracts.append("distinct")
@@ -308,6 +377,12 @@ def _apply_semantic_contract(sql: str, question: str) -> Tuple[str, List[str], L
         active_contracts.append("count_distinct")
     if contract["requires_winner_row"]:
         active_contracts.append("winner_row")
+    if contract["requires_anti_existence"]:
+        active_contracts.append("anti_existence")
+    if contract["requires_include_zero"]:
+        active_contracts.append("include_zero")
+    if contract["requires_final_order"]:
+        active_contracts.append("final_order")
 
     if violations:
         status = "pending_retry"
@@ -3932,7 +4007,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         elif AGENT_AST_GUARDS_DEBUG and ast_meta.get("error"):
             _dbg_print_two("[REFINER - AST] parse skipped", f"{ast_meta.get('error')}")
 
-    final_sql, contract_corrections, contract_violations = _apply_semantic_contract(final_sql, question)
+    final_sql, contract_corrections, contract_violations = _apply_semantic_contract(final_sql, question, ctx)
     if contract_corrections:
         corrections.extend(contract_corrections)
 
@@ -4091,6 +4166,23 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "STRICT REQUIREMENT: The question asks for a count of distinct values. "
                 "You MUST use COUNT(DISTINCT target_column) and avoid grouping by the distinct target "
                 "unless the question explicitly asks to display that target column."
+            )
+        elif "missing_anti_existence" in contract_violations:
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question asks for rows WITHOUT related child rows. "
+                "You MUST use an anti-existence pattern such as NOT EXISTS, NOT IN, "
+                "or LEFT JOIN ... WHERE child_key IS NULL. Do NOT use positive existence filtering."
+            )
+        elif "missing_include_zero" in contract_violations:
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question explicitly asks to keep parent rows even when no child rows exist. "
+                "You MUST preserve zero-match parents with LEFT JOIN (or an equivalent zero-preserving pattern) "
+                "instead of dropping them with INNER JOIN."
+            )
+        elif "missing_final_order" in contract_violations:
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question explicitly requests final result ordering. "
+                "You MUST include a top-level ORDER BY in the final query with the requested sort direction."
             )
         else:
             extra_instruction = (

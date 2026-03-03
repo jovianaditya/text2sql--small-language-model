@@ -51,6 +51,7 @@ from .helpers_core import (
     _move_rhs_filter_from_where_to_on,  # Only triggers for "ALL entities" questions
     _rewrite_left_join_to_inner_if_not_needed, _rewrite_left_join_to_inner_if_rhs_filtered,
     _rewrite_inner_join_filter_to_exists, _rewrite_inner_join_existence_to_exists,
+    _rewrite_invalid_grouped_existence_subquery_to_join,
     _remove_redundant_and_ornamental_joins, _rewrite_invalid_fk_join_conditions, has_non_inner_join, join_count,
     # phase 2
     _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns, _repair_simple_single_table_column_names,
@@ -2986,6 +2987,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _rewrite_left_join_to_inner_if_not_needed(s, question, ctx)
     s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question, ctx)
     s = _rewrite_invalid_fk_join_conditions(s, ctx)
+    s = _rewrite_invalid_grouped_existence_subquery_to_join(s, question, ctx)
     s = _rewrite_inner_join_filter_to_exists(s)
     s = _rewrite_inner_join_existence_to_exists(s, question, ctx)
     s = _remove_redundant_and_ornamental_joins(s)
@@ -3487,7 +3489,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _normalize_simple_set_operation_branches(s, question)
     s = _rewrite_union_case_label_to_literal_branches(s, question)
     s = _rewrite_concat_label_union(s, question)
-    s = _strip_unneeded_count_distinct(s)
+    s = _strip_unneeded_count_distinct(s, question)
     # ---------------------------------------------------------------------------
     # Phase 6.5 — Strip Hallucinated WHERE on GROUP BY Column for "For Each" Queries
     # ---------------------------------------------------------------------------
