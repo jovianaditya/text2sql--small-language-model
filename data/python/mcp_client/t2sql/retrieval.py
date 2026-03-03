@@ -360,7 +360,7 @@ def _build_cards(
     # debug_count = 0
     if RETRIEVE_DEBUG:
         debug_count = 0 
-        print(f"\n[DEBUG CARD PREVIEW] Menampilkan Top {RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT} Kartu untuk LLM:")
+        print(f"\n[RETRIEVAL - CARD PREVIEW] Menampilkan Top {RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT} Kartu untuk LLM:")
 
     for it in (reranked or [])[:max_cards]:
         md = it.get("meta") or {}
@@ -1698,12 +1698,12 @@ def retrieve_node(state: RAGState) -> RAGState:
 
                 if RETRIEVE_DEBUG:
                     print(
-                        "[LOCK] Low-confidence single-table lock -> fallback "
+                        "[RETRIEVAL - LOCK] Low-confidence single-table lock -> fallback "
                         f"to top-{fallback_k} tables: {sorted(fallback_tables)}"
                     )
             if RETRIEVE_DEBUG and force_single_lock:
                 print(
-                    "[LOCK] Aggregate override -> forced single-table lock "
+                    "[RETRIEVAL - LOCK] Aggregate override -> forced single-table lock "
                     f"to primary table: {primary_for_lock}"
                 )
         else:
@@ -1721,7 +1721,7 @@ def retrieve_node(state: RAGState) -> RAGState:
 
                 # DEBUG: Print table scores
                 if RETRIEVE_DEBUG:
-                    print(f"\n[TABLE SCORES]")
+                    print(f"\n[RETRIEVAL - TABLE SCORES]")
                     for tbl, score in sorted_tbls:
                         print(f"  {tbl}: {score:.2f}")
 
@@ -1809,7 +1809,7 @@ def retrieve_node(state: RAGState) -> RAGState:
 
                 # DEBUG: Print what we're adding
                 if RETRIEVE_DEBUG:
-                    print(f"\n[COLUMN-DRIVEN SELECTION]")
+                    print(f"\n[RETRIEVAL - COLUMN-DRIVEN SELECTION]")
                     print(f"  tables_with_reranked_cols: {tables_with_reranked_cols}")
                     print(f"  all_table_keys_lower: {list(all_table_keys_lower.keys())}")
                     to_add = [

@@ -2071,8 +2071,8 @@ def _drop_unused_from_table_aliases(sql: str) -> str:
     
     if not sql:
         return sql
-    print(f"[DROP_ALIAS] Input: {sql[:100]}")
-    print(f"[DROP_ALIAS] has_join: {has_join(sql)}")
+    print(f"[REFINER - DROP ALIAS] Input: {sql[:100]}")
+    print(f"[REFINER - DROP ALIAS] has_join: {has_join(sql)}")
     # FIX 1: Kalau ada JOIN di mana pun, jangan sentuh (biar aman).
     if has_join(sql):
         return sql
@@ -2130,26 +2130,26 @@ def _strip_alias_if_single_table(sql: str) -> str:
 
     # ULTRA SAFE GUARDS
     if re.search(r"\bjoin\b", s):
-        print(f"[STRIP_ALIAS] SKIP: has join")
+        print(f"[REFINER - STRIP ALIAS] SKIP: has join")
         return sql
     
     if re.search(r"\bgroup\s+by\b", s):
-        print(f"[STRIP_ALIAS] SKIP: has GROUP BY")
+        print(f"[REFINER - STRIP ALIAS] SKIP: has GROUP BY")
         return sql
     
     if re.search(r"\bfrom\s*\(", s):
-        print(f"[STRIP_ALIAS] SKIP: has subquery")
+        print(f"[REFINER - STRIP ALIAS] SKIP: has subquery")
         return sql
     
     if re.search(r"\brow_number\b", s):
-        print(f"[STRIP_ALIAS] SKIP: has ROW_NUMBER")
+        print(f"[REFINER - STRIP ALIAS] SKIP: has ROW_NUMBER")
         return sql
     
     if re.search(r"\b(sum|count|avg|min|max)\s*\(", s):
-        print(f"[STRIP_ALIAS] SKIP: has aggregate")
+        print(f"[REFINER - STRIP ALIAS] SKIP: has aggregate")
         return sql
 
-    print(f"[STRIP_ALIAS] Processing simple single-table query...")
+    print(f"[REFINER - STRIP ALIAS] Processing simple single-table query...")
 
     m = re.search(r"\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", s)
     if not m:
@@ -2165,7 +2165,7 @@ def _strip_alias_if_single_table(sql: str) -> str:
         )
 
     result = "".join(parts)
-    print(f"[STRIP_ALIAS] Output: {result[:100]}")
+    print(f"[REFINER - STRIP ALIAS] Output: {result[:100]}")
     return result
 # =======================================================================
 # ============ Phase 3 — Column Naming & GROUP BY Consistency ===========

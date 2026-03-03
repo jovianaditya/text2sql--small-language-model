@@ -2934,7 +2934,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     if DEBUG_WR and "HAVING" in s.upper():
         # Check if HAVING still stuck to previous token
         if re.search(r"[A-Za-z0-9_]HAVING", s, flags=re.I):
-            print(f"[PH4] WARNING: HAVING still stuck after normalization: {s[:200]}")
+            print(f"[REFINER - PH4] WARNING: HAVING still stuck after normalization: {s[:200]}")
 
     def _norm_kw(text: str) -> str:
         CHUNKS = re.compile(
@@ -3280,7 +3280,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     before_phase4 = s
 
-    if DEBUG_WR: print("\n[PH4] start ----")
+    if DEBUG_WR: print("\n[REFINER - PH4] start ----")
     s = _fix_missing_space_before_clauses(s)
     # FIX: NO re.I flag - creditLimit won't match (lowercase 'imit'), but HAVING will match (uppercase)
     s = re.sub(
@@ -3288,48 +3288,48 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     r"\1 \2",
     s)
     s = _fix_missing_space_before_clauses(s)
-    if DEBUG_WR: print(f"[PH4] after re-spacing: {s[:200]}")
+    if DEBUG_WR: print(f"[REFINER - PH4] after re-spacing: {s[:200]}")
 
     # pre-sanity only (no rewrite)
     s = _winner_row_sanity_date_in_groupby(s, question)
-    if DEBUG_WR: print("[PH4] after sanity:", s)
+    if DEBUG_WR: print("[REFINER - PH4] after sanity:", s)
 
     # remove MAX(..) HAVING self-subquery hacks
     s = _strip_having_max_self_subquery(s)
-    if DEBUG_WR: print("[PH4] after strip having max self subquery:", s)
+    if DEBUG_WR: print("[REFINER - PH4] after strip having max self subquery:", s)
 
     # NEW: Detect and fix malformed MAX/GROUP BY + ROW_NUMBER mixed pattern
     # This catches cases where 7B model incorrectly combines aggregate and window function patterns
     fixed_mixed = _fix_mixed_max_groupby_rownumber(s)
     if fixed_mixed:
-        if DEBUG_WR: print("[PH4] Fixed malformed MAX/GROUP BY + ROW_NUMBER pattern")
+        if DEBUG_WR: print("[REFINER - PH4] Fixed malformed MAX/GROUP BY + ROW_NUMBER pattern")
         s = fixed_mixed
 
     # NEW: Fix redundant GROUP BY + MAX(CASE WHEN rn = N...) when WHERE rn = N is present
     # When WHERE rn = N exists, each group has exactly ONE row, so GROUP BY is redundant
     fixed_redundant = _fix_redundant_groupby_with_rn_filter(s)
     if fixed_redundant:
-        if DEBUG_WR: print("[PH4] Fixed redundant GROUP BY with WHERE rn = N pattern")
-        if DEBUG_WR: print(f"[PH4] Before: {s[:200]}")
-        if DEBUG_WR: print(f"[PH4] After:  {fixed_redundant[:200]}")
+        if DEBUG_WR: print("[REFINER - PH4] Fixed redundant GROUP BY with WHERE rn = N pattern")
+        if DEBUG_WR: print(f"[REFINER - PH4] Before: {s[:200]}")
+        if DEBUG_WR: print(f"[REFINER - PH4] After:  {fixed_redundant[:200]}")
         s = fixed_redundant
 
     # NEW: Fix malformed ordinal-ranking pattern where WHERE rn = N is placed
     # inside the same SELECT block that defines ROW_NUMBER()
     fixed_inner_rn = _fix_inner_rn_filter_scope(s)
     if fixed_inner_rn:
-        if DEBUG_WR: print("[PH4] Fixed inner WHERE rn = N scope")
-        if DEBUG_WR: print(f"[PH4] Before: {s[:200]}")
-        if DEBUG_WR: print(f"[PH4] After:  {fixed_inner_rn[:200]}")
+        if DEBUG_WR: print("[REFINER - PH4] Fixed inner WHERE rn = N scope")
+        if DEBUG_WR: print(f"[REFINER - PH4] Before: {s[:200]}")
+        if DEBUG_WR: print(f"[REFINER - PH4] After:  {fixed_inner_rn[:200]}")
         s = fixed_inner_rn
 
     # NEW: Fix inconsistent subquery alias hallucination
     # LLM sometimes uses different alias in outer SELECT than the subquery alias
     fixed_alias = _fix_inconsistent_subquery_alias(s)
     if fixed_alias:
-        if DEBUG_WR: print("[PH4] Fixed inconsistent subquery alias")
-        if DEBUG_WR: print(f"[PH4] Before: {s[:200]}")
-        if DEBUG_WR: print(f"[PH4] After:  {fixed_alias[:200]}")
+        if DEBUG_WR: print("[REFINER - PH4] Fixed inconsistent subquery alias")
+        if DEBUG_WR: print(f"[REFINER - PH4] Before: {s[:200]}")
+        if DEBUG_WR: print(f"[REFINER - PH4] After:  {fixed_alias[:200]}")
         s = fixed_alias
 
     # -------------------------------------------------------------
@@ -3339,7 +3339,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     if _looks_like_max_date_tiebreaker(s):
         # Jangan force rewrite kalau question JELAS bukan winner-row
         if _question_wants_winner_row(question):
-            if DEBUG_WR: print("[PH4] detected max-date tie-breaker + winner-row intent -> forcing guardrail")
+            if DEBUG_WR: print("[REFINER - PH4] detected max-date tie-breaker + winner-row intent -> forcing guardrail")
             # CRITICAL: Check if query is already corrupted
             s_forced = _rewrite_winner_row_guardrail(s, question, force=True)
             forced_rewrite_ok = False
@@ -3358,20 +3358,20 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             # SANITY: Only accept forced rewrite when structurally parseable.
             # Otherwise fall back to normal winner-row heuristic flow.
             if not forced_rewrite_ok:
-                if DEBUG_WR: print("[PH4] ABORT: forced rewrite malformed/unparseable, fallback to normal winner-row flow")
+                if DEBUG_WR: print("[REFINER - PH4] ABORT: forced rewrite malformed/unparseable, fallback to normal winner-row flow")
                 s = before_phase4
                 goto_phase5 = False
             else:
                 s = s_forced
-                if DEBUG_WR: print("[PH4] FINAL after forced guardrail:", s)
+                if DEBUG_WR: print("[REFINER - PH4] FINAL after forced guardrail:", s)
                 # Skip normal heuristic flow - forced rewrite is valid.
                 s = _rewrite_having_alias_to_expr(s)
                 s = _force_restore_groupby_if_aggregate_without_groupby(before_phase4, s)
-                if DEBUG_WR: print("[PH4] end ----", s, "\n")
+                if DEBUG_WR: print("[REFINER - PH4] end ----", s, "\n")
                 # DON'T return early - continue to Phase 5-7
                 goto_phase5 = True
         else:
-            if DEBUG_WR: print("[PH4] max-date pattern detected BUT question wants true aggregation -> skip force")
+            if DEBUG_WR: print("[REFINER - PH4] max-date pattern detected BUT question wants true aggregation -> skip force")
             goto_phase5 = False
     else:
         goto_phase5 = False
@@ -3380,66 +3380,66 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ------------------------------------------------------------
     if not goto_phase5:
         s = _rewrite_winner_row_guardrail(s, question)
-        if DEBUG_WR: print("[PH4] after guardrail:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after guardrail:", s)
 
         s = _rewrite_winner_row_aggregate_misuse(s, question, ctx)
-        if DEBUG_WR: print("[PH4] after agg-misuse:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after agg-misuse:", s)
 
         s = _fix_winner_row_window_order_priority(s, question)
-        if DEBUG_WR: print("[PH4] after winner-row window order fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after winner-row window order fix:", s)
 
         s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
-        if DEBUG_WR: print("[PH4] after metric-agg-column fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after metric-agg-column fix:", s)
 
         s = _rewrite_employee_customer_payment_rollup(s, question, ctx)
-        if DEBUG_WR: print("[PH4] after employee-customer-payment rollup fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after employee-customer-payment rollup fix:", s)
 
         s = _rewrite_customer_orders_payment_fanout(s, question, ctx)
-        if DEBUG_WR: print("[PH4] after customer-order-payment fanout fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after customer-order-payment fanout fix:", s)
 
         s = _rewrite_latest_year_same_year_aggregate(s, question, ctx)
-        if DEBUG_WR: print("[PH4] after latest-year-sum fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year-sum fix:", s)
 
         s = _rewrite_latest_year_correlated_maxdate_misuse(s, question, ctx)
-        if DEBUG_WR: print("[PH4] after latest-year correlated-max fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year correlated-max fix:", s)
 
         s = _rewrite_latest_year_derived_subquery_misuse(s, question, ctx)
-        if DEBUG_WR: print("[PH4] after latest-year derived-subquery fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year derived-subquery fix:", s)
 
         s = _canonicalize_latest_year_same_year_pattern(s, question, ctx)
-        if DEBUG_WR: print("[PH4] after latest-year canonical pattern fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year canonical pattern fix:", s)
 
         s = _move_latest_year_filter_where_to_inner_on(s)
-        if DEBUG_WR: print("[PH4] after latest-year WHERE->ON style fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year WHERE->ON style fix:", s)
 
         s = _rewrite_latest_year_projection_to_year(s, question)
-        if DEBUG_WR: print("[PH4] after latest-year projection->year fix:", s)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year projection->year fix:", s)
         
         if not AGENT_AST_SEMANTIC_FIRST:
             s = _fix_aggregate_in_where(s)
-            if DEBUG_WR: print(f"[PH4] after agg-in-where fix: {s}")
+            if DEBUG_WR: print(f"[REFINER - PH4] after agg-in-where fix: {s}")
 
             # Fix raw column WHERE -> HAVING for aggregate questions
             s = _fix_raw_column_where_to_having(s, question)
-            if DEBUG_WR: print(f"[PH4] after raw-where-to-having fix: {s}")
+            if DEBUG_WR: print(f"[REFINER - PH4] after raw-where-to-having fix: {s}")
         elif DEBUG_WR:
-            print("[PH4] AST semantic-first enabled: skip regex agg/having surgery")
+            print("[REFINER - PH4] AST semantic-first enabled: skip regex agg/having surgery")
 
         # Add missing COUNT(*) for GROUP BY aggregates
         s = _add_missing_count_for_group_by(s, question)
-        if DEBUG_WR: print(f"[PH4] after add-count fix: {s}")
+        if DEBUG_WR: print(f"[REFINER - PH4] after add-count fix: {s}")
 
         s = _rewrite_row_level_nonnull_to_group_existence(s, question)
-        if DEBUG_WR: print(f"[PH4] after nonnull row-filter->group existence fix: {s}")
+        if DEBUG_WR: print(f"[REFINER - PH4] after nonnull row-filter->group existence fix: {s}")
 
         s = _drop_unrequested_exists_filters(s, question, ctx)
-        if DEBUG_WR: print(f"[PH4] after unrequested EXISTS-drop fix: {s}")
+        if DEBUG_WR: print(f"[REFINER - PH4] after unrequested EXISTS-drop fix: {s}")
 
         s = _drop_unrequested_temporal_filters(s, question, ctx)
-        if DEBUG_WR: print(f"[PH4] after unrequested temporal-filter drop fix: {s}")
+        if DEBUG_WR: print(f"[REFINER - PH4] after unrequested temporal-filter drop fix: {s}")
 
         s = _prefer_not_exists_for_simple_exclusion(s, question, ctx)
-        if DEBUG_WR: print(f"[PH4] after NOT EXISTS anti-join preference: {s}")
+        if DEBUG_WR: print(f"[REFINER - PH4] after NOT EXISTS anti-join preference: {s}")
 
         s = _rewrite_having_alias_to_expr(s)
         s = _winner_row_final_sanity(s, question)
@@ -3447,12 +3447,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         # fail-safe restore group by if pipeline broke it
         s = _force_restore_groupby_if_aggregate_without_groupby(before_phase4, s)
 
-        if DEBUG_WR: print("[PH4] end ----", s, "\n")
+        if DEBUG_WR: print("[REFINER - PH4] end ----", s, "\n")
     else:
             # Phase 4 was skipped due to goto_phase5, but still need aggregate fix
             if not AGENT_AST_SEMANTIC_FIRST:
                 s = _fix_aggregate_in_where(s)
-                if DEBUG_WR: print(f"[PH4-FORCE] after agg-in-where fix: {s}")
+                if DEBUG_WR: print(f"[REFINER - PH4-FORCE] after agg-in-where fix: {s}")
                 s = _fix_raw_column_where_to_having(s, question)
                 if DEBUG_WR: print(f"[PH4-FORCE] after raw-where-to-having fix: {s}")
             elif DEBUG_WR:
@@ -3689,7 +3689,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Catch and repair remaining high-risk anti-patterns before execution.
     # ---------------------------------------------------------------------------
     s = _preexecute_sql_safety_pass(s, question)
-    if DEBUG_WR: print("[PH9] after pre-exec safety:", s)
+    if DEBUG_WR: print("[REFINER - PH9] after pre-exec safety:", s)
 
     # ---------------------------------------------------------------------------
     # Final Polish
@@ -3704,7 +3704,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
     - repair alias berdasarkan alias_map
     - postprocess lagi setelah alias diganti
     """
-    _dbg_print_two("[normalize] input sql:", raw_sql)
+    _dbg_print_two("[REFINER - NORMALIZE] input sql:", raw_sql)
     if not raw_sql:
         return raw_sql
 
@@ -3739,7 +3739,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
         if ast_meta.get("parse_ok", False) and ast_meta.get("fixes"):
             sql_in = ast_sql
         if AGENT_AST_GUARDS_DEBUG and ast_meta.get("warnings"):
-            _dbg_print_two("[AST] warnings", f"{ast_meta.get('warnings')}")
+            _dbg_print_two("[REFINER - AST] warnings", f"{ast_meta.get('warnings')}")
         return sql_in, ast_meta
 
     s = _apply_postprocess(raw_sql)
@@ -3764,7 +3764,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
 
     if should_early_stop:
         s = _collapse_spaces_outside_quotes(s)
-        _dbg_print_two("[normalize] output sql:", s)
+        _dbg_print_two("[REFINER - NORMALIZE] output sql:", s)
         return s
 
     needs_second_pass = (
@@ -3776,5 +3776,5 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
         s = _apply_postprocess(s)
         s, _ = _ast_stabilize(s)
 
-    _dbg_print_two("[normalize] output sql:", s)
+    _dbg_print_two("[REFINER - NORMALIZE] output sql:", s)
     return s

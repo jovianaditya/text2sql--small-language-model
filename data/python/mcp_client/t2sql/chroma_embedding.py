@@ -81,15 +81,15 @@ def build_vector_store():
     current_count = _CHROMA_COL.count()
     
     if current_count == 0:
-        print(f"[Chroma] Collection '{COLLECTION_NAME}' is EMPTY.")
+        print(f"[STATUS - CHROMA] Collection '{COLLECTION_NAME}' is EMPTY.")
         ingest_paths = _resolve_ingest_jsonl_paths()
         if not ingest_paths:
             print(
-                f"[Chroma] No JSONL files found for ingestion. "
+                f"[STATUS - CHROMA] No JSONL files found for ingestion. "
                 f"Checked specs: EXPORT_JSONL_OUTPUT='{EXPORT_JSONL_OUTPUT}', JSON_INPUT='{JSON_INPUT}'"
             )
         else:
-            print(f"[Chroma] Triggering AUTO-INGEST from {len(ingest_paths)} file(s):")
+            print(f"[STATUS - CHROMA] Triggering AUTO-INGEST from {len(ingest_paths)} file(s):")
             for p in ingest_paths:
                 print(f"  - {p}")
             ingest_dense_data(jsonl_paths=ingest_paths)
@@ -101,8 +101,8 @@ def build_vector_store():
         )
     else:
         # --- [INI TAMBAHAN LOGS YANG ANDA MINTA] ---
-        print(f"[Chroma] Collection '{COLLECTION_NAME}' ready. Contains {current_count} docs.")
-        print(f"[Chroma] No update needed. Skipping auto-ingest.")
+        print(f"[STATUS - CHROMA] Collection '{COLLECTION_NAME}' ready. Contains {current_count} docs.")
+        print(f"[STATUS - CHROMA] No update needed. Skipping auto-ingest.")
 
     return _CHROMA_COL
 # ==============================================================================
@@ -116,7 +116,7 @@ def ingest_dense_data(jsonl_paths: List[str], batch_size: int = 50):
     # Gunakan get_or_create_collection
     collection = client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=emb_fn)
     
-    print(f"[Chroma] Starting ingestion...")
+    print(f"[STATUS - CHROMA] Starting ingestion...")
     total_docs = 0
 
     for filepath in jsonl_paths:
@@ -127,7 +127,7 @@ def ingest_dense_data(jsonl_paths: List[str], batch_size: int = 50):
             continue
 
         filename = os.path.basename(filepath)
-        print(f"[Chroma] Processing: {filename}...")
+        print(f"[STATUS - CHROMA] Processing: {filename}...")
 
         batch_ids = []
         batch_docs = []
@@ -173,7 +173,7 @@ def ingest_dense_data(jsonl_paths: List[str], batch_size: int = 50):
             collection.upsert(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
             total_docs += len(batch_ids)
 
-    print(f"[Chroma] Auto-Ingestion Complete. Indexed {total_docs} docs.")
+    print(f"[STATUS - CHROMA] Auto-Ingestion Complete. Indexed {total_docs} docs.")
 
 # ==============================================================================
 # EXISTING EMBEDDING CLASS

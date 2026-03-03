@@ -212,6 +212,10 @@ from .helpers_core import (
     _ast_guardrails,
     _rewrite_grouped_winner_row_ranked_aggregate,
     _question_wants_winner_row,
+    _wants_distinct_from_question,
+    _question_wants_count_distinct,
+    _ensure_reasonable_distinct,
+    _ensure_reasonable_count_distinct,
     _question_requires_word_boundary_regex,
     _question_requires_inner_join,
     _question_requests_ordering,
@@ -223,11 +227,105 @@ from .helpers_core import (
 
 
 def _dbg_agent3_retry(check_name: str, detail: str) -> None:
-    _dbg_print_two(f"[Agent3] Retry Gate - {check_name}", detail)
+    _dbg_print_two(f"[REFINER] Retry Gate - {check_name}", detail)
 
 
 def _dbg_safety_block(scope: str, detail: str) -> None:
-    _dbg_print_two(f"[{scope}] Safety Block", detail)
+    label = "REFINER" if str(scope).strip().lower() == "agent3" else str(scope)
+    _dbg_print_two(f"[{label}] Safety Block", detail)
+
+
+def _derive_semantic_contract(question: str) -> Dict[str, bool]:
+    """
+    Minimal semantic contract derived from question wording.
+
+    This does not replace routing or the acceptance gate. It centralizes a few
+    high-value meaning checks so final SQL can be repaired (or retried) against
+    the question's intent in one place.
+    """
+    wants_count_distinct = _question_wants_count_distinct(question)
+    wants_projection_distinct = _wants_distinct_from_question(question) and not wants_count_distinct
+    wants_winner_row = _question_wants_winner_row(question)
+    return {
+        "requires_projection_distinct": wants_projection_distinct,
+        "requires_count_distinct": wants_count_distinct,
+        "requires_winner_row": wants_winner_row,
+    }
+
+
+def _has_winner_row_shape(sql: str) -> bool:
+    s_up = (sql or "").upper()
+    if not s_up:
+        return False
+    has_row_number = bool(re.search(r"\bROW_NUMBER\s*\(", s_up))
+    has_rn_filter = bool(
+        re.search(r"\bWHERE\b[^;]*\brn\s*=\s*\d+\b", s_up, flags=re.I | re.S)
+        or re.search(r"\bQUALIFY\b[^;]*\brn\s*=\s*\d+\b", s_up, flags=re.I | re.S)
+    )
+    return has_row_number and has_rn_filter
+
+
+def _apply_semantic_contract(sql: str, question: str) -> Tuple[str, List[str], List[str]]:
+    """
+    Apply low-risk semantic repairs and report any remaining unmet contracts.
+    """
+    contract = _derive_semantic_contract(question)
+    if not sql:
+        return sql, [], []
+
+    out_sql = sql
+    corrections: List[str] = []
+    violations: List[str] = []
+
+    if contract["requires_projection_distinct"]:
+        fixed = _ensure_reasonable_distinct(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: enforced projection DISTINCT")
+        if not re.search(r"^\s*SELECT\s+DISTINCT\b", out_sql, flags=re.I):
+            violations.append("missing_projection_distinct")
+
+    if contract["requires_count_distinct"]:
+        fixed = _ensure_reasonable_count_distinct(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: enforced COUNT(DISTINCT)")
+        if "COUNT(" in out_sql.upper() and not re.search(r"\bCOUNT\s*\(\s*DISTINCT\b", out_sql, flags=re.I):
+            violations.append("missing_count_distinct")
+
+    if contract["requires_winner_row"] and not _has_winner_row_shape(out_sql):
+        fixed = _rewrite_grouped_winner_row_ranked_aggregate(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: enforced winner-row pattern")
+        if not _has_winner_row_shape(out_sql):
+            violations.append("missing_winner_row")
+
+    active_contracts: List[str] = []
+    if contract["requires_projection_distinct"]:
+        active_contracts.append("distinct")
+    if contract["requires_count_distinct"]:
+        active_contracts.append("count_distinct")
+    if contract["requires_winner_row"]:
+        active_contracts.append("winner_row")
+
+    if violations:
+        status = "pending_retry"
+    elif corrections:
+        status = "autofix_passed"
+    elif active_contracts:
+        status = "passed"
+    else:
+        status = "not_applicable"
+
+    detail = f"requires={active_contracts}; status={status}"
+    if corrections:
+        detail += f"; fixes={len(corrections)}"
+    if violations:
+        detail += f"; violations={violations}"
+    _dbg_print_two("[REFINER - CONTRACT]", detail)
+
+    return out_sql, corrections, list(dict.fromkeys(violations))
 
 # ======================================================================
 # ======================= AGENT 0 - QUESTION GUARD =====================
@@ -657,7 +755,7 @@ Return JSON: {{"is_data_query": true/false, "reason": "brief explanation"}}"""
         
     except Exception as e:
         # If LLM fails, be permissive (let it through)
-        print(f"[Guard] LLM judge failed: {e}, allowing question through")
+        print(f"[ROUTER - GUARD] LLM judge failed: {e}, allowing question through")
         return True, ""
 
 def validate_question_intent(question: str) -> Tuple[bool, str]:
@@ -674,27 +772,27 @@ def validate_question_intent(question: str) -> Tuple[bool, str]:
         2. Regex definite SQL (obvious valid) → No LLM cost
         3. LLM 1.5B judge (borderline cases) → Smart decision
     """
-    print(f"[Guard] Validating question: '{question[:50]}...'")
+    print(f"[ROUTER - GUARD] Validating question: '{question[:50]}...'")
     
     # Layer 1: Instant reject obvious garbage
     should_reject, reason = _check_instant_reject(question)
     if should_reject:
-        print(f"[Guard] Layer 1 REJECT (regex): {reason[:50]}")
+        print(f"[ROUTER - GUARD] Layer 1 REJECT (regex): {reason[:50]}")
         return False, reason
     
     # Layer 1b: Instant accept definite SQL
     if _check_definite_sql(question):
-        print(f"[Guard] ✓ Layer 1 ACCEPT (definite SQL pattern)")
+        print(f"[ROUTER - GUARD] ✓ Layer 1 ACCEPT (definite SQL pattern)")
         return True, ""
     
     # Layer 2: LLM judge for borderline cases
-    print(f"[Guard] → Layer 2: LLM 1.5B judging...")
+    print(f"[ROUTER - GUARD] → Layer 2: LLM 1.5B judging...")
     is_valid, reason = _llm_judge_sql_intent(question)
     
     if is_valid:
-        print(f"[Guard] ✓ Layer 2 ACCEPT (LLM approved)")
+        print(f"[ROUTER - GUARD] ✓ Layer 2 ACCEPT (LLM approved)")
     else:
-        print(f"[Guard] Layer 2 REJECT (LLM): {reason[:50]}")
+        print(f"[ROUTER - GUARD] Layer 2 REJECT (LLM): {reason[:50]}")
     
     return is_valid, reason
 
@@ -860,7 +958,7 @@ def router_agent(state: RAGState) -> RAGState:
     Router agent - determines query complexity and target model.
     Note: Question guard is now handled by separate question_guard_node (runs before retrieve).
     """
-    print(f"\n[Router] Evidence-Based Analysis starting...")
+    print(f"\n[ROUTER] Evidence-Based Analysis starting...")
     question_raw = state.get("question", "")
     question = question_raw.lower()
     ctx = state.get("context", "")
@@ -944,19 +1042,19 @@ def router_agent(state: RAGState) -> RAGState:
                 ):
                     relevant_tables.append(tbl)
                     if RETRIEVE_DEBUG:
-                        print(f"[Router] ✓ Added {tbl} (with ID ref check)")
+                        print(f"[ROUTER] ✓ Added {tbl} (with ID ref check)")
             else:
                 relevant_tables.append(tbl)
                 if RETRIEVE_DEBUG:
                     if inflected_entity_match and not direct_entity_match:
-                        print(f"[Router] ✓ Added {tbl} (inflected entity match)")
+                        print(f"[ROUTER] ✓ Added {tbl} (inflected entity match)")
                     else:
-                        print(f"[Router] ✓ Added {tbl} (direct match)")
+                        print(f"[ROUTER] ✓ Added {tbl} (direct match)")
         elif RETRIEVE_DEBUG:
             pattern_str = rf"\b{table_pattern}\b"
-            print(f"[Router] ✗ Skipped {tbl} (no match in question)")
-            print(f"[Router]   Pattern: {pattern_str}")
-            print(f"[Router]   In question? {bool(re.search(pattern_str, search_scope))}")
+            print(f"[ROUTER] ✗ Skipped {tbl} (no match in question)")
+            print(f"[ROUTER]   Pattern: {pattern_str}")
+            print(f"[ROUTER]   In question? {bool(re.search(pattern_str, search_scope))}")
     
     # ═══════════════════════════════════════════════════════════════════
     # STEP 2: FK-ONLY FILTER (Hapus tabel yang hanya disebutkan untuk FK)
@@ -1018,7 +1116,7 @@ def router_agent(state: RAGState) -> RAGState:
                         if tbl_lower not in relevant_lower:
                             relevant_tables.append(original_tbl)
                             if RETRIEVE_DEBUG:
-                                print(f"[Router] Including {original_tbl} (implicit column mention)")
+                                print(f"[ROUTER] Including {original_tbl} (implicit column mention)")
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 2.5:  DETECT SIGNALS EARLY (needed for FK inference)
@@ -1234,7 +1332,7 @@ def router_agent(state: RAGState) -> RAGState:
             evidence_tables.add(tbl_lower)
             evidence_details[tbl_lower] = evidence
             if RETRIEVE_DEBUG:
-                print(f"[Router] Evidence table: {tbl} (evidence: {', '.join(evidence)})")
+                print(f"[ROUTER] Evidence table: {tbl} (evidence: {', '.join(evidence)})")
 
     # STEP 2.8: Remove parent tables that are only referenced by "for each" pattern
     # If a table is ONLY added because of "for each/per/each" pattern (no column mentions),
@@ -1255,14 +1353,14 @@ def router_agent(state: RAGState) -> RAGState:
         is_explicit_subject = has_table_attr_evidence and (explicit_subject_score > 0)
         if is_explicit_subject:
             if RETRIEVE_DEBUG:
-                print(f"[Router] Keeping {tbl_lower}: explicit subject entity in question")
+                print(f"[ROUTER] Keeping {tbl_lower}: explicit subject entity in question")
             continue
 
         # Preserve weak tables that are explicitly the target of exclusion intent
         # (e.g., "customers with no orders", "never paid").
         if _question_targets_entity_exclusion(question_lower, tbl_lower):
             if RETRIEVE_DEBUG:
-                print(f"[Router] Keeping {tbl_lower}: exclusion target entity in question")
+                print(f"[ROUTER] Keeping {tbl_lower}: exclusion target entity in question")
             continue
 
         # Check if evidence is ONLY weak patterns
@@ -1326,7 +1424,7 @@ def router_agent(state: RAGState) -> RAGState:
         #    like customerName, city, etc.
         if has_fk_col_evidence and has_non_id_entity_mention and is_multi_hop_bridge and non_fk_mentioned:
             if RETRIEVE_DEBUG:
-                print(f"[Router] Keeping {tbl_lower}: explicit entity mention + FK evidence")
+                print(f"[ROUTER] Keeping {tbl_lower}: explicit entity mention + FK evidence")
             continue
 
         # Aggregate/count mentions of a leaf parent entity (e.g., "distinct products")
@@ -1348,7 +1446,7 @@ def router_agent(state: RAGState) -> RAGState:
             tables_to_remove.append(tbl_lower)
             if RETRIEVE_DEBUG:
                 print(
-                    f"[Router] Skipping {tbl_lower}: aggregate-only leaf entity "
+                    f"[ROUTER] Skipping {tbl_lower}: aggregate-only leaf entity "
                     f"covered by child FK table"
                 )
             continue
@@ -1359,7 +1457,7 @@ def router_agent(state: RAGState) -> RAGState:
                     # Safe to remove - only referenced via "for each" and FK exists elsewhere
                     tables_to_remove.append(tbl_lower)
                     if RETRIEVE_DEBUG:
-                        print(f"[Router] Skipping {tbl_lower}: only 'for each' ref, FK exists in other table")
+                        print(f"[ROUTER] Skipping {tbl_lower}: only 'for each' ref, FK exists in other table")
             else:
                 # Fallback: remove weak-only table if another table has strong evidence
                 # and shares the weak FK column(s). This handles key-sharing schemas like
@@ -1395,7 +1493,7 @@ def router_agent(state: RAGState) -> RAGState:
                         if shared_with_other:
                             tables_to_remove.append(tbl_lower)
                             if RETRIEVE_DEBUG:
-                                print(f"[Router] Skipping {tbl_lower}: weak-only FK evidence, strong sibling table covers shared key")
+                                print(f"[ROUTER] Skipping {tbl_lower}: weak-only FK evidence, strong sibling table covers shared key")
 
     # Remove identified tables
     for tbl_lower in tables_to_remove:
@@ -1471,7 +1569,7 @@ def router_agent(state: RAGState) -> RAGState:
             relevant_tables.append(tbl_original)
             relevant_lowers.add(tbl_lower)
             if RETRIEVE_DEBUG:
-                print(f"[Router] Including {tbl_original}: connector in minimal subgraph")
+                print(f"[ROUTER] Including {tbl_original}: connector in minimal subgraph")
 
     # --- STEP 3.4: Remove Tables Not in Connecting Subgraph ---
     # Keep tables that are:
@@ -1579,13 +1677,13 @@ def router_agent(state: RAGState) -> RAGState:
         # Keep if it's an evidence table
         if tbl_lower in evidence_tables:
             if RETRIEVE_DEBUG:
-                print(f"[Router] Keeping {tbl}: evidence table")
+                print(f"[ROUTER] Keeping {tbl}: evidence table")
             continue
 
         # Keep if it's in the connecting subgraph
         if tbl_lower in tables_in_subgraph:
             if RETRIEVE_DEBUG:
-                print(f"[Router] Keeping {tbl}: in connecting subgraph")
+                print(f"[ROUTER] Keeping {tbl}: in connecting subgraph")
             continue
 
         # Keep if it has outgoing FKs to an evidence table (might be needed for query)
@@ -1614,7 +1712,7 @@ def router_agent(state: RAGState) -> RAGState:
 
             if needs_non_fk:
                 if RETRIEVE_DEBUG:
-                    print(f"[Router] Keeping {tbl}: has FK to evidence table + needs non-FK columns")
+                    print(f"[ROUTER] Keeping {tbl}: has FK to evidence table + needs non-FK columns")
                 continue
 
         # Temporal recency/year/date questions may need a date-bearing table
@@ -1625,13 +1723,13 @@ def router_agent(state: RAGState) -> RAGState:
                 or _question_mentions_table_temporal_column(question_lower, tbl)
             ):
                 if RETRIEVE_DEBUG:
-                    print(f"[Router] Keeping {tbl}: temporal intent + date-bearing table")
+                    print(f"[ROUTER] Keeping {tbl}: temporal intent + date-bearing table")
                 continue
 
         # Mark for removal
         tables_to_remove.append(tbl)
         if RETRIEVE_DEBUG:
-            print(f"[Router] Removing {tbl}: not in minimal subgraph")
+            print(f"[ROUTER] Removing {tbl}: not in minimal subgraph")
 
     # Apply removals
     for tbl in tables_to_remove:
@@ -1643,7 +1741,7 @@ def router_agent(state: RAGState) -> RAGState:
         fallback_table = list(whitelisted_tables)[0]
         relevant_tables.append(fallback_table)
         if RETRIEVE_DEBUG:
-            print(f"[Router] All tables removed, falling back to: {fallback_table}")
+            print(f"[ROUTER] All tables removed, falling back to: {fallback_table}")
 
     # --- STEP 3.45: Ensure JOIN Connectivity via FK Bridge Tables ---
     # If multiple kept tables are not directly connected, include minimal bridge
@@ -1669,7 +1767,7 @@ def router_agent(state: RAGState) -> RAGState:
                 if original not in relevant_tables:
                     relevant_tables.append(original)
                     if RETRIEVE_DEBUG:
-                        print(f"[Router] Keeping {original}: bridge table for FK connectivity")
+                        print(f"[ROUTER] Keeping {original}: bridge table for FK connectivity")
 
     # FINAL NORMALIZATION: drop redundant aggregate-only leaf entities that are
     # covered by child FK tables, then restore any missing bridge connectors.
@@ -1744,7 +1842,7 @@ def router_agent(state: RAGState) -> RAGState:
                 if tbl in relevant_tables:
                     relevant_tables.remove(tbl)
                     if RETRIEVE_DEBUG:
-                        print(f"[Router] Final cleanup: removing {tbl} (redundant aggregate-only leaf)")
+                        print(f"[ROUTER] Final cleanup: removing {tbl} (redundant aggregate-only leaf)")
 
             if len(relevant_tables) >= 2:
                 relevant_lower_now = [t.lower() for t in relevant_tables]
@@ -1763,7 +1861,7 @@ def router_agent(state: RAGState) -> RAGState:
                     if original not in relevant_tables:
                         relevant_tables.append(original)
                         if RETRIEVE_DEBUG:
-                            print(f"[Router] Final cleanup: adding {original} (bridge table)")
+                            print(f"[ROUTER] Final cleanup: adding {original} (bridge table)")
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 4: DETEKSI SINYAL (Complete Detection)
@@ -1947,7 +2045,7 @@ def router_agent(state: RAGState) -> RAGState:
             primary_reason = "first table (fallback)"
 
     if RETRIEVE_DEBUG:
-        print(f"[Router] Primary Table: {primary_table} (reason: {primary_reason})")
+        print(f"[ROUTER] Primary Table: {primary_table} (reason: {primary_reason})")
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
@@ -1984,7 +2082,7 @@ def router_agent(state: RAGState) -> RAGState:
     # "second highest", "third largest", "2nd lowest" - requires ROW_NUMBER() WHERE rn = N
     if is_ordinal_ranking:
         is_winner_row = True
-        print(f"[Router] Ordinal ranking detected ('second highest' etc) -> requires ROW_NUMBER subquery")
+        print(f"[ROUTER] Ordinal ranking detected ('second highest' etc) -> requires ROW_NUMBER subquery")
     
     # Pattern A: ranking + grouping + multi-table (original logic)
     if not is_winner_row and is_ranking_value and has_grouping and is_multi_table:
@@ -2174,9 +2272,9 @@ def router_agent(state: RAGState) -> RAGState:
     should_escalate = bool(escalation_reasons)
 
     if is_multi_table and not should_escalate and AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B:
-        print(f"[Router] Multi-table simple pattern detected: {relevant_tables} -> keeping 3B")
+        print(f"[ROUTER] Multi-table simple pattern detected: {relevant_tables} -> keeping 3B")
     elif escalation_reasons:
-        print(f"[Router] Escalating to 7B. reasons={escalation_reasons}")
+        print(f"[ROUTER] Escalating to 7B. reasons={escalation_reasons}")
 
     chosen_model = LARGE_MODEL if should_escalate else SMALL_MODEL
     complexity = AGENT_ROUTER_COMPLEXITY_COMPLEX if should_escalate else AGENT_ROUTER_COMPLEXITY_SIMPLE
@@ -2189,9 +2287,9 @@ def router_agent(state: RAGState) -> RAGState:
     else: 
         qtype = AGENT_ROUTER_QTYPE_LOOKUP
     
-    print(f"[Router] Detected Tables: {relevant_tables}")
+    print(f"[ROUTER] Detected Tables: {relevant_tables}")
     print(
-        f"[Router] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, "
+        f"[ROUTER] Signals -> Math:{has_math}, Sort:{is_sorting}, Rank:{is_ranking}, "
         f"Group:{has_grouping}, WinnerRow:{is_winner_row}, OrdinalRank:{is_ordinal_ranking}, "
         f"Exclusion:{has_exclusion}, WindowAgg:{is_window_aggregate}, "
         f"ExplicitRank:{is_explicit_rank_function}, SubqueryIntent:{is_subquery_intent}, "
@@ -2200,7 +2298,7 @@ def router_agent(state: RAGState) -> RAGState:
         f"SimpleExistsSubquery:{is_simple_exists_subquery}, "
         f"DualFactRollup:{has_dual_fact_rollup}"
     )
-    print(f"[Router] Decision: {complexity.upper()} -> {chosen_model}")
+    print(f"[ROUTER] Decision: {complexity.upper()} -> {chosen_model}")
 
     return {
         **state,
@@ -3020,7 +3118,7 @@ def _attempt_last_chance_rescue_7b(
 
     result["used"] = True
     llm_rescue = build_llm_repair(model=LARGE_MODEL)
-    _dbg_print_two("[Agent3] Last-chance rescue", "Regenerating with 7B")
+    _dbg_print_two("[REFINER] Last-chance rescue", "Regenerating with 7B")
 
     rescue_instruction = _build_gate_retry_instruction(
         "LAST-CHANCE RESCUE: Rewrite SQL to satisfy deterministic acceptance gate. Return one valid MySQL SELECT only.",
@@ -3081,7 +3179,7 @@ def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM
         idle_time = now - last_warmup
         # Only warmup if idle_time > keep_alive
         if idle_time < keep_alive_sec:
-            print(f"[DRAFT] Model {target_model} still warm (idle {idle_time:.1f}s < keep_alive {keep_alive_sec}s), skip warmup.")
+            print(f"[STATUS] Model {target_model} still warm (idle {idle_time:.1f}s < keep_alive {keep_alive_sec}s), skip warmup.")
             return True
 
         """
@@ -3090,22 +3188,22 @@ def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM
         """
         for attempt in range(max_retries):
             try:
-                print(f"[Model] Loading: {target_model}..." + (f" (attempt {attempt+1})" if attempt > 0 else ""))
+                print(f"[STATUS] Loading model: {target_model}..." + (f" (attempt {attempt+1})" if attempt > 0 else ""))
                 llm.invoke("Say OK")  # Quick call to load model into memory
-                print(f"[Model] Ready: {target_model}")
+                print(f"[STATUS] Model ready: {target_model}")
                 _last_model_warmup[target_model] = _time.time()
                 return True
             except Exception as e:
                 error_msg = str(e).lower()
                 if AGENT_PREWARM_MEMORY_ERROR_TOKEN in error_msg:
-                    print(f"[DRAFT OOM] Memory issue detected. Waiting {OOM_WAIT_TIME}s for previous model to unload...")
+                    print(f"[STATUS] Memory issue detected. Waiting {OOM_WAIT_TIME}s for previous model to unload...")
                     _time.sleep(OOM_WAIT_TIME)
-                    print(f"[DRAFT OOM] Retrying model load...")
+                    print(f"[STATUS] Retrying model load...")
                 else:
-                    print(f"[DRAFT] Pre-warm failed: {e}")
+                    print(f"[STATUS] Pre-warm failed: {e}")
                     return False
         
-        print(f"[DRAFT] Failed to load model after {max_retries} OOM retries")
+        print(f"[STATUS] Failed to load model after {max_retries} OOM retries")
         return False
 
 
@@ -3295,7 +3393,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # --- Guard: Skip if question was rejected by router ---
     decision = state.get("router_decision", {})
     if decision.get("complexity") == AGENT_ROUTER_COMPLEXITY_REJECTED or decision.get("is_valid_question") is False:
-        print("[DRAFT] Skipped: Question was rejected by router guard")
+        print("[DRAFTER] Skipped: Question was rejected by router guard")
         return state  # Pass through unchanged
 
     question = state.get("question", "")
@@ -3656,8 +3754,8 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         
     draft_sql = (obj.get("sql") or "SELECT 1;").strip()
     reasoning = (obj.get("notes") or "No reasoning provided.").strip()
-    print(f"\n[DRAFT] Raw from LLM: {draft_sql}")
-    print(f"[DRAFT] LLM Reasoning: {reasoning}")
+    print(f"\n[DRAFTER] Raw from LLM: {draft_sql}")
+    print(f"[DRAFTER] LLM Reasoning: {reasoning}")
     draft_sql = _remove_top_level_order_by_if_not_requested(draft_sql, question)
     # 2. [NEW] Hapus syntax error: SELECT col DESC FROM ...
     # Regex ini mencari DESC/ASC sebelum FROM (hanya di SELECT clause, bukan di ORDER BY)
@@ -3694,7 +3792,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             draft_sql = re.sub(AGENT_DRAFT_LIMIT_REMOVE_PATTERN, "", draft_sql, flags=re.IGNORECASE).strip()
     
     if not draft_sql.endswith(";"): draft_sql += ";"
-    print(f"[DRAFT] After cleanup: {draft_sql}")
+    print(f"[DRAFTER] After cleanup: {draft_sql}")
     return {
         **state,
         "draft_source": "llm",
@@ -3829,10 +3927,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 final_sql = ast_sql
                 corrections.append(f"AST guardrails fixes: {ast_fixes}")
             if AGENT_AST_GUARDS_DEBUG and ast_warnings:
-                _dbg_print_two("[AST] warnings", f"{ast_warnings}")
+                _dbg_print_two("[REFINER - AST] warnings", f"{ast_warnings}")
                 corrections.append(f"AST guardrails warnings: {ast_warnings}")
         elif AGENT_AST_GUARDS_DEBUG and ast_meta.get("error"):
-            _dbg_print_two("[AST] parse skipped", f"{ast_meta.get('error')}")
+            _dbg_print_two("[REFINER - AST] parse skipped", f"{ast_meta.get('error')}")
+
+    final_sql, contract_corrections, contract_violations = _apply_semantic_contract(final_sql, question)
+    if contract_corrections:
+        corrections.extend(contract_corrections)
 
     sql_up = final_sql.upper()
 
@@ -3974,6 +4076,30 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         else:
             regeneration_model = LARGE_MODEL
 
+    # --- SEMANTIC CONTRACT (centralized high-value intent checks) ---
+    if contract_violations and not needs_regeneration:
+        contract_detail = ", ".join(contract_violations)
+        _dbg_agent3_retry("Semantic Contract", contract_detail)
+        if "missing_winner_row" in contract_violations:
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question requires one winning row per group. "
+                "You MUST use ROW_NUMBER() (or equivalent winner-row logic), rank within each group, "
+                "and keep only rn = 1 in the outer query."
+            )
+        elif "missing_count_distinct" in contract_violations:
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question asks for a count of distinct values. "
+                "You MUST use COUNT(DISTINCT target_column) and avoid grouping by the distinct target "
+                "unless the question explicitly asks to display that target column."
+            )
+        else:
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question requires deduplicated output rows. "
+                "You MUST use SELECT DISTINCT (or an equivalent deduplication pattern) so duplicates are not returned."
+            )
+        needs_regeneration = True
+        regeneration_model = LARGE_MODEL
+
     # --- KASUS A: Schema Validation & Hallucination Check (HARD ERROR) ---
     if alien_cols and AGENT_REFINE_JOIN_KEYWORD not in sql_up and not needs_regeneration:
         # SMART SUBQUERY HANDLING
@@ -4035,12 +4161,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 else:
                     # Alien columns only in subquery → safe to skip
                     _dbg_print_two(
-                        "[Agent3] Skipping hallucination check", 
+                        "[REFINER] Skipping hallucination check", 
                         "Alien columns only in subquery (different scope)"
                     )
             else:
                 # Can't parse SELECT clause → skip conservatively
-                _dbg_print_two("[Agent3] Skipping hallucination check", "Cannot parse SELECT clause")
+                _dbg_print_two("[REFINER] Skipping hallucination check", "Cannot parse SELECT clause")
         else:
             # No subquery → original logic
             can_be_solved_by_join = False
@@ -4793,7 +4919,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         def _regen_once(model_name: str, instruction: str, tag: str, strict_schema: bool = False) -> Optional[Dict[str, Any]]:
             llm_regen_local = build_llm_repair(model=model_name)
             model_label_local = "7B" if model_name == LARGE_MODEL else "3B"
-            _dbg_print_two("[Agent3] Regenerating with", f"{model_label_local} ({tag})")
+            _dbg_print_two("[REFINER] Regenerating with", f"{model_label_local} ({tag})")
 
             packed_instruction = _regen_constraint_pack(instruction, strict_schema=strict_schema)
             new_sql_local, _ = regenerate_with_extra_constraint(
@@ -4982,7 +5108,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if not final_sql.endswith(";"):
         final_sql += ";"
 
-    _dbg_print_two("[refine] final sql:", final_sql)
+    _dbg_print_two("[REFINER] final sql:", final_sql)
 
     # Final validation snapshot for observability in benchmark output.
     final_validation_errors = list(final_gate.get("identifier_errors") or validate_identifiers(final_sql, ctx))

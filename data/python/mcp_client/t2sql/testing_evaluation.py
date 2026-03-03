@@ -799,7 +799,7 @@ async def warmup_models(app, paths: list[str]):
     async with httpx.AsyncClient(timeout=120.0) as client:
         now = time.time()
         for model, desc in models_to_warmup:
-            print(f"[Warmup] Loading {desc}: {model}")
+            print(f"[STATUS] Loading {desc}: {model}")
             try:
                 response = await client.post(
                     f"{OLLAMA_URL}/api/generate",
