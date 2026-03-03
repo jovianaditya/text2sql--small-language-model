@@ -291,12 +291,12 @@ Notes:
 | M14 |      3B       | Window avg partition single-table                             |
 | M15 |      3B       | Window percentage-over-total single-table                     |
 | M16 |      3B       | Simple single-table set operation (`UNION`) stays in LLM lane |
-| M17 |      IR       | Single-table aggregate vs average aggregate                   |
+| M17 |      IR       | Single-table `COUNT(DISTINCT ...)` grouped by order year      |
 | M18 |      3B       | Offset window (`LAG`) single-table                            |
 | M19 |      3B       | Scalar extrema-date subquery single-table                     |
 | M20 |      IR       | Single-table `COUNT(DISTINCT ...)` + HAVING                   |
 
-### 10.3 Hard (H1-H16)
+### 10.3 Hard (H1-H17)
 
 | ID  | Expected lane |                            Note                          |
 |-----|---------------|----------------------------------------------------------|
@@ -316,6 +316,7 @@ Notes:
 | H14 |      7B       | Dual-fact rollup fanout-risk pattern                     |
 | H15 |      7B       | Cross-year exclusion + grouped ordering                  |
 | H16 |      7B       | Multi-table `COUNT(DISTINCT ...)` with numeric threshold |
+| H17 |      7B       | Multi-table winner-row per group with tie-break metrics  |
 
 ### 10.4 Legacy Route Split Reference (40-case baseline)
 

@@ -226,7 +226,7 @@ cases:
         FROM employees;
     - id: M11
       difficulty: medium
-      question: "For each customer, return the customer ID, and the second highest payment amount they have made. Exclude customers who have fewer than two payment records."
+      question: "For each customer, return the customer ID and the payment amount from their second payment row when that customer's payments are sorted by amount in descending order. Exclude customers who have fewer than two payment records."
       groundtruth_sql: |
         SELECT
           pmt.customerNumber,
@@ -240,7 +240,7 @@ cases:
         WHERE rn = 2;
     - id: M12
       difficulty: medium
-      question: "For each payment record, return the customer number, payment date, amount, and the cumulative payment amount per customer ordered by payment date."
+      question: "For each payment record, return the customer number, payment date, amount, and the running cumulative payment amount for that customer in payment-date order."
       groundtruth_sql: |
         SELECT
           customerNumber,
@@ -314,7 +314,7 @@ cases:
           order_year ASC;
     - id: M18
       difficulty: medium
-      question: "For each payment record, return the customer number, payment date, amount, and the previous payment amount for the same customer ordered by payment date. Sort by customer number ascending, then payment date descending."
+      question: "For each payment record, return the customer number, payment date, amount, and the previous payment amount in that customer's payment-date sequence. Sort the final result by customer number ascending, then payment date descending."
       groundtruth_sql: |
         SELECT
           customerNumber,
@@ -426,7 +426,7 @@ cases:
           emp.lastName;
     - id: H6
       difficulty: hard
-      question: "Show only products that have been ordered, and for each such product display the product code, product name, and rank the products by total sales value in descending order."
+      question: "Show only products that have been ordered, and for each such product display the product code, product name, and rank the products by total sales value calculated using the actual price charged on each order line, in descending order."
       groundtruth_sql: |
         SELECT
           p.productCode,
@@ -495,7 +495,7 @@ cases:
           p.productCode ASC;
     - id: H9
       difficulty: hard
-      question: "Show product lines that have at least one product with MSRP greater than the average MSRP of all products. For each such product line, display the product line name and the number of products in that line. Sort it so product lines with more products appear first; if there’s a tie, sort by product line name A–Z."
+      question: "Show product lines that have at least one product with MSRP greater than the average MSRP of all products. For each such product line, display the product line name and the number of products in that line that satisfy that MSRP condition. Sort it so product lines with more qualifying products appear first; if there’s a tie, sort by product line name A–Z."
       groundtruth_sql: |
         SELECT
           pl.productLine,
@@ -697,3 +697,38 @@ cases:
         ORDER BY
           distinct_product_count DESC,
           c.customerNumber ASC;
+    - id: H17
+      difficulty: hard
+      question: "For each product line, show the best-selling product based on total quantity ordered. If multiple products tie on quantity, choose the one with the higher total sales amount calculated using the actual price charged on each order line; if there is still a tie, choose the product with the smaller product code. Return product line, product code, product name, total quantity ordered, and total sales value. Sort by product line ascending."
+      groundtruth_sql: |
+        SELECT
+          ranked.productLine,
+          ranked.productCode,
+          ranked.productName,
+          ranked.total_quantity_ordered,
+          ranked.total_sales_value
+        FROM (
+          SELECT
+            p.productLine,
+            p.productCode,
+            p.productName,
+            SUM(od.quantityOrdered) AS total_quantity_ordered,
+            SUM(od.quantityOrdered * od.priceEach) AS total_sales_value,
+            ROW_NUMBER() OVER (
+              PARTITION BY p.productLine
+              ORDER BY
+                SUM(od.quantityOrdered) DESC,
+                SUM(od.quantityOrdered * od.priceEach) DESC,
+                p.productCode ASC
+            ) AS rn
+          FROM products AS p
+          JOIN orderdetails AS od
+            ON od.productCode = p.productCode
+          GROUP BY
+            p.productLine,
+            p.productCode,
+            p.productName
+        ) AS ranked
+        WHERE ranked.rn = 1
+        ORDER BY
+          ranked.productLine ASC;

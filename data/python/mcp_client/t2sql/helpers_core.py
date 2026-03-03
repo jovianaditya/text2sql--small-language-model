@@ -3961,14 +3961,24 @@ def _question_wants_winner_row(question: str) -> bool:
       - "berapa pembayaran tertinggi" (hanya minta nilai max)
     """
     q = (question or "").lower()
+    # Ignore trailing output-order instructions so phrases like
+    # "ordered by amount from highest to lowest" do not get misread as a
+    # winner-row intent. Winner-row should come from the main ask, not from
+    # display ordering.
+    q_core = re.sub(
+        r"\b(?:sort(?:ed)?|order(?:ed)?)\s+(?:the\s+results?|the\s+result|results?|result|output|rows)?\s*by\b.*$",
+        "",
+        q,
+        flags=re.I,
+    ).strip()
+    if not q_core:
+        q_core = q
 
-    # Guard: kalau ada "total", "sum", "count" -> ini aggregation, bukan winner-row
-    if any(k in q for k in ["total", "sum of", "count", "berapa banyak", "jumlah total"]):
-        return False
-
-    rank_sig = any(k in q for k in [
+    rank_sig = any(k in q_core for k in [
         "largest", "highest", "maximum", "max", "biggest",
         "smallest", "lowest", "minimum", "min",
+        "best", "worst", "top", "bottom",
+        "best-selling", "best selling", "top-selling", "top selling",
         "terbesar", "tertinggi", "maksimum",
         "terkecil", "terendah", "minimum",
         "paling besar", "paling kecil",
@@ -3977,8 +3987,13 @@ def _question_wants_winner_row(question: str) -> bool:
     if not rank_sig:
         return False
 
+    explicit_multirow_rank_sig = bool(re.search(
+        r"\b(?:show|list|display|find|return)\s+(?:the\s+)?(?:top\s+)?(?:[2-9]|\d{2,})\b",
+        q_core,
+    ))
+
     # Sinyal 1: eksplisit minta atribut dari "baris yang sama"
-    same_row_sig = any(k in q for k in [
+    same_row_sig = any(k in q_core for k in [
         "and its", "and their", "and the", "along with",
         "dan", "beserta", "serta",
         "which", "that", "who",
@@ -3986,7 +4001,7 @@ def _question_wants_winner_row(question: str) -> bool:
     ])
 
     # Sinyal 2: minta informasi temporal/kontekstual
-    context_sig = any(k in q for k in [
+    context_sig = any(k in q_core for k in [
         "when", "date when", "occurred", "on what date", "at what date",
         "what date", "which date",
         "kapan", "tanggal", "pada tanggal", "waktu", "tanggalnya", "kapan terjadinya",
@@ -3998,12 +4013,36 @@ def _question_wants_winner_row(question: str) -> bool:
 
     # Sinyal 3: pola "X and Y" atau "X with Y" (multi-attribute request)
     multi_attr_sig = bool(re.search(
-        r"\b(largest|highest|maximum|biggest|terbesar|tertinggi)\s+\w+\s+(and|with|beserta|dan)\s+",
-        q
+        r"\b(largest|highest|maximum|biggest|best|worst|top|bottom|terbesar|tertinggi)\s+\w+\s+(and|with|beserta|dan)\s+",
+        q_core
     ))
 
+    tie_sig = any(k in q_core for k in [
+        "if multiple", "if there are multiple", "if there is still a tie",
+        "tie", "ties", "tied", "choose the one", "pick the one",
+    ])
+
+    per_group_sig = bool(
+        rank_sig
+        and re.search(r"\b(?:for\s+each|per|each)\b", q_core)
+    )
+
+    # Guard: explicit top-N / multi-row ranking asks are not winner-row asks.
+    # Example: "Show the 10 products with the highest stock levels".
+    # These should stay as ORDER BY ... LIMIT N, not ROW_NUMBER() winner-row.
+    if explicit_multirow_rank_sig and not tie_sig and not per_group_sig:
+        return False
+
+    strong_winner_sig = rank_sig and (same_row_sig or context_sig or multi_attr_sig or tie_sig or per_group_sig)
+
+    # Guard: "total"/"count" usually means pure aggregation, but do not suppress
+    # clear winner-row asks like "best-selling product for each product line"
+    # or tie-break questions.
+    if any(k in q_core for k in ["total", "sum of", "count", "berapa banyak", "jumlah total"]) and not strong_winner_sig:
+        return False
+
     # Winner-row jika ada rank + (same_row ATAU context ATAU multi_attr)
-    return rank_sig and (same_row_sig or context_sig or multi_attr_sig)
+    return strong_winner_sig
 
 def _fix_mixed_max_groupby_rownumber(sql: str) -> Optional[str]:
     """
@@ -4596,6 +4635,113 @@ def _fix_inconsistent_subquery_alias(sql: str) -> Optional[str]:
     # Debug output
     # print(f"[ALIAS FIX] Fixed inconsistent alias: {inconsistent_aliases} -> {correct_alias}")
 
+    return fixed
+
+
+def _fix_inner_rn_filter_scope(sql: str) -> Optional[str]:
+    """
+    Fix malformed ordinal-ranking SQL where WHERE rn = N is placed inside the
+    same SELECT block that defines ROW_NUMBER().
+
+    Wrong:
+      SELECT customerNumber, amount
+      FROM (
+        SELECT customerNumber, amount,
+               ROW_NUMBER() OVER (...) AS rn
+        FROM payments
+        WHERE rn = 2
+      ) AS t;
+
+    Correct:
+      SELECT customerNumber, amount
+      FROM (
+        SELECT customerNumber, amount,
+               ROW_NUMBER() OVER (...) AS rn
+        FROM payments
+      ) AS t
+      WHERE t.rn = 2;
+    """
+    if not sql:
+        return None
+
+    s = sql.strip()
+    if "ROW_NUMBER" not in s.upper():
+        return None
+
+    from_match = re.search(r"\bFROM\s*\(", s, re.I)
+    if not from_match:
+        return None
+
+    open_idx = s.find("(", from_match.start())
+    if open_idx < 0:
+        return None
+
+    depth = 0
+    in_sq = False
+    in_dq = False
+    close_idx = -1
+    for i in range(open_idx, len(s)):
+        ch = s[i]
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+        elif ch == '"' and not in_sq:
+            in_dq = not in_dq
+        elif not in_sq and not in_dq:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close_idx = i
+                    break
+
+    if close_idx < 0:
+        return None
+
+    inner_sql = s[open_idx + 1:close_idx].strip()
+    if not re.match(r"(?is)^select\b", inner_sql):
+        return None
+    if "ROW_NUMBER" not in inner_sql.upper():
+        return None
+
+    inner_where_match = re.search(r"\bWHERE\s+(\w+\.)?rn\s*=\s*(\d+)\b", inner_sql, re.I)
+    if not inner_where_match:
+        return None
+    rn_value = inner_where_match.group(2)
+
+    outer_tail = s[close_idx + 1:].strip()
+    if re.search(r"\bWHERE\s+(\w+\.)?rn\s*=\s*" + re.escape(rn_value) + r"\b", outer_tail, re.I):
+        return None
+
+    inner_fixed = re.sub(
+        r"\s*\bWHERE\s+(\w+\.)?rn\s*=\s*" + re.escape(rn_value) + r"\b\s*",
+        " ",
+        inner_sql,
+        count=1,
+        flags=re.I,
+    )
+    inner_fixed = re.sub(r"\s{2,}", " ", inner_fixed).strip()
+
+    alias_match = re.match(r"(?is)^(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\b(.*)$", outer_tail)
+    if not alias_match:
+        return None
+
+    alias = alias_match.group(1)
+    tail_rest = (alias_match.group(2) or "").strip()
+
+    fixed = (
+        s[:open_idx + 1]
+        + inner_fixed
+        + s[close_idx]
+        + f" AS {alias} WHERE {alias}.rn = {rn_value}"
+    )
+    if tail_rest:
+        fixed += " " + tail_rest
+
+    fixed = re.sub(r"\)\s+AS\s+AS\b", ") AS", fixed, flags=re.I)
+    fixed = re.sub(r"\s{2,}", " ", fixed).strip()
+    if sql.rstrip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
     return fixed
 
 
@@ -5868,6 +6014,173 @@ def _winner_row_final_sanity(sql: str, question: str) -> str:
     outer = exp.Select(expressions=outer_select_exprs).from_(
         exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier("t")))
     ).where(exp.EQ(this=exp.column("rn", table="t"), expression=exp.Literal.number(1)))
+
+    return outer.sql(dialect="mysql")
+
+
+def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str:
+    """
+    Repair grouped aggregate near-misses for winner-row questions.
+
+    Typical bad shape:
+      SELECT group_key, candidate_cols, metric_aliases...
+      FROM ...
+      GROUP BY ...
+      ORDER BY group_key ASC, metric1 DESC, metric2 DESC, stable_key ASC
+
+    The query already computes the candidate grain correctly, but it still
+    returns every candidate row. Wrap it into:
+      1) aggregated candidate subquery
+      2) ROW_NUMBER() OVER (PARTITION BY group_key ORDER BY metric/tiebreakers)
+      3) outer WHERE rn = 1
+
+    Conservative guardrails:
+    - only for clear winner-row questions
+    - only if SQL has GROUP BY + ORDER BY and no ROW_NUMBER yet
+    - only if every SELECT expression has a stable outer alias
+    - only if ORDER BY items can be mapped back to projected columns
+    """
+    if not sql or not _question_wants_winner_row(question):
+        return sql
+    if re.search(r"\bROW_NUMBER\s*\(", sql, flags=re.I):
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(sql, read="mysql")
+    except Exception:
+        return sql
+
+    sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return sql
+
+    grp = sel.args.get("group")
+    order = sel.args.get("order")
+    if not grp or not getattr(grp, "expressions", None):
+        return sql
+    if not order or not getattr(order, "expressions", None):
+        return sql
+    if len(order.expressions) < 2:
+        return sql
+    if sel.args.get("limit"):
+        return sql
+
+    def _norm_expr(e: exp.Expression) -> str:
+        return re.sub(r"\s+", " ", e.sql(dialect="mysql").strip().lower())
+
+    alias_names: List[str] = []
+    expr_to_alias: Dict[str, str] = {}
+    alias_by_lower: Dict[str, str] = {}
+
+    for idx, item in enumerate(sel.expressions):
+        if isinstance(item, exp.Star):
+            return sql
+
+        if isinstance(item, exp.Alias):
+            alias = item.alias
+            base = item.this
+        else:
+            base = item
+            if isinstance(base, exp.Column):
+                alias = base.name
+            else:
+                # Complex expressions need explicit aliases so the ranked layer
+                # can reference them safely.
+                return sql
+
+        alias = (alias or f"col_{idx + 1}").strip()
+        if not alias or alias.lower() == "rn" or alias.lower() in alias_by_lower:
+            return sql
+
+        alias_names.append(alias)
+        alias_by_lower[alias.lower()] = alias
+        expr_to_alias[_norm_expr(base)] = alias
+
+    order_aliases: List[str] = []
+    order_dirs: List[bool] = []
+    for ordered in order.expressions:
+        expr = ordered.this
+        desc = bool(ordered.args.get("desc"))
+        alias = None
+
+        expr_norm = _norm_expr(expr)
+        alias = expr_to_alias.get(expr_norm)
+
+        if alias is None and isinstance(expr, exp.Column):
+            alias = alias_by_lower.get((expr.name or "").lower())
+            if alias is None:
+                bare_name = (expr.name or "").lower()
+                matches = [a for low, a in alias_by_lower.items() if low == bare_name]
+                if len(matches) == 1:
+                    alias = matches[0]
+
+        if alias is None:
+            return sql
+
+        order_aliases.append(alias)
+        order_dirs.append(desc)
+
+    partition_alias = order_aliases[0]
+    rank_aliases = order_aliases[1:]
+    rank_dirs = order_dirs[1:]
+    if not rank_aliases:
+        return sql
+
+    candidate_ast = ast.copy()
+    candidate_sel = candidate_ast if isinstance(candidate_ast, exp.Select) else candidate_ast.find(exp.Select)
+    if not isinstance(candidate_sel, exp.Select):
+        return sql
+    candidate_sel.set("order", None)
+
+    candidate_sub = exp.Subquery(
+        this=candidate_ast,
+        alias=exp.TableAlias(this=exp.to_identifier("c")),
+    )
+
+    ranked_order = exp.Order(
+        expressions=[
+            exp.Ordered(this=exp.column(alias, table="c"), desc=desc)
+            for alias, desc in zip(rank_aliases, rank_dirs)
+        ]
+    )
+    rn_expr = exp.alias_(
+        exp.Window(
+            this=exp.RowNumber(),
+            partition_by=exp.Partition(expressions=[exp.column(partition_alias, table="c")]),
+            order=ranked_order,
+        ),
+        "rn",
+        quoted=False,
+    )
+
+    ranked_select = exp.Select(
+        expressions=[exp.column(alias, table="c") for alias in alias_names] + [rn_expr]
+    ).from_(candidate_sub)
+
+    ranked_sub = exp.Subquery(
+        this=ranked_select,
+        alias=exp.TableAlias(this=exp.to_identifier("t")),
+    )
+
+    outer = exp.Select(
+        expressions=[exp.column(alias, table="t") for alias in alias_names]
+    ).from_(ranked_sub).where(
+        exp.EQ(this=exp.column("rn", table="t"), expression=exp.Literal.number(1))
+    )
+    outer.set(
+        "order",
+        exp.Order(
+            expressions=[
+                exp.Ordered(this=exp.column(partition_alias, table="t"), desc=order_dirs[0])
+            ]
+        ),
+    )
 
     return outer.sql(dialect="mysql")
 

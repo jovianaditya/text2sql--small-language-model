@@ -210,6 +210,8 @@ from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_
 from .helpers_core import (
     has_join,
     _ast_guardrails,
+    _rewrite_grouped_winner_row_ranked_aggregate,
+    _question_wants_winner_row,
     _question_requires_word_boundary_regex,
     _question_requires_inner_join,
     _question_requests_ordering,
@@ -218,6 +220,15 @@ from .helpers_core import (
     _remove_top_level_order_by_if_not_requested,
     _SQL_KEYWORDS,
 )
+
+
+def _dbg_agent3_retry(check_name: str, detail: str) -> None:
+    _dbg_print_two(f"[Agent3] Retry Gate - {check_name}", detail)
+
+
+def _dbg_safety_block(scope: str, detail: str) -> None:
+    _dbg_print_two(f"[{scope}] Safety Block", detail)
+
 # ======================================================================
 # ======================= AGENT 0 - QUESTION GUARD =====================
 # ======================================================================
@@ -1306,10 +1317,14 @@ def router_agent(state: RAGState) -> RAGState:
                 break
 
         # If the entity is explicitly mentioned in non-ID form and evidence comes
-        # from FK columns, keep it only when it is a true bridge node between
-        # at least two relevant tables (prevents unnecessary joins in single-table
-        # aggregates/window queries like payments/customer or employees/offices).
-        if has_fk_col_evidence and has_non_id_entity_mention and is_multi_hop_bridge:
+        # from FK columns, keep it only when:
+        # 1) it is a true bridge node between at least two relevant tables, AND
+        # 2) the question also asks for at least one non-FK attribute from that
+        #    table. This prevents unnecessary parent-table joins in single-table
+        #    aggregates/window queries like payments/customer where only the FK
+        #    key is needed, but still preserves cases that truly need attributes
+        #    like customerName, city, etc.
+        if has_fk_col_evidence and has_non_id_entity_mention and is_multi_hop_bridge and non_fk_mentioned:
             if RETRIEVE_DEBUG:
                 print(f"[Router] Keeping {tbl_lower}: explicit entity mention + FK evidence")
             continue
@@ -1785,11 +1800,17 @@ def router_agent(state: RAGState) -> RAGState:
     is_explicit_rank_function = any(re.search(pat, question_lower) for pat in explicit_rank_patterns)
     
     # ORDINAL RANKING DETECTION: "second highest", "third largest", "2nd lowest", etc.
+    # Also cover row-selection phrasings like "second payment row ... sorted by amount".
     # These patterns ALWAYS need ROW_NUMBER() with rn = N, much more complex than simple MAX/MIN
     ordinal_words = AGENT_ROUTER_ORDINAL_WORDS
     ordinal_targets = AGENT_ROUTER_ORDINAL_TARGET_TERMS
     ordinal_pattern = rf"\b({'|'.join(re.escape(w) for w in ordinal_words)})\s+({'|'.join(re.escape(w) for w in ordinal_targets)})\b"
-    is_ordinal_ranking = bool(re.search(ordinal_pattern, question_lower))
+    ordinal_row_pattern = rf"\b({'|'.join(re.escape(w) for w in ordinal_words)})\b(?:\s+\w+){{0,8}}\s+(?:row|record|entry)\b"
+    has_explicit_sort_sequence = bool(re.search(r"\b(?:sorted|ordered)\s+by\b", question_lower))
+    is_ordinal_ranking = bool(
+        re.search(ordinal_pattern, question_lower)
+        or (re.search(ordinal_row_pattern, question_lower) and has_explicit_sort_sequence)
+    )
     
     # WINDOW AGGREGATE DETECTION: "within the same X" / "in the same X" pattern
     # This pattern requires COUNT(*) OVER (PARTITION BY X), NOT GROUP BY
@@ -3729,7 +3750,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         rescue_7b_used = False
         ir_final_model = "ir_planner"
         if not current_gate.get("accepted", False) and _is_critical_gate_failure(current_gate):
-            _dbg_print_two("[IR] FINAL GATE FAIL-CLOSED", f"{current_gate.get('reasons')}")
+            _dbg_safety_block("IR", f"{current_gate.get('reasons')}")
             rescue = _attempt_last_chance_rescue_7b(
                 question=question,
                 ctx=ctx,
@@ -3929,7 +3950,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS 0: IDENTIFIER VALIDATION (HARD ERROR) ---
     if hard_identifier_errors:
-        _dbg_print_two("[Agent3] HARD ERROR - Identifier Validation", f"{hard_identifier_errors}")
+        _dbg_agent3_retry("Identifier Validation", f"{hard_identifier_errors}")
         table_chain = " -> ".join(detected_tables) if detected_tables else "schema tables"
         extra_instruction = (
             "STRICT REQUIREMENT: Your SQL references undefined aliases/tables/columns. "
@@ -3975,9 +3996,9 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 
                 if aliens_in_main:
                     # Alien columns in main SELECT → NOT safe to skip
-                    _dbg_print_two(
-                        "[Agent3] HARD ERROR - Hallucination in Main Query", 
-                        f"Columns {aliens_in_main} in SELECT but not in FROM table"
+                    _dbg_agent3_retry(
+                        "Hallucination in Main Query",
+                        f"Columns {aliens_in_main} in SELECT but not in FROM table",
                     )
                     
                     # Check if can be solved by JOIN
@@ -4033,7 +4054,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     break
             
             if can_be_solved_by_join:
-                _dbg_print_two("[Agent3] HARD ERROR - Missing JOIN", f"Columns {alien_cols} belong to {potential_table}")
+                _dbg_agent3_retry("Missing JOIN", f"Columns {alien_cols} belong to {potential_table}")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: Columns {alien_cols} do NOT exist in table '{primary_tbl}', but they belong to '{potential_table}'. "
                     f"Detected intent implies multiple tables: {detected_tables}. "
@@ -4043,7 +4064,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 regeneration_model = LARGE_MODEL
                 
             elif not can_be_solved_by_join:
-                _dbg_print_two("[Agent3] HARD ERROR - Hallucination", f"Columns {alien_cols} do not exist in Schema.")
+                _dbg_agent3_retry("Hallucination", f"Columns {alien_cols} do not exist in Schema.")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: The columns {alien_cols} do NOT exist in the database schema. "
                     "1. Check the exact column names in the schema context. "
@@ -4055,9 +4076,37 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS B: Winner-Row Leak Check (HARD ERROR) ---
     is_winner_row = decision.get("is_winner_row", False)
+    wants_true_winner_row = _question_wants_winner_row(question)
+    if wants_true_winner_row and not needs_regeneration:
+        has_row_number = bool(re.search(r"\bROW_NUMBER\s*\(", sql_up))
+        has_rn_filter = bool(
+            re.search(r"\bWHERE\b[^;]*\brn\s*=\s*\d+\b", sql_up, flags=re.I | re.S)
+            or re.search(r"\bQUALIFY\b[^;]*\brn\s*=\s*\d+\b", sql_up, flags=re.I | re.S)
+        )
+        if not (has_row_number and has_rn_filter):
+            rewritten_winner_sql = _rewrite_grouped_winner_row_ranked_aggregate(final_sql, question)
+            if rewritten_winner_sql != final_sql:
+                final_sql = rewritten_winner_sql
+                sql_up = final_sql.upper()
+                corrections.append("Applied grouped winner-row ranking rewrite")
+            else:
+                _dbg_agent3_retry("Missing Winner-Row Pattern", "ROW_NUMBER() winner-row filter missing.")
+                extra_instruction = (
+                    "STRICT REQUIREMENT: This question asks for one winning row per group. "
+                    "You MUST use a grouped winner-row pattern with a derived table and ROW_NUMBER(). "
+                    "First aggregate at the candidate grain, then rank inside each group, then keep rn = 1. "
+                    "CORRECT PATTERN: "
+                    "`SELECT * FROM (SELECT group_col, candidate_cols, metric1, metric2, "
+                    "ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY primary_metric DESC, tiebreak_metric DESC, stable_key ASC) AS rn "
+                    "FROM (...) aggregated_candidates) t WHERE t.rn = 1`. "
+                    "Do NOT return all grouped rows. Do NOT use plain GROUP BY + ORDER BY only."
+                )
+                needs_regeneration = True
+                regeneration_model = LARGE_MODEL
+
     if is_winner_row and not needs_regeneration:
         if re.search(AGENT_REFINE_WINNER_ROW_LEAK_PATTERN, sql_up):
-             _dbg_print_two("[Agent3] HARD ERROR - Winner-Row Leak", "rn column found in outer select.")
+             _dbg_agent3_retry("Winner-Row Leak", "rn column found in outer select.")
              extra_instruction = (
                 "STRICT REQUIREMENT: Use standard Winner-Row pattern. "
                 "Do NOT include the 'rn' (row number) column in the final output."
@@ -4068,7 +4117,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # --- KASUS C: ANTI-PATTERN (WHERE IN Subquery) (HARD ERROR) ---
     tuple_in_pattern = re.search(AGENT_REFINE_TUPLE_IN_PATTERN, sql_up)
     if tuple_in_pattern and not needs_regeneration:
-        _dbg_print_two("[Agent3] HARD ERROR - Anti-Pattern", "Tuple comparison inside WHERE IN (...)")
+        _dbg_agent3_retry("Anti-Pattern", "Tuple comparison inside WHERE IN (...)")
         extra_instruction = (
             "STRICT REQUIREMENT: Do NOT use the `WHERE (col1, col2) IN (SELECT ...)` pattern. "
             "It causes Error 1055. INSTEAD, use the Window Function pattern:\n"
@@ -4079,17 +4128,19 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS D: MISSING PARTITION KEY IN OUTPUT (HARD ERROR) ---
     if is_winner_row and not needs_regeneration:
-        part_match = re.search(AGENT_REFINE_PARTITION_BY_PATTERN, sql_up)
+        part_match = re.search(AGENT_REFINE_PARTITION_BY_PATTERN, final_sql, re.IGNORECASE)
         if part_match:
             part_col = part_match.group(1)
-            select_clause_match = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, sql_up, re.DOTALL)
+            select_clause_match = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, final_sql, re.IGNORECASE | re.DOTALL)
             if select_clause_match:
                 select_clause = select_clause_match.group(1)
                 select_clause_up = select_clause.upper()
 
                 def _partition_key_present_semantically(part_col_up: str, outer_select_up: str, full_sql: str) -> bool:
+                    part_col_norm = (part_col_up or "").strip().lower()
+                    outer_select_norm = (outer_select_up or "").strip().lower()
                     # Direct presence in outer SELECT.
-                    if part_col_up in outer_select_up:
+                    if part_col_norm and part_col_norm in outer_select_norm:
                         return True
 
                     outer_select_tokens = set(
@@ -4120,14 +4171,157 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     return False
 
                 if not _partition_key_present_semantically(part_col, select_clause_up, final_sql):
-                    _dbg_print_two("[Agent3] HARD ERROR - Missing Partition Key", f"'{part_col}' missing from SELECT")
-                    extra_instruction = (
-                        f"STRICT REQUIREMENT: The query partitions by '{part_col}', but it is MISSING from the final SELECT list. "
-                        f"You MUST include '{part_col}' in the output so we know who the record belongs to. "
-                        f"Target format: SELECT {part_col}, [other columns] FROM ..."
-                    )
-                    needs_regeneration = True
-                    regeneration_model = LARGE_MODEL  # Force 7B
+                    def _inject_partition_key_into_outer_select(full_sql: str, partition_col: str) -> Optional[str]:
+                        s = (full_sql or "").strip()
+                        if not s:
+                            return None
+
+                        def _split_top_level_csv_local(text: str) -> List[str]:
+                            items: List[str] = []
+                            buf: List[str] = []
+                            depth = 0
+                            in_sq = False
+                            in_dq = False
+                            i = 0
+                            while i < len(text):
+                                ch = text[i]
+                                if ch == "'" and not in_dq:
+                                    if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                                        buf.append(ch)
+                                        buf.append(text[i + 1])
+                                        i += 2
+                                        continue
+                                    in_sq = not in_sq
+                                    buf.append(ch)
+                                    i += 1
+                                    continue
+                                if ch == '"' and not in_sq:
+                                    in_dq = not in_dq
+                                    buf.append(ch)
+                                    i += 1
+                                    continue
+                                if not in_sq and not in_dq:
+                                    if ch == "(":
+                                        depth += 1
+                                    elif ch == ")":
+                                        depth = max(0, depth - 1)
+                                    elif ch == "," and depth == 0:
+                                        item = "".join(buf).strip()
+                                        if item:
+                                            items.append(item)
+                                        buf = []
+                                        i += 1
+                                        continue
+                                buf.append(ch)
+                                i += 1
+                            tail = "".join(buf).strip()
+                            if tail:
+                                items.append(tail)
+                            return items
+
+                        select_match = re.match(r"(?is)^\s*SELECT\s+(?P<outer>.+?)\s+FROM\s*\(", s)
+                        if not select_match:
+                            return None
+
+                        from_match = re.search(r"\bFROM\s*\(", s, re.IGNORECASE)
+                        if not from_match:
+                            return None
+                        open_idx = s.find("(", from_match.start())
+                        if open_idx < 0:
+                            return None
+
+                        depth = 0
+                        in_sq = False
+                        in_dq = False
+                        close_idx = -1
+                        for i in range(open_idx, len(s)):
+                            ch = s[i]
+                            if ch == "'" and not in_dq:
+                                in_sq = not in_sq
+                            elif ch == '"' and not in_sq:
+                                in_dq = not in_dq
+                            elif not in_sq and not in_dq:
+                                if ch == "(":
+                                    depth += 1
+                                elif ch == ")":
+                                    depth -= 1
+                                    if depth == 0:
+                                        close_idx = i
+                                        break
+
+                        if close_idx < 0:
+                            return None
+
+                        inner_sql = s[open_idx + 1:close_idx]
+                        outer_tail = s[close_idx + 1:].strip()
+                        alias_match = re.match(r"(?is)^(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\b", outer_tail)
+                        if not alias_match:
+                            return None
+                        outer_alias = alias_match.group(1)
+
+                        projected_name = partition_col
+                        alias_from_inner = re.search(
+                            rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\.)?{re.escape(partition_col)}\b\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
+                            inner_sql,
+                            flags=re.IGNORECASE,
+                        )
+                        if alias_from_inner:
+                            projected_name = alias_from_inner.group(1)
+                        else:
+                            has_inner_projection = re.search(
+                                rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\.)?{re.escape(partition_col)}\b",
+                                inner_sql,
+                                flags=re.IGNORECASE,
+                            )
+                            if not has_inner_projection:
+                                return None
+
+                        outer_select = (select_match.group("outer") or "").strip()
+                        qualified_outer_items: List[str] = []
+                        for item in _split_top_level_csv_local(outer_select):
+                            bare_col_match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*$", item)
+                            if bare_col_match:
+                                qualified_outer_items.append(f"{outer_alias}.{bare_col_match.group(1)}")
+                            else:
+                                qualified_outer_items.append(item)
+                        outer_select_qualified = ", ".join(qualified_outer_items)
+                        candidate_expr = f"{outer_alias}.{projected_name}"
+                        fixed = "SELECT " + candidate_expr + ", " + outer_select_qualified + s[select_match.end("outer"):]
+                        fixed = re.sub(r"\s{2,}", " ", fixed).strip()
+                        if full_sql.rstrip().endswith(";") and not fixed.endswith(";"):
+                            fixed += ";"
+                        return fixed
+
+                    repaired_partition_sql = _inject_partition_key_into_outer_select(final_sql, part_col)
+                    if repaired_partition_sql:
+                        repaired_select_match = re.search(
+                            AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN,
+                            repaired_partition_sql,
+                            re.IGNORECASE | re.DOTALL,
+                        )
+                        repaired_select_up = repaired_select_match.group(1).upper() if repaired_select_match else ""
+                        if _partition_key_present_semantically(part_col, repaired_select_up, repaired_partition_sql):
+                            final_sql = repaired_partition_sql
+                            sql_up = final_sql.upper()
+                            corrections.append(f"Restored missing partition key '{part_col}' to outer SELECT")
+                        else:
+                            _dbg_agent3_retry("Missing Partition Key", f"'{part_col}' missing from SELECT")
+                            extra_instruction = (
+                                f"STRICT REQUIREMENT: The query partitions by '{part_col}', but it is MISSING from the final SELECT list. "
+                                f"You MUST include '{part_col}' in the output so we know who the record belongs to. "
+                                f"Target format: SELECT {part_col}, [other columns] FROM ..."
+                            )
+                            needs_regeneration = True
+                            regeneration_model = LARGE_MODEL  # Force 7B
+                    else:
+                        _dbg_agent3_retry("Missing Partition Key", f"'{part_col}' missing from SELECT")
+                        extra_instruction = (
+                            f"STRICT REQUIREMENT: The query partitions by '{part_col}', but it is MISSING from the final SELECT list. "
+                            f"You MUST include '{part_col}' in the output so we know who the record belongs to. "
+                            f"Target format: SELECT {part_col}, [other columns] FROM ..."
+                        )
+                        needs_regeneration = True
+                        regeneration_model = LARGE_MODEL  # Force 7B
 
     # --- KASUS E: INNER JOIN TRAP (HARD ERROR) ---
     # Apply this guard ONLY when question intent expects inclusive parent rows
@@ -4147,7 +4341,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             group_refs = set(re.findall(AGENT_REFINE_TABLE_REF_TOKEN_PATTERN, group_clause))
             risky_filters = where_refs - group_refs
             if risky_filters:
-                 _dbg_print_two("[Agent3] HARD ERROR - INNER JOIN Trap", f"Filtering child table {risky_filters}")
+                 _dbg_agent3_retry("INNER JOIN Trap", f"Filtering child table {risky_filters}")
                  extra_instruction = (
                     "STRICT REQUIREMENT: You are aggregating data (GROUP BY), but you are filtering a related table in the WHERE clause. "
                     "This behaves like an INNER JOIN and removes master records with no matches. "
@@ -4187,6 +4381,81 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             for part in re.findall(r"[a-z0-9]+", camel_spaced.lower()):
                 if part:
                     select_semantic_tokens.add(part)
+
+        def _split_top_level_csv(text: str) -> List[str]:
+            items: List[str] = []
+            buf: List[str] = []
+            depth = 0
+            in_sq = False
+            in_dq = False
+            i = 0
+            while i < len(text):
+                ch = text[i]
+                if ch == "'" and not in_dq:
+                    if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                        buf.append(ch)
+                        buf.append(text[i + 1])
+                        i += 2
+                        continue
+                    in_sq = not in_sq
+                    buf.append(ch)
+                    i += 1
+                    continue
+                if ch == '"' and not in_sq:
+                    in_dq = not in_dq
+                    buf.append(ch)
+                    i += 1
+                    continue
+                if not in_sq and not in_dq:
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth = max(0, depth - 1)
+                    elif ch == "," and depth == 0:
+                        item = "".join(buf).strip()
+                        if item:
+                            items.append(item)
+                        buf = []
+                        i += 1
+                        continue
+                buf.append(ch)
+                i += 1
+            tail_item = "".join(buf).strip()
+            if tail_item:
+                items.append(tail_item)
+            return items
+
+        def _semantic_parts(text: str) -> Set[str]:
+            out: Set[str] = set()
+            if not text:
+                return out
+            for token in re.findall(r"[A-Za-z0-9_]+", text):
+                low = token.lower()
+                if low:
+                    out.add(low)
+                for part in low.split("_"):
+                    if part:
+                        out.add(part)
+                camel_spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r"\1 \2", token)
+                for part in re.findall(r"[a-z0-9]+", camel_spaced.lower()):
+                    if part:
+                        out.add(part)
+            return out
+
+        projected_alias_token_sets: List[Set[str]] = []
+        for select_item in _split_top_level_csv(select_text_chk_raw):
+            alias_match = re.search(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", select_item, re.IGNORECASE)
+            if alias_match:
+                label = alias_match.group(1)
+            else:
+                simple_col_match = re.match(
+                    r"\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)\s*$",
+                    select_item,
+                )
+                label = simple_col_match.group(1) if simple_col_match else ""
+            token_set = _semantic_parts(label)
+            if token_set:
+                projected_alias_token_sets.append(token_set)
         
         # STEP 1b: Ambil tokens dari WHERE/HAVING/subquery (kolom yang dipakai sebagai filter)
         # Kolom yang sudah dipakai di WHERE tidak perlu ada di SELECT (bukan "missing")
@@ -4243,6 +4512,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             parts = clean_name.split()
             if not parts: continue
 
+            parts_set = {p for p in parts if p}
+            if parts_set and any(parts_set.issubset(token_set) for token_set in projected_alias_token_sets):
+                continue
+
             last_word = parts[-1]
             if last_word in suffix_synonyms:
                 prefix = " ".join(parts[:-1])
@@ -4261,7 +4534,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             # TIERING LOGIC - Smart escalation based on complexity
             if complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE and qtype == AGENT_ROUTER_QTYPE_LOOKUP:
                 # Avoid SQL string surgery. Regenerate so final SQL naturally includes requested columns.
-                _dbg_print_two("[Agent3] MEDIUM ERROR - Missing Columns", f"Retry (no auto-append): {missing_cols}")
+                _dbg_agent3_retry("Missing Columns", f"Retry (no auto-append): {missing_cols}")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
                     f"But they are MISSING from the SELECT clause. "
@@ -4272,7 +4545,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             
             elif draft_model == SMALL_MODEL and complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE:
                 # MEDIUM ERROR: Regenerate dengan 3B (simple query dari 3B yang salah)
-                _dbg_print_two("[Agent3] MEDIUM ERROR - Missing Columns", f"Retry with 3B: {missing_cols}")
+                _dbg_agent3_retry("Missing Columns", f"Retry with 3B: {missing_cols}")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
                     f"But they are MISSING from the SELECT clause. "
@@ -4283,7 +4556,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             
             else:
                 # HARD ERROR: Complex query atau 7B draft → escalate ke 7B
-                _dbg_print_two("[Agent3] HARD ERROR - Critical Omission", f"{missing_cols}")
+                _dbg_agent3_retry("Critical Omission", f"{missing_cols}")
                 extra_instruction = (
                     f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
                     f"Please add {missing_cols} to the SELECT clause."
@@ -4294,7 +4567,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # --- KASUS G: BROKEN ALIAS SYNTAX (HARD ERROR) ---
     if not needs_regeneration:
         if re.search(AGENT_REFINE_BROKEN_ALIAS_PATTERN, sql_up.lower()):
-             _dbg_print_two("[Agent3] HARD ERROR - Syntax Error", "Broken alias syntax `alias.(...)` detected.")
+             _dbg_agent3_retry("Syntax Error", "Broken alias syntax `alias.(...)` detected.")
              extra_instruction = (
                 "SYNTAX ERROR: You generated invalid SQL syntax like `table_alias.(condition)`. "
                 "CORRECT: `(table_alias.column IS NULL ...)`."
@@ -4312,7 +4585,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         )
         
         if requires_strict_pattern and uses_simple_like:
-             _dbg_print_two("[Agent3] HARD ERROR - Pattern Mismatch", "Question asks for strict pattern (digits), but SQL uses simple LIKE.")
+             _dbg_agent3_retry("Pattern Mismatch", "Question asks for strict pattern (digits), but SQL uses simple LIKE.")
              extra_instruction = (
                 "STRICT REQUIREMENT: The user asks for a strict pattern (e.g. 'digits' vs 'characters', or exact length). "
                 "Simple 'LIKE' cannot distinguish digits from characters. "
@@ -4337,7 +4610,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         )
 
         if has_month_name_group and not has_safe_sort:
-            _dbg_print_two("[Agent3] HARD ERROR - Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
+            _dbg_agent3_retry("Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
             extra_instruction = (
                 "STRICT REQUIREMENT: You are grouping by Month Name, which sorts Alphabetically (Apr, Aug...). "
                 "FIX: You MUST Group and Sort by the Month Number as well. "
@@ -4372,7 +4645,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     )
                     
                     if not is_func and not is_alias:
-                         _dbg_print_two("[Agent3] HARD ERROR - Aggregation Violation", f"Raw column '{col}' selected but grouped by derived value.")
+                         _dbg_agent3_retry("Aggregation Violation", f"Raw column '{col}' selected but grouped by derived value.")
                          extra_instruction = (
                             f"STRICT REQUIREMENT: You are grouping by a derived value of '{col}' (e.g. CASE or DATE_FORMAT), "
                             f"but you are selecting the raw '{col}' column. This causes SQL Error 1055. "
@@ -4397,7 +4670,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         if pre_reasons and pre_reasons.issubset({"semantic_contract_mismatch"}):
             corrections.append(f"Soft semantic warning: {sorted(pre_reasons)}")
         else:
-            _dbg_print_two("[Agent3] HARD ERROR - Acceptance Gate", f"{pre_gate.get('reasons')}")
+            _dbg_agent3_retry("Acceptance Gate", f"{pre_gate.get('reasons')}")
             extra_instruction = _build_gate_retry_instruction("", pre_gate)
             needs_regeneration = True
             regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
@@ -4679,7 +4952,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     rescue_7b_used = False
     if not final_gate.get("accepted", False) and _is_critical_gate_failure(final_gate):
-        _dbg_print_two("[Agent3] FINAL GATE FAIL-CLOSED", f"{final_gate.get('reasons')}")
+        _dbg_safety_block("Agent3", f"{final_gate.get('reasons')}")
         rescue = _attempt_last_chance_rescue_7b(
             question=question,
             ctx=ctx,
@@ -4708,6 +4981,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     if not final_sql.endswith(";"):
         final_sql += ";"
+
+    _dbg_print_two("[refine] final sql:", final_sql)
 
     # Final validation snapshot for observability in benchmark output.
     final_validation_errors = list(final_gate.get("identifier_errors") or validate_identifiers(final_sql, ctx))

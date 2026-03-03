@@ -1074,7 +1074,7 @@ AGENT_REFINE_TUPLE_IN_PATTERN = os.getenv(
 
 AGENT_REFINE_PARTITION_BY_PATTERN = os.getenv(
     "AGENT_REFINE_PARTITION_BY_PATTERN",
-    r"PARTITION\s+BY\s+([A-Za-z0-9_]+)",
+    r"PARTITION\s+BY\s+(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?([A-Za-z_][A-Za-z0-9_]*)`?",
 ).strip()
 
 AGENT_REFINE_BROKEN_ALIAS_PATTERN = os.getenv(

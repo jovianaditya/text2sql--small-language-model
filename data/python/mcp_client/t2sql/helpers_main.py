@@ -60,7 +60,7 @@ from .helpers_core import (
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
     _normalize_alias_lengths,
     # phase 4
-    _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _fix_redundant_groupby_with_rn_filter, _fix_inconsistent_subquery_alias, _looks_like_max_date_tiebreaker,
+    _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _fix_redundant_groupby_with_rn_filter, _fix_inconsistent_subquery_alias, _fix_inner_rn_filter_scope, _looks_like_max_date_tiebreaker,
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _preexecute_sql_safety_pass,
@@ -390,7 +390,10 @@ def classify_query(question: str) -> str:
     # "second highest", "third largest", etc. ALWAYS need ROW_NUMBER subquery
     # ---------------------------------------------------------------------------
     ordinal_pattern = r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th|kedua|ketiga|keempat|kelima)\s+(highest|lowest|largest|smallest|biggest|top|bottom|best|worst|most|least|terbesar|terkecil|tertinggi|terendah)\b"
-    if re.search(ordinal_pattern, q):
+    ordinal_row_pattern = r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th|kedua|ketiga|keempat|kelima)\b(?:\s+\w+){0,8}\s+(row|record|entry)\b"
+    if re.search(ordinal_pattern, q) or (
+        re.search(ordinal_row_pattern, q) and re.search(r"\b(sorted|ordered)\s+by\b", q)
+    ):
         return "rank"
     # ---------------------------------------------------------------------------
     # --- 1. DETEKSI RANK (The "Winner-Row" Pattern) ---
@@ -2291,6 +2294,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     is_winner_row = router_decision.get("is_winner_row", False)
     is_set_operation_intent = router_decision.get("is_set_operation_intent", False)
     is_simple_set_operation = router_decision.get("is_simple_set_operation", False)
+    router_tables = state.get("router_tables", []) if state else []
     
     # Detect tiebreaker pattern: "if multiple...choose the one with latest/earliest"
     has_tiebreaker = bool(re.search(
@@ -2456,6 +2460,11 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         constraints.append(
             "WINNER-ROW STRATEGY: You MUST use the standard 'Select-Filter-Rank' pattern."
         )
+        if len(router_tables) == 1 and router_tables[0]:
+            constraints.append(
+                f"SINGLE-TABLE RANKING RULE (CRITICAL): This ranking query should use ONLY the `{router_tables[0]}` table. "
+                "Do NOT add joins to lookup tables unless the question explicitly asks for columns that only exist there."
+            )
 
         # ORDINAL RANKING: Detect the specific rank number from question
         if is_ordinal_ranking:
@@ -2482,6 +2491,10 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 f"STRICT SYNTAX (FOLLOW EXACTLY): "
                 f"`SELECT t.col1, t.col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY valueCol DESC) AS rn FROM table) t WHERE t.rn = {rank_n}` "
                 f"Do NOT use GROUP BY, HAVING, or MAX(CASE WHEN...) - just WHERE rn = {rank_n} is enough!"
+            )
+            constraints.append(
+                "ORDINAL RANKING RULE (CRITICAL): Do NOT use MySQL session variables such as `@rn`, `@cn`, or manual running counters. "
+                "Use the standard ANSI window function `ROW_NUMBER()` only."
             )
             constraints.append(
                 f"REDUNDANT PATTERN WARNING: When you use `WHERE rn = {rank_n}`, each group already has exactly ONE row. "
@@ -3300,6 +3313,15 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         if DEBUG_WR: print(f"[PH4] Before: {s[:200]}")
         if DEBUG_WR: print(f"[PH4] After:  {fixed_redundant[:200]}")
         s = fixed_redundant
+
+    # NEW: Fix malformed ordinal-ranking pattern where WHERE rn = N is placed
+    # inside the same SELECT block that defines ROW_NUMBER()
+    fixed_inner_rn = _fix_inner_rn_filter_scope(s)
+    if fixed_inner_rn:
+        if DEBUG_WR: print("[PH4] Fixed inner WHERE rn = N scope")
+        if DEBUG_WR: print(f"[PH4] Before: {s[:200]}")
+        if DEBUG_WR: print(f"[PH4] After:  {fixed_inner_rn[:200]}")
+        s = fixed_inner_rn
 
     # NEW: Fix inconsistent subquery alias hallucination
     # LLM sometimes uses different alias in outer SELECT than the subquery alias
