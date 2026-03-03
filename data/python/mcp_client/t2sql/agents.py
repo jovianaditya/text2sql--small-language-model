@@ -217,6 +217,8 @@ from .helpers_core import (
     _question_wants_count_distinct,
     _ensure_reasonable_distinct,
     _ensure_reasonable_count_distinct,
+    _question_requires_regex,
+    _question_requires_structural_regex,
     _question_requires_word_boundary_regex,
     _question_requires_inner_join,
     _question_requests_ordering,
@@ -257,6 +259,9 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
     wants_include_zero = relational_ctx and _question_wants_include_zero(question, ctx)
     wants_anti_existence = relational_ctx and _question_wants_anti_existence(question, ctx) and not wants_include_zero
     wants_final_order = _question_requests_ordering(question)
+    wants_boundary_regex = _question_requires_word_boundary_regex(question)
+    wants_regex = _question_requires_regex(question)
+    wants_structural_regex = _question_requires_structural_regex(question)
     return {
         "requires_projection_distinct": wants_projection_distinct,
         "requires_count_distinct": wants_count_distinct,
@@ -264,6 +269,9 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         "requires_anti_existence": wants_anti_existence,
         "requires_include_zero": wants_include_zero,
         "requires_final_order": wants_final_order,
+        "requires_boundary_regex": wants_boundary_regex,
+        "requires_regex": wants_regex,
+        "requires_structural_regex": wants_structural_regex,
     }
 
 
@@ -370,6 +378,18 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         if not _has_top_level_order_by(out_sql):
             violations.append("missing_final_order")
 
+    requires_boundary_regex = bool(contract.get("requires_boundary_regex"))
+    requires_regex = bool(contract.get("requires_regex"))
+    requires_structural_regex = bool(contract.get("requires_structural_regex"))
+    if requires_regex or requires_boundary_regex or requires_structural_regex:
+        if not _regex_requirement_ok(
+            out_sql,
+            requires_regex,
+            requires_boundary_regex,
+            requires_structural_regex,
+        ):
+            violations.append("missing_regex_semantics")
+
     active_contracts: List[str] = []
     if contract["requires_projection_distinct"]:
         active_contracts.append("distinct")
@@ -383,6 +403,8 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         active_contracts.append("include_zero")
     if contract["requires_final_order"]:
         active_contracts.append("final_order")
+    if requires_regex or requires_boundary_regex or requires_structural_regex:
+        active_contracts.append("regex")
 
     if violations:
         status = "pending_retry"
@@ -3464,6 +3486,104 @@ def _is_ir_low_risk_single_table_lookup(
     return True
 
 
+def _ir_regex_family_status(intent_ir: Dict[str, Any], question: str) -> Tuple[bool, bool]:
+    """
+    Decide whether regex intent is deterministic enough for IR.
+
+    Returns:
+      (regex_is_ir_safe, has_regex_family)
+    """
+    filters = [f for f in (intent_ir.get("filters") or []) if isinstance(f, dict)]
+    regex_filters = [
+        f for f in filters
+        if str(f.get("op") or "").strip().lower() == "regexp"
+    ]
+
+    requires_boundary = _question_requires_word_boundary_regex(question)
+    requires_regex = _question_requires_regex(question)
+    requires_structural_regex = _question_requires_structural_regex(question)
+    has_regex_family = bool(requires_boundary or requires_regex or regex_filters)
+    if not has_regex_family:
+        return True, False
+
+    # Broad/open regex stays LLM-first.
+    if requires_boundary:
+        return False, True
+    if requires_structural_regex:
+        return False, True
+
+    # If the question explicitly requires regex but intent_ir did not resolve a
+    # regexp filter, do not force IR.
+    if requires_regex and not regex_filters:
+        return False, True
+
+    # Only allow narrow, template-generated regex forms in IR.
+    deterministic_re = re.compile(
+        r"^\^(?:[A-Za-z0-9_\\-]+|\[A-Z\]\{\d+\}|\[0-9\]\{\d+\}|\[0-9\])+\$$"
+    )
+    for f in regex_filters:
+        value = str(f.get("value") or "")
+        if not value or not deterministic_re.match(value):
+            return False, True
+
+    return True, True
+
+
+def _is_ir_family_preferred(
+    intent_ir: Dict[str, Any],
+    decision: Dict[str, Any],
+    qtype: str,
+    mentioned_tables: List[str],
+    router_tables: List[str],
+    question: str,
+) -> bool:
+    """
+    Family-first IR preference for compact, planner-safe query shapes.
+
+    This is intentionally narrower than "anything plannable". It keeps IR
+    aligned to the deterministic safe subset while making retrieval breadth a
+    secondary signal instead of a hard veto for compact supported families.
+    """
+    qtype_norm = str(qtype or "").strip().lower()
+    if qtype_norm not in {AGENT_ROUTER_QTYPE_LOOKUP, AGENT_ROUTER_QTYPE_AGGREGATE}:
+        return False
+    if not bool(intent_ir.get("planner_compatible", True)):
+        return False
+
+    compact_scope = max(len(mentioned_tables or []), len(router_tables or []), 1)
+    if compact_scope > int(AGENT_IR_MAX_TABLES):
+        return False
+
+    # Multi-table COUNT(DISTINCT ...) is still too semantically fragile for the
+    # current generic planner. Keep it in the LLM lane unless/ until a direct
+    # planner-safe family is implemented explicitly.
+    if compact_scope >= 2 and _question_wants_count_distinct(question):
+        return False
+
+    if bool(decision.get("has_dual_fact_rollup", False)):
+        return False
+
+    # These families remain LLM-first by design.
+    family_blocking_flags = (
+        "is_winner_row",
+        "has_exclusion",
+        "is_window_aggregate",
+        "is_explicit_rank_function",
+        "is_ordinal_ranking",
+        "is_subquery_intent",
+        "is_simple_scalar_subquery_single_table",
+        "is_set_operation_intent",
+    )
+    if any(bool(decision.get(flag, False)) for flag in family_blocking_flags):
+        return False
+
+    regex_is_ir_safe, _ = _ir_regex_family_status(intent_ir, question)
+    if not regex_is_ir_safe:
+        return False
+
+    return True
+
+
 def draft_sql_agent(state: RAGState) -> RAGState:
     # --- Guard: Skip if question was rejected by router ---
     decision = state.get("router_decision", {})
@@ -3542,8 +3662,19 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             qtype=qtype,
             safe_filter_ops=safe_filter_ops,
         )
+        family_ir_preferred = _is_ir_family_preferred(
+            intent_ir=intent_ir,
+            decision=decision,
+            qtype=qtype,
+            mentioned_tables=mentioned_tables,
+            router_tables=router_tables,
+            question=question,
+        )
+        regex_is_ir_safe, has_regex_family = _ir_regex_family_status(intent_ir, question)
         if low_risk_single_table_lookup:
             table_count = 1
+        elif family_ir_preferred:
+            table_count = max(len(mentioned_tables), len(router_tables), 1)
         elif lookup_subject_focused:
             table_count = max(len(mentioned_tables), len(router_tables), 1)
         else:
@@ -3551,6 +3682,9 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 
         if qtype not in {AGENT_ROUTER_QTYPE_LOOKUP, AGENT_ROUTER_QTYPE_AGGREGATE}:
             ir_gate_reasons.append(f"unsupported_qtype_for_ir:{qtype or 'unknown'}")
+
+        if has_regex_family and not regex_is_ir_safe:
+            ir_gate_reasons.append("open_regex_prefers_llm")
 
         if table_count > AGENT_IR_MAX_TABLES:
             ir_gate_reasons.append(
@@ -3560,6 +3694,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             ctx_table_count > AGENT_IR_MAX_TABLES
             and not lookup_subject_focused
             and not low_risk_single_table_lookup
+            and not family_ir_preferred
         ):
             ir_gate_reasons.append(
                 f"context_table_count_exceeds_ir_max:{ctx_table_count}>{AGENT_IR_MAX_TABLES}"
@@ -3747,12 +3882,14 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         state["ir_gate_reasons"] = list(ir_gate_reasons)
         state["ir_table_count"] = int(table_count)
         state["ir_context_table_count"] = int(ctx_table_count)
+        state["ir_family_preferred"] = bool(family_ir_preferred)
 
         if AGENT_IR_DEBUG:
             print(
                 "[IR] confidence="
                 f"{ir_confidence:.2f}, "
                 f"plannable={ir_plannable}, "
+                f"family_preferred={bool(family_ir_preferred)}, "
                 f"table_count={table_count}, "
                 f"context_table_count={ctx_table_count}, "
                 f"min_conf={dynamic_min_conf:.2f}, "
@@ -4183,6 +4320,13 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             extra_instruction = (
                 "STRICT REQUIREMENT: The question explicitly requests final result ordering. "
                 "You MUST include a top-level ORDER BY in the final query with the requested sort direction."
+            )
+        elif "missing_regex_semantics" in contract_violations:
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question requires regex-level structural matching. "
+                "You MUST use REGEXP (or RLIKE), not LIKE, for exact structural patterns. "
+                "If the question describes an exact shape, use anchored regex with ^ and $. "
+                "Do NOT weaken exact multi-word or exact-format intent into a loose substring match."
             )
         else:
             extra_instruction = (

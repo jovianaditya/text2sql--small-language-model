@@ -10737,6 +10737,80 @@ def _question_requires_word_boundary_regex(question: str) -> bool:
     ]
     return any(p in q for p in boundary_phrases)
 
+
+def _extract_whole_word_target(question: str) -> Optional[str]:
+    q = question or ""
+    patterns = [
+        r'whole\s+word\s+["\']([^"\']+)["\']',
+        r'word\s+boundary\s+["\']([^"\']+)["\']',
+        r'token\s+["\']([^"\']+)["\']',
+        r'kata\s+utuh\s+["\']([^"\']+)["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, q, flags=re.I)
+        if not m:
+            continue
+        token = (m.group(1) or "").strip()
+        if token:
+            return token
+    return None
+
+
+def _question_requires_structural_regex(question: str) -> bool:
+    q = (question or "").lower()
+
+    structural_patterns = [
+        r"\bconsists?\s+of\s+(?:exactly\s+)?(\d+|one|two|three|four|five)\s+words?\b",
+        r"\bhas\s+(?:exactly\s+)?(\d+|one|two|three|four|five)\s+words?\b",
+        r"\b(?:single|one|two|three|four|five)\s+words?\b(?:\s+separated\s+by\s+(?:a\s+)?space)?",
+        r"\bseparated\s+by\s+(?:a\s+)?space\b",
+        r"\bword\s+count\b",
+    ]
+    return any(re.search(pat, q, flags=re.I) for pat in structural_patterns)
+
+
+def _question_requires_two_word_space_pattern(question: str) -> bool:
+    q = (question or "").lower()
+    patterns = [
+        r"\bconsists?\s+of\s+(?:exactly\s+)?two\s+words?\b",
+        r"\bmade\s+up\s+of\s+(?:exactly\s+)?two\s+words?\b",
+        r"\bhas\s+(?:exactly\s+)?two\s+words?\b",
+        r"\bexactly\s+two\s+words?\b",
+        r"\btwo\s+words?\b(?:\s+separated\s+by\s+(?:a\s+)?space)?",
+    ]
+    return any(re.search(pat, q, flags=re.I) for pat in patterns)
+
+
+def _extract_structural_word_count(question: str) -> Optional[int]:
+    q = (question or "").lower()
+    word_to_num = {
+        "single": 1,
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+    }
+    patterns = [
+        r"\bconsists?\s+of\s+(?:exactly\s+)?(?P<count>\d+|single|one|two|three|four|five)\s+words?\b",
+        r"\bmade\s+up\s+of\s+(?:exactly\s+)?(?P<count>\d+|single|one|two|three|four|five)\s+words?\b",
+        r"\bhas\s+(?:exactly\s+)?(?P<count>\d+|single|one|two|three|four|five)\s+words?\b",
+        r"\bexactly\s+(?P<count>\d+|single|one|two|three|four|five)\s+words?\b",
+        r"\b(?P<count>single|one|two|three|four|five)\s+words?\b(?:\s+separated\s+by\s+(?:a\s+)?space)?",
+    ]
+    for pat in patterns:
+        m = re.search(pat, q, flags=re.I)
+        if not m:
+            continue
+        raw = (m.group("count") or "").strip().lower()
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= 5:
+                return n
+            return None
+        return word_to_num.get(raw)
+    return None
+
 def _question_requires_regex(question: str) -> bool:
     q = (question or "").strip().lower()
 
@@ -10753,6 +10827,10 @@ def _question_requires_regex(question: str) -> bool:
 
     # 3. Deteksi pola "followed by" (kasus spesifik Anda)
     if "followed by" in q or "diikuti oleh" in q:
+        return True
+
+    # 4. Structural text patterns that need anchored REGEXP, e.g. "exactly two words"
+    if _question_requires_structural_regex(question):
         return True
 
     return False
@@ -10802,6 +10880,92 @@ def _rewrite_simple_regexp_to_like(sql: str, question: str) -> str:
     )
 
     return sql
+
+
+def _canonicalize_structural_regex(sql: str, question: str) -> str:
+    """
+    Canonicalize narrow structural-regex families that are semantically clear but
+    easy for the LLM to express incorrectly.
+
+    Current supported family:
+      - exactly N words separated by a single space (N = 1..5)
+    """
+    if not sql:
+        return sql
+    word_count = _extract_structural_word_count(question)
+    if not word_count:
+        return sql
+
+    canonical = "^" + " ".join(["[^ ]+"] * word_count) + "$"
+    out = sql
+
+    # REGEXP_LIKE(col, '...')
+    out = re.sub(
+        r"(?is)(REGEXP_LIKE\s*\(\s*[^,]+,\s*)(N?'(?:''|[^'])*'|\"(?:[^\"\\\\]|\\\\.)*\")(\s*\))",
+        lambda m: f"{m.group(1)}'{canonical}'{m.group(3)}",
+        out,
+    )
+
+    # col REGEXP '...' / col RLIKE '...'
+    out = re.sub(
+        r"(?is)(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+\b(?:REGEXP|RLIKE)\b\s*)(N?'(?:''|[^'])*'|\"(?:[^\"\\\\]|\\\\.)*\")",
+        lambda m: f"{m.group(1)}'{canonical}'",
+        out,
+    )
+
+    # If the model weakens this to a simple "contains a space" LIKE pattern,
+    # strengthen it to the canonical REGEXP instead.
+    if word_count == 2:
+        out = re.sub(
+            r"(?is)(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+)LIKE\s+'% %'",
+            lambda m: f"{m.group(1)}REGEXP '{canonical}'",
+            out,
+        )
+
+    return out
+
+
+def _canonicalize_boundary_regex(sql: str, question: str) -> str:
+    """
+    Canonicalize narrow word-boundary regex family:
+      - contains the whole word "X"
+
+    Rewrites any existing regex/rlike literal (or weak LIKE substring) to the
+    canonical MySQL-safe boundary pattern:
+      (^|[^[:alnum:]_])X([^[:alnum:]_]|$)
+    """
+    if not sql or not _question_requires_word_boundary_regex(question):
+        return sql
+    target = _extract_whole_word_target(question)
+    if not target:
+        return sql
+
+    canonical = f"(^|[^[:alnum:]_]){re.escape(target)}([^[:alnum:]_]|$)"
+    out = sql
+
+    # REGEXP_LIKE(col, '...')
+    out = re.sub(
+        r"(?is)(REGEXP_LIKE\s*\(\s*[^,]+,\s*)(N?'(?:''|[^'])*'|\"(?:[^\"\\\\]|\\\\.)*\")(\s*\))",
+        lambda m: f"{m.group(1)}'{canonical}'{m.group(3)}",
+        out,
+    )
+
+    # col REGEXP '...' / col RLIKE '...'
+    out = re.sub(
+        r"(?is)(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+\b(?:REGEXP|RLIKE)\b\s*)(N?'(?:''|[^'])*'|\"(?:[^\"\\\\]|\\\\.)*\")",
+        lambda m: f"{m.group(1)}'{canonical}'",
+        out,
+    )
+
+    # Upgrade weak substring LIKE to boundary regex for whole-word intent.
+    like_pat = rf"(?is)(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+)LIKE\s+'%{re.escape(target)}%'"
+    out = re.sub(
+        like_pat,
+        lambda m: f"{m.group(1)}REGEXP '{canonical}'",
+        out,
+    )
+
+    return out
 
 def _rewrite_regexp_literal_to_posix_if_needed(lit: str) -> str:
     r"""

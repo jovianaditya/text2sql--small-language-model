@@ -1281,7 +1281,7 @@ def _detect_filters(
     # Pattern: "starts with two uppercase letters, followed by exactly 5 digits,
     # and ends with any single digit" (single-table deterministic regex).
     m_upper_start = re.search(
-        r"\bstart(?:s)?\s+with\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+uppercase\s+letters?\b",
+        r"\bstart(?:s)?\s+with\s+(?:exactly\s+)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+uppercase\s+letters?\b",
         q,
         flags=re.I,
     )
@@ -1314,6 +1314,27 @@ def _detect_filters(
         )
         if m_prefix:
             token = m_prefix.group(1)
+            token_low = str(token or "").strip().lower()
+            # Guard against quantifier capture on structural regex phrases like
+            # "starts with exactly two uppercase letters ...", where the
+            # fallback prefix parser would otherwise treat "exactly" / "two"
+            # as a literal prefix.
+            if token_low in {
+                "exactly",
+                "one",
+                "two",
+                "three",
+                "four",
+                "five",
+                "six",
+                "seven",
+                "eight",
+                "nine",
+                "ten",
+                "eleven",
+                "twelve",
+            }:
+                token = ""
             target = None
             name_prefix_intent = bool(
                 re.search(r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+(?:start(?:s)?|begin(?:s)?)\b", q)
@@ -1325,7 +1346,7 @@ def _detect_filters(
                     target = (subject, name_col)
             if not target:
                 target = _pick_text_target_column()
-            if target:
+            if target and token:
                 exact_digits = re.search(
                     r"\bexactly\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+digits?\b",
                     q,

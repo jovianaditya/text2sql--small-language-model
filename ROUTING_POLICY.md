@@ -41,7 +41,7 @@ Assumptions for this document:
 9. If gate has critical failure, do bounded rescue.
 10. If still critical, fail-closed (`FINAL_GATE_BLOCKED`), do not run unsafe SQL.
 
-## 4. IR Eligibility Policy (IR Safe Subset v1)
+## 4. Family-First IR Eligibility Policy (IR Safe Subset v1)
 
 Default target settings:
 
@@ -51,35 +51,66 @@ Default target settings:
 4. `AGENT_IR_MAX_TABLES=2`
 5. `AGENT_IR_ALLOW_MULTI_TABLE=1`
 
+Primary routing principle:
+
+1. Route by supported query family first, not by raw retrieval breadth alone.
+2. `qtype` is only a coarse label; family shape decides whether IR is truly safe.
+3. Retrieval breadth (`context_table_count`) remains a secondary signal:
+   - hard veto for unsupported/borderline families
+   - soft penalty only for compact IR-safe families
+
+IR-preferred families:
+
+1. Single-table lookup/filter/distinct lookup inside planner-safe subset.
+2. Single-table aggregate/group/having patterns that stay inside planner-safe subset.
+3. Simple 2-table direct join aggregate / grouped count / grouped sum.
+4. Deterministic regex templates only (fixed-shape code/prefix patterns that map to known-safe `REGEXP` templates).
+5. Compact planner-safe aggregate family where router/intent scope is `<= AGENT_IR_MAX_TABLES`, excluding multi-table `COUNT(DISTINCT ...)` unless a dedicated planner-safe family is added.
+
+LLM-preferred families (remain out of IR by design):
+
+1. Winner-row / ordinal rank.
+2. Window functions (`RANK`, running total, `LAG`, partition windows).
+3. Set operations (`UNION`, etc.).
+4. Exclusion / anti-join and include-zero null-preserving rollups.
+5. Scalar subquery / explicit subquery intent.
+6. Broad/open regex intent (word-boundary, exact multi-word structure, or non-template regex semantics) should stay in LLM lane and be validated by regex semantic contract.
+7. Dual-fact rollups and other fanout-risk patterns.
+8. Multi-table `COUNT(DISTINCT ...)` families that need join/existence semantics beyond the current safe deterministic subset.
+
 IR is allowed only when all conditions pass:
 
 1. `qtype` is `lookup` or `aggregate`.
 2. `confidence >= dynamic_min_conf`.
 3. `table_count <= AGENT_IR_MAX_TABLES`.
-4. `context_table_count <= AGENT_IR_MAX_TABLES`.
-5. No hard router flags.
-6. No dual-fact rollup fanout risk.
-7. Percentage intent is allowed only when IR metric supports it (`pct_non_null`).
-8. IR operators/metrics stay inside planner-safe subset:
+4. Retrieval breadth does not disqualify compact IR-safe families.
+5. If family is not compact IR-safe, `context_table_count <= AGENT_IR_MAX_TABLES`.
+6. No hard router flags.
+7. No dual-fact rollup fanout risk.
+8. Percentage intent is allowed only when IR metric supports it (`pct_non_null`).
+9. IR operators/metrics stay inside planner-safe subset:
    - filter ops: `eq|in|gt|gte|lt|lte|between|year_eq|like_prefix|regexp|is_null_or_empty`
    - metric ops: `count|sum|avg|min|max|pct_non_null`
-9. If table scope is 2 tables, FK path must be simple and plannable.
+10. If table scope is 2 tables, FK path must be simple and plannable.
 
 Implementation notes:
 
-1. `table_count = max(len(mentioned_tables), len(router_tables), context_table_count)`.
-2. `dynamic_min_conf`:
+1. For low-risk single-table lookup, `table_count = 1`.
+2. For compact IR-safe families, `table_count = max(len(mentioned_tables), len(router_tables), 1)`.
+3. Otherwise, `table_count = max(len(mentioned_tables), len(router_tables), context_table_count)`.
+4. `dynamic_min_conf`:
    - `0.80` for single-table scope.
    - `0.90` for 2-table scope.
-3. IR hard router flags are:
+5. `context_table_count` is telemetry + secondary penalty, not the primary family classifier.
+6. IR hard router flags are:
    - `is_winner_row`
    - `has_exclusion`
    - `is_window_aggregate`
    - `is_explicit_rank_function`
    - `is_ordinal_ranking`
    - `is_subquery_intent`
-4. If planner cannot produce valid SQL, route falls back to LLM lane.
-5. Retrieval single-table lock should prefer preserving single-table context when confidence is acceptable.
+7. If planner cannot produce valid SQL, route falls back to LLM lane.
+8. Retrieval single-table lock should prefer preserving single-table context when confidence is acceptable.
 
 IR is gated off when any condition fails.
 
@@ -88,6 +119,7 @@ Important interpretation:
 1. IR is intentionally not universal; it covers safe deterministic subset only.
 2. Hard semantic shapes remain in LLM lane by design.
 3. Policy target keeps IR coverage moderate so LLM contribution remains measurable.
+4. Retrieval breadth can still keep borderline queries in LLM, but compact IR-safe families should not be rejected only because retrieval pulled one extra table.
 
 ## 5. 3B vs 7B Policy
 

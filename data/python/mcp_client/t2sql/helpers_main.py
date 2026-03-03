@@ -41,7 +41,7 @@ from .schema_analyzer import (
     get_singular_form,
 )
 from .helpers_core import (
-    _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_regex, has_join,
+    _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_structural_regex, _question_requires_regex, has_join,
     _question_requires_inner_join,
     _question_wants_include_zero,
     _SQL_KEYWORDS,  # SQL keywords constant
@@ -81,7 +81,7 @@ from .helpers_core import (
     _fix_raw_column_where_to_having,
     _add_missing_count_for_group_by,
     # phase 5 — Pattern, REGEXP, and Predicate Normalization
-    _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _guardrail_fix_mysql_regexp_literals,
+    _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _canonicalize_structural_regex, _canonicalize_boundary_regex, _guardrail_fix_mysql_regexp_literals,
     # phase 6
     _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _parse_from_join_aliases,
     _ast_guardrails,
@@ -447,19 +447,37 @@ def _get_requires_regex(state: "RAGState") -> bool:
     state["_requires_regex_q"] = q
     return needs
 
-def _regex_requirement_ok(sql: str, requires_regex: bool, requires_boundary: bool) -> bool:
-    if not (requires_regex or requires_boundary):
+def _regex_requirement_ok(
+    sql: str,
+    requires_regex: bool,
+    requires_boundary: bool,
+    requires_structural: bool = False,
+) -> bool:
+    if not (requires_regex or requires_boundary or requires_structural):
         return True
 
-    low = (sql or "").lower()
+    raw = sql or ""
+    low = raw.lower()
     has_regexp = ("regexp" in low) or ("rlike" in low)
     if not has_regexp:
         return False
 
     if requires_boundary:
-        return "(^|[^[:alnum:]_])" in (sql or "")
+        if "(^|[^[:alnum:]_])" in raw:
+            return True
+        return ("[[:<:]]" in raw) and ("[[:>:]]" in raw)
 
-    return ("^" in (sql or "")) and ("$" in (sql or ""))
+    if requires_structural:
+        if not (("^" in raw) and ("$" in raw)):
+            return False
+        structural_ok_patterns = [
+            r"\[\^ \]\+(?:\s+\[\^ \]\+)+",
+            r"\[:space:\]",
+            r"\[\[:alnum:\]_\]\+(?:\s+\[\[:alnum:\]_\]\+)+",
+        ]
+        return any(re.search(pat, raw) for pat in structural_ok_patterns)
+
+    return ("^" in raw) and ("$" in raw)
 # -----------------------------------------------------------
 # -------------------- HELPER CROSS MODULE ------------------
 # ------------------------- retrieval.py --------------------
@@ -2344,6 +2362,30 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "Do NOT use plain COUNT(*) or COUNT(id) for that metric. "
             "Do NOT GROUP BY the distinct target column unless the question explicitly asks to display that column."
         )
+    requires_boundary_regex = _question_requires_word_boundary_regex(question)
+    requires_regex = _question_requires_regex(question)
+    requires_structural_regex = _question_requires_structural_regex(question)
+    if requires_boundary_regex:
+        constraints.append(
+            "REGEX RULE (CRITICAL): This question needs true regex boundary semantics. "
+            "Use REGEXP (or RLIKE), not LIKE. "
+            "Do NOT weaken whole-word or word-boundary intent into a simple substring match."
+        )
+    elif requires_regex:
+        constraints.append(
+            "REGEX RULE (CRITICAL): This question requires a structural pattern match. "
+            "Use REGEXP (or RLIKE), not LIKE, when the shape must be exact."
+        )
+        constraints.append(
+            "REGEX RULE (CRITICAL): When the question describes an exact structure, prefer anchored regex with ^ and $. "
+            "Do NOT use a loose LIKE pattern for exact structural matching."
+        )
+        if requires_structural_regex:
+            constraints.append(
+                "REGEX RULE (CRITICAL): For exact word-count or space-separated structure (for example 'exactly two words'), "
+                "use a structural REGEXP pattern. "
+                "Do NOT reduce it to `LIKE '% %'`, because that only checks for any space and is semantically too weak."
+            )
     if is_set_operation_intent:
         union_keyword = "UNION" if re.search(
             r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
@@ -3475,8 +3517,14 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     # Phase 5 — Pattern, REGEXP, and Predicate Normalization
     # ---------------------------------------------------------------------------
-    if re.search(r"\b(?:regexp|rlike)\b", s, flags=re.I):
+    if (
+        re.search(r"\b(?:regexp_like|regexp|rlike)\b", s, flags=re.I)
+        or _question_requires_structural_regex(question)
+        or _question_requires_word_boundary_regex(question)
+    ):
         s = _guardrail_fix_like_regex_anchors(s, question)
+        s = _canonicalize_boundary_regex(s, question)
+        s = _canonicalize_structural_regex(s, question)
         s = _guardrail_fix_mysql_regexp_literals(s)
     # ---------------------------------------------------------------------------
     # Phase 6 — NULL / DISTINCT / Result Cardinality Policies
