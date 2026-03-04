@@ -2395,14 +2395,15 @@ def router_agent(state: RAGState) -> RAGState:
         f"SimpleExistsSubquery:{is_simple_exists_subquery}, "
         f"DualFactRollup:{has_dual_fact_rollup}"
     )
-    print(f"[ROUTER] Decision: {complexity.upper()} -> {chosen_model}")
+    print(f"[ROUTER] LLM Fallback Candidate: {complexity.upper()} -> {chosen_model}")
 
     return {
         **state,
         "router_tables": relevant_tables,
         "primary_table": primary_table,
         "primary_table_reason": primary_reason,
-        "target_model": chosen_model,
+        "router_model_candidate": chosen_model,
+        "target_model": "",
         "router_decision": {
             "complexity": complexity,
             "qtype": qtype,
@@ -3923,7 +3924,21 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         elif AGENT_IR_DEBUG and ir_gate_reasons:
             print(f"[IR] gated off -> LLM. reasons={ir_gate_reasons}")
 
-    target_model = state.get("target_model") or LARGE_MODEL
+    fallback_model = (
+        state.get("router_model_candidate")
+        or (LARGE_MODEL if (decision.get("escalation_reasons") or []) else SMALL_MODEL)
+    )
+    fallback_complexity = str(decision.get("complexity") or "").strip().lower()
+    if not fallback_complexity:
+        fallback_complexity = (
+            AGENT_ROUTER_COMPLEXITY_COMPLEX
+            if fallback_model == LARGE_MODEL
+            else AGENT_ROUTER_COMPLEXITY_SIMPLE
+        )
+    target_model = str(fallback_model or LARGE_MODEL)
+    state["target_model"] = target_model
+    print(f"[DRAFTER] Using LLM fallback: {str(fallback_complexity).upper()} -> {target_model}")
+
     llm = build_llm_json(model=target_model)
 
     # ===== PRE-WARM WITH OOM RETRY =====
@@ -3932,7 +3947,12 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     model_ready = _prewarm_model_with_oom_retry(llm, target_model)
 
     if not model_ready:
-        return {**state, "draft_source": "llm", "draft_sql": "SELECT 'Error: Model OOM after retries';"}
+        return {
+            **state,
+            "target_model": target_model,
+            "draft_source": "llm",
+            "draft_sql": "SELECT 'Error: Model OOM after retries';",
+        }
 
     # START TIMER: Model ready → Final SQL complete (for thesis latency benchmark)
     # This measures the core text-to-SQL processing time, excluding:
@@ -3962,7 +3982,12 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     print(f"[DEBUG] Draft inference time: {_inference_time:.2f}s")
 
     if obj is None:
-        return {**state, "draft_source": "llm", "draft_sql": "SELECT 'Error: LLM failed';"}
+        return {
+            **state,
+            "target_model": target_model,
+            "draft_source": "llm",
+            "draft_sql": "SELECT 'Error: LLM failed';",
+        }
         
     draft_sql = (obj.get("sql") or "SELECT 1;").strip()
     reasoning = (obj.get("notes") or "No reasoning provided.").strip()
@@ -4007,6 +4032,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     print(f"[DRAFTER] After cleanup: {draft_sql}")
     return {
         **state,
+        "target_model": target_model,
         "draft_source": "llm",
         "draft_sql": draft_sql,
         "agent_notes": (obj.get("notes") or "").strip(),

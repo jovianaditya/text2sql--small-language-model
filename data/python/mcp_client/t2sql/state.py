@@ -23,7 +23,8 @@ class RAGState(TypedDict, total=False):
     router_tables: List[str]
     primary_table: str  # Primary table determined by router
     primary_table_reason: str  # Reason for primary table selection
-    target_model: str  # Initial model chosen by router
+    router_model_candidate: str  # Router-computed LLM fallback candidate
+    target_model: str  # Actual LLM model used if LLM lane is selected
     final_model: str  # Final model used (may differ if regeneration occurred)
     # generation outputs
     answer: str
@@ -71,6 +72,7 @@ def make_state(paths, question: str) -> RAGState:
         "router_tables": [],
         "primary_table": "",
         "primary_table_reason": "",
+        "router_model_candidate": "",
         "target_model": "",
         "final_model": "",  # Track final model after any regeneration
         "answer": "",

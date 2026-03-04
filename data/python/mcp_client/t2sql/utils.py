@@ -294,15 +294,105 @@ def display_table_from_json(data, max_cell_len: int = 80):
         print("Query executed but returned no rows.")
     
 # Helper wajib untuk extract JSON dari teks LLM yang kotor
+def _strip_code_fences(text: str) -> str:
+    s = (text or "").strip()
+    if not s.startswith("```"):
+        return s
+
+    lines = s.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _coerce_llm_content_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except Exception:
+            return str(content)
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                piece = item.get("text") or item.get("content")
+                if piece:
+                    parts.append(str(piece))
+                    continue
+            piece = getattr(item, "text", None) or getattr(item, "content", None)
+            if piece is not None:
+                parts.append(str(piece))
+            else:
+                parts.append(str(item))
+        return "\n".join(p for p in parts if p).strip()
+    return str(content)
+
+
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    try:
-        # Cari pattern {...} termasuk nested braces
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-            return json.loads(json_str)
-    except json.JSONDecodeError:
+    txt = _strip_code_fences(str(text or ""))
+    if not txt:
         return None
+
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+
+    for idx, ch in enumerate(txt):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+            continue
+
+        if ch != "}":
+            continue
+        if depth == 0:
+            continue
+
+        depth -= 1
+        if depth != 0 or start < 0:
+            continue
+
+        candidate = txt[start : idx + 1]
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            start = -1
+            continue
+        if isinstance(obj, dict):
+            return obj
+        start = -1
+
     return None
 
 def try_llm_json(
@@ -331,8 +421,13 @@ def try_llm_json(
             resp = llm.invoke(prompt)
             
             # Handle response types (String or Object)
-            content = getattr(resp, "content", None) or str(resp)
-            
+            content = getattr(resp, "content", None)
+
+            if isinstance(content, dict):
+                return content
+
+            content = _coerce_llm_content_text(content if content is not None else resp)
+
             # 2. Extract JSON (Gunakan regex yang kuat)
             obj = _extract_json_object(content)
             

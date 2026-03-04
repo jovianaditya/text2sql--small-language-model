@@ -485,6 +485,99 @@ def _format_with_sqlglot(sql: str) -> str:
         return sql
 
 
+def _strip_sql_wrappers(sql: str) -> Tuple[str, List[str]]:
+    warnings: List[str] = []
+    s = (sql or "").strip()
+    if not s:
+        return "", warnings
+
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+        warnings.append("stripped_code_fences")
+
+    lines = s.splitlines()
+    if lines and lines[0].strip().lower() in {"sql", "mysql"}:
+        s = "\n".join(lines[1:]).strip()
+        warnings.append("stripped_sql_language_tag")
+
+    prefix_match = re.match(r"^(?:sql|mysql|query)\s*:\s*", s, flags=re.I)
+    if prefix_match:
+        s = s[prefix_match.end() :].strip()
+        warnings.append("stripped_sql_prefix_label")
+
+    return s, warnings
+
+
+def _extract_first_sql_statement(sql: str) -> Tuple[str, List[str]]:
+    warnings: List[str] = []
+    s = (sql or "").strip()
+    if not s:
+        return "", warnings
+
+    start_match = re.search(r"(?:^|[\r\n])\s*((?:with|select)\b)", s, flags=re.I)
+    if start_match and start_match.start(1) > 0:
+        s = s[start_match.start(1):].strip()
+        warnings.append("trimmed_non_sql_prefix")
+
+    depth = 0
+    in_single = False
+    in_double = False
+    in_backtick = False
+    escaped = False
+
+    for idx, ch in enumerate(s):
+        if in_single:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == "'":
+                in_single = False
+            continue
+
+        if in_double:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_double = False
+            continue
+
+        if in_backtick:
+            if ch == "`":
+                in_backtick = False
+            continue
+
+        if ch == "'":
+            in_single = True
+            continue
+        if ch == '"':
+            in_double = True
+            continue
+        if ch == "`":
+            in_backtick = True
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")" and depth > 0:
+            depth -= 1
+            continue
+        if ch == ";" and depth == 0:
+            tail = s[idx + 1 :].strip()
+            if tail:
+                warnings.append("truncated_trailing_sql_text")
+            return s[: idx + 1].strip(), warnings
+
+    return s, warnings
+
+
 def _validate_generated_sql(sql: str, intent_ir: Dict[str, Any]) -> Tuple[bool, List[str]]:
     errors: List[str] = []
     if not sql:
@@ -565,6 +658,100 @@ def _group_filters_by_table(filters: List[Dict[str, Any]]) -> Dict[str, List[Dic
     return out
 
 
+def _validate_ir_identifiers(intent_ir: Dict[str, Any], allowed: Dict[str, Set[str]]) -> List[str]:
+    errors: List[str] = []
+    allowed_lower = {
+        str(t).lower(): {str(c).lower() for c in (cols or set()) if str(c)}
+        for t, cols in (allowed or {}).items()
+        if str(t)
+    }
+
+    visible_aliases = {
+        str(d.get("alias") or "").strip().lower()
+        for d in (intent_ir.get("dimensions") or [])
+        if isinstance(d, dict) and bool(d.get("visible", True)) and str(d.get("alias") or "").strip()
+    }
+    visible_aliases.update(
+        str(m.get("alias") or "").strip().lower()
+        for m in (intent_ir.get("metrics") or [])
+        if isinstance(m, dict) and str(m.get("alias") or "").strip()
+    )
+
+    def _require_table(table: str, scope: str) -> bool:
+        t = str(table or "").strip().lower()
+        if not t:
+            errors.append(f"{scope}:missing_table")
+            return False
+        if t not in allowed_lower:
+            errors.append(f"{scope}:table_not_allowed:{t}")
+            return False
+        return True
+
+    def _require_column(table: str, column: str, scope: str, allow_star: bool = False) -> bool:
+        col = str(column or "").strip()
+        if allow_star and col == "*":
+            return True
+        if not col:
+            errors.append(f"{scope}:missing_column")
+            return False
+
+        t = str(table or "").strip().lower()
+        if t not in allowed_lower:
+            errors.append(f"{scope}:table_not_allowed:{t or 'unknown'}")
+            return False
+        if col.lower() not in allowed_lower[t]:
+            errors.append(f"{scope}:column_not_allowed:{t}.{col}")
+            return False
+        return True
+
+    subject = str(intent_ir.get("subject_entity") or "").strip().lower()
+    if subject and subject not in allowed_lower:
+        errors.append(f"subject_not_allowed:{subject}")
+
+    for d in (intent_ir.get("dimensions") or []):
+        if not isinstance(d, dict):
+            continue
+        table = str(d.get("table") or subject).strip().lower()
+        if _require_table(table, "dimension"):
+            _require_column(table, str(d.get("column") or ""), "dimension")
+
+    for m in (intent_ir.get("metrics") or []):
+        if not isinstance(m, dict):
+            continue
+        table = str(m.get("table") or "").strip().lower()
+        if _require_table(table, "metric"):
+            _require_column(table, str(m.get("column") or "*"), "metric", allow_star=True)
+
+    for f in (intent_ir.get("filters") or []):
+        if not isinstance(f, dict):
+            continue
+        table = str(f.get("table") or "").strip().lower()
+        if _require_table(table, "filter"):
+            _require_column(table, str(f.get("column") or ""), "filter")
+
+    for ex in (intent_ir.get("existence") or []):
+        if not isinstance(ex, dict):
+            continue
+        _require_table(str(ex.get("table") or "").strip().lower(), "existence")
+
+    for o in (intent_ir.get("ordering") or []):
+        if not isinstance(o, dict):
+            continue
+        kind = str(o.get("kind") or "").strip().lower()
+        by = str(o.get("by") or "").strip()
+        if not by:
+            errors.append("ordering:missing_target")
+            continue
+        if kind == "column":
+            table = str(o.get("table") or subject).strip().lower()
+            if _require_table(table, "ordering"):
+                _require_column(table, by, "ordering")
+        elif kind == "alias" and by.lower() not in visible_aliases:
+            errors.append(f"ordering:unknown_alias:{by}")
+
+    return list(dict.fromkeys(errors))
+
+
 def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional[str], Dict[str, Any]]:
     meta: Dict[str, Any] = {"mode": "deterministic_ir", "errors": [], "warnings": [], "join_plan": {}}
     if not intent_ir:
@@ -579,6 +766,14 @@ def build_sql_from_intent(intent_ir: Dict[str, Any], ctx: str) -> Tuple[Optional
         return None, {"mode": "deterministic_ir", "errors": ["missing_schema_context"]}
     if subject not in allowed:
         return None, {"mode": "deterministic_ir", "errors": [f"subject_not_allowed:{subject}"]}
+
+    identifier_errors = _validate_ir_identifiers(intent_ir, allowed)
+    if identifier_errors:
+        return None, {
+            "mode": "deterministic_ir",
+            "errors": identifier_errors,
+            "warnings": ["planner_fallback_due_to_ir_identifier_validation"],
+        }
 
     fk_map, adj = _build_fk_maps(allowed)
     subject_id_col = _id_like_column(subject, allowed)
@@ -1080,6 +1275,12 @@ def safety_normalize_sql(sql: str) -> Tuple[str, List[str]]:
     s = (sql or "").strip()
     if not s:
         return s, ["empty_sql"]
+
+    s, wrapper_warnings = _strip_sql_wrappers(s)
+    warnings.extend(wrapper_warnings)
+
+    s, statement_warnings = _extract_first_sql_statement(s)
+    warnings.extend(statement_warnings)
 
     if _sql_has_banned_pattern(s):
         warnings.append("banned_pattern_detected")

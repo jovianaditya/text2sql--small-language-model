@@ -652,14 +652,21 @@ async def run_single_case(
                 latency_source = "no_llm_ir_path"
         print(f"[LATENCY] source={latency_source}, latency_s={result['latency_s']:.2f}")
 
-        # Get initial model used (extract short name: 3b/7b)
-        target_model = state.get("target_model", "")
-        if "3b" in target_model.lower():
+        # Track router-computed LLM fallback candidate separately from the
+        # actual model used after the IR gate.
+        router_model_candidate = (
+            str(state.get("router_model_candidate", "") or "").strip()
+            or str(state.get("target_model", "") or "").strip()
+        )
+        target_model = str(state.get("target_model", "") or "").strip()
+
+        # Get router LLM fallback candidate (extract short name: 3b/7b)
+        if "3b" in router_model_candidate.lower():
             result["initial_model_used"] = "3b"
-        elif "7b" in target_model.lower():
+        elif "7b" in router_model_candidate.lower():
             result["initial_model_used"] = "7b"
         else:
-            result["initial_model_used"] = target_model or "unknown"
+            result["initial_model_used"] = router_model_candidate or "unknown"
 
         # Get final model used (may differ if regeneration occurred)
         final_model = state.get("final_model", target_model)
@@ -670,7 +677,7 @@ async def run_single_case(
         else:
             result["final_model_used"] = final_model or result["initial_model_used"]
 
-        print(f"[MODEL] Initial: {result['initial_model_used']} → Final: {result['final_model_used']}")
+        print(f"[MODEL] LLM Candidate: {result['initial_model_used']} → Final: {result['final_model_used']}")
         print(
             f"[ROUTE] draft_source={result['draft_source'] or 'unknown'}, "
             f"ir_used={result['ir_used']}, ir_conf={result['ir_confidence']:.3f}"
