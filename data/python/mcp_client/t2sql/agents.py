@@ -3639,6 +3639,10 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             "like_prefix",
             "regexp",
             "is_null_or_empty",
+            "col_gt",
+            "col_gte",
+            "col_lt",
+            "col_lte",
         }
         prefer_ir_lookup_qtype = (
             ir_qtype == AGENT_ROUTER_QTYPE_LOOKUP
@@ -3766,6 +3770,8 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         ir_metrics = list(intent_ir.get("metrics") or [])
         ir_existence = list(intent_ir.get("existence") or [])
         ir_dims = list(intent_ir.get("dimensions") or [])
+        ir_filters = list(intent_ir.get("filters") or [])
+        ir_ordering = list(intent_ir.get("ordering") or [])
         visible_dim_cols = [
             str(d.get("column") or "").strip().lower()
             for d in ir_dims
@@ -3775,6 +3781,16 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             1
             for col in visible_dim_cols
             if any(tok in col for tok in ("date", "time", "timestamp", "year", "month", "day"))
+        )
+        has_column_compare_filter = any(
+            isinstance(f, dict)
+            and str(f.get("op") or "").strip().lower() in {"col_gt", "col_gte", "col_lt", "col_lte"}
+            for f in ir_filters
+        )
+        has_resolved_ordering = any(
+            isinstance(o, dict)
+            and str(o.get("kind") or "").strip().lower() in {"alias", "column", "expression"}
+            for o in ir_ordering
         )
 
         if (
@@ -3794,6 +3810,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             and not ir_existence
             and date_like_dim_count >= 2
             and bool(re.search(r"\b(?:after|before|later\s+than|earlier\s+than)\b", q_low, flags=re.I))
+            and not has_column_compare_filter
         ):
             ir_gate_reasons.append("column_to_column_compare_ir_unsupported")
 
@@ -3836,8 +3853,9 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             and isinstance(intent_ir.get("limit"), int)
             and int(intent_ir.get("limit") or 0) > 0
             and bool(re.search(r"\b(?:top|bottom|highest|lowest|largest|smallest)\b", q_low, flags=re.I))
+            and not has_resolved_ordering
         ):
-            ir_gate_reasons.append("top_n_lookup_prefers_llm")
+            ir_gate_reasons.append("top_n_lookup_ir_unresolved")
 
         quoted_literals = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or "")
         has_set_operation_cue = bool(
@@ -3859,7 +3877,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         if has_set_operation_cue and (has_set_labeling_shape or has_dedupe_request):
             ir_gate_reasons.append("set_operation_ir_unsupported")
 
-        for f in (intent_ir.get("filters") or []):
+        for f in ir_filters:
             if not isinstance(f, dict):
                 continue
             op = str(f.get("op") or "").strip().lower()
@@ -3905,6 +3923,41 @@ def draft_sql_agent(state: RAGState) -> RAGState:
                     print(f"[IR] SQL planned successfully. warnings={normalize_warnings}")
                 if not normalized_sql.endswith(";"):
                     normalized_sql += ";"
+                ir_note_parts = [
+                    "Deterministic IR planner used",
+                    f"qtype={qtype or 'unknown'}",
+                    f"conf={ir_confidence:.2f}",
+                    f"tables={table_count}",
+                ]
+                subject_entity = str(intent_ir.get("subject_entity") or "").strip()
+                if subject_entity:
+                    ir_note_parts.append(f"subject={subject_entity}")
+                if has_column_compare_filter:
+                    ir_note_parts.append("filter=column_compare")
+                if has_resolved_ordering and ir_ordering:
+                    first_order = next(
+                        (o for o in ir_ordering if isinstance(o, dict)),
+                        None,
+                    )
+                    if first_order:
+                        order_kind = str(first_order.get("kind") or "").strip().lower()
+                        order_target = str(first_order.get("by") or "").strip()
+                        order_dir = str(first_order.get("direction") or "ASC").strip().upper()
+                        if order_kind == "expression":
+                            ir_note_parts.append(f"order=expr:{order_dir}")
+                        elif order_target:
+                            ir_note_parts.append(f"order={order_kind}:{order_target}:{order_dir}")
+                if isinstance(intent_ir.get("limit"), int) and int(intent_ir.get("limit") or 0) > 0:
+                    ir_note_parts.append(f"limit={int(intent_ir.get('limit') or 0)}")
+                ir_internal_notes = [
+                    str(n).strip()
+                    for n in (intent_ir.get("notes") or [])
+                    if str(n).strip()
+                ]
+                if ir_internal_notes:
+                    ir_note_parts.append(f"ir_notes={','.join(ir_internal_notes[:2])}")
+                if normalize_warnings:
+                    ir_note_parts.append(f"warnings={','.join(str(w) for w in normalize_warnings[:2])}")
                 return {
                     **state,
                     "processing_start_time": ir_processing_start,
@@ -3913,10 +3966,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
                     "ir_used": True,
                     "join_plan": plan_meta.get("join_plan", {}),
                     "draft_sql": normalized_sql,
-                    "agent_notes": (
-                        "Deterministic IR planner used."
-                        + (f" warnings={normalize_warnings}" if normalize_warnings else "")
-                    ),
+                    "agent_notes": " | ".join(ir_note_parts),
                 }
             else:
                 if AGENT_IR_DEBUG:

@@ -38,6 +38,7 @@ _NUMERIC_HINTS = (
     "rate",
     "count",
     "number",
+    "limit",
 )
 _DATE_HINTS = ("date", "time", "timestamp", "year", "month", "day")
 _NUMBER_TOKEN_PATTERN = r"-?\d[\d,]*(?:\.\d+)?"
@@ -62,6 +63,18 @@ _FUNCTION_WORD_TOKENS = {
     "their", "its", "his", "her", "our", "your",
     "of", "to", "for", "with", "without", "and", "or",
 }
+_LEXICAL_MATCH_STOP_TOKENS = _FUNCTION_WORD_TOKENS.union(
+    {
+        "show", "list", "display", "find", "return", "get",
+        "top", "bottom", "first", "last",
+        "highest", "lowest", "largest", "smallest",
+        "latest", "newest", "earliest", "oldest",
+        "sorted", "sort", "ordered", "order",
+        "level", "levels",
+        "than", "over", "under", "above", "below",
+        "more", "less", "least", "most", "minimum", "maximum",
+    }
+)
 
 
 def _fallback_singular(table: str) -> str:
@@ -137,9 +150,10 @@ class IRMetric:
 class IRFilter:
     table: str
     column: str
-    op: str  # eq|in|gt|gte|lt|lte|between|year_eq|like_prefix|regexp|is_null_or_empty
+    op: str  # eq|in|gt|gte|lt|lte|between|year_eq|like_prefix|regexp|is_null_or_empty|col_gt|col_gte|col_lt|col_lte
     value: Any = None
     value2: Any = None
+    value_column: str = ""
 
 
 @dataclass
@@ -303,11 +317,6 @@ def _column_variants(table: str, column: str) -> Set[str]:
         expanded.add(_pluralize_last_token(vv))
         expanded.add(_singularize_last_token(vv))
 
-    # Domain-friendly reorder variants for common business phrasings.
-    if "quantity" in c_low and "stock" in c_low:
-        expanded.update({"stock quantity", "stock quantities", "quantity stock"})
-    if "amount" in c_low and "payment" in c_low:
-        expanded.update({"payment amount", "payment amounts", "amount paid"})
     if c_low.endswith("number"):
         stem = c_low[:-6].strip("_")
         if stem:
@@ -331,11 +340,7 @@ def _phrase_pos(text: str, phrase: str) -> int:
 def _is_numeric_column(col: str) -> bool:
     words = _camel_to_words(col or "")
     tokens = {t for t in re.findall(r"[a-z0-9]+", words) if t}
-    if any(k in tokens for k in _NUMERIC_HINTS):
-        return True
-    if "credit limit" in words:
-        return True
-    return False
+    return any(k in tokens for k in _NUMERIC_HINTS)
 
 
 def _is_date_column(col: str) -> bool:
@@ -373,6 +378,144 @@ def _to_int_count_token(token: str) -> Optional[int]:
         except ValueError:
             return None
     return _NUMBER_WORDS.get(s)
+
+
+def _normalize_match_token(token: str) -> str:
+    t = str(token or "").strip().lower()
+    if not t:
+        return ""
+    if t.endswith("ies") and len(t) > 3:
+        t = t[:-3] + "y"
+    elif t.endswith("ses") and len(t) > 3:
+        t = t[:-2]
+    elif t.endswith("s") and len(t) > 2 and not t.endswith(("ss", "us")):
+        t = t[:-1]
+    return t
+
+
+def _tokenize_for_match(text: str, stop_tokens: Optional[Set[str]] = None) -> List[str]:
+    stop = {str(tok).lower() for tok in (stop_tokens or set()) if str(tok)}
+    out: List[str] = []
+    seen: Set[str] = set()
+    for raw in re.findall(r"[a-z0-9]+", str(text or "").lower()):
+        if raw.isdigit():
+            continue
+        tok = _normalize_match_token(raw)
+        if not tok or tok in stop:
+            continue
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    return out
+
+
+def _column_semantic_tokens(table: str, column: str) -> Set[str]:
+    c = str(column or "").strip()
+    if not c:
+        return set()
+
+    phrases: Set[str] = {_camel_to_words(c)}
+    if "_" in c:
+        phrases.add(c.lower().replace("_", " "))
+    for syn in _safe_get_column_synonyms(table, c):
+        s = str(syn).strip().lower()
+        if not s:
+            continue
+        phrases.add(s.replace("_", " "))
+        phrases.add(s.replace("-", " "))
+
+    structural_stop_tokens = _FUNCTION_WORD_TOKENS.union({"in", "on", "at", "by"})
+    tokens: Set[str] = set()
+    for phrase in phrases:
+        for tok in _tokenize_for_match(phrase, stop_tokens=structural_stop_tokens):
+            if tok:
+                tokens.add(tok)
+    return tokens
+
+
+def _best_semantic_column_match(
+    text: str,
+    table: str,
+    allowed: Dict[str, Set[str]],
+    *,
+    numeric_only: bool = False,
+    min_score: float = 1.5,
+) -> Optional[str]:
+    t = (table or "").strip().lower()
+    cols = list(allowed.get(t, set()))
+    if not cols:
+        return None
+
+    query_tokens = _tokenize_for_match(text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS)
+    if not query_tokens:
+        return None
+    query_token_set = set(query_tokens)
+
+    best_col = None
+    best_score = 0.0
+    best_overlap = 0
+    for col in cols:
+        if numeric_only and not _is_numeric_column(col):
+            continue
+        col_tokens = _column_semantic_tokens(t, col)
+        if not col_tokens:
+            continue
+        overlap = query_token_set.intersection(col_tokens)
+        if not overlap:
+            continue
+
+        score = float(len(overlap))
+        score += (len(overlap) / max(len(col_tokens), 1)) * 0.5
+        if any(tok in _NUMERIC_HINTS for tok in overlap):
+            score += 0.35
+
+        if score > best_score or (score == best_score and best_col is not None and len(col) < len(best_col)):
+            best_col = col
+            best_score = score
+            best_overlap = len(overlap)
+
+    if best_col is None:
+        return None
+    if best_score < float(min_score) and best_overlap < 2:
+        return None
+    return best_col
+
+
+def _extract_projection_segments(question: str) -> List[str]:
+    q_raw = str(question or "").strip()
+    if not q_raw:
+        return []
+
+    matches = list(
+        re.finditer(
+            r"\b(?:show|display|return|list)\b\s+([^.;!?]+)",
+            q_raw,
+            flags=re.I,
+        )
+    )
+    if not matches:
+        return []
+
+    tail = str(matches[-1].group(1) or "").strip()
+    if not tail:
+        return []
+    if "," not in tail and not re.search(r"\band\b", tail, flags=re.I):
+        return []
+
+    segments: List[str] = []
+    for raw_seg in re.split(r"\s*,\s*|\s+\band\b\s+|\s+\bor\b\s+", tail, flags=re.I):
+        seg = str(raw_seg or "").strip(" \t\r\n.,;:!?")
+        if not seg:
+            continue
+        seg = re.sub(
+            r"^(?:their|the|all|any|its|his|her|our|your)\s+",
+            "",
+            seg,
+            flags=re.I,
+        ).strip()
+        if seg:
+            segments.append(seg)
+    return segments
 
 
 def _choose_subject(
@@ -520,35 +663,12 @@ def _prefer_numeric_column_from_question(
     subject: str,
     allowed: Dict[str, Set[str]],
 ) -> Optional[str]:
-    q = (question or "").lower()
-    cols = list(allowed.get((subject or "").lower(), set()))
-    if not cols:
-        return None
-
-    def choose(col_terms: Tuple[str, ...]) -> Optional[str]:
-        hits = [c for c in cols if any(k in c.lower() for k in col_terms)]
-        if not hits:
-            return None
-        hits.sort(key=len)
-        return hits[0]
-
-    if "stock" in q:
-        c = choose(("stock", "quantity"))
-        if c:
-            return c
-    if any(k in q for k in ("payment amount", "amount paid", "amount")):
-        c = choose(("amount", "payment"))
-        if c:
-            return c
-    if "credit" in q:
-        c = choose(("credit",))
-        if c:
-            return c
-    if any(k in q for k in ("buy price", "msrp", "price", "cost")):
-        c = choose(("price", "msrp", "cost"))
-        if c:
-            return c
-    return None
+    return _best_semantic_column_match(
+        text=question,
+        table=subject,
+        allowed=allowed,
+        numeric_only=True,
+    )
 
 
 def _table_entity_pattern(table: str) -> str:
@@ -859,6 +979,10 @@ def _detect_metrics(
         if mentioned_numeric_cols:
             t, c, _ = mentioned_numeric_cols[0]
             return t, c
+        for t in dict.fromkeys([subject] + [tm for tm, _ in table_mentions]):
+            preferred = _prefer_numeric_column_from_question(question, t, allowed)
+            if preferred:
+                return t, preferred
         for t, _ in table_mentions:
             col = _find_best_numeric_column(t, allowed)
             if col:
@@ -1023,6 +1147,55 @@ def _detect_dimensions(
                     continue
             add_dim(IRDimension(table=table, column=col))
 
+    # Projection-list semantic enrichment for lookup questions:
+    # use schema-grounded matching on explicit "show/display/return/list" tails.
+    if (qtype or "").lower() == "lookup" and subject:
+        for seg in _extract_projection_segments(question):
+            resolved_col = _best_semantic_column_match(
+                text=seg,
+                table=subject,
+                allowed=allowed,
+                min_score=1.0,
+            )
+            if resolved_col:
+                add_dim(IRDimension(table=subject, column=resolved_col))
+
+    # Top-N lookup enrichment: keep an identity column alongside the ranking field.
+    if (
+        (qtype or "").lower() == "lookup"
+        and re.search(r"\b(?:top|bottom|highest|lowest|largest|smallest)\b", q, flags=re.I)
+    ):
+        ranked_numeric_col = _prefer_numeric_column_from_question(question, subject, allowed)
+        has_numeric_dim = any(
+            d.table == subject and _is_numeric_column(d.column)
+            for d in dims
+        )
+        has_identity_dim = any(
+            d.table == subject and not _is_numeric_column(d.column)
+            for d in dims
+        )
+        if ranked_numeric_col and not any(
+            d.table == subject and d.column.lower() == ranked_numeric_col.lower()
+            for d in dims
+        ):
+            add_dim(IRDimension(table=subject, column=ranked_numeric_col))
+            has_numeric_dim = True
+        if has_numeric_dim and not has_identity_dim:
+            name_col = _best_name_column(subject, allowed)
+            id_col = _best_id_column(subject, allowed)
+            if name_col:
+                add_dim(IRDimension(table=subject, column=name_col))
+            elif id_col:
+                add_dim(IRDimension(table=subject, column=id_col))
+        if has_numeric_dim:
+            dims.sort(
+                key=lambda d: (
+                    1 if d.table == subject and _is_numeric_column(d.column) else 0,
+                    d.table.lower(),
+                    d.column.lower(),
+                )
+            )
+
     # Generic "name" request without explicit entity token.
     if subject and re.search(r"\bname(s)?\b", q):
         name_col = _best_name_column(subject, allowed)
@@ -1060,6 +1233,7 @@ def _detect_filters(
                 and ex.op == f.op
                 and ex.value == f.value
                 and ex.value2 == f.value2
+                and ex.value_column == f.value_column
             ):
                 return
         filters.append(f)
@@ -1191,6 +1365,59 @@ def _detect_filters(
                     break
         if date_col:
             add_filter(IRFilter(table=date_table, column=date_col, op="year_eq", value=int(years[0])))
+
+    # Same-table column-to-column comparison (conservative):
+    # only explicit date-like columns, no aggregate metrics, and a short span
+    # between the two column mentions.
+    if not metrics:
+        compare_specs = (
+            (r"\bon\s+or\s+after\b", "col_gte"),
+            (r"\bon\s+or\s+before\b", "col_lte"),
+            (r"\b(?:after|later\s+than)\b", "col_gt"),
+            (r"\b(?:before|earlier\s+than)\b", "col_lt"),
+        )
+        date_mentions = [
+            (t, c, p) for (t, c, p) in column_mentions if _is_date_column(c)
+        ]
+        best_compare = None
+        best_gap = 10**9
+        for i, (t1, c1, p1) in enumerate(date_mentions):
+            for t2, c2, p2 in date_mentions[i + 1:]:
+                if t1 != t2 or c1.lower() == c2.lower():
+                    continue
+                if p1 <= p2:
+                    left_table, left_col, left_pos = t1, c1, p1
+                    right_col, right_pos = c2, p2
+                else:
+                    left_table, left_col, left_pos = t2, c2, p2
+                    right_col, right_pos = c1, p1
+                gap = right_pos - left_pos
+                if gap <= 0 or gap > 96:
+                    continue
+                between = q[left_pos:right_pos]
+                if re.search(r"\b(?:most\s+recent|latest|newest|earliest|oldest)\b", between, flags=re.I):
+                    continue
+                matched_op = ""
+                for pat, op in compare_specs:
+                    if re.search(pat, between, flags=re.I):
+                        matched_op = op
+                        break
+                if not matched_op:
+                    continue
+                if gap < best_gap:
+                    best_gap = gap
+                    best_compare = (left_table, left_col, matched_op, right_col)
+
+        if best_compare is not None:
+            left_table, left_col, matched_op, right_col = best_compare
+            add_filter(
+                IRFilter(
+                    table=left_table,
+                    column=left_col,
+                    op=matched_op,
+                    value_column=right_col,
+                )
+            )
 
     # Country/city style location filter:
     # "customers in Japan", "customers from USA".
@@ -1766,6 +1993,14 @@ def _detect_ordering_and_limit(
         if numeric_mentions:
             t, c, _ = numeric_mentions[0]
             add_order(IROrder(kind="column", by=c, table=t, direction=direction))
+        else:
+            numeric_dims = [
+                d for d in dimensions
+                if _is_numeric_column(d.column)
+            ]
+            if numeric_dims:
+                d0 = numeric_dims[0]
+                add_order(IROrder(kind="column", by=d0.column, table=d0.table, direction=direction))
 
     # Top-N fallback by first metric.
     if limit and metrics:
@@ -1775,6 +2010,14 @@ def _detect_ordering_and_limit(
         if numeric_mentions:
             t, c, _ = numeric_mentions[0]
             add_order(IROrder(kind="column", by=c, table=t, direction=direction))
+        else:
+            numeric_dims = [
+                d for d in dimensions
+                if _is_numeric_column(d.column)
+            ]
+            if numeric_dims:
+                d0 = numeric_dims[0]
+                add_order(IROrder(kind="column", by=d0.column, table=d0.table, direction=direction))
 
     return ordering, limit
 

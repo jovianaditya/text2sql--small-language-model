@@ -207,6 +207,8 @@ def _render_filter_sql(f: Dict[str, Any], alias: str) -> Optional[str]:
         return None
 
     ref = f"{alias}.{_quote_ident(col)}"
+    other_col = str(f.get("value_column") or "").strip()
+    other_ref = f"{alias}.{_quote_ident(other_col)}" if other_col else ""
     v = f.get("value")
     v2 = f.get("value2")
 
@@ -236,6 +238,14 @@ def _render_filter_sql(f: Dict[str, Any], alias: str) -> Optional[str]:
         return f"{ref} REGEXP {_quote_literal(v)}"
     if op == "is_null_or_empty":
         return f"({ref} IS NULL OR {ref} = '')"
+    if op == "col_gt":
+        return f"{ref} > {other_ref}" if other_ref else None
+    if op == "col_gte":
+        return f"{ref} >= {other_ref}" if other_ref else None
+    if op == "col_lt":
+        return f"{ref} < {other_ref}" if other_ref else None
+    if op == "col_lte":
+        return f"{ref} <= {other_ref}" if other_ref else None
     return None
 
 
@@ -728,6 +738,9 @@ def _validate_ir_identifiers(intent_ir: Dict[str, Any], allowed: Dict[str, Set[s
         table = str(f.get("table") or "").strip().lower()
         if _require_table(table, "filter"):
             _require_column(table, str(f.get("column") or ""), "filter")
+            op = str(f.get("op") or "").strip().lower()
+            if op in {"col_gt", "col_gte", "col_lt", "col_lte"}:
+                _require_column(table, str(f.get("value_column") or ""), "filter_value_column")
 
     for ex in (intent_ir.get("existence") or []):
         if not isinstance(ex, dict):

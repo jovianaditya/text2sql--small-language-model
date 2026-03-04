@@ -14,7 +14,7 @@ Primary target: keep behavior stable when new questions are added, without patch
 Assumptions for this document:
 
 1. This file reflects the current default runtime behavior from `agents.py` and `config.py`.
-2. The examples and route map are aligned to the current 50-case dev benchmark (`run_full.log`).
+2. The examples and route map are aligned to the current default code path; a checked-in `run_full.log` can lag until the benchmark is rerun.
 3. If env knobs are overridden, runtime behavior can differ from this document.
 
 ## 2. Key Terms
@@ -62,16 +62,18 @@ Primary routing principle:
 
 1. Route by supported query family first, not by raw retrieval breadth alone.
 2. `context_table_count` is a secondary signal, not the primary family classifier.
-3. The IR gate is conservative: several single-table query families still prefer the LLM lane even when they look simple.
+3. The IR gate is conservative: tightly resolved single-table top-N is in the active safe subset, and top-N resolution must come from schema-grounded lexical matching rather than phrase-specific rules; same-table date-column comparison remains stricter and still prefers the LLM lane unless a safe compare filter is actually formed.
 
 IR-preferred families:
 
 1. Low-risk single-table lookup/filter/distinct lookup inside the planner-safe subset.
-2. Single-table aggregate/group/having patterns inside the planner-safe subset.
-3. Compact planner-safe aggregate families where effective scope is `<= AGENT_IR_MAX_TABLES`.
-4. Deterministic regex templates only.
-5. Supported percentage intent only when the IR metric is `pct_non_null`.
-6. Simple 2-table deterministic aggregate families that remain planner-safe.
+2. Single-table lookup with schema-grounded numeric column resolution, deterministic top-N ordering, and `LIMIT`.
+3. Experimental single-table lookup with resolved same-table date-column comparison only when a safe compare filter is actually formed.
+4. Single-table aggregate/group/having patterns inside the planner-safe subset.
+5. Compact planner-safe aggregate families where effective scope is `<= AGENT_IR_MAX_TABLES`.
+6. Deterministic regex templates only.
+7. Supported percentage intent only when the IR metric is `pct_non_null`.
+8. Simple 2-table deterministic aggregate families that remain planner-safe.
 
 LLM-preferred families (IR is gated off by current runtime):
 
@@ -82,11 +84,11 @@ LLM-preferred families (IR is gated off by current runtime):
 5. Exclusion / anti-join semantics.
 6. Dual-fact rollups and other fanout-risk patterns.
 7. Multi-table `COUNT(DISTINCT ...)` threshold patterns.
-8. Top-N lookup patterns (`top`, `bottom`, `highest`, `lowest`, `largest`, `smallest`) when routed as lookup with `LIMIT`.
-9. Projection null-fill lookup patterns (for example, `show ... state as 'N/A' when missing`).
-10. Column-to-column comparison lookups (for example, `shippedDate > requiredDate`).
-11. Scalar extrema-date lookup patterns (for example, `on the latest date` lookup shape).
-12. Offset-window phrasing (for example, `previous`, `next`, `prior`, `following` with `ordered by`).
+8. Projection null-fill lookup patterns (for example, `show ... state as 'N/A' when missing`).
+9. Unresolved column-to-column comparison lookups where no safe same-table IR compare filter is formed.
+10. Scalar extrema-date lookup patterns (for example, `on the latest date` lookup shape).
+11. Offset-window phrasing (for example, `previous`, `next`, `prior`, `following` with `ordered by`).
+12. Unresolved top-N lookup patterns where `LIMIT` is found but no high-confidence schema-grounded numeric ordering is formed.
 13. Open / broad regex semantics outside the deterministic regex template family.
 
 IR gate mechanics:
@@ -125,7 +127,7 @@ Exact IR gate reason labels currently emitted by runtime:
 19. `column_to_column_compare_ir_unsupported`
 20. `scalar_extrema_date_subquery_ir_unsupported`
 21. `offset_window_ir_unsupported`
-22. `top_n_lookup_prefers_llm`
+22. `top_n_lookup_ir_unresolved`
 23. `set_operation_ir_unsupported`
 24. `unsupported_ir_filter_op:<op>`
 25. `unsupported_ir_metric:<agg>`
@@ -181,13 +183,13 @@ Operational nuance:
 
 ## 6. Decision Matrix
 
-| Condition | Final lane |
-|-----------|------------|
-| Guard reject | reject |
-| IR gate passes and planner returns SQL | IR |
-| IR not selected and `escalation_reasons` is empty | 3B |
-| IR not selected and `escalation_reasons` is non-empty | 7B |
-| Gate critical fail after draft/refine | rescue then fail-closed |
+|                       Condition                       |        Final lane       |
+|-------------------------------------------------------|-------------------------|
+| Guard reject                                          | reject                  |
+| IR gate passes and planner returns SQL                | IR                      |
+| IR not selected and `escalation_reasons` is empty     | 3B                      |
+| IR not selected and `escalation_reasons` is non-empty | 7B                      |
+| Gate critical fail after draft/refine                 | rescue then fail-closed |
 
 ## 7. Canonical Examples
 
@@ -210,7 +212,7 @@ FROM employees
 WHERE extension REGEXP '^x[0-9]{3}$';
 ```
 
-### Example B: LLM `3B` due to IR gate-off
+### Example B: Top-N Lookup Now Uses `IR`
 
 Question:
 `Show the 10 products with the highest stock levels.`
@@ -218,8 +220,8 @@ Question:
 Expected route:
 
 1. Router computes `SIMPLE -> 3B` as the LLM fallback candidate.
-2. IR is gated off with `top_n_lookup_prefers_llm`.
-3. Draft phase selects the `3B` fallback model and final lane stays `3B`.
+2. IR resolves the numeric sort key from schema-grounded lexical matching, then applies `LIMIT` deterministically.
+3. Final lane becomes `IR` before any LLM model is selected.
 
 Expected SQL shape:
 
@@ -317,85 +319,85 @@ Router knobs:
 8. `AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT`
 9. `AGENT_ROUTER_ALLOW_SIMPLE_SINGLE_TABLE_SUBQUERY_3B`
 
-## 10. Route Map (Current 50-Case Dev Benchmark)
+## 10. Route Map (Current Default Runtime for the 50-Case Dev Benchmark)
 
-This map reflects the current observed final-lane allocation for the working 50-case dev benchmark.
+This map reflects the current default final-lane allocation for the 50-case dev benchmark.
 
 Notes:
 
-1. This is aligned to the current `run_full.log`.
+1. The checked-in `run_full.log` can lag this policy until the benchmark is rerun. The latest `run_easy.log` confirms `E2 -> IR` while `E13` still remains on `3B`.
 2. `IR` means final lane is deterministic planner, even if the router fallback candidate was `3B`.
-3. The easy, medium, and hard tables below all reflect the current benchmark.
+3. The easy, medium, and hard tables below reflect the current code path.
 
 ### 10.1 Easy (E1-E13)
 
-| ID  | Current lane | Note |
-|-----|--------------|------|
-| E1  | IR | Single-table equality filter + simple sort |
-| E2  | 3B | Top-N lookup stays in LLM lane (`top_n_lookup_prefers_llm`) |
-| E3  | IR | Single-table year filter + descending date sort |
-| E4  | IR | Single-table numeric threshold + explicit sort |
-| E5  | IR | Single-table null / empty filter |
-| E6  | IR | Single-table prefix pattern (`LIKE 'prefix%'`) |
-| E7  | IR | Single-table `IN (...)` filter on FK-like code column |
-| E8  | IR | Single-table deterministic regex pattern |
-| E9  | IR | Single-table categorical `IN (...)` filter |
-| E10 | IR | Single-table `BETWEEN` numeric filter |
-| E11 | IR | Single-table lookup with top-level `SELECT DISTINCT` |
-| E12 | 3B | Projection null-fill lookup is outside current IR shape |
-| E13 | 3B | Column-to-column compare is outside current IR filter model |
+| ID  | Current Lane |                                               Note                                             |
+|-----|--------------|------------------------------------------------------------------------------------------------|
+| E1  | IR           | Single-table equality filter + simple sort                                                     |
+| E2  | IR           | Top-N lookup uses IR when schema-grounded numeric ordering + `LIMIT` resolve deterministically |
+| E3  | IR           | Single-table year filter + descending date sort                                                |
+| E4  | IR           | Single-table numeric threshold + explicit sort                                                 |
+| E5  | IR           | Single-table null / empty filter                                                               |
+| E6  | IR           | Single-table prefix pattern (`LIKE 'prefix%'`)                                                 |
+| E7  | IR           | Single-table `IN (...)` filter on FK-like code column                                          |
+| E8  | IR           | Single-table deterministic regex pattern                                                       |
+| E9  | IR           | Single-table categorical `IN (...)` filter                                                     |
+| E10 | IR           | Single-table `BETWEEN` numeric filter                                                          |
+| E11 | IR           | Single-table lookup with top-level `SELECT DISTINCT`                                           |
+| E12 | 3B           | Projection null-fill lookup is outside current IR shape                                        |
+| E13 | 3B           | Current benchmark phrasing still falls back to LLM (`column_to_column_compare_ir_unsupported`) |
 
 ### 10.2 Medium (M1-M20)
 
-| ID  | Current lane | Note |
-|-----|--------------|------|
-| M1  | IR | Single-table aggregate + month grouping |
-| M2  | 3B | CASE-band aggregation |
-| M3  | 3B | Winner-row single-table (payments) |
-| M4  | IR | Single-table group + min/count |
-| M5  | 3B | Group + HAVING aggregate filter |
-| M6  | 3B | Simple scalar subquery single-table |
-| M7  | IR | Supported percentage metric pattern |
-| M8  | IR | Group + HAVING count |
-| M9  | IR | Single-table group + order-by aggregate |
-| M10 | 3B | Window rank single-table |
-| M11 | 3B | Second-highest single-table winner-row |
-| M12 | 3B | Window cumulative single-table |
-| M13 | 3B | Window count partition single-table |
-| M14 | 3B | Window avg partition single-table |
-| M15 | 3B | Window percentage-over-total single-table |
-| M16 | 3B | Simple single-table set operation stays in LLM lane |
-| M17 | IR | Single-table `COUNT(DISTINCT ...)` grouped by order year |
-| M18 | 3B | Offset window (`LAG`) single-table |
-| M19 | 3B | Scalar extrema-date subquery single-table |
-| M20 | IR | Single-table `COUNT(DISTINCT ...)` + HAVING |
+| ID  | Current Lane |                          Note                            |
+|-----|--------------|----------------------------------------------------------|
+| M1  | IR           | Single-table aggregate + month grouping                  |
+| M2  | 3B           | CASE-band aggregation                                    |
+| M3  | 3B           | Winner-row single-table (payments)                       |
+| M4  | IR           | Single-table group + min/count                           |
+| M5  | 3B           | Group + HAVING aggregate filter                          |
+| M6  | 3B           | Simple scalar subquery single-table                      |
+| M7  | IR           | Supported percentage metric pattern                      |
+| M8  | IR           | Group + HAVING count                                     |
+| M9  | IR           | Single-table group + order-by aggregate                  |
+| M10 | 3B           | Window rank single-table                                 |
+| M11 | 3B           | Second-highest single-table winner-row                   |
+| M12 | 3B           | Window cumulative single-table                           |
+| M13 | 3B           | Window count partition single-table                      |
+| M14 | 3B           | Window avg partition single-table                        |
+| M15 | 3B           | Window percentage-over-total single-table                |
+| M16 | 3B           | Simple single-table set operation stays in LLM lane      |
+| M17 | IR           | Single-table `COUNT(DISTINCT ...)` grouped by order year |
+| M18 | 3B           | Offset window (`LAG`) single-table                       |
+| M19 | 3B           | Scalar extrema-date subquery single-table                |
+| M20 | IR           | Single-table `COUNT(DISTINCT ...)` + HAVING              |
 
 ### 10.3 Hard (H1-H17)
 
-| ID  | Current lane | Note |
-|-----|--------------|------|
-| H1  | IR | Multi-table aggregate, planner-safe family |
-| H2  | IR | Simple 2-table existence + grouped count |
-| H3  | IR | Simple 2-table join + grouped sum |
-| H4  | 3B | Simple multi-join + grouped sum |
-| H5  | 3B | Null-preserving multi-table rollup stays in LLM lane but does not escalate |
-| H6  | 7B | Explicit ranking in multi-table context |
-| H7  | 7B | Multi-table winner-row pattern |
-| H8  | 7B | Multi-table winner-row / derived-subquery pattern |
-| H9  | 7B | Complex subquery intent |
-| H10 | 7B | Multi-table winner-row pattern |
-| H11 | 3B | Current phrasing stays in 3B (no router escalation reason fired) |
-| H12 | 7B | Multi-table complex subquery intent |
-| H13 | 7B | Multi-table winner-row + exclusion |
-| H14 | 7B | Dual-fact rollup fanout-risk pattern |
-| H15 | 7B | Cross-table exclusion |
-| H16 | 7B | Multi-table `COUNT(DISTINCT ...)` threshold |
-| H17 | 7B | Multi-table winner-row per group |
+| ID  | Current Lane |                                 Note                                       |
+|-----|--------------|----------------------------------------------------------------------------|
+| H1  | IR           | Multi-table aggregate, planner-safe family                                 |
+| H2  | IR           | Simple 2-table existence + grouped count                                   |
+| H3  | IR           | Simple 2-table join + grouped sum                                          |
+| H4  | 3B           | Simple multi-join + grouped sum                                            |
+| H5  | 3B           | Null-preserving multi-table rollup stays in LLM lane but does not escalate |
+| H6  | 7B           | Explicit ranking in multi-table context                                    |
+| H7  | 7B           | Multi-table winner-row pattern                                             |
+| H8  | 7B           | Multi-table winner-row / derived-subquery pattern                          |
+| H9  | 7B           | Complex subquery intent                                                    |
+| H10 | 7B           | Multi-table winner-row pattern                                             |
+| H11 | 3B           | Current phrasing stays in 3B (no router escalation reason fired)           |
+| H12 | 7B           | Multi-table complex subquery intent                                        |
+| H13 | 7B           | Multi-table winner-row + exclusion                                         |
+| H14 | 7B           | Dual-fact rollup fanout-risk pattern                                       |
+| H15 | 7B           | Cross-table exclusion                                                      |
+| H16 | 7B           | Multi-table `COUNT(DISTINCT ...)` threshold                                |
+| H17 | 7B           | Multi-table winner-row per group                                           |
 
-### 10.4 Current Observed Split (50-Case Dev Benchmark)
+### 10.4 Current Expected Split (50-Case Dev Benchmark)
 
-1. Final `IR`: 20/50
-2. Final `3B`: 19/50
+1. Final `IR`: 21/50
+2. Final `3B`: 18/50
 3. Final `7B`: 11/50
 4. Router fallback candidate `SIMPLE`: 39/50
 5. Router fallback candidate `COMPLEX`: 11/50
@@ -419,4 +421,4 @@ Acceptance criteria for a routing patch:
 1. No regression on the benchmark.
 2. Reduced hard-error frequency on new questions.
 3. No uncontrolled increase in `7B` usage or latency.
-4. If the 50-case dev route mix moves materially away from the current baseline (`IR=20`, `3B=19`, `7B=11`), treat that as a deliberate policy change and document why.
+4. If the 50-case dev route mix moves materially away from the current baseline (`IR=21`, `3B=18`, `7B=11`), treat that as a deliberate policy change and document why.
