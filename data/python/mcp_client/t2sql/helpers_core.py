@@ -12892,15 +12892,25 @@ def _question_requests_ordering(question: str) -> bool:
         return True
     
     # --- Pattern 3: Superlative / ranking output (implies ORDER BY + LIMIT) ---
-    # "top 10", "highest", "lowest", etc. → needs ORDER BY
+    # Keep this conservative. Bare "first"/"last" is too ambiguous because it
+    # often appears in projection phrases like "first names" / "last names".
+    # Treat "first"/"last" as ordering only in bounded row-selection shapes.
     superlative_keywords = [
-        "top ", "bottom ", "first ", "last ",
+        "top ", "bottom ",
         "highest", "lowest", "most expensive", "cheapest",
         "terbesar", "terkecil", "tertinggi", "terendah", 
         "termahal", "termurah", "terbaru", "terlama",
     ]
     
     if any(k in q for k in superlative_keywords):
+        return True
+
+    first_last_row_selection_patterns = [
+        r"\b(?:first|last)\s+\d+\b",
+        r"\b(?:first|last)\s+(?:row|rows|record|records|entry|entries|result|results)\b",
+        r"\b(?:the\s+)?(?:first|last)\s+page\b",
+    ]
+    if any(re.search(pat, q) for pat in first_last_row_selection_patterns):
         return True
     
     # --- Pattern 4: Explicit sort direction (only if NOT in window context) ---

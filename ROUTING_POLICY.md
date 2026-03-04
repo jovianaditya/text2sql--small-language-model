@@ -41,8 +41,9 @@ Assumptions for this document:
    - deterministic IR semantic repair
    - LLM semantic fallback using the router fallback candidate
    - one optional semantic escalation to `7B` if the router candidate was `3B`
-9. If the gate has a critical failure, runtime does bounded rescue.
-10. If the query still has a critical failure, runtime fail-closes (`FINAL_GATE_BLOCKED`) and does not execute unsafe SQL.
+9. On the LLM path, a whitelisted non-critical semantic mismatch at the final pre-exec acceptance gate triggers bounded semantic retry instead of immediate execution.
+10. If the gate has a critical failure, runtime does bounded rescue.
+11. If the query still has a critical failure, runtime fail-closes (`FINAL_GATE_BLOCKED`) and does not execute unsafe SQL.
 
 Observable logging behavior:
 
@@ -50,7 +51,8 @@ Observable logging behavior:
 2. Logs then show the IR gate result.
 3. If IR is not used, the drafter logs the actual fallback selection before LLM inference.
 4. If IR draft SQL hits the semantic-recovery path, logs show `Semantic repair` and, when needed, `Semantic fallback`.
-5. Final logs may therefore show `LLM Candidate: 3b -> Final: ir_planner` for clean IR, or a `3B`/`7B` final model if bounded semantic fallback replaced the IR SQL.
+5. On the LLM path, logs show `[LLM] Semantic retry: not needed`, `eligible`, or `skipped (non-whitelisted)` at the final pre-exec acceptance gate.
+6. Final logs may therefore show `LLM Candidate: 3b -> Final: ir_planner` for clean IR, or a `3B`/`7B` final model if bounded semantic fallback or bounded LLM semantic retry replaced the original draft SQL.
 
 ## 4. IR Gate Policy (Current Runtime)
 
@@ -299,18 +301,31 @@ Non-critical reasons:
 Policy:
 
 1. Critical failure triggers retry/rescue logic.
-2. On the IR path, `semantic_contract_mismatch` does not immediately force execution. Runtime first tries bounded semantic recovery when all semantic failures are inside the current safe whitelist:
+2. `missing_order_by` is evaluated against final-result ordering intent, not raw sort words alone. Window-ranking phrasing such as `rank ... in descending order` does not by itself require a top-level `ORDER BY`, a top-level `ORDER BY` on a set-operation root (for example, `UNION ... ORDER BY`) satisfies the contract, and projection phrases such as `first names` / `last names` do not count as ordering intent.
+3. On the LLM path, `semantic_contract_mismatch` does not immediately force execution when all semantic failures are inside the current safe whitelist:
+   - `missing_order_by`
+   - `missing_limit`
+   - `unparsed_limit`
+   - `limit_mismatch:*`
+   - `missing_agg_count`
+   - `missing_agg_sum`
+   - `missing_agg_avg`
+4. LLM semantic retry order is:
+   - bounded regeneration starting from the current draft model (`3B` or `7B`)
+   - one targeted retry with the same model if the first regenerated SQL still fails the gate
+   - one optional escalation to `7B` only when the original retry model was `3B`
+5. On the IR path, `semantic_contract_mismatch` does not immediately force execution. Runtime first tries bounded semantic recovery when all semantic failures are inside the current safe whitelist:
    - `missing_order_by`
    - `missing_limit`
    - `limit_mismatch:*`
    - `missing_agg_count`
    - `missing_agg_sum`
    - `missing_agg_avg`
-3. IR semantic recovery order is:
+6. IR semantic recovery order is:
    - deterministic rebuild from `intent_ir`
    - LLM semantic fallback using the router fallback candidate
    - one optional semantic escalation to `7B` if the router fallback candidate was `3B`
-4. If bounded semantic recovery still does not clear the mismatch and the failure remains non-critical, runtime can continue with warning.
+7. If bounded semantic recovery or bounded LLM semantic retry still does not clear the mismatch and the failure remains non-critical, runtime can continue with warning.
 
 ## 9. Operational Knobs
 

@@ -2461,17 +2461,11 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     if not q:
         return contract
 
-    explicit_sort_phrase = bool(
-        re.search(
-            r"\b(order(?:ed)?\s+by|sort(?:ed)?\s+by|ascending|descending|asc|desc)\b",
-            q,
-        )
-    )
-
-    # IMPORTANT:
-    # For acceptance-gate semantics we only enforce ORDER BY on explicit
-    # sorting cues. Heuristic sort detectors may misfire on projection phrases
-    # such as "first names, last names" (not sorting intent).
+    # Reuse the shared final-order detector so acceptance-gate semantics stay
+    # aligned with the refiner contract logic. This avoids false positives on
+    # window-ranking prompts where "descending order" belongs inside OVER (...),
+    # not as a top-level ORDER BY requirement.
+    explicit_sort_phrase = _question_requests_ordering(question)
     contract["requires_order_by"] = explicit_sort_phrase
 
     # Ordinal per-group winner pattern (e.g. "second highest per customer")
@@ -2604,18 +2598,27 @@ def _evaluate_semantic_contract(
     if not contract:
         return failures
 
+    def _semantic_clause_arg(name: str) -> Any:
+        # For set-operation roots (e.g. UNION ... ORDER BY), semantic clauses
+        # live on the top-level parsed expression, not necessarily on the first
+        # inner SELECT returned by parsed.find(exp.Select).
+        root_arg = getattr(parsed, "args", {}).get(name)
+        if root_arg is not None:
+            return root_arg
+        return getattr(sel, "args", {}).get(name)
+
     requires_order = bool(contract.get("requires_order_by"))
     required_limit = contract.get("required_limit")
     required_aggs = {str(a).upper() for a in (contract.get("required_aggs") or []) if str(a).strip()}
 
     if requires_order:
-        order_arg = sel.args.get("order")
-        has_order = bool(order_arg is not None and (order_arg.expressions or []))
+        order_arg = _semantic_clause_arg("order")
+        has_order = bool(order_arg is not None and (getattr(order_arg, "expressions", None) or []))
         if not has_order:
             failures.append("missing_order_by")
 
     if required_limit is not None:
-        limit_arg = sel.args.get("limit")
+        limit_arg = _semantic_clause_arg("limit")
         if limit_arg is None:
             failures.append("missing_limit")
         else:
@@ -3284,6 +3287,40 @@ def _is_ir_semantic_fallback_gate(gate: Dict[str, Any]) -> bool:
         if failure in _IR_SEMANTIC_FALLBACK_FAILURES:
             continue
         if any(failure.startswith(prefix) for prefix in _IR_SEMANTIC_FALLBACK_FAILURE_PREFIXES):
+            continue
+        return False
+    return True
+
+
+_LLM_SEMANTIC_RETRY_FAILURE_PREFIXES = ("limit_mismatch:",)
+_LLM_SEMANTIC_RETRY_FAILURES = {
+    "missing_order_by",
+    "missing_limit",
+    "unparsed_limit",
+    "missing_agg_count",
+    "missing_agg_sum",
+    "missing_agg_avg",
+}
+
+
+def _is_llm_semantic_retry_gate(gate: Dict[str, Any]) -> bool:
+    if not gate or bool(gate.get("accepted", False)):
+        return False
+    if _is_critical_gate_failure(gate):
+        return False
+
+    reasons = {str(r) for r in (gate.get("reasons") or []) if str(r).strip()}
+    if not reasons or not reasons.issubset({"semantic_contract_mismatch"}):
+        return False
+
+    failures = [str(f) for f in (gate.get("semantic_failures") or []) if str(f).strip()]
+    if not failures:
+        return False
+
+    for failure in failures:
+        if failure in _LLM_SEMANTIC_RETRY_FAILURES:
+            continue
+        if any(failure.startswith(prefix) for prefix in _LLM_SEMANTIC_RETRY_FAILURE_PREFIXES):
             continue
         return False
     return True
@@ -5394,11 +5431,33 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         final_sql = gated_sql
         corrections.append("Deterministic acceptance gate rewrites applied")
 
+    pre_reason_labels = {str(r) for r in (pre_gate.get("reasons") or []) if str(r).strip()}
+    llm_semantic_retry_eligible = _is_llm_semantic_retry_gate(pre_gate)
+    if pre_gate.get("accepted", False):
+        print("[LLM] Semantic retry: not needed")
+    elif llm_semantic_retry_eligible:
+        print("[LLM] Semantic retry: eligible")
+    elif pre_reason_labels and pre_reason_labels.issubset({"semantic_contract_mismatch"}):
+        print("[LLM] Semantic retry: skipped (non-whitelisted)")
+
     if not needs_regeneration and not pre_gate.get("accepted", False):
-        pre_reasons = {str(r) for r in (pre_gate.get("reasons") or [])}
-        # Soft semantic mismatch only: keep original SQL, avoid risky regen churn.
-        # We still surface warning for observability and allow final execution.
-        if pre_reasons and pre_reasons.issubset({"semantic_contract_mismatch"}):
+        pre_reasons = pre_reason_labels
+        if llm_semantic_retry_eligible:
+            _dbg_agent3_retry("Acceptance Gate - Semantic", f"{pre_gate.get('semantic_failures')}")
+            extra_instruction = _build_gate_retry_instruction(
+                (
+                    "STRICT REQUIREMENT: The SQL is structurally valid but still mismatches the "
+                    "question's semantic contract. Fix only the ORDER BY/LIMIT/aggregate mismatch "
+                    "while preserving already-valid identifiers and join structure."
+                ),
+                pre_gate,
+            )
+            needs_regeneration = True
+            regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
+            corrections.append("Bounded LLM semantic retry requested")
+        # Non-whitelisted soft semantic mismatch: keep original SQL to avoid
+        # churn on lower-confidence semantics, but keep the warning visible.
+        elif pre_reasons and pre_reasons.issubset({"semantic_contract_mismatch"}):
             corrections.append(f"Soft semantic warning: {sorted(pre_reasons)}")
         else:
             _dbg_agent3_retry("Acceptance Gate", f"{pre_gate.get('reasons')}")
