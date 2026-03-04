@@ -34,18 +34,23 @@ Assumptions for this document:
 2. Retrieval builds context and allowed identifiers.
 3. Router detects tables, computes signals, and stores an LLM fallback candidate (`3B` or `7B`).
 4. The draft phase then builds `intent_ir` and runs the IR gate before any LLM model is selected for execution.
-5. If IR is enabled, eligible, plannable, and the planner returns SQL, final lane becomes `IR` and no LLM model is invoked.
+5. If IR is enabled, eligible, plannable, and the planner returns SQL, the draft source becomes `IR` and no LLM model is invoked in the draft phase.
 6. If IR is gated off or the planner fails, the draft phase selects the actual LLM model from the router fallback candidate and runs the LLM lane.
 7. Refiner + acceptance gate always run before execution.
-8. If the gate has a critical failure, runtime does bounded rescue.
-9. If the query still has a critical failure, runtime fail-closes (`FINAL_GATE_BLOCKED`) and does not execute unsafe SQL.
+8. On the IR path, a whitelisted non-critical semantic mismatch triggers bounded semantic recovery in this order:
+   - deterministic IR semantic repair
+   - LLM semantic fallback using the router fallback candidate
+   - one optional semantic escalation to `7B` if the router candidate was `3B`
+9. If the gate has a critical failure, runtime does bounded rescue.
+10. If the query still has a critical failure, runtime fail-closes (`FINAL_GATE_BLOCKED`) and does not execute unsafe SQL.
 
 Observable logging behavior:
 
 1. Logs show the router fallback candidate first.
 2. Logs then show the IR gate result.
 3. If IR is not used, the drafter logs the actual fallback selection before LLM inference.
-4. Final logs may therefore show `LLM Candidate: 3b -> Final: ir_planner`.
+4. If IR draft SQL hits the semantic-recovery path, logs show `Semantic repair` and, when needed, `Semantic fallback`.
+5. Final logs may therefore show `LLM Candidate: 3b -> Final: ir_planner` for clean IR, or a `3B`/`7B` final model if bounded semantic fallback replaced the IR SQL.
 
 ## 4. IR Gate Policy (Current Runtime)
 
@@ -103,6 +108,7 @@ IR gate mechanics:
 4. `dynamic_min_conf` starts at `0.80`.
 5. If `table_count > 1`, `dynamic_min_conf` becomes `max(current, 0.90)`.
 6. If the IR gate passes but `build_sql_from_intent(...)` fails, runtime falls back to the router-computed LLM fallback candidate.
+7. If the IR draft passes planning but later hits a whitelisted semantic-only acceptance mismatch, runtime can still hand off to bounded semantic recovery before execution.
 
 Exact IR gate reason labels currently emitted by runtime:
 
@@ -286,14 +292,25 @@ Critical reasons (must block or rescue):
 5. `invalid_join_path`
 6. `fanout_risk_dual_fact`
 
-Non-critical reasons (warning-only unless combined with a critical reason):
+Non-critical reasons:
 
 1. `semantic_contract_mismatch`
 
 Policy:
 
 1. Critical failure triggers retry/rescue logic.
-2. Non-critical-only failure can continue with warning.
+2. On the IR path, `semantic_contract_mismatch` does not immediately force execution. Runtime first tries bounded semantic recovery when all semantic failures are inside the current safe whitelist:
+   - `missing_order_by`
+   - `missing_limit`
+   - `limit_mismatch:*`
+   - `missing_agg_count`
+   - `missing_agg_sum`
+   - `missing_agg_avg`
+3. IR semantic recovery order is:
+   - deterministic rebuild from `intent_ir`
+   - LLM semantic fallback using the router fallback candidate
+   - one optional semantic escalation to `7B` if the router fallback candidate was `3B`
+4. If bounded semantic recovery still does not clear the mismatch and the failure remains non-critical, runtime can continue with warning.
 
 ## 9. Operational Knobs
 

@@ -3256,6 +3256,205 @@ def _attempt_last_chance_rescue_7b(
     return result
 
 
+_IR_SEMANTIC_FALLBACK_FAILURE_PREFIXES = ("limit_mismatch:",)
+_IR_SEMANTIC_FALLBACK_FAILURES = {
+    "missing_order_by",
+    "missing_limit",
+    "missing_agg_count",
+    "missing_agg_sum",
+    "missing_agg_avg",
+}
+
+
+def _is_ir_semantic_fallback_gate(gate: Dict[str, Any]) -> bool:
+    if not gate or bool(gate.get("accepted", False)):
+        return False
+    if _is_critical_gate_failure(gate):
+        return False
+
+    reasons = {str(r) for r in (gate.get("reasons") or []) if str(r).strip()}
+    if not reasons or not reasons.issubset({"semantic_contract_mismatch"}):
+        return False
+
+    failures = [str(f) for f in (gate.get("semantic_failures") or []) if str(f).strip()]
+    if not failures:
+        return False
+
+    for failure in failures:
+        if failure in _IR_SEMANTIC_FALLBACK_FAILURES:
+            continue
+        if any(failure.startswith(prefix) for prefix in _IR_SEMANTIC_FALLBACK_FAILURE_PREFIXES):
+            continue
+        return False
+    return True
+
+
+def _attempt_ir_semantic_repair(
+    *,
+    question: str,
+    ctx: str,
+    state: RAGState,
+    current_sql: str,
+    gate: Dict[str, Any],
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "used": False,
+        "accepted": False,
+        "sql": (current_sql or "").strip(),
+        "gate": gate,
+        "error": "",
+    }
+
+    if not _is_ir_semantic_fallback_gate(gate):
+        return result
+
+    _dbg_print_two("[IR] Semantic repair", "Rebuilding deterministic SQL from intent_ir")
+    result["used"] = True
+
+    rebuilt_intent = build_intent_ir(
+        question=question,
+        ctx=ctx,
+        router_decision=state.get("router_decision", {}),
+        primary_table=state.get("primary_table", ""),
+    )
+    candidate_intent = dict(rebuilt_intent or state.get("intent_ir") or {})
+    if not candidate_intent:
+        result["error"] = "semantic_repair_missing_intent_ir"
+        return result
+
+    semantic_contract = gate.get("semantic_contract") or {}
+    required_limit = semantic_contract.get("required_limit")
+    if isinstance(required_limit, int) and required_limit > 0:
+        candidate_intent["limit"] = int(required_limit)
+
+    planned_sql, plan_meta = build_sql_from_intent(candidate_intent, ctx)
+    if not planned_sql:
+        result["error"] = ",".join(str(e) for e in (plan_meta.get("errors") or [])) or "semantic_repair_empty_sql"
+        return result
+
+    candidate_sql, _ = safety_normalize_sql(planned_sql)
+    candidate_gate = _deterministic_sql_acceptance_gate(
+        candidate_sql,
+        ctx=ctx,
+        question=question,
+        strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+    )
+    candidate_sql = str(candidate_gate.get("sql") or candidate_sql).strip()
+    if candidate_sql and not candidate_sql.endswith(";"):
+        candidate_sql += ";"
+
+    result["sql"] = candidate_sql
+    result["gate"] = candidate_gate
+    result["accepted"] = bool(candidate_gate.get("accepted", False))
+    if not result["accepted"]:
+        result["error"] = "semantic_repair_gate_failed"
+    return result
+
+
+def _attempt_ir_semantic_fallback_llm(
+    *,
+    question: str,
+    ctx: str,
+    current_sql: str,
+    gate: Dict[str, Any],
+    model_name: str,
+    intent_ir: Optional[Dict[str, Any]] = None,
+    strict_join_key: bool = False,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "used": False,
+        "accepted": False,
+        "sql": (current_sql or "").strip(),
+        "gate": gate,
+        "model": str(model_name or "").strip(),
+        "error": "",
+    }
+
+    if not _is_ir_semantic_fallback_gate(gate):
+        return result
+    if model_name not in {SMALL_MODEL, LARGE_MODEL}:
+        result["error"] = "semantic_fallback_invalid_model"
+        return result
+
+    result["used"] = True
+    model_label = "7B" if model_name == LARGE_MODEL else "3B"
+    _dbg_print_two("[IR] Semantic fallback", f"Regenerating with {model_label}")
+
+    semantic_failures = [str(f) for f in (gate.get("semantic_failures") or []) if str(f).strip()]
+    semantic_contract = gate.get("semantic_contract") or {}
+
+    contract_parts: List[str] = []
+    if semantic_contract.get("requires_order_by"):
+        contract_parts.append("ORDER BY required")
+    if semantic_contract.get("required_limit") is not None:
+        contract_parts.append(f"LIMIT {semantic_contract.get('required_limit')}")
+    required_aggs = [str(a).upper() for a in (semantic_contract.get("required_aggs") or []) if str(a).strip()]
+    if required_aggs:
+        contract_parts.append(f"aggregates={required_aggs}")
+
+    ir_summary_parts: List[str] = []
+    ir_payload = intent_ir or {}
+    ir_qtype = str(ir_payload.get("qtype") or "").strip()
+    ir_subject = str(ir_payload.get("subject_entity") or "").strip()
+    if ir_qtype:
+        ir_summary_parts.append(f"qtype={ir_qtype}")
+    if ir_subject:
+        ir_summary_parts.append(f"subject={ir_subject}")
+    ir_limit = ir_payload.get("limit")
+    if isinstance(ir_limit, int) and ir_limit > 0:
+        ir_summary_parts.append(f"limit={ir_limit}")
+
+    instruction_lines = [
+        "SEMANTIC FALLBACK: Rewrite the SQL so it satisfies the semantic contract. Return one valid MySQL SELECT only.",
+        f"- Current IR SQL: {str(current_sql or '').strip()}",
+        f"- Semantic failures: {semantic_failures}",
+    ]
+    if contract_parts:
+        instruction_lines.append(f"- Semantic requirements: {'; '.join(contract_parts)}")
+    if ir_summary_parts:
+        instruction_lines.append(f"- Intent IR summary: {'; '.join(ir_summary_parts)}")
+    instruction_lines.extend(
+        [
+            "- Preserve the intended tables and columns when they are valid.",
+            "- Do NOT invent identifiers outside ALLOWED IDENTIFIERS.",
+        ]
+    )
+
+    allowed_snapshot = _allowed_identifiers_snapshot(ctx)
+    if allowed_snapshot:
+        instruction_lines.append(allowed_snapshot)
+
+    llm_fallback = build_llm_repair(model=model_name)
+    regenerated_sql, _ = regenerate_with_extra_constraint(
+        llm_fallback,
+        make_generation_prompt,
+        ctx,
+        question,
+        "\n".join(instruction_lines),
+    )
+    if not regenerated_sql:
+        result["error"] = "semantic_fallback_empty_sql"
+        return result
+
+    candidate_sql = normalize_sql_pipeline(str(regenerated_sql).strip(), question, ctx)
+    candidate_gate = _deterministic_sql_acceptance_gate(
+        candidate_sql,
+        ctx=ctx,
+        question=question,
+        strict_join_key=strict_join_key,
+    )
+    candidate_sql = str(candidate_gate.get("sql") or candidate_sql).strip()
+    if candidate_sql and not candidate_sql.endswith(";"):
+        candidate_sql += ";"
+
+    result["sql"] = candidate_sql
+    result["gate"] = candidate_gate
+    result["accepted"] = bool(candidate_gate.get("accepted", False))
+    if not result["accepted"]:
+        result["error"] = "semantic_fallback_gate_failed"
+    return result
+
+
 def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM_MAX_RETRIES) -> bool:
         global _last_model_warmup
         # Get keep_alive in seconds
@@ -4109,6 +4308,9 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if draft_source == "ir_planner":
         final_sql, warnings = safety_normalize_sql(draft_sql)
         corrections = ["Deterministic IR planner output"]
+        ir_semantic_repair_used = False
+        ir_semantic_fallback_used = False
+        ir_semantic_fallback_model = ""
         gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
         current_gate = gate
         final_sql = str(gate.get("sql") or final_sql)
@@ -4133,8 +4335,96 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     f"Post-fallback acceptance warnings: {gate_after_fallback.get('reasons')}"
                 )
 
+        semantic_seed_sql = final_sql
+        semantic_fallback_eligible = _is_ir_semantic_fallback_gate(current_gate)
+        if current_gate.get("accepted", False):
+            print("[IR] Semantic fallback: not needed")
+        elif semantic_fallback_eligible:
+            print("[IR] Semantic fallback: eligible")
+        elif _is_critical_gate_failure(current_gate):
+            print("[IR] Semantic fallback: skipped (critical gate path)")
+        else:
+            print("[IR] Semantic fallback: skipped (non-whitelisted)")
+
+        if not current_gate.get("accepted", False) and semantic_fallback_eligible:
+            semantic_repair = _attempt_ir_semantic_repair(
+                question=question,
+                ctx=ctx,
+                state=state,
+                current_sql=final_sql,
+                gate=current_gate,
+            )
+            if semantic_repair.get("used", False):
+                semantic_seed_sql = str(semantic_repair.get("sql") or semantic_seed_sql).strip() or semantic_seed_sql
+            if semantic_repair.get("accepted", False):
+                final_sql = str(semantic_repair.get("sql") or final_sql).strip()
+                current_gate = semantic_repair.get("gate") or current_gate
+                ir_semantic_repair_used = True
+                corrections.append("Deterministic IR semantic repair succeeded")
+                print("[IR] Semantic fallback: not needed after deterministic repair")
+            elif semantic_repair.get("used", False):
+                corrections.append(
+                    f"Deterministic IR semantic repair did not clear gate: {semantic_repair.get('error') or (semantic_repair.get('gate') or {}).get('reasons')}"
+                )
+
+        semantic_fallback_eligible = _is_ir_semantic_fallback_gate(current_gate)
+        if not current_gate.get("accepted", False) and semantic_fallback_eligible:
+            fallback_model = str(
+                state.get("router_model_candidate")
+                or (LARGE_MODEL if (decision.get("escalation_reasons") or []) else SMALL_MODEL)
+                or SMALL_MODEL
+            ).strip()
+
+            semantic_fallback = _attempt_ir_semantic_fallback_llm(
+                question=question,
+                ctx=ctx,
+                current_sql=semantic_seed_sql,
+                gate=current_gate,
+                model_name=fallback_model,
+                intent_ir=state.get("intent_ir") or {},
+                strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+            )
+            if semantic_fallback.get("accepted", False):
+                final_sql = str(semantic_fallback.get("sql") or final_sql).strip()
+                current_gate = semantic_fallback.get("gate") or current_gate
+                ir_semantic_fallback_used = True
+                ir_semantic_fallback_model = str(semantic_fallback.get("model") or fallback_model)
+                corrections.append(
+                    "IR semantic fallback succeeded "
+                    f"({'7B' if ir_semantic_fallback_model == LARGE_MODEL else '3B'})"
+                )
+            elif semantic_fallback.get("used", False):
+                corrections.append(
+                    f"IR semantic fallback ({'7B' if fallback_model == LARGE_MODEL else '3B'}) did not clear gate"
+                )
+
+            if (
+                not current_gate.get("accepted", False)
+                and _is_ir_semantic_fallback_gate(current_gate)
+                and fallback_model != LARGE_MODEL
+            ):
+                semantic_fallback_7b = _attempt_ir_semantic_fallback_llm(
+                    question=question,
+                    ctx=ctx,
+                    current_sql=semantic_seed_sql,
+                    gate=current_gate,
+                    model_name=LARGE_MODEL,
+                    intent_ir=state.get("intent_ir") or {},
+                    strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+                )
+                if semantic_fallback_7b.get("accepted", False):
+                    final_sql = str(semantic_fallback_7b.get("sql") or final_sql).strip()
+                    current_gate = semantic_fallback_7b.get("gate") or current_gate
+                    ir_semantic_fallback_used = True
+                    ir_semantic_fallback_model = LARGE_MODEL
+                    corrections.append("IR semantic fallback escalated and succeeded (7B)")
+                elif semantic_fallback_7b.get("used", False):
+                    corrections.append("IR semantic fallback escalation (7B) did not clear gate")
+
         rescue_7b_used = False
         ir_final_model = "ir_planner"
+        if ir_semantic_fallback_used and ir_semantic_fallback_model:
+            ir_final_model = ir_semantic_fallback_model
         if not current_gate.get("accepted", False) and _is_critical_gate_failure(current_gate):
             _dbg_safety_block("IR", f"{current_gate.get('reasons')}")
             rescue = _attempt_last_chance_rescue_7b(
@@ -4187,6 +4477,9 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             "final_gate_pass": bool(current_gate.get("accepted", False)),
             "final_gate_reasons": list(current_gate.get("reasons") or []),
             "rescue_7b_used": bool(rescue_7b_used),
+            "ir_semantic_repair_used": bool(ir_semantic_repair_used),
+            "ir_semantic_fallback_used": bool(ir_semantic_fallback_used),
+            "ir_semantic_fallback_model": ir_semantic_fallback_model,
         }
 
     # DYNAMIC MODEL SELECTION berdasarkan draft quality

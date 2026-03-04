@@ -43,6 +43,9 @@ class RAGState(TypedDict, total=False):
     ir_gate_reasons: List[str]
     ir_table_count: int
     ir_context_table_count: int
+    ir_semantic_repair_used: bool
+    ir_semantic_fallback_used: bool
+    ir_semantic_fallback_model: str
     # Jenis query hasil classifier ('lookup', 'aggregate', 'rank', dst.)
     qtype: str
     # Flag apakah pertanyaan ini butuh REGEXP/pattern handling
@@ -89,6 +92,9 @@ def make_state(paths, question: str) -> RAGState:
         "ir_gate_reasons": [],
         "ir_table_count": 0,
         "ir_context_table_count": 0,
+        "ir_semantic_repair_used": False,
+        "ir_semantic_fallback_used": False,
+        "ir_semantic_fallback_model": "",
         "qtype": "",
         "requires_regex": False,
         "agent_notes": "",
