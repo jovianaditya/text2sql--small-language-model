@@ -5,7 +5,8 @@
 # - Batch evaluation script for Text-to-SQL pipeline using MCP client.
 # - Loads test cases from YAML file.
 # - Executes predicted SQL and groundtruth SQL against MCP database.
-# - Currently only compares results for Execution Accuracy (EX) and Valid SQL (VA) checks.
+# - Compares results for Valid SQL (VA), Execution Accuracy (EX), and Test Suite (TS)
+#   across multiple database distributions.
 
 # ======================================================================
 # ====================== STANDARD LIBRARY IMPORT =======================
@@ -376,9 +377,18 @@ def compare_results(
         return False, f"Comparison error: {e}"
 
 
-def save_to_excel(results: list, fieldnames: list, output_path: str, 
-                  by_difficulty: dict, total: int, exec_success: int, 
-                  result_match: int, latencies: list):
+def save_to_excel(
+    results: list,
+    fieldnames: list,
+    output_path: str,
+    by_difficulty: dict,
+    total: int,
+    exec_success: int,
+    result_match: int,
+    latencies: list,
+    ts_total_cases: int = 0,
+    ts_success_cases: int = 0,
+):
     """Save evaluation results to formatted Excel file."""
     
     # Calculate avg latency per difficulty (in seconds)
@@ -423,6 +433,11 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
         ("Total Cases", total, ""),
         ("Result Match (VA)", sum(r.get("va_success", 0) for r in results), f"{100*sum(r.get('va_success', 0) for r in results)/total:.1f}%"),
         ("Result Match (EX)", result_match, f"{100*result_match/total:.1f}%"),
+        (
+            "Test Suite (TS)",
+            ts_success_cases if ts_total_cases else "N/A",
+            f"{100*ts_success_cases/ts_total_cases:.1f}%" if ts_total_cases else "N/A",
+        ),
         ("Average Latency (s)", f"{avg_latency_sec:.2f}" if latencies else "N/A", ""),
     ]
     
@@ -445,6 +460,8 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
         "Percentage VA Success (%)",
         "VA Success",
         "Percentage EX Match (%)",
+        "TS Success",
+        "Percentage TS Success (%)",
         "Avg Latency (s)"
     ]
     for col_idx, h in enumerate(diff_header, start=1):
@@ -457,12 +474,15 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
         t = stats["total"]
         ex_match = stats["result_match"]
         va = stats.get("va_success", 0)
+        ts_cases = stats.get("ts_cases", 0)
+        ts_success = stats.get("ts_success", 0)
+        ts_pct = f"{100*ts_success/ts_cases:.1f}%" if ts_cases else "N/A"
         # Calculate avg latency for this difficulty
         diff_latencies = latency_by_diff.get(d, [])
         avg_lat = f"{sum(diff_latencies)/len(diff_latencies):.2f}" if diff_latencies else "N/A"
         pct_va = f"{100*va/t:.1f}%" if t else "N/A"
         pct_ex = f"{100*ex_match/t:.1f}%" if t else "N/A"
-        row_data = [d, t, ex_match, pct_va, va, pct_ex, avg_lat]
+        row_data = [d, t, ex_match, pct_va, va, pct_ex, ts_success, ts_pct, avg_lat]
         for col_idx, value in enumerate(row_data, start=1):
             cell = ws_summary.cell(row=row_idx, column=col_idx, value=value)
             cell.border = border
@@ -474,6 +494,9 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     ws_summary.column_dimensions['D'].width = 15
     ws_summary.column_dimensions['E'].width = 12
     ws_summary.column_dimensions['F'].width = 15
+    ws_summary.column_dimensions['G'].width = 12
+    ws_summary.column_dimensions['H'].width = 18
+    ws_summary.column_dimensions['I'].width = 15
     
     # ============================================================
     # Sheet 2: Detail Results
@@ -495,8 +518,8 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
             cell.border = border
             cell.alignment = Alignment(wrap_text=True, vertical='top')
             
-            # Highlight result_match column
-            if field == "result_match":
+            # Highlight success flags with the same green/red behavior.
+            if field in {"va_success", "exec_success", "ts_success"}:
                 if value:
                     cell.fill = match_fill
                 else:
@@ -507,12 +530,13 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
         "id": 8, "difficulty": 10,
         "question": 50,
         "groundtruth_sql": 40, "predicted_sql": 40,
-        "draft_source": 14, "ir_used": 10, "ir_confidence": 12, "ir_plannable": 12, "ir_gate_reasons": 28,
-        "initial_model_used": 12, "final_model_used": 12,  # Model tracking
-        "va_success": 12, "va_error": 30,
-        "exec_success": 12, "result_match": 12, "match_reason": 25,
-        "pred_row_count": 12, "gt_row_count": 12,
-        "latency_s": 12, "error": 30
+        "draft_source": 14, "ir_confidence": 12, "ir_gate_reasons": 28,
+        "final_model_used": 12,  # Model tracking
+        "va_success": 12, "va_notes": 30,
+        "exec_success": 12, "exec_notes": 34,
+        "ts_success": 12, "ts_failed_databases": 24,
+        "pred_row_count": 28, "gt_row_count": 28,
+        "latency_s": 12
     }
     for col_idx, field in enumerate(fieldnames, start=1):
         ws_detail.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = col_widths.get(field, 15)
@@ -524,13 +548,17 @@ def save_to_excel(results: list, fieldnames: list, output_path: str,
     wb.save(output_path)
     print(f"\nResults saved to Excel: {output_path}")
 
-async def execute_sql(mcp: Client, sql: str) -> tuple[bool, list | None, str | None]:
+async def execute_sql(
+    mcp: Client,
+    sql: str,
+    database: str | None = None,
+) -> tuple[bool, list | None, str | None]:
     """
     Execute SQL via MCP (FULL mode - tanpa LIMIT) and return (success, rows, error).
     """
     sql_clean = sql.rstrip(";").strip()
     try:
-        payload = await query_db_full(sql_clean, mcp=mcp)
+        payload = await query_db_full(sql_clean, mcp=mcp, database=database)
         if isinstance(payload, dict) and payload.get("success"):
             # query_db_full returns rows as list of lists, convert to list of dicts
             columns = payload.get("columns", [])
@@ -543,13 +571,20 @@ async def execute_sql(mcp: Client, sql: str) -> tuple[bool, list | None, str | N
         return False, None, str(e)
 
 # --- VA: Valid SQL check using EXPLAIN ---
-async def check_valid_sql(mcp: Client, sql: str) -> tuple[bool, str | None]:
+async def check_valid_sql(
+    mcp: Client,
+    sql: str,
+    database: str | None = None,
+) -> tuple[bool, str | None]:
     """
     Run EXPLAIN <sql> via MCP tool to check validity. Return (is_valid, error_message_if_any)
     """
     sql_clean = sql.rstrip(";").strip()
     try:
-        payload = await _mcp_call(mcp, "query_explain", {"sql": sql_clean})
+        req_payload = {"sql": sql_clean}
+        if database:
+            req_payload["database"] = str(database).strip()
+        payload = await _mcp_call(mcp, "query_explain", req_payload)
         # Ambil dict dari CallToolResult jika perlu
         if not isinstance(payload, dict):
             if hasattr(payload, "structured_content") and isinstance(payload.structured_content, dict):
@@ -570,6 +605,8 @@ async def run_single_case(
     case: dict,
     execute_groundtruth: bool = True,
     null_zero_mode: str = "auto",
+    ts_databases: list[str] | None = None,
+    base_database: str = "classicmodels",
 ) -> dict:
     """
     Run a single test case and return evaluation result.
@@ -586,10 +623,24 @@ async def run_single_case(
     print(f"[{case_id}] ({difficulty}) {question[:80]}...")
     print(f"{'='*60}")
     
+    ts_db_list: list[str] = []
+    for db in (ts_databases or []):
+        db_name = str(db or "").strip()
+        if db_name and db_name not in ts_db_list:
+            ts_db_list.append(db_name)
+    primary_db = str(base_database or "classicmodels").strip() or "classicmodels"
+    # TS targets exclude base DB because base is already covered by EX.
+    ts_db_targets = [db for db in ts_db_list if db != primary_db]
+    eval_db_order: list[str] = [primary_db]
+    for db in ts_db_targets:
+        if db not in eval_db_order:
+            eval_db_order.append(db)
+
     result = {
         "id": case_id,
         "difficulty": difficulty,
         "question": question,
+        "base_database": primary_db,
         "groundtruth_sql": groundtruth_sql,
         "predicted_sql": "",
         "draft_source": "",
@@ -598,17 +649,33 @@ async def run_single_case(
         "ir_plannable": False,
         "ir_gate_reasons": "",
         "initial_model_used": "",  # Initial model chosen by router (3b/7b)
-        "final_model_used": "",    # Final model used (may differ if regeneration occurred)
+        "final_model_used": "",    # Standardized route label: ir_planner | llm_3b | llm_7b
         "va_success": False,       # Valid SQL (EXPLAIN)
-        "va_error": None,          # Error message if not valid
+        "va_notes": None,          # Notes/message from VA check
         "exec_success": False,
+        "exec_notes": "",          # EX notes (success/mismatch/error detail)
         "result_match": False,     # Execution Accuracy (hasil sama)
         "match_reason": "",        # Alasan match/mismatch
-        "pred_row_count": 0,
-        "gt_row_count": 0,
+        "pred_row_count": "",
+        "gt_row_count": "",
+        "ts_success": False,            # Test Suite: match across all configured DBs
+        "ts_match_count": 0,            # Number of DBs that match for this case
+        "ts_total_databases": 0,        # Number of DBs evaluated for TS
+        "ts_failed_databases": "",      # Newline-separated DBs that mismatched/failed
         "latency_s": 0,            # Primary: warm prompt->final SQL latency (seconds)
         "error": None,
     }
+    pred_counts_by_db = {db: "N/A" for db in eval_db_order}
+    gt_counts_by_db = {db: "N/A" for db in eval_db_order}
+
+    def _format_row_counts(counts: dict[str, str]) -> str:
+        return "\n".join(f"{db} = {counts.get(db, 'N/A')}" for db in eval_db_order)
+
+    def _refresh_row_count_fields() -> None:
+        result["pred_row_count"] = _format_row_counts(pred_counts_by_db)
+        result["gt_row_count"] = _format_row_counts(gt_counts_by_db)
+
+    _refresh_row_count_fields()
     
     # 1. Run pipeline
     t0 = time.perf_counter()
@@ -626,7 +693,7 @@ async def run_single_case(
         predicted_sql = _preexecute_sql_safety_pass(predicted_sql, question)
         
         result["predicted_sql"] = predicted_sql
-        result["draft_source"] = str(state.get("draft_source", "") or "")
+        result["draft_source"] = str(state.get("draft_source", "") or "").strip().lower()
         result["ir_used"] = bool(state.get("ir_used", False))
         result["ir_confidence"] = round(float(state.get("ir_confidence", 0.0) or 0.0), 3)
         result["ir_plannable"] = bool(state.get("ir_plannable", False))
@@ -668,14 +735,33 @@ async def run_single_case(
         else:
             result["initial_model_used"] = router_model_candidate or "unknown"
 
-        # Get final model used (may differ if regeneration occurred)
-        final_model = state.get("final_model", target_model)
-        if "3b" in final_model.lower():
-            result["final_model_used"] = "3b"
-        elif "7b" in final_model.lower():
-            result["final_model_used"] = "7b"
+        # Standardize final model/route label to match draft_source format.
+        final_model = str(state.get("final_model", target_model) or "").strip()
+        final_model_lower = final_model.lower()
+        if "3b" in final_model_lower:
+            result["final_model_used"] = "llm_3b"
+        elif "7b" in final_model_lower:
+            result["final_model_used"] = "llm_7b"
+        elif final_model_lower == "ir_planner":
+            result["final_model_used"] = "ir_planner"
+        elif final_model_lower == "gate_blocked":
+            result["final_model_used"] = "gate_blocked"
+        elif result["initial_model_used"] == "3b":
+            result["final_model_used"] = "llm_3b"
+        elif result["initial_model_used"] == "7b":
+            result["final_model_used"] = "llm_7b"
         else:
-            result["final_model_used"] = final_model or result["initial_model_used"]
+            result["final_model_used"] = final_model or (result["draft_source"] or "unknown")
+
+        # Make draft_source explicit for LLM path (llm_3b / llm_7b),
+        # with the same label standard as final_model_used.
+        if result["draft_source"] == "llm":
+            if result["final_model_used"] in {"llm_3b", "llm_7b"}:
+                result["draft_source"] = result["final_model_used"]
+            elif result["initial_model_used"] in {"3b", "7b"}:
+                result["draft_source"] = f"llm_{result['initial_model_used']}"
+            else:
+                result["draft_source"] = "llm"
 
         print(f"[MODEL] LLM Candidate: {result['initial_model_used']} → Final: {result['final_model_used']}")
         print(
@@ -693,44 +779,80 @@ async def run_single_case(
     # Fail-closed outputs must be treated as failed evaluation cases.
     if "FINAL_GATE_BLOCKED" in (predicted_sql or "").upper():
         result["va_success"] = False
-        result["va_error"] = "FINAL_GATE_BLOCKED"
+        result["va_notes"] = "FINAL_GATE_BLOCKED"
         result["exec_success"] = False
+        result["exec_notes"] = "Skipped: blocked by acceptance gate"
         result["result_match"] = False
         result["match_reason"] = "Predicted SQL blocked by deterministic acceptance gate"
         result["error"] = "Predicted SQL blocked by deterministic acceptance gate"
+        _refresh_row_count_fields()
         print("[VA] Invalid SQL: FINAL_GATE_BLOCKED")
         print("[EX] Skipped execution: blocked by acceptance gate")
         return result
     
 
     # 2a. Valid SQL (VA) check using EXPLAIN
-    va_success, va_error = await check_valid_sql(mcp, predicted_sql)
+    va_success, va_error = await check_valid_sql(mcp, predicted_sql, database=primary_db)
     result["va_success"] = va_success
-    result["va_error"] = va_error
+    result["va_notes"] = va_error
     if va_success:
         print("[VA] Valid SQL (EXPLAIN) ✓")
     else:
         print(f"[VA] Invalid SQL (EXPLAIN): {va_error}")
-
-    # 2b. Execute predicted SQL
-    pred_success, pred_rows, pred_error = await execute_sql(mcp, predicted_sql)
-    result["exec_success"] = pred_success
-    
-    if not pred_success:
-        result["error"] = f"Predicted SQL execution failed: {pred_error}"
-        print(f"[EX] Predicted SQL failed: {pred_error}")
+        result["exec_success"] = False
+        result["exec_notes"] = f"Skipped: invalid SQL (EXPLAIN): {va_error}"
+        result["result_match"] = False
+        result["match_reason"] = f"Invalid SQL (EXPLAIN): {va_error}"
+        result["error"] = f"Predicted SQL invalid (EXPLAIN): {va_error}"
+        _refresh_row_count_fields()
+        print("[EX] Skipped execution: VA failed")
+        print("[TS] Skipped: VA failed")
         return result
-    
-    result["pred_row_count"] = len(pred_rows or [])
-    print(f"[EX] Predicted SQL returned {result['pred_row_count']} rows")
-    
-    # 3. Execute groundtruth SQL for comparison (Execution Accuracy)
-    if execute_groundtruth and groundtruth_sql:
-        gt_success, gt_rows, gt_error = await execute_sql(mcp, groundtruth_sql)
-        
-        if gt_success:
-            result["gt_row_count"] = len(gt_rows or [])
 
+    # 2b. Execute predicted SQL (base DB)
+    pred_success, pred_rows, pred_error = await execute_sql(mcp, predicted_sql, database=primary_db)
+    result["exec_success"] = pred_success
+    pred_base_rows_count: int | None = None
+    if pred_success:
+        result["exec_notes"] = "Predicted SQL executed successfully"
+        pred_base_rows_count = len(pred_rows or [])
+        pred_counts_by_db[primary_db] = f"{pred_base_rows_count} rows"
+        _refresh_row_count_fields()
+        print(f"[EX] Predicted SQL returned {pred_base_rows_count} rows")
+    else:
+        result["exec_notes"] = f"Predicted SQL execution failed: {pred_error}"
+        result["error"] = f"Predicted SQL execution failed: {pred_error}"
+        result["match_reason"] = f"Predicted SQL execution failed: {pred_error}"
+        pred_counts_by_db[primary_db] = "ERROR"
+        _refresh_row_count_fields()
+        print(f"[EX] Predicted SQL failed: {pred_error}")
+
+    explicit_null_violation = False
+    explicit_null_reason = ""
+    if explicit_null_to_zero_required and not _sql_has_null_to_zero_handling(predicted_sql):
+        explicit_null_violation = True
+        explicit_null_reason = (
+            "Question explicitly requires NULL->0 handling, "
+            "but predicted SQL has no COALESCE/IFNULL/NVL/CASE null handling"
+        )
+
+    # 3. Execute groundtruth SQL for comparison (Execution Accuracy)
+    gt_success = False
+    gt_rows = None
+    gt_error = None
+    gt_base_rows_count: int | None = None
+    if execute_groundtruth and groundtruth_sql:
+        gt_success, gt_rows, gt_error = await execute_sql(mcp, groundtruth_sql, database=primary_db)
+        if gt_success:
+            gt_base_rows_count = len(gt_rows or [])
+            gt_counts_by_db[primary_db] = f"{gt_base_rows_count} rows"
+            _refresh_row_count_fields()
+        else:
+            gt_counts_by_db[primary_db] = "ERROR"
+            _refresh_row_count_fields()
+            print(f"[WARN] Groundtruth SQL failed: {gt_error}")
+
+        if pred_success and gt_success:
             # Check if either SQL has ORDER BY - if so, row order matters
             has_order_by = (
                 "ORDER BY" in predicted_sql.upper() or
@@ -745,16 +867,7 @@ async def run_single_case(
                 f"(enabled: {allow_null_zero_equivalent})"
             )
 
-            explicit_null_violation = False
-            explicit_null_reason = ""
-            if explicit_null_to_zero_required and not _sql_has_null_to_zero_handling(predicted_sql):
-                explicit_null_violation = True
-                explicit_null_reason = (
-                    "Question explicitly requires NULL->0 handling, "
-                    "but predicted SQL has no COALESCE/IFNULL/NVL/CASE null handling"
-                )
-
-            # Compare results
+            # Compare results on base DB for EX
             is_match, reason = compare_results(
                 pred_rows,
                 gt_rows,
@@ -766,14 +879,108 @@ async def run_single_case(
                 result["match_reason"] = f"{reason}; {explicit_null_reason}" if reason else explicit_null_reason
             else:
                 result["match_reason"] = reason
-            
+            base_count_notes = (
+                f"base={primary_db}; pred: {pred_base_rows_count} rows, "
+                f"groundtruth: {gt_base_rows_count} rows"
+            )
+            if result["result_match"]:
+                result["exec_notes"] = result["match_reason"] or f"MATCH ({base_count_notes})"
+            else:
+                if result["match_reason"]:
+                    result["exec_notes"] = f"{result['match_reason']} | {base_count_notes}"
+                else:
+                    result["exec_notes"] = f"MISMATCH ({base_count_notes})"
+
             status = "MATCH" if result["result_match"] else "MISMATCH"
             print(f"[EVALUATION] {status} - {result['match_reason']}")
-            print(f"       (pred: {result['pred_row_count']} rows, gt: {result['gt_row_count']} rows)")
+            print(f"       (pred: {pred_base_rows_count} rows, gt: {gt_base_rows_count} rows)")
         else:
-            result["match_reason"] = f"Groundtruth SQL failed: {gt_error}"
-            print(f"[WARN] Groundtruth SQL failed: {gt_error}")
-    
+            if not pred_success and gt_success:
+                result["match_reason"] = f"Predicted SQL execution failed: {pred_error}"
+                result["exec_notes"] = f"Predicted SQL execution failed: {pred_error}"
+            elif pred_success and not gt_success:
+                result["match_reason"] = f"Groundtruth SQL failed: {gt_error}"
+                result["exec_notes"] = f"Groundtruth SQL failed: {gt_error}"
+            else:
+                result["match_reason"] = (
+                    f"Predicted SQL failed: {pred_error}; Groundtruth SQL failed: {gt_error}"
+                )
+                result["exec_notes"] = result["match_reason"]
+
+        # 4. Test Suite (TS): evaluate on distilled databases only
+        ts_rows = []
+        if ts_db_targets:
+            print(f"[TS] Running cross-database checks on: {', '.join(ts_db_targets)}")
+        else:
+            print("[TS] No target TS databases configured; TS will be marked as N/A for this case.")
+        for db_name in ts_db_targets:
+            db_pred_success, db_pred_rows, db_pred_error = await execute_sql(
+                mcp, predicted_sql, database=db_name
+            )
+            if not db_pred_success:
+                pred_counts_by_db[db_name] = "ERROR"
+                ts_rows.append({
+                    "database": db_name,
+                    "match": False,
+                    "reason": f"Predicted SQL failed: {db_pred_error}",
+                })
+                continue
+            pred_counts_by_db[db_name] = f"{len(db_pred_rows or [])} rows"
+
+            db_gt_success, db_gt_rows, db_gt_error = await execute_sql(
+                mcp, groundtruth_sql, database=db_name
+            )
+            if not db_gt_success:
+                gt_counts_by_db[db_name] = "ERROR"
+                ts_rows.append({
+                    "database": db_name,
+                    "match": False,
+                    "reason": f"Groundtruth SQL failed: {db_gt_error}",
+                })
+                continue
+            gt_counts_by_db[db_name] = f"{len(db_gt_rows or [])} rows"
+
+            db_has_order_by = (
+                "ORDER BY" in predicted_sql.upper() or
+                "ORDER BY" in groundtruth_sql.upper()
+            )
+            db_is_match, db_reason = compare_results(
+                db_pred_rows,
+                db_gt_rows,
+                order_sensitive=db_has_order_by,
+                null_zero_equivalent=allow_null_zero_equivalent,
+            )
+            if explicit_null_violation:
+                db_is_match = False
+                db_reason = (
+                    f"{db_reason}; explicit NULL->0 handling required"
+                    if db_reason else
+                    "explicit NULL->0 handling required"
+                )
+
+            ts_rows.append({
+                "database": db_name,
+                "match": bool(db_is_match),
+                "reason": str(db_reason),
+            })
+        _refresh_row_count_fields()
+
+        # TS validity uses distilled DBs only (base DB is covered by EX metric).
+        result["ts_total_databases"] = len(ts_rows)
+        result["ts_match_count"] = sum(1 for x in ts_rows if x.get("match"))
+        result["ts_success"] = (
+            result["ts_total_databases"] > 0
+            and result["ts_match_count"] == result["ts_total_databases"]
+        )
+        result["ts_failed_databases"] = "\n".join(
+            x["database"] for x in ts_rows if not x.get("match")
+        )
+        ts_status = "PASS" if result["ts_success"] else "FAIL"
+        print(
+            f"[TS] {ts_status} - {result['ts_match_count']}/{result['ts_total_databases']} "
+            f"databases matched"
+        )
+    _refresh_row_count_fields()
     return result
 
 
@@ -841,6 +1048,8 @@ async def run_batch_eval(
     skip_warmup: bool = False,
     difficulty_filters: dict[str, set[int] | None] | None = None,
     null_zero_mode: str = "auto",
+    ts_databases: list[str] | None = None,
+    base_database: str = "classicmodels",
 ):
     """
     Main batch evaluation function.
@@ -854,6 +1063,8 @@ async def run_batch_eval(
         difficulty_filters: Dict mapping difficulty to ID filter (e.g., {'easy': {4, 5, 6, 7}})
                           None value means all IDs for that difficulty.
                           Example: {'easy': {4, 5, 6, 7}, 'hard': None}
+        ts_databases: Ordered list of DB names for TS evaluation.
+        base_database: Database used for VA/EX only.
     """
     # Load test cases
     all_cases = load_testset(testset_path)
@@ -922,6 +1133,19 @@ async def run_batch_eval(
         else:
             print("[WARN] No JSONL paths found - sparse search may not work!")
     
+    base_db = str(base_database or "classicmodels").strip() or "classicmodels"
+
+    ts_db_list: list[str] = []
+    for db in (ts_databases or []):
+        db_name = str(db or "").strip()
+        if db_name and db_name not in ts_db_list:
+            ts_db_list.append(db_name)
+    if not ts_db_list:
+        ts_db_list = ["classicmodels_2", "classicmodels_3"]
+    ts_db_targets = [db for db in ts_db_list if db != base_db]
+    print(f"Base database (VA/EX): {base_db}")
+    print(f"TS databases (excluding base): {ts_db_targets}")
+
     # Build app
     app = build_app()
     
@@ -941,6 +1165,8 @@ async def run_batch_eval(
                 app, mcp, paths, case, 
                 execute_groundtruth=execute_groundtruth,
                 null_zero_mode=null_zero_mode,
+                ts_databases=ts_db_targets,
+                base_database=base_db,
             )
             results.append(result)
     
@@ -950,6 +1176,9 @@ async def run_batch_eval(
     va_success = sum(1 for r in results if r["va_success"])
     exec_success = sum(1 for r in results if r["exec_success"])
     result_match = sum(1 for r in results if r["result_match"])
+    ts_evaluable_cases = [r for r in results if int(r.get("ts_total_databases", 0) or 0) > 0]
+    ts_total_cases = len(ts_evaluable_cases)
+    ts_success_cases = sum(1 for r in ts_evaluable_cases if bool(r.get("ts_success", False)))
     ir_used_count = sum(1 for r in results if bool(r.get("ir_used", False)))
     llm_fallback_count = total - ir_used_count
 
@@ -958,7 +1187,14 @@ async def run_batch_eval(
     for r in results:
         d = r["difficulty"]
         if d not in by_difficulty:
-            by_difficulty[d] = {"total": 0, "va_success": 0, "exec_success": 0, "result_match": 0}
+            by_difficulty[d] = {
+                "total": 0,
+                "va_success": 0,
+                "exec_success": 0,
+                "result_match": 0,
+                "ts_cases": 0,
+                "ts_success": 0,
+            }
         by_difficulty[d]["total"] += 1
         if r["va_success"]:
             by_difficulty[d]["va_success"] += 1
@@ -966,6 +1202,10 @@ async def run_batch_eval(
             by_difficulty[d]["exec_success"] += 1
         if r["result_match"]:
             by_difficulty[d]["result_match"] += 1
+        if int(r.get("ts_total_databases", 0) or 0) > 0:
+            by_difficulty[d]["ts_cases"] += 1
+            if bool(r.get("ts_success", False)):
+                by_difficulty[d]["ts_success"] += 1
 
 
     # Print summary (custom format)
@@ -975,6 +1215,10 @@ async def run_batch_eval(
     print(f"Total cases: {total}")
     print(f"Valid SQL (VA): {va_success}/{total} ({100*va_success/total:.1f}%)")
     print(f"Execution Summary (EX): {result_match}/{total} ({100*result_match/total:.1f}%)")
+    if ts_total_cases > 0:
+        print(f"Test Suite (TS): {ts_success_cases}/{ts_total_cases} ({100*ts_success_cases/ts_total_cases:.1f}%)")
+    else:
+        print("Test Suite (TS): N/A")
     print(
         f"Route Split: IR={ir_used_count}/{total} ({100*ir_used_count/total:.1f}%), "
         f"LLM fallback={llm_fallback_count}/{total} ({100*llm_fallback_count/total:.1f}%)"
@@ -985,7 +1229,10 @@ async def run_batch_eval(
         t = stats["total"]
         va = stats["va_success"]
         rm = stats["result_match"]
-        print(f"  {d}: VA={va}/{t} ({100*va/t:.1f}%), Execution Summary ={rm}/{t} ({100*rm/t:.1f}%)")
+        ts_cases = stats.get("ts_cases", 0)
+        ts_ok = stats.get("ts_success", 0)
+        ts_str = f", TS={ts_ok}/{ts_cases} ({100*ts_ok/ts_cases:.1f}%)" if ts_cases else ", TS=N/A"
+        print(f"  {d}: VA={va}/{t} ({100*va/t:.1f}%), Execution Summary ={rm}/{t} ({100*rm/t:.1f}%){ts_str}")
 
     print("\n\n")
 
@@ -998,21 +1245,32 @@ async def run_batch_eval(
 
     if output_path:
         fieldnames = [
-            # Put final result verdict early to avoid horizontal scrolling.
-            "id", "difficulty", "result_match", "match_reason",
+            # Keep key identifiers first to reduce horizontal scrolling.
+            "id", "difficulty",
             "question",
             "groundtruth_sql", "predicted_sql",
-            "draft_source", "ir_used", "ir_confidence", "ir_plannable", "ir_gate_reasons",
-            "initial_model_used", "final_model_used",  # Model tracking
-            "va_success", "va_error",
-            "exec_success",
+            "draft_source", "final_model_used", "ir_confidence", "ir_gate_reasons",
+            "va_success", "va_notes",
+            "exec_success", "exec_notes",
+            "ts_success", "ts_failed_databases",
             "pred_row_count", "gt_row_count",
-            "latency_s", "error"
+            "latency_s"
         ]
         
         if output_path.endswith('.xlsx') and HAS_EXCEL:
             # Save as Excel with formatting
-            save_to_excel(results, fieldnames, output_path, by_difficulty, total, exec_success, result_match, latencies)
+            save_to_excel(
+                results,
+                fieldnames,
+                output_path,
+                by_difficulty,
+                total,
+                exec_success,
+                result_match,
+                latencies,
+                ts_total_cases=ts_total_cases,
+                ts_success_cases=ts_success_cases,
+            )
         else:
             # Fallback to CSV
             if output_path.endswith('.xlsx'):
@@ -1074,6 +1332,12 @@ Examples:
 
   # Test specific questions: easy #1, #3, #5
   python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy1,3,5
+
+  # Run EX/VA on base DB and TS on distilled DBs
+  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --base-database classicmodels --ts-databases classicmodels,classicmodels_2,classicmodels_3
+
+  # Recommended (explicit): EX/VA on classicmodels, TS only on shifted DBs
+  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --base-database classicmodels --ts-databases classicmodels_2,classicmodels_3
         """
     )
     parser.add_argument(
@@ -1110,6 +1374,19 @@ Examples:
             "auto=allow NULL~0 unless question explicitly asks NULL->0 handling"
         )
     )
+    parser.add_argument(
+        "--ts-databases",
+        default="classicmodels_2,classicmodels_3",
+        help=(
+            "Comma-separated database list for Test Suite evaluation. "
+            "Base DB is excluded automatically from TS metrics."
+        ),
+    )
+    parser.add_argument(
+        "--base-database",
+        default="classicmodels",
+        help="Database for VA/EX checks (default: classicmodels).",
+    )
     # Difficulty filter arguments (supports: --easy, --easy4, --easy4-7, etc.)
     parser.add_argument(
         "--easy",
@@ -1133,6 +1410,10 @@ Examples:
     args = parser.parse_args()
     # Backward compatibility for existing commands
     null_zero_mode = "on" if args.null_zero_equivalent else args.null_zero_mode
+    ts_databases = [
+        x.strip() for x in str(args.ts_databases or "").split(",") if x.strip()
+    ] or ["classicmodels_2", "classicmodels_3"]
+    base_database = str(args.base_database or "classicmodels").strip() or "classicmodels"
 
     # Build difficulty filter dict with optional ID ranges
     difficulty_filters = {}
@@ -1170,6 +1451,8 @@ Examples:
         skip_warmup=args.skip_warmup,
         difficulty_filters=difficulty_filters if difficulty_filters else None,
         null_zero_mode=null_zero_mode,
+        ts_databases=ts_databases,
+        base_database=base_database,
     ))
 
 if __name__ == "__main__":

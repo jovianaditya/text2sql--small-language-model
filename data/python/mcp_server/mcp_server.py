@@ -9,6 +9,7 @@ import time
 import uuid
 import re
 from difflib import get_close_matches
+from typing import Optional, Tuple
 
 # -----------------------------
 # Env & logging
@@ -48,6 +49,12 @@ DB_CONFIG = {
     "autocommit": True,
     # Optional: stabilitas sesi awal
     "init_command": "SET time_zone = '+00:00'",
+}
+DEFAULT_DB = str(DB_CONFIG.get("db") or "").strip()
+_DB_NAME_SAFE = re.compile(r"^[A-Za-z0-9_]+$")
+_ALLOWED_DBS_RAW = os.getenv("MYSQL_ALLOWED_DATABASES", "").strip()
+ALLOWED_DBS = {
+    x.strip() for x in _ALLOWED_DBS_RAW.split(",") if x.strip()
 }
 
 # Preview sizing (server-side)
@@ -180,9 +187,28 @@ def _build_preview_sql(normalized_sql: str, limit: int) -> str:
         return q
     return f"{q} LIMIT {int(limit)}"
 
-def _conn():
+def _resolve_target_db(requested_db: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve target database for a request.
+    - Defaults to DB_CONFIG['db'] when empty.
+    - Restricts to MYSQL_ALLOWED_DATABASES if configured.
+    """
+    db = str(requested_db or DEFAULT_DB).strip()
+    if not db:
+        return None, "No target database configured."
+    if not _DB_NAME_SAFE.fullmatch(db):
+        return None, f"Invalid database name: {db}"
+    if ALLOWED_DBS and db not in ALLOWED_DBS:
+        return None, f"Database '{db}' is not allowed. Allowed: {sorted(ALLOWED_DBS)}"
+    return db, None
+
+
+def _conn(database: Optional[str] = None):
     """Open connection + ping to ensure healthy session."""
-    c = pymysql.connect(**DB_CONFIG)
+    cfg = dict(DB_CONFIG)
+    if database:
+        cfg["db"] = database
+    c = pymysql.connect(**cfg)
     try:
         c.ping(reconnect=True)
     except Exception:
@@ -208,9 +234,15 @@ def suggest_tables(conn, missing_name: str, max_suggestions: int = 3):
         suggestions = [f"{DB_CONFIG.get('db','classicmodels')}.{m}" for m in get_close_matches(missing_name, bare, n=max_suggestions, cutoff=0.6)]
     return tables, suggestions
 
-def suggest_columns(conn, table_fqn: str, missing_col: str, max_suggestions: int = 5):
+def suggest_columns(
+    conn,
+    table_fqn: str,
+    missing_col: str,
+    max_suggestions: int = 5,
+    default_schema: Optional[str] = None,
+):
     """Given a table and a missing column name, return closest columns."""
-    schema = DB_CONFIG.get("db")
+    schema = default_schema or DB_CONFIG.get("db")
     table = table_fqn
     if "." in table_fqn:
         schema, table = table_fqn.split(".", 1)
@@ -269,14 +301,17 @@ def _warn_identifier_keyword_split(tag: str, sql: str):
 # Tools
 # -----------------------------
 @mcp.tool()
-def query_explain(sql: str) -> dict:
+def query_explain(sql: str, database: str = "") -> dict:
     """Run EXPLAIN <sql> and return the result (for Valid SQL/VA metric)."""
     req = _req_id()
     t0 = time.perf_counter()
-    logger.info(f"[{req}] query_explain CALLED")
+    target_db, db_err = _resolve_target_db(database)
+    if db_err:
+        return {"success": False, "error": db_err}
+    logger.info(f"[{req}] query_explain CALLED db={target_db}")
     conn = None
     try:
-        conn = _conn()
+        conn = _conn(target_db)
         set_statement_timeout(conn, STATEMENT_TIMEOUT_MS)
         with conn.cursor() as cur:
             cur.execute("EXPLAIN " + sql)
@@ -325,11 +360,14 @@ def list_tables() -> dict:
             conn.close()
 
 @mcp.tool()
-def query_db(sql: str) -> dict:
+def query_db(sql: str, database: str = "") -> dict:
     """Return a safe server-side 5x5 preview + counts for a SELECT query (MySQL)."""
     req = _req_id()
     t0 = time.perf_counter()
-    logger.info(f"[{req}] query_db CALLED host={DB_CONFIG.get('host')} db={DB_CONFIG.get('db')}")
+    target_db, db_err = _resolve_target_db(database)
+    if db_err:
+        return {"success": False, "error": db_err}
+    logger.info(f"[{req}] query_db CALLED host={DB_CONFIG.get('host')} db={target_db}")
     logger.info(f"[{req}] 📥 Input SQL: {sql}")
 
     if not is_single_select(sql):
@@ -338,7 +376,7 @@ def query_db(sql: str) -> dict:
 
     conn = None
     try:
-        conn = _conn()
+        conn = _conn(target_db)
         set_statement_timeout(conn, STATEMENT_TIMEOUT_MS)
 
         # Normalize terlebih dahulu (safe)
@@ -380,7 +418,11 @@ def query_db(sql: str) -> dict:
                 missing_col = col_m.group(1) if col_m else ""
                 tbl_m = re.search(r"\bfrom\s+([`\"\w\.]+)", base_query, flags=re.I)
                 table_fqn = tbl_m.group(1).strip('`"') if tbl_m else ""
-                col_sug = suggest_columns(conn, table_fqn, missing_col, 5) if (table_fqn and missing_col) else []
+                col_sug = (
+                    suggest_columns(conn, table_fqn, missing_col, 5, default_schema=target_db)
+                    if (table_fqn and missing_col)
+                    else []
+                )
                 return {
                     "success": False,
                     "error": f"Unknown column: {missing_col or 'unknown'}",
@@ -436,14 +478,17 @@ def query_db(sql: str) -> dict:
             conn.close()
 
 @mcp.tool()
-def query_db_full(sql: str) -> dict:
+def query_db_full(sql: str, database: str = "") -> dict:
     """
     Execute the SELECT (without LIMIT) and return ALL rows (capped by MAX_EXPORT_ROWS).
     Intended for file export only—do not print these rows on client. (MySQL)
     """
     req = _req_id()
     t0 = time.perf_counter()
-    logger.info(f"[{req}] query_db_full CALLED host={DB_CONFIG.get('host')} db={DB_CONFIG.get('db')}")
+    target_db, db_err = _resolve_target_db(database)
+    if db_err:
+        return {"success": False, "error": db_err}
+    logger.info(f"[{req}] query_db_full CALLED host={DB_CONFIG.get('host')} db={target_db}")
     logger.info(f"[{req}] 📥 Input SQL: {sql}")
 
     if not is_single_select(sql := str(sql)):
@@ -452,7 +497,7 @@ def query_db_full(sql: str) -> dict:
 
     conn = None
     try:
-        conn = _conn()
+        conn = _conn(target_db)
         set_statement_timeout(conn, STATEMENT_TIMEOUT_MS)
 
         normalized_sql = _normalize_sql_for_wrapping(sql)
@@ -513,7 +558,11 @@ def query_db_full(sql: str) -> dict:
             missing_col = col_m.group(1) if col_m else ""
             tbl_m = re.search(r"\bfrom\s+([`\"\w\.]+)", base_query, flags=re.I)
             table_fqn = tbl_m.group(1).strip('`"') if tbl_m else ""
-            col_sug = suggest_columns(conn, table_fqn, missing_col, 5) if (table_fqn and missing_col) else []
+            col_sug = (
+                suggest_columns(conn, table_fqn, missing_col, 5, default_schema=target_db)
+                if (table_fqn and missing_col)
+                else []
+            )
             return {
                 "success": False,
                 "error": f"Unknown column: {missing_col or 'unknown'}",

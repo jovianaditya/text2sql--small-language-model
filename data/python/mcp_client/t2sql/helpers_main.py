@@ -69,7 +69,9 @@ from .helpers_core import (
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _rewrite_customer_orders_payment_fanout,
-    _rewrite_employee_customer_payment_rollup,
+    _rewrite_missing_metric_join_in_rollup,
+    _rewrite_missing_overall_avg_having,
+    _rewrite_employee_latest_payment_customer_identity,
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
     _drop_unrequested_exists_filters,
@@ -3005,7 +3007,37 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         return "".join(out)
 
+    def _rewrite_pipes_concat_mysql(text: str) -> str:
+        """
+        Convert common string-concat style `a || b` into MySQL-safe CONCAT(a, b).
+        Applied conservatively only when `||` appears with quoted string literals.
+        """
+        if not text or "||" not in text:
+            return text
+        if not re.search(r"(?is)(\|\|\s*['\"]|['\"]\s*\|\|)", text):
+            return text
+
+        term = (
+            r"(?:"
+            r"`?[A-Za-z_][A-Za-z0-9_]*`?(?:\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?)?"
+            r"|[A-Za-z_][A-Za-z0-9_]*\s*\([^()]*\)"
+            r"|'(?:''|[^'])*'"
+            r'|"(?:\"\"|[^"])*"'
+            r"|[0-9]+(?:\.[0-9]+)?"
+            r")"
+        )
+        pipe_pat = re.compile(rf"(?is)(?P<l>{term})\s*\|\|\s*(?P<r>{term})")
+
+        out = text
+        for _ in range(8):
+            new_out = pipe_pat.sub(lambda m: f"CONCAT({m.group('l').strip()}, {m.group('r').strip()})", out)
+            if new_out == out:
+                break
+            out = new_out
+        return out
+
     s = _norm_kw(s)
+    s = _rewrite_pipes_concat_mysql(s)
     s = _fix_missing_space_before_clauses(s)
     if not s.endswith(";"):
         s += ";"
@@ -3435,8 +3467,14 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after metric-agg-column fix:", s)
 
-        s = _rewrite_employee_customer_payment_rollup(s, question, ctx)
-        if DEBUG_WR: print("[REFINER - PH4] after employee-customer-payment rollup fix:", s)
+        s = _rewrite_missing_overall_avg_having(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after overall-avg baseline fix:", s)
+
+        s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after include-zero winner-row id-source fix:", s)
+
+        s = _rewrite_missing_metric_join_in_rollup(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after hierarchical metric rollup fix:", s)
 
         s = _rewrite_customer_orders_payment_fanout(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after customer-order-payment fanout fix:", s)
@@ -3510,6 +3548,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             if DEBUG_WR: print(f"[PH4-FORCE] after agg-misuse fix: {s}")
             s = _fix_winner_row_window_order_priority(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after winner-row window order fix: {s}")
+
+            s = _rewrite_missing_overall_avg_having(s, question, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after overall-avg baseline fix: {s}")
+
+            s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after include-zero winner-row id-source fix: {s}")
 
             s = _rewrite_having_alias_to_expr(s)
             s = _winner_row_final_sanity(s, question)

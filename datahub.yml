@@ -87,6 +87,8 @@ services:
     volumes:
       - ./data/mysql:/var/lib/mysql
       - ./data/sql_init/classicmodels.sql:/docker-entrypoint-initdb.d/classicmodels.sql:ro
+      - ./data/sql_init/classicmodels_2.sql:/docker-entrypoint-initdb.d/classicmodels_2.sql:ro
+      - ./data/sql_init/classicmodels_3.sql:/docker-entrypoint-initdb.d/classicmodels_3.sql:ro
       - ./data/sql_init/permission.sql:/docker-entrypoint-initdb.d/permission.sql:ro
     deploy:
       resources:

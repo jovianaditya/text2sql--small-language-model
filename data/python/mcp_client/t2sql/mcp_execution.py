@@ -28,6 +28,7 @@ async def _mcp_call(
 async def query_db(
     sql: str,
     mcp: Client | None = None,
+    database: str | None = None,
 ) -> dict:
     """
     Panggil tool `query_db` pada MCP server.
@@ -37,7 +38,10 @@ async def query_db(
     sql_clean = (sql or "").strip().rstrip(";")
 
     async def _do_call(client: Client) -> dict:
-        result = await _mcp_call(client, "query_db", {"sql": sql_clean})
+        payload = {"sql": sql_clean}
+        if database:
+            payload["database"] = str(database).strip()
+        result = await _mcp_call(client, "query_db", payload)
 
         payload = _extract_payload(result)
         as_json = _ensure_json(payload)
@@ -54,6 +58,7 @@ async def query_db(
 async def query_db_full(
     sql: str,
     mcp: Client | None = None,
+    database: str | None = None,
 ) -> dict:
     """
     Panggil tool `query_db_full` pada MCP server.
@@ -62,7 +67,10 @@ async def query_db_full(
     sql_clean = (sql or "").strip().rstrip(";")
 
     async def _do_call(client: Client) -> dict:
-        result = await _mcp_call(client, "query_db_full", {"sql": sql_clean})
+        payload = {"sql": sql_clean}
+        if database:
+            payload["database"] = str(database).strip()
+        result = await _mcp_call(client, "query_db_full", payload)
 
         payload = _extract_payload(result)
         as_json = _ensure_json(payload)

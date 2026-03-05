@@ -2068,17 +2068,21 @@ def _drop_redundant_column_aliases(sql: str) -> str:
     except Exception:
         return sql
 
+    changed = False
+
     def transform(node: "exp.Expression") -> "exp.Expression":
+        nonlocal changed
         # Drop only: Alias(Column, alias_name) where alias_name == column.name
         if isinstance(node, exp.Alias) and isinstance(node.this, exp.Column):
             alias = (node.alias or "").strip()
             colname = (node.this.name or "").strip()
             if alias and colname and alias.lower() == colname.lower():
+                changed = True
                 return node.this
         return node
 
     ast2 = ast.transform(transform)
-    return ast2.sql(dialect="mysql")
+    return ast2.sql(dialect="mysql") if changed else sql
 
 def _drop_unused_from_table_aliases(sql: str) -> str:
     """
@@ -2811,8 +2815,96 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
             f"{singular}_name",
             f"{table.lower()}_name",
             f"{qual_l}_name",
+            f"{singular}name",
+            f"{table.lower()}name",
+            f"{qual_l}name",
             "name",
         }
+
+        # Build schema-driven name component candidates for this table.
+        try:
+            analyzer = get_schema_analyzer()
+            table_cols = {
+                str(c).strip("`").lower()
+                for c in analyzer.get_table_columns(t)
+                if str(c).strip()
+            }
+        except Exception:
+            analyzer = None
+            table_cols = set()
+
+        def _identifier_tokens(val: str) -> Set[str]:
+            s = str(val or "").strip()
+            if not s:
+                return set()
+            s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+            s = s.replace("_", " ")
+            return {tok.lower() for tok in re.findall(r"[a-z0-9]+", s)}
+
+        def _is_name_component_column(col: str) -> bool:
+            c = str(col or "").strip().lower()
+            if not c:
+                return False
+            if c == name_col_l:
+                return True
+            toks = _identifier_tokens(c)
+            # Generic lexical hints (schema-agnostic, not table-specific).
+            if "name" in toks or "fullname" in toks:
+                return True
+            if {"full", "name"}.issubset(toks):
+                return True
+            if toks.intersection({"first", "last", "given", "family", "surname", "forename", "middle"}):
+                return True
+            if analyzer is not None:
+                try:
+                    role = str((analyzer._column_roles.get(t, {}) or {}).get(c, "")).strip().lower()
+                except Exception:
+                    role = ""
+                if role == "name":
+                    return True
+                try:
+                    syns = (analyzer._column_synonyms.get(f"{t}.{c}", []) or [])
+                except Exception:
+                    syns = []
+                syn_blob = " ".join(str(x).lower() for x in syns)
+                if re.search(
+                    r"\b(full\s*name|name|first\s*name|last\s*name|surname|family\s*name|given\s*name)\b",
+                    syn_blob,
+                    flags=re.I,
+                ):
+                    return True
+            return False
+
+        name_component_cols = {c for c in table_cols if _is_name_component_column(c)}
+        if not name_component_cols:
+            name_component_cols = {name_col_l}
+
+        accepted_quals = {x.lower() for x in aliases}
+        accepted_quals.add(t)
+
+        def _entity_expr_refs(expr: str) -> Set[str]:
+            e = str(expr or "")
+            if not e:
+                return set()
+            refs: Set[str] = set()
+            qual_refs = list(
+                re.finditer(
+                    r"(?is)\b`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\b",
+                    e,
+                )
+            )
+            for m_ref in qual_refs:
+                a_l = m_ref.group(1).lower()
+                c_l = m_ref.group(2).lower()
+                if a_l in accepted_quals:
+                    refs.add(c_l)
+            if refs:
+                return refs
+            # Fallback for unqualified expressions on single-entity projections.
+            if not qual_refs and table_cols:
+                toks = {tok.lower() for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", e)}
+                refs = {tok for tok in toks if tok in table_cols}
+            return refs
 
         has_id = any(
             c == id_col_l and (qf is None or qf == qual_l or qf == t)
@@ -2823,18 +2915,25 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
             for qf, c in selected_cols
         )
         has_name_alias = any(a in table_name_aliases for a in selected_aliases)
-        has_fullname_expr = any(
-            re.search(
-                rf"""(?is)\bCONCAT\s*\(\s*`?{re.escape(qual)}`?\s*\.\s*`?(firstName|first_name)`?\s*,\s*'[^']*'\s*,\s*`?{re.escape(qual)}`?\s*\.\s*`?(lastName|last_name)`?\s*\)""",
-                expr,
-            )
-            or re.search(
-                rf"""(?is)\bCONCAT\s*\(\s*`?{re.escape(qual)}`?\s*\.\s*`?(lastName|last_name)`?\s*,\s*'[^']*'\s*,\s*`?{re.escape(qual)}`?\s*\.\s*`?(firstName|first_name)`?\s*\)""",
-                expr,
-            )
-            for expr in selected_exprs
-        )
-        has_name = has_name_simple or has_name_alias or has_fullname_expr
+        def _is_composite_name_expression(expr: str) -> bool:
+            e = str(expr or "")
+            if not e:
+                return False
+            # Composite-name expressions are usually string concatenations.
+            if not (re.search(r"(?is)\bconcat\s*\(", e) or "||" in e):
+                return False
+            refs = _entity_expr_refs(e)
+            if len(refs) < 2:
+                return False
+            name_refs = refs.intersection(name_component_cols)
+            if len(name_refs) >= 2:
+                return True
+            # Fallback: treat as name-like when it combines >=2 entity columns
+            # and includes the canonical name column.
+            return name_col_l in refs and len(refs) >= 2
+
+        has_composite_name_expr = any(_is_composite_name_expression(expr) for expr in selected_exprs)
+        has_name = has_name_simple or has_name_alias or has_composite_name_expr
 
         if not has_id:
             prepended_cols.append(f"{qual}.{id_col}")
@@ -3063,27 +3162,103 @@ def _prune_non_primary_dimensions_for_primary_aggregate(sql: str, question: str,
 
 def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str) -> str:
     """
-    If SELECT already contains CONCAT(alias.firstName, ' ', alias.lastName),
-    drop redundant raw alias.firstName / alias.lastName columns (and their GROUP BY entries)
-    unless the question explicitly asks for first/last name.
+    If SELECT already contains a composite-name expression (e.g., CONCAT of
+    multiple name-part columns), drop redundant raw name-part columns for the
+    same alias unless the question explicitly asks for component names.
     """
     if not sql or not question:
         return sql
 
     q = (question or "").lower()
-    if "first name" in q or "last name" in q:
-        return sql
+    has_name_word = bool(re.search(r"\bnames?\b", q, flags=re.I))
+    has_first_component = bool(re.search(r"\b(first|given|forename)\b", q, flags=re.I))
+    has_last_component = bool(re.search(r"\b(last|family|surname)\b", q, flags=re.I))
+    wants_split_name_components = has_name_word and has_first_component and has_last_component
+    wants_combined_name = bool(
+        re.search(r"\b(full|complete)\s+names?\b", q, flags=re.I)
+        or re.search(
+            r"\b(?:combin(?:e|ed|ing)|concatenat(?:e|ed|ing)|concat(?:enate)?|join(?:ed|ing)?)\b[\w\s]{0,20}\bnames?\b",
+            q,
+            flags=re.I,
+        )
+        or re.search(
+            r"\bnames?\b[\w\s]{0,20}\b(?:combin(?:e|ed|ing)|concatenat(?:e|ed|ing)|concat(?:enate)?|join(?:ed|ing)?)\b",
+            q,
+            flags=re.I,
+        )
+    )
 
     parsed = _parse_select_from_groupby(sql)
     if not parsed:
-        return sql
-    if not parsed.get("groupby"):
+        if not (wants_split_name_components and not wants_combined_name):
+            return sql
+        # Minimal fallback parser for non-GROUP BY SELECT queries.
+        s0 = (sql or "").strip().rstrip(";").strip()
+        m_sel = re.match(r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<after>.+)$", s0)
+        if not m_sel:
+            return sql
+        select_part = (m_sel.group("select") or "").strip()
+        after_from = (m_sel.group("after") or "").strip()
+        if not select_part or not after_from:
+            return sql
+
+        kw_match = re.search(r"\b(ORDER\s+BY|LIMIT)\b", after_from, flags=re.I)
+        if kw_match:
+            core_part = after_from[:kw_match.start()].strip()
+            tail_part = after_from[kw_match.start():].strip()
+        else:
+            core_part = after_from
+            tail_part = ""
+        if not core_part:
+            return sql
+
+        where_match = re.search(r"\bWHERE\b", core_part, flags=re.I)
+        if where_match:
+            from_core = core_part[:where_match.start()].strip()
+            where_part = core_part[where_match.start():].strip()
+        else:
+            from_core = core_part
+            where_part = ""
+        if not from_core:
+            return sql
+
+        parsed = {
+            "select": select_part,
+            "from_core": from_core,
+            "where": where_part,
+            "groupby": "",
+            "having": "",
+            "tail": tail_part,
+        }
+    has_groupby = bool((parsed.get("groupby") or "").strip())
+    if not has_groupby and not (wants_split_name_components and not wants_combined_name):
         return sql
 
     select_items = _split_top_level_commas(parsed["select"])
-    group_items = _split_top_level_commas(parsed["groupby"])
+    group_items = _split_top_level_commas(parsed.get("groupby", ""))
     if not select_items:
         return sql
+
+    from_core = (parsed.get("from_core") or "").strip()
+    alias_to_table: Dict[str, str] = {}
+    if from_core:
+        try:
+            parsed_aliases = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+        except Exception:
+            parsed_aliases = {}
+        for a, t in (parsed_aliases or {}).items():
+            if a and t:
+                alias_to_table[a.lower()] = t.lower()
+        if not alias_to_table:
+            m_base = re.match(r"(?is)^`?([A-Za-z_][A-Za-z0-9_]*)`?", from_core)
+            if m_base:
+                t0 = m_base.group(1).lower()
+                alias_to_table[t0] = t0
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
 
     def _split_expr_alias(item: str) -> tuple:
         m = re.match(
@@ -3103,24 +3278,216 @@ def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str
             return None
         return (m.group(1) or "").lower(), m.group(2).lower()
 
-    # Detect aliases that already project full-name via CONCAT(first,last).
-    concat_aliases: Set[str] = set()
+    def _identifier_tokens(val: str) -> Set[str]:
+        s = str(val or "").strip()
+        if not s:
+            return set()
+        s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+        s = s.replace("_", " ")
+        return {tok.lower() for tok in re.findall(r"[a-z0-9]+", s)}
+
+    name_cols_cache: Dict[str, Set[str]] = {}
+
+    def _table_name_component_cols(table_l: str) -> Set[str]:
+        t_l = str(table_l or "").strip().lower()
+        if not t_l:
+            return set()
+        if t_l in name_cols_cache:
+            return name_cols_cache[t_l]
+        table_cols: Set[str] = set()
+        if analyzer is not None:
+            try:
+                table_cols = {
+                    str(c).strip("`").lower()
+                    for c in analyzer.get_table_columns(t_l)
+                    if str(c).strip()
+                }
+            except Exception:
+                table_cols = set()
+        out: Set[str] = set()
+        for c in table_cols:
+            toks = _identifier_tokens(c)
+            if "name" in toks or "fullname" in toks or {"full", "name"}.issubset(toks):
+                out.add(c)
+                continue
+            if toks.intersection({"first", "last", "given", "family", "surname", "forename", "middle"}):
+                out.add(c)
+                continue
+            if analyzer is not None:
+                try:
+                    role = str((analyzer._column_roles.get(t_l, {}) or {}).get(c, "")).strip().lower()
+                except Exception:
+                    role = ""
+                if role == "name":
+                    out.add(c)
+                    continue
+                try:
+                    syns = (analyzer._column_synonyms.get(f"{t_l}.{c}", []) or [])
+                except Exception:
+                    syns = []
+                syn_blob = " ".join(str(x).lower() for x in syns)
+                if re.search(
+                    r"\b(full\s*name|name|first\s*name|last\s*name|surname|family\s*name|given\s*name)\b",
+                    syn_blob,
+                    flags=re.I,
+                ):
+                    out.add(c)
+        name_cols_cache[t_l] = out
+        return out
+
+    def _expr_alias_col_refs(expr: str) -> Dict[str, Set[str]]:
+        refs: Dict[str, Set[str]] = {}
+        for m_ref in re.finditer(
+            r"(?is)\b`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\b",
+            str(expr or ""),
+        ):
+            a_l = m_ref.group(1).lower()
+            c_l = m_ref.group(2).lower()
+            refs.setdefault(a_l, set()).add(c_l)
+        return refs
+
+    def _ordered_name_components(table_l: str, cols: Set[str]) -> List[str]:
+        t_l = str(table_l or "").strip().lower()
+        cols_l = {str(c).strip().lower() for c in cols if str(c).strip()}
+        if not cols_l:
+            return []
+
+        col_order: Dict[str, int] = {}
+        if analyzer is not None:
+            try:
+                table_cols = [str(c).strip("`").lower() for c in analyzer.get_table_columns(t_l) if str(c).strip()]
+            except Exception:
+                table_cols = []
+            col_order = {c: i for i, c in enumerate(table_cols)}
+
+        def _name_priority(col_name: str) -> int:
+            c_low = str(col_name or "").lower()
+            toks = _identifier_tokens(col_name)
+            if any(k in c_low for k in ("firstname", "givenname", "forename")):
+                return 0
+            if toks.intersection({"first", "given", "forename"}):
+                return 0
+            if "middlename" in c_low:
+                return 1
+            if "middle" in toks:
+                return 1
+            if any(k in c_low for k in ("lastname", "familyname", "surname")):
+                return 2
+            if toks.intersection({"last", "family", "surname"}):
+                return 2
+            if "name" in toks or "fullname" in toks:
+                return 3
+            return 4
+
+        return sorted(
+            cols_l,
+            key=lambda c: (_name_priority(c), col_order.get(c, 10_000), c),
+        )
+
+    # If the question asks first/given + last/surname components (not full/combine),
+    # keep them as separate columns instead of a single CONCAT projection.
+    if wants_split_name_components and not wants_combined_name:
+        existing_simple_cols: Set[Tuple[str, str]] = set()
+        for it in select_items:
+            expr_i, _ = _split_expr_alias(it)
+            p_i = _parse_simple_col(expr_i)
+            if p_i:
+                existing_simple_cols.add((p_i[0], p_i[1]))
+
+        new_select_split: List[str] = []
+        inserted_for_group: List[str] = []
+        changed_split = False
+
+        for it in select_items:
+            expr, _a = _split_expr_alias(it)
+            e = str(expr or "")
+            if not (re.search(r"(?is)\bconcat\s*\(", e) or "||" in e):
+                new_select_split.append(it.strip())
+                continue
+
+            alias_refs = _expr_alias_col_refs(e)
+            replaced = False
+            for a_l, cols in alias_refs.items():
+                table_l = alias_to_table.get(a_l, a_l)
+                name_candidates = _table_name_component_cols(table_l)
+                matched = cols.intersection(name_candidates)
+                if len(matched) < 2:
+                    continue
+
+                ordered_parts = _ordered_name_components(table_l, matched)
+                emitted_cols: List[str] = []
+                for c in ordered_parts:
+                    key = (a_l, c)
+                    if key in existing_simple_cols:
+                        continue
+                    c_out = c
+                    if analyzer is not None:
+                        try:
+                            c_out = str(analyzer._column_original_case.get(f"{table_l}.{c}", c))
+                        except Exception:
+                            c_out = c
+                    emitted = f"{a_l}.{c_out}"
+                    emitted_cols.append(emitted)
+                    inserted_for_group.append(emitted)
+                    existing_simple_cols.add(key)
+
+                # Remove CONCAT projection even if parts already exist.
+                if emitted_cols:
+                    new_select_split.extend(emitted_cols)
+                changed_split = True
+                replaced = True
+                break
+
+            if not replaced:
+                new_select_split.append(it.strip())
+
+        if changed_split and new_select_split:
+            new_group_split = [g.strip() for g in group_items]
+            if new_group_split and inserted_for_group:
+                seen_group = {g.lower() for g in new_group_split}
+                for gc in inserted_for_group:
+                    if gc.lower() in seen_group:
+                        continue
+                    new_group_split.append(gc)
+                    seen_group.add(gc.lower())
+
+            out_lines = []
+            out_lines.append("SELECT " + ", ".join(new_select_split))
+            out_lines.append("FROM " + (parsed.get("from_core") or "").strip())
+            if parsed.get("where"):
+                out_lines.append(parsed["where"].strip())
+            if new_group_split:
+                out_lines.append("GROUP BY " + ", ".join(new_group_split))
+            if parsed.get("having"):
+                out_lines.append("HAVING " + parsed["having"].strip())
+            if parsed.get("tail"):
+                out_lines.append(parsed["tail"].strip())
+
+            fixed_split = "\n".join(out_lines).strip()
+            if not fixed_split.endswith(";"):
+                fixed_split += ";"
+            return fixed_split
+
+    # Detect aliases that already project composite-name expressions.
+    concat_alias_name_parts: Dict[str, Set[str]] = {}
     for it in select_items:
         expr, _a = _split_expr_alias(it)
-        m1 = re.match(
-            r"""(?is)^CONCAT\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(firstName|first_name)`?\s*,\s*'[^']*'\s*,\s*`?\1`?\s*\.\s*`?(lastName|last_name)`?\s*\)\s*$""",
-            expr,
-        )
-        m2 = re.match(
-            r"""(?is)^CONCAT\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(lastName|last_name)`?\s*,\s*'[^']*'\s*,\s*`?\1`?\s*\.\s*`?(firstName|first_name)`?\s*\)\s*$""",
-            expr,
-        )
-        if m1:
-            concat_aliases.add(m1.group(1).lower())
-        elif m2:
-            concat_aliases.add(m2.group(1).lower())
+        e = str(expr or "")
+        if not (re.search(r"(?is)\bconcat\s*\(", e) or "||" in e):
+            continue
+        alias_refs = _expr_alias_col_refs(e)
+        if not alias_refs:
+            continue
+        for a_l, cols in alias_refs.items():
+            table_l = alias_to_table.get(a_l, a_l)
+            name_candidates = _table_name_component_cols(table_l)
+            if not name_candidates:
+                continue
+            matched = cols.intersection(name_candidates)
+            if len(matched) >= 2:
+                concat_alias_name_parts.setdefault(a_l, set()).update(matched)
 
-    if not concat_aliases:
+    if not concat_alias_name_parts:
         return sql
 
     def _is_raw_name_col(item: str) -> bool:
@@ -3129,11 +3496,16 @@ def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str
         if not p:
             return False
         a, c = p
-        if not a:
+        if a in concat_alias_name_parts:
+            return c in concat_alias_name_parts.get(a, set())
+
+        # Unqualified projection fallback for single-alias cases.
+        if a:
             return False
-        if a not in concat_aliases:
+        if len(concat_alias_name_parts) != 1:
             return False
-        return c in {"firstname", "first_name", "lastname", "last_name"}
+        only_alias = next(iter(concat_alias_name_parts.keys()))
+        return c in concat_alias_name_parts.get(only_alias, set())
 
     new_select = [it.strip() for it in select_items if not _is_raw_name_col(it)]
     if len(new_select) == len(select_items):
@@ -3916,14 +4288,45 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
                     # Conservative support for unqualified columns in single-table queries.
                     preserve_via_entity_key = True
 
-            if base_sql not in group_set and not alias_in_groupby and not preserve_via_entity_key:
+            # Preserve deterministic computed expressions when ALL referenced
+            # columns are already covered by GROUP BY.
+            refs_all_in_group = False
+            ref_cols = [c for c in base.find_all(exp.Column)]
+            if ref_cols:
+                all_grouped = True
+                for rc in ref_cols:
+                    rc_name = str(rc.name or "").strip("`").lower()
+                    rc_table = str(rc.table or "").strip("`").lower()
+                    if not rc_name:
+                        all_grouped = False
+                        break
+                    cands = {rc_name}
+                    if rc_table:
+                        cands.add(f"{rc_table}.{rc_name}")
+                        resolved_rc_table = alias_to_table.get(rc_table, rc_table)
+                        if resolved_rc_table:
+                            cands.add(f"{resolved_rc_table}.{rc_name}")
+                    if len(table_names) == 1:
+                        only_table = next(iter(table_names))
+                        cands.add(f"{only_table}.{rc_name}")
+                    if not any(c in group_set for c in cands):
+                        all_grouped = False
+                        break
+                refs_all_in_group = all_grouped
+
+            if (
+                base_sql not in group_set
+                and not alias_in_groupby
+                and not preserve_via_entity_key
+                and not refs_all_in_group
+            ):
                 expressions_to_remove.append(item)
 
         if expressions_to_remove:
             new_expressions = [e for e in sel.expressions if e not in expressions_to_remove]
             sel.set("expressions", new_expressions)
-
-        return ast.sql(dialect="mysql")
+            return ast.sql(dialect="mysql")
+        return sql
 
     except Exception:
         # FALLBACK: Use regex when sqlglot fails (syntax errors, etc.)
@@ -4014,10 +4417,44 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
             # Check if it's a CASE expression (should always be kept)
             is_case = bool(re.search(r'\bCASE\s+WHEN\b', base, re.IGNORECASE))
 
-            # Keep if: aggregate, window, CASE, base in GROUP BY, or alias in GROUP BY (MySQL compatibility)
-            # MySQL allows GROUP BY alias, so check both base expression and alias
+            # Preserve deterministic computed expressions when all referenced
+            # columns are covered by GROUP BY.
+            refs_all_in_group = False
+            ref_cols = [
+                ref.lower()
+                for ref in re.findall(
+                    r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?",
+                    base,
+                    flags=re.I,
+                )
+                if ref and not re.fullmatch(r"`?(?:as|case|when|then|else|end)`?", ref.strip(), flags=re.I)
+            ]
+            if ref_cols:
+                norm_group = {g.replace("`", "").replace(" ", "").lower() for g in group_set}
+                all_grouped = True
+                for ref in ref_cols:
+                    ref_n = ref.replace("`", "").replace(" ", "").lower()
+                    if "." in ref_n:
+                        cands = {ref_n, ref_n.split(".")[-1]}
+                    else:
+                        cands = {ref_n}
+                    if not any(c in norm_group for c in cands):
+                        all_grouped = False
+                        break
+                refs_all_in_group = all_grouped
+
+            # Keep if: aggregate, window, CASE, base in GROUP BY, alias in GROUP BY,
+            # or all referenced columns are grouped.
+            # MySQL allows GROUP BY alias, so check both base expression and alias.
             alias_in_groupby = alias and alias.lower() in group_set if alias else False
-            if is_aggregate or is_window or is_case or base_lower in group_set or alias_in_groupby:
+            if (
+                is_aggregate
+                or is_window
+                or is_case
+                or base_lower in group_set
+                or alias_in_groupby
+                or refs_all_in_group
+            ):
                 new_select_parts.append(item)
             # Otherwise, remove it (hallucinated column)
 
@@ -5418,6 +5855,8 @@ def _preexecute_sql_safety_pass(sql: str, question: str = "") -> str:
             s = fixed
 
         s = _fix_outer_order_by_for_derived_alias(s)
+        s = _rewrite_missing_overall_avg_having(s, question)
+        s = _rewrite_employee_latest_payment_customer_identity(s, question)
 
         # Winner-row fallback: force rewrite if query still looks like MAX-date misuse.
         # IMPORTANT: skip for "latest year + aggregate amount" intent, where MAX(date)
@@ -5435,6 +5874,7 @@ def _preexecute_sql_safety_pass(sql: str, question: str = "") -> str:
                     "GROUP BY" in forced.upper() and "ROW_NUMBER" in forced.upper()
                 ):
                     s = forced
+                    s = _rewrite_employee_latest_payment_customer_identity(s, question)
 
         s = _drop_aggregate_or_window_items_from_group_by(s)
 
@@ -6773,6 +7213,343 @@ def _force_restore_groupby_if_aggregate_without_groupby(sql_before, sql_after):
 
     return sql_after
 
+
+def _question_wants_group_avg_vs_overall_avg(question: str) -> bool:
+    """
+    Dynamic detector for intent:
+    group average compared against an overall/global average baseline.
+    """
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    has_avg = bool(re.search(r"\b(?:avg|average|mean)\b", q, flags=re.I))
+    has_overall = bool(
+        re.search(
+            r"\b(?:overall|global|across\s+all|entire)\b|\bacross\s+the\s+(?:whole|entire)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    has_cmp = bool(
+        re.search(
+            r"\b(?:higher|greater|more|above|over|lower|less|below|under)\s+than\b",
+            q,
+            flags=re.I,
+        )
+    )
+    return has_avg and has_overall and has_cmp
+
+
+def _rewrite_missing_overall_avg_having(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Add missing HAVING clause for aggregate-vs-overall-average intent.
+
+    Generic shape repaired:
+      SELECT ..., AVG(t.col) ...
+      FROM ...
+      GROUP BY ...
+    ->
+      ... HAVING AVG(t.col) >/< (SELECT AVG(x.col) FROM <same-source-table> x ...)
+    """
+    if not sql or not question:
+        return sql
+    if not _question_wants_group_avg_vs_overall_avg(question):
+        return sql
+    if not re.search(r"\bGROUP\s+BY\b", sql, flags=re.I):
+        return sql
+    if re.search(r"\bHAVING\b", sql, flags=re.I):
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(sql, read="mysql")
+    except Exception:
+        return sql
+
+    sel = ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return sql
+    if sel.args.get("group") is None:
+        return sql
+    if sel.args.get("having") is not None:
+        return sql
+
+    # Build top-level alias -> table map.
+    alias_to_table: Dict[str, str] = {}
+
+    def _register_source(src: Optional["exp.Expression"]) -> None:
+        if isinstance(src, exp.Table):
+            table_name = (src.name or "").strip("`").lower()
+            if not table_name:
+                return
+            alias_raw = (src.alias_or_name or src.name or "").strip("`").lower()
+            if alias_raw and alias_raw not in alias_to_table:
+                alias_to_table[alias_raw] = table_name
+            if table_name and table_name not in alias_to_table:
+                alias_to_table[table_name] = table_name
+
+    from_arg = sel.args.get("from") or sel.args.get("from_")
+    if from_arg is not None and getattr(from_arg, "this", None) is not None:
+        _register_source(from_arg.this)
+    for j in sel.args.get("joins") or []:
+        _register_source(getattr(j, "this", None))
+
+    # Pick aggregate candidate from SELECT projection (prefer AVG(column)).
+    avg_candidates: List[Tuple["exp.AggFunc", "exp.Column"]] = []
+    for item in sel.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        if base is None:
+            continue
+        for avg_node in base.find_all(exp.Avg):
+            cols = list(avg_node.find_all(exp.Column))
+            if len(cols) == 1:
+                avg_candidates.append((avg_node, cols[0]))
+
+    if not avg_candidates:
+        return sql
+
+    avg_node, avg_col = avg_candidates[0]
+    col_name = str(avg_col.name or "").strip("`")
+    if not col_name:
+        return sql
+
+    avg_col_table_alias = str(avg_col.table or "").strip("`").lower()
+    if avg_col_table_alias:
+        baseline_table = alias_to_table.get(avg_col_table_alias, "")
+    else:
+        # Conservative fallback only when a single real base table can be inferred.
+        unique_tables = sorted(set(alias_to_table.values()))
+        baseline_table = unique_tables[0] if len(unique_tables) == 1 else ""
+    if not baseline_table:
+        return sql
+
+    q = (question or "").lower()
+    is_lower = bool(re.search(r"\b(?:lower|less|below|under)\s+than\b", q, flags=re.I))
+    is_higher = bool(re.search(r"\b(?:higher|greater|more|above|over)\s+than\b", q, flags=re.I))
+    op = "<" if (is_lower and not is_higher) else ">"
+
+    # Preserve explicit null-ignore intent when present in question or WHERE.
+    ignore_null = bool(
+        re.search(r"\b(?:ignore|excluding?|without)\s+null\b", q, flags=re.I)
+        or re.search(r"\bnon[-\s]?null\b", q, flags=re.I)
+    )
+    where_arg = sel.args.get("where")
+    if isinstance(where_arg, exp.Where):
+        where_sql = where_arg.sql(dialect="mysql")
+        if re.search(
+            rf"\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?{re.escape(col_name)}`?\s+IS\s+NOT\s+NULL\b",
+            where_sql,
+            flags=re.I,
+        ):
+            ignore_null = True
+
+    baseline_sql = f"SELECT AVG(c2.{col_name}) FROM {baseline_table} AS c2"
+    if ignore_null:
+        baseline_sql += f" WHERE c2.{col_name} IS NOT NULL"
+    try:
+        baseline_select = sqlglot.parse_one(baseline_sql, read="mysql")
+    except Exception:
+        return sql
+    if not isinstance(baseline_select, exp.Select):
+        return sql
+
+    left_expr = avg_node.copy()
+    right_expr = exp.Subquery(this=baseline_select)
+    if op == "<":
+        cmp_expr = exp.LT(this=left_expr, expression=right_expr)
+    else:
+        cmp_expr = exp.GT(this=left_expr, expression=right_expr)
+    sel.set("having", exp.Having(this=cmp_expr))
+
+    out = ast.sql(dialect="mysql")
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    if out and not out.endswith(";"):
+        out += ";"
+    return out or sql
+
+
+def _rewrite_employee_latest_payment_customer_identity(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Dynamic include-zero winner-row repair.
+
+    If ROW_NUMBER winner-row query uses LEFT JOIN chain and selects/tie-breaks
+    on identifier from nullable joined side, rewrite identifier source to the
+    preserved side of the LEFT JOIN equality.
+    """
+    if not sql or not question:
+        return sql
+    if "ROW_NUMBER" not in (sql or "").upper():
+        return sql
+    if not _question_wants_winner_row(question):
+        return sql
+    if not _question_wants_include_zero(question, ctx):
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(sql, read="mysql")
+    except Exception:
+        return sql
+
+    def _norm_key_name(name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+    def _is_identifier_col(name: str) -> bool:
+        n = _norm_key_name(name)
+        return bool(
+            n.endswith("id")
+            or n.endswith("number")
+            or n.endswith("code")
+            or n.endswith("key")
+        )
+
+    def _register_sources(sel: "exp.Select") -> Dict[str, str]:
+        alias_to_table: Dict[str, str] = {}
+
+        def _register(src: Optional["exp.Expression"]) -> None:
+            if isinstance(src, exp.Table):
+                table_name = (src.name or "").strip("`").lower()
+                if not table_name:
+                    return
+                alias_raw = (src.alias_or_name or src.name or "").strip("`").lower()
+                if alias_raw and alias_raw not in alias_to_table:
+                    alias_to_table[alias_raw] = table_name
+                if table_name and table_name not in alias_to_table:
+                    alias_to_table[table_name] = table_name
+
+        from_arg = sel.args.get("from") or sel.args.get("from_")
+        if from_arg is not None and getattr(from_arg, "this", None) is not None:
+            _register(from_arg.this)
+        for j in sel.args.get("joins") or []:
+            _register(getattr(j, "this", None))
+        return alias_to_table
+
+    changed = False
+
+    for sel in ast.find_all(exp.Select):
+        has_rownum = any(
+            isinstance(w.this, exp.RowNumber)
+            for w in sel.find_all(exp.Window)
+            if isinstance(w, exp.Window)
+        )
+        if not has_rownum:
+            continue
+
+        # Map nullable-side identifier -> preserved-side identifier for LEFT JOIN keys.
+        replacement_map: Dict[Tuple[str, str], Tuple[str, str]] = {}
+
+        joins = sel.args.get("joins") or []
+        for j in joins:
+            side = str(j.args.get("side") or "").upper()
+            if side != "LEFT":
+                continue
+            right_src = getattr(j, "this", None)
+            if not isinstance(right_src, exp.Table):
+                continue
+
+            right_alias = (right_src.alias_or_name or right_src.name or "").strip("`").lower()
+            if not right_alias:
+                continue
+
+            on_expr = j.args.get("on")
+            if on_expr is None:
+                continue
+
+            for eq in on_expr.find_all(exp.EQ):
+                left_col = getattr(eq, "left", None)
+                right_col = getattr(eq, "right", None)
+                if not isinstance(left_col, exp.Column) or not isinstance(right_col, exp.Column):
+                    continue
+
+                l_alias = str(left_col.table or "").strip("`").lower()
+                r_alias = str(right_col.table or "").strip("`").lower()
+                l_name = str(left_col.name or "").strip("`")
+                r_name = str(right_col.name or "").strip("`")
+                if not l_alias or not r_alias or not l_name or not r_name:
+                    continue
+
+                nullable_alias = ""
+                nullable_name = ""
+                preserved_alias = ""
+                preserved_name = ""
+
+                if l_alias == right_alias and r_alias != right_alias:
+                    nullable_alias, nullable_name = l_alias, l_name
+                    preserved_alias, preserved_name = r_alias, r_name
+                elif r_alias == right_alias and l_alias != right_alias:
+                    nullable_alias, nullable_name = r_alias, r_name
+                    preserved_alias, preserved_name = l_alias, l_name
+                else:
+                    continue
+
+                if not (_is_identifier_col(nullable_name) and _is_identifier_col(preserved_name)):
+                    continue
+                if _norm_key_name(nullable_name) != _norm_key_name(preserved_name):
+                    continue
+
+                replacement_map[(nullable_alias, nullable_name.lower())] = (
+                    preserved_alias,
+                    preserved_name,
+                )
+
+        if not replacement_map:
+            continue
+
+        # Replace projected columns in this SELECT block.
+        for item in sel.expressions or []:
+            base = item.this if isinstance(item, exp.Alias) else item
+            if not isinstance(base, exp.Column):
+                continue
+            key = (str(base.table or "").strip("`").lower(), str(base.name or "").strip("`").lower())
+            repl = replacement_map.get(key)
+            if repl is None:
+                continue
+            new_alias, new_col = repl
+            base.set("table", exp.to_identifier(new_alias))
+            base.set("this", exp.to_identifier(new_col))
+            changed = True
+
+        # Replace ROW_NUMBER ORDER BY identifier source.
+        for win in sel.find_all(exp.Window):
+            if not isinstance(win.this, exp.RowNumber):
+                continue
+            order = win.args.get("order")
+            if not isinstance(order, exp.Order):
+                continue
+            for ordered in order.expressions or []:
+                c = getattr(ordered, "this", None)
+                if not isinstance(c, exp.Column):
+                    continue
+                key = (str(c.table or "").strip("`").lower(), str(c.name or "").strip("`").lower())
+                repl = replacement_map.get(key)
+                if repl is None:
+                    continue
+                new_alias, new_col = repl
+                c.set("table", exp.to_identifier(new_alias))
+                c.set("this", exp.to_identifier(new_col))
+                changed = True
+
+    if not changed:
+        return sql
+
+    out = ast.sql(dialect="mysql")
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    if out and not out.endswith(";"):
+        out += ";"
+    return out or sql
+
+
 def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "") -> str:
     """
     Catch winner-row questions where the SQL still uses MAX/MIN (often with
@@ -7489,18 +8266,19 @@ def _question_wants_customer_orders_payment_rollup(question: str) -> bool:
     return _question_wants_entity_orders_payments_rollup(question)
 
 
-def _question_wants_employee_customer_payment_rollup(question: str) -> bool:
+def _question_wants_hierarchical_metric_rollup(question: str, ctx: str = "") -> bool:
     """
-    Detect intent like H5:
-    - for each employee
-    - include employees/customers with no matches
-    - return total payment amount collected by their customers
+    Dynamic detector for hierarchical rollup intent:
+    - "for each/per/every <entity>"
+    - aggregate total/sum of a metric (amount/value/revenue/etc.)
+    - multi-entity question (at least two schema entities mentioned)
+    - not winner-row/latest/ranking intent
     """
     q = (question or "").lower().strip()
     if not q:
         return False
 
-    # Exclude winner-row/latest style intents (handled by different pathways).
+    # Exclude winner-row/latest/ranking style intents.
     if re.search(
         r"\b(latest|most\s+recent|newest|earliest|row_number|rank|dense_rank|if\s+multiple|if\s+there\s+are\s+ties)\b",
         q,
@@ -7508,56 +8286,67 @@ def _question_wants_employee_customer_payment_rollup(question: str) -> bool:
     ):
         return False
 
-    def _entity_alt(table_name: str) -> str:
-        words = _entity_words_for_table(table_name)
-        escaped = []
-        for w in words:
-            ww = (w or "").strip().lower()
-            if not ww:
-                continue
-            escaped.append(re.escape(ww).replace(r"\ ", r"\s+"))
-        escaped = sorted(set(escaped), key=len, reverse=True)
-        return "|".join(escaped)
-
-    emp_alt = _entity_alt("employees")
-    cust_alt = _entity_alt("customers")
-    pay_alt = _entity_alt("payments")
-
-    def _has_alt(alt: str) -> bool:
-        return bool(alt and re.search(rf"\b(?:{alt})\b", q, flags=re.I))
-
-    has_employee = _has_alt(emp_alt)
-    has_customer = _has_alt(cust_alt)
-    has_payment = _has_alt(pay_alt) or bool(re.search(r"\bpaid\b", q, flags=re.I))
-
-    asks_for_each_employee = bool(
-        re.search(rf"\bfor\s+each\s+(?:{emp_alt})\b", q, flags=re.I)
-        if emp_alt
-        else re.search(r"\bfor\s+each\s+employees?\b", q, flags=re.I)
+    asks_for_each = bool(
+        re.search(r"\b(?:for\s+each|per|every)\b", q, flags=re.I)
     )
-    asks_total_payment = bool(
-        re.search(
-            r"\b(total\s+payment(?:\s+amount)?|sum\s+of\s+payments?|amount\s+collected|collected\s+by)\b",
+    asks_total_metric = bool(
+        re.search(r"\b(?:total|sum|jumlah)\b", q, flags=re.I)
+        and re.search(
+            r"\b(?:amount|value|revenue|sales|price|quantity|cost|spend|paid|payment)\b",
             q,
             flags=re.I,
         )
     )
+    if not (asks_for_each and asks_total_metric):
+        return False
 
-    return has_employee and has_customer and has_payment and asks_for_each_employee and asks_total_payment
+    # Require at least two schema entities mentioned in the question.
+    # This keeps the detector conservative for single-table aggregates.
+    terms = sorted(_entity_terms_from_ctx(ctx), key=len, reverse=True)
+    if terms:
+        mentioned = 0
+        for t in terms:
+            tt = (t or "").strip().lower()
+            if not tt:
+                continue
+            pat = re.escape(tt).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pat}\b", q, flags=re.I):
+                mentioned += 1
+                if mentioned >= 2:
+                    break
+        if mentioned < 2:
+            return False
+
+    # Prefer include-zero style, but allow collection phrasing too.
+    include_zero = _question_wants_include_zero(question, ctx)
+    collection_phrase = bool(
+        re.search(
+            r"\b(?:collected\s+by|handled\s+by|managed\s+by|owned\s+by|by\s+their)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    return include_zero or collection_phrase
 
 
-def _rewrite_employee_customer_payment_rollup(sql: str, question: str, ctx: str = "") -> str:
+def _rewrite_missing_metric_join_in_rollup(sql: str, question: str, ctx: str = "") -> str:
     """
-    Canonical rewrite for employee -> customer -> payment rollup:
-      employees LEFT JOIN customers LEFT JOIN payments
-      GROUP BY employee identity fields
+    Schema-agnostic repair for hierarchical rollup queries where aggregate
+    metric alias/table is missing.
 
-    This targets robust repair for drafts that miss payments join alias
-    (e.g., SUM(p.amount) without joining `p`).
+    Typical near-miss:
+      SELECT ..., SUM(p.amount) ...
+      FROM A ... JOIN B ...
+      GROUP BY ...
+    where `p` alias/table is never joined.
+
+    Repair strategy:
+    1) If a joined table already has the metric column, remap SUM alias to that table alias.
+    2) Otherwise infer a metric table (schema metadata + FK graph) and add LEFT JOIN.
     """
     if not sql or not question:
         return sql
-    if not _question_wants_employee_customer_payment_rollup(question):
+    if not _question_wants_hierarchical_metric_rollup(question, ctx):
         return sql
 
     parsed = _parse_select_from_groupby(sql)
@@ -7576,82 +8365,272 @@ def _rewrite_employee_customer_payment_rollup(sql: str, question: str, ctx: str 
     if re.search(r"\brow_number\s*\(", sql, flags=re.I):
         return sql
 
-    alias_map_raw = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
-    alias_to_table: Dict[str, str] = {}
-    for a, t in alias_map_raw.items():
-        al = (a or "").strip().lower()
-        tl = (t or "").strip().lower()
-        if not al or not tl:
+    # Ordered source list (alias -> table), including aliasless table refs.
+    source_pairs: List[Tuple[str, str]] = []
+    seen_aliases: Set[str] = set()
+    reserved_alias_tokens = {
+        "left", "right", "inner", "outer", "full", "cross", "join",
+        "on", "where", "group", "order", "having", "limit",
+    }
+    for m_tbl in re.finditer(
+        r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?""",
+        f"FROM {from_core}",
+    ):
+        raw_tbl = (m_tbl.group(1) or "").replace("`", "").strip()
+        tbl = raw_tbl.split(".")[-1].lower()
+        if not tbl:
             continue
-        if al not in alias_to_table:
-            alias_to_table[al] = tl
+        alias_raw = (m_tbl.group(2) or "").strip()
+        if alias_raw.lower() in reserved_alias_tokens:
+            alias_raw = ""
+        alias = (alias_raw or tbl).strip()
+        alias_l = alias.lower()
+        if not alias_l or alias_l in seen_aliases:
+            continue
+        seen_aliases.add(alias_l)
+        source_pairs.append((alias, tbl))
 
-    # Aliasless fallback: map table name -> table name from FROM/JOIN clauses.
-    if not alias_to_table:
-        for m_tbl in re.finditer(
-            r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\b""",
-            f"FROM {from_core}",
-        ):
-            raw_tbl = (m_tbl.group(1) or "").replace("`", "").strip()
-            tbl = raw_tbl.split(".")[-1].lower()
-            if tbl and tbl not in alias_to_table:
-                alias_to_table[tbl] = tbl
+    if len(source_pairs) < 2:
+        return sql
+    alias_to_table: Dict[str, str] = {a.lower(): t for a, t in source_pairs}
 
-    has_employees = any(t == "employees" for t in alias_to_table.values())
-    has_customers = any(t == "customers" for t in alias_to_table.values())
-    if not (has_employees and has_customers):
+    # Parse SELECT items to find SUM(alias.metric_col) references.
+    select_items = _split_top_level_commas(parsed["select"])
+    if not select_items:
         return sql
 
-    # If payments already joined, don't force canonical rewrite here.
-    if any(t == "payments" for t in alias_to_table.values()):
+    def _split_expr_alias(item: str) -> tuple[str, Optional[str]]:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            (item or "").strip(),
+        )
+        if not m:
+            return (item or "").strip(), None
+        return (m.group(1) or "").strip(), (m.group(2) or "").strip()
+
+    sum_ref_pat = re.compile(
+        r"""(?is)\bSUM\s*\(\s*(?:DISTINCT\s+)?`?(?P<alias>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<col>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)"""
+    )
+
+    missing_ref = None
+    for idx, raw_item in enumerate(select_items):
+        expr, _out_alias = _split_expr_alias(raw_item)
+        for m_sum in sum_ref_pat.finditer(expr):
+            ref_alias = str(m_sum.group("alias") or "").strip()
+            ref_col = str(m_sum.group("col") or "").strip()
+            if not ref_alias or not ref_col:
+                continue
+            if ref_alias.lower() not in alias_to_table:
+                missing_ref = {
+                    "item_idx": idx,
+                    "old_alias": ref_alias,
+                    "metric_col": ref_col,
+                }
+                break
+        if missing_ref:
+            break
+
+    if not missing_ref:
         return sql
 
-    # Build canonical projection fields dynamically where possible.
-    emp_id_col = get_id_column("employees") or "employeeNumber"
-    emp_first_col = "firstName"
-    emp_last_col = "lastName"
-    emp_name_col = get_name_column("employees") or ""
+    metric_col = str(missing_ref["metric_col"]).strip()
+    metric_col_l = metric_col.lower()
+    old_alias = str(missing_ref["old_alias"]).strip()
+    item_idx = int(missing_ref["item_idx"])
 
-    analyzer = None
     try:
         analyzer = get_schema_analyzer()
     except Exception:
         analyzer = None
+    allowed_identifiers = _parse_allowed_identifiers(ctx)
 
-    emp_cols_lower: Set[str] = set()
+    def _table_cols_lower(table: str) -> Set[str]:
+        table_l = str(table or "").lower().strip()
+        if not table_l:
+            return set()
+        if analyzer is not None:
+            try:
+                return {
+                    str(c).strip("`").lower()
+                    for c in analyzer.get_table_columns(table_l)
+                }
+            except Exception:
+                pass
+        for t, cols in (allowed_identifiers or {}).items():
+            if str(t or "").lower().strip() != table_l:
+                continue
+            return {
+                str(c).strip("`").lower()
+                for c in (cols or set())
+                if str(c or "").strip()
+            }
+        return set()
+
+    # Case A: table with metric already joined -> remap alias only.
+    joined_metric_aliases = [
+        a for a, t in source_pairs
+        if metric_col_l in _table_cols_lower(t)
+    ]
+    if joined_metric_aliases:
+        new_alias = joined_metric_aliases[0]
+        pat_ref = re.compile(
+            rf"""(?is)\b`?{re.escape(old_alias)}`?\s*\.\s*`?{re.escape(metric_col)}`?\b"""
+        )
+        select_items[item_idx] = pat_ref.sub(
+            f"{new_alias}.{metric_col}",
+            select_items[item_idx],
+        )
+        new_select = ", ".join(select_items)
+        rebuilt = f"SELECT {new_select} FROM {from_core}"
+        if (parsed.get("where") or "").strip():
+            rebuilt += f" {parsed['where'].strip()}"
+        rebuilt += f" GROUP BY {parsed['groupby'].strip()}"
+        if (parsed.get("tail") or "").strip():
+            rebuilt += f" {parsed['tail'].strip()}"
+        if sql.strip().endswith(";"):
+            rebuilt += ";"
+        return rebuilt
+
+    # Case B: infer missing metric table using schema + FK graph.
     if analyzer is not None:
         try:
-            emp_cols_lower = {
-                str(c).strip("`").lower()
-                for c in analyzer.get_table_columns("employees")
-            }
+            all_tables = sorted(str(t).lower() for t in get_all_tables())
         except Exception:
-            emp_cols_lower = set()
-
-    has_first_last = (
-        emp_first_col.lower() in emp_cols_lower
-        and emp_last_col.lower() in emp_cols_lower
-    ) or not emp_cols_lower
-
-    if has_first_last:
-        name_select = "CONCAT(emp.firstName, ' ', emp.lastName) AS employee_name"
-        group_by = f"emp.{emp_id_col}, emp.firstName, emp.lastName"
+            all_tables = []
     else:
-        safe_name_col = emp_name_col if emp_name_col else emp_id_col
-        name_select = f"emp.{safe_name_col} AS employee_name"
-        group_by = f"emp.{emp_id_col}, emp.{safe_name_col}"
+        all_tables = sorted(str(t).lower() for t in (allowed_identifiers or {}).keys())
+    if not all_tables:
+        return sql
+    metric_tables = [
+        t for t in all_tables
+        if metric_col_l in _table_cols_lower(t) and t not in {tbl for _, tbl in source_pairs}
+    ]
+    if not metric_tables:
+        return sql
 
-    rewritten = (
-        "SELECT "
-        f"emp.{emp_id_col}, "
-        f"{name_select}, "
-        "SUM(pmt.amount) AS total_payment_amount "
-        "FROM employees AS emp "
-        f"LEFT JOIN customers AS cust ON emp.{emp_id_col} = cust.salesRepEmployeeNumber "
-        "LEFT JOIN payments AS pmt ON cust.customerNumber = pmt.customerNumber "
-        f"GROUP BY {group_by};"
+    try:
+        fk_map_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_map_raw = {}
+    fk_map: Dict[str, Dict[str, str]] = {}
+    for src, mapping in fk_map_raw.items():
+        src_l = str(src or "").lower().strip()
+        if not src_l:
+            continue
+        fk_map[src_l] = {}
+        for fk_col, tgt in (mapping or {}).items():
+            fk_l = str(fk_col or "").lower().strip()
+            tgt_l = str(tgt or "").lower().strip()
+            if fk_l and tgt_l:
+                fk_map[src_l][fk_l] = tgt_l
+
+    def _safe_id_col(table_name: str) -> str:
+        try:
+            return (get_id_column(table_name) or "").strip()
+        except Exception:
+            return ""
+
+    def _find_join_plan(metric_table: str) -> Optional[Tuple[str, str, str, str, str]]:
+        # returns:
+        # ("conn_to_metric", conn_alias, conn_fk_col, metric_table, metric_key_col)
+        # or ("metric_to_conn", conn_alias, metric_fk_col, metric_table, conn_key_col)
+        for conn_alias, conn_table in source_pairs:
+            for fk_col, tgt in (fk_map.get(conn_table, {}) or {}).items():
+                if tgt == metric_table:
+                    metric_key = (_safe_id_col(metric_table) or fk_col or "").strip()
+                    if metric_key:
+                        return ("conn_to_metric", conn_alias, fk_col, metric_table, metric_key)
+            for fk_col, tgt in (fk_map.get(metric_table, {}) or {}).items():
+                if tgt == conn_table:
+                    conn_key = (_safe_id_col(conn_table) or fk_col or "").strip()
+                    if conn_key:
+                        return ("metric_to_conn", conn_alias, fk_col, metric_table, conn_key)
+
+            # Fallback when FK metadata is unavailable:
+            # join by shared key-like column names between connector and metric tables.
+            metric_cols = _table_cols_lower(metric_table)
+            conn_cols = _table_cols_lower(conn_table)
+            shared_key_cols = sorted(
+                c for c in (metric_cols & conn_cols)
+                if c.endswith(("id", "number", "code", "key"))
+            )
+            if shared_key_cols:
+                best = shared_key_cols[0]
+                metric_id = (_safe_id_col(metric_table) or "").lower()
+                conn_id = (_safe_id_col(conn_table) or "").lower()
+                if metric_id and metric_id in shared_key_cols:
+                    best = metric_id
+                elif conn_id and conn_id in shared_key_cols:
+                    best = conn_id
+                return ("shared_key", conn_alias, best, metric_table, best)
+        return None
+
+    try:
+        transaction_tables = {str(t).lower() for t in get_transaction_tables()}
+    except Exception:
+        transaction_tables = set()
+
+    candidates: List[Tuple[int, str, Tuple[str, str, str, str, str]]] = []
+    q = (question or "").lower()
+    for mt in metric_tables:
+        plan = _find_join_plan(mt)
+        if plan is None:
+            continue
+        score = 0
+        if mt in transaction_tables:
+            score += 3
+        # Small intent boost when table name/synonym appears in question.
+        words = _entity_words_for_table(mt)
+        mentioned_metric_table = False
+        for w in words:
+            ww = (w or "").strip()
+            if not ww:
+                continue
+            w_pat = re.escape(ww).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{w_pat}\b", q, flags=re.I):
+                mentioned_metric_table = True
+                break
+        if mentioned_metric_table:
+            score += 1
+        if plan[0] == "metric_to_conn":
+            score += 1
+        candidates.append((score, mt, plan))
+
+    if not candidates:
+        return sql
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    _score, metric_table, plan = candidates[0]
+
+    used_aliases = {a.lower() for a, _t in source_pairs}
+    metric_alias = _alias_for_table(metric_table, used_aliases)
+
+    join_mode, conn_alias, lhs_fk_col, _mt, rhs_key_col = plan
+    if join_mode == "conn_to_metric":
+        on_clause = f"{conn_alias}.{lhs_fk_col} = {metric_alias}.{rhs_key_col}"
+    elif join_mode == "shared_key":
+        on_clause = f"{metric_alias}.{lhs_fk_col} = {conn_alias}.{rhs_key_col}"
+    else:
+        on_clause = f"{metric_alias}.{lhs_fk_col} = {conn_alias}.{rhs_key_col}"
+
+    from_core_new = f"{from_core} LEFT JOIN {metric_table} AS {metric_alias} ON {on_clause}"
+    pat_ref = re.compile(
+        rf"""(?is)\b`?{re.escape(old_alias)}`?\s*\.\s*`?{re.escape(metric_col)}`?\b"""
     )
-    return rewritten
+    select_items[item_idx] = pat_ref.sub(
+        f"{metric_alias}.{metric_col}",
+        select_items[item_idx],
+    )
+
+    new_select = ", ".join(select_items)
+    rebuilt = f"SELECT {new_select} FROM {from_core_new}"
+    if (parsed.get("where") or "").strip():
+        rebuilt += f" {parsed['where'].strip()}"
+    rebuilt += f" GROUP BY {parsed['groupby'].strip()}"
+    if (parsed.get("tail") or "").strip():
+        rebuilt += f" {parsed['tail'].strip()}"
+    if sql.strip().endswith(";"):
+        rebuilt += ";"
+    return rebuilt
 
 
 def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = "") -> str:

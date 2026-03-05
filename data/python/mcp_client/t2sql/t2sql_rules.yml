@@ -1,0 +1,272 @@
+schema_version: 1
+profile: default
+description: >
+  Centralized intent lexicon and heuristic rules for Text-to-SQL behavior.
+  This file is configuration-only (no code wiring yet).
+
+meta:
+  owners:
+    - t2sql
+  locales:
+    - en
+    - id
+
+matching:
+  case_sensitive: false
+  normalize:
+    lowercase: true
+    collapse_whitespace: true
+    trim: true
+  regex:
+    enabled: true
+    default_flags:
+      - IGNORECASE
+
+name_intent:
+  split_components:
+    require_any:
+      - name
+      - names
+      - nama
+    require_group_1:
+      - first
+      - given
+      - forename
+      - depan
+    require_group_2:
+      - last
+      - family
+      - surname
+      - belakang
+    forbid_phrases:
+      - full name
+      - complete name
+      - nama lengkap
+  combined_full_name:
+    any_phrases:
+      - full name
+      - complete name
+      - nama lengkap
+    any_verbs:
+      - combine
+      - combined
+      - combining
+      - concatenate
+      - concatenated
+      - concatenating
+      - concat
+      - join
+      - joined
+      - joining
+      - gabung
+      - gabungkan
+  name_component_column_hints:
+    lexical_tokens:
+      - name
+      - fullname
+      - full_name
+      - first
+      - last
+      - given
+      - family
+      - surname
+      - forename
+      - middle
+    synonym_hints:
+      - full name
+      - first name
+      - last name
+      - given name
+      - family name
+      - surname
+
+identifier_intent:
+  id_like_terms:
+    - id
+    - ids
+    - identifier
+    - identifiers
+    - code
+    - codes
+    - number
+    - numbers
+    - nomor
+    - nomors
+    - no
+    - kode
+  id_column_suffix_hints:
+    - id
+    - code
+    - number
+
+ordering_intent:
+  explicit_sort_keywords:
+    - order by
+    - sort by
+    - sorted by
+    - ordered by
+    - arrange by
+    - urut berdasarkan
+    - urutkan berdasarkan
+    - diurutkan berdasarkan
+  direction_keywords:
+    asc:
+      - asc
+      - ascending
+      - menaik
+    desc:
+      - desc
+      - descending
+      - menurun
+  superlative_keywords:
+    - top
+    - bottom
+    - highest
+    - lowest
+    - largest
+    - smallest
+    - newest
+    - latest
+    - earliest
+    - oldest
+    - terbesar
+    - terkecil
+    - tertinggi
+    - terendah
+    - terbaru
+    - terlama
+  window_context_regex:
+    - "\\brank\\b.*\\b(ascending|descending)\\s+order\\b"
+    - "\\brow[_\\s]?number\\b.*\\b(ascending|descending)\\s+order\\b"
+    - "\\bdense[_\\s]?rank\\b.*\\b(ascending|descending)\\s+order\\b"
+    - "\\bpartition\\s+by\\b.*\\b(ascending|descending)\\b"
+    - "\\bbased\\s+on\\b.*\\b(ascending|descending)\\s+order\\b"
+    - "\\b(cumulative|running)\\b.*\\bordered\\s+by\\b"
+
+grouping_intent:
+  for_each_keywords:
+    - for each
+    - each
+    - per
+    - every
+    - tiap
+    - setiap
+  aggregate_keywords:
+    - sum
+    - total
+    - count
+    - avg
+    - average
+    - min
+    - max
+    - jumlah
+    - rata-rata
+
+set_operation_intent:
+  set_op_keywords:
+    - union
+    - union all
+    - combine results
+    - gabungkan hasil
+  distinct_union_cues:
+    - remove duplicate rows
+    - without duplicates
+    - no duplicate
+    - distinct
+  branch_label_hints:
+    - label
+    - year label
+    - category label
+
+regex_intent:
+  boundary_cues:
+    - whole word
+    - exact word
+    - word boundary
+  structural_cues:
+    - exactly
+    - exact pattern
+    - regex
+    - regexp
+    - rlike
+
+temporal_intent:
+  latest_keywords:
+    - latest
+    - newest
+    - most recent
+    - terakhir
+    - terbaru
+  earliest_keywords:
+    - earliest
+    - oldest
+    - pertama
+    - terlama
+  year_scope_keywords:
+    - latest year
+    - most recent year
+    - tahun terbaru
+    - tahun terakhir
+
+ranking_intent:
+  ranking_keywords:
+    - rank
+    - ranking
+    - row_number
+    - dense_rank
+    - top
+    - bottom
+    - peringkat
+  winner_row_keywords:
+    - most recent per
+    - highest per
+    - largest per
+    - latest per
+
+exclusion_intent:
+  negative_keywords:
+    - not
+    - no
+    - without
+    - exclude
+    - excluding
+    - except
+    - selain
+    - tanpa
+
+include_zero_intent:
+  include_zero_keywords:
+    - including zero
+    - include zero
+    - even if none
+    - even when none
+    - termasuk yang tidak punya
+    - termasuk nol
+
+aggregation_intent:
+  count_distinct_keywords:
+    - distinct
+    - unique
+    - different
+    - unik
+    - berbeda
+  count_distinct_phrases:
+    - how many distinct
+    - number of unique
+    - jumlah unik
+
+precedence:
+  - name_intent.combined_full_name
+  - name_intent.split_components
+  - grouping_intent.for_each_keywords
+  - set_operation_intent.set_op_keywords
+  - ranking_intent.ranking_keywords
+  - temporal_intent.latest_keywords
+
+actions:
+  name_intent.combined_full_name:
+    output_shape: combined_name
+    allow_concat: true
+  name_intent.split_components:
+    output_shape: split_name_columns
+    allow_concat: false
