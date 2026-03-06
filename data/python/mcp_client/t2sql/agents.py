@@ -196,6 +196,122 @@ from .utils import _dbg_print_two, try_llm_json, build_router_schema
 from .generation import regenerate_with_extra_constraint
 from .intent_ir import build_intent_ir, is_ir_plannable
 from .sql_planner import build_sql_from_intent, safety_normalize_sql
+from .confidence import compute_sql_confidence
+
+# Confidence threshold - below this, log warning
+CONFIDENCE_THRESHOLD = 0.70
+
+
+def _log_confidence_result(confidence_result: dict) -> None:
+    """Log confidence score with threshold-aware formatting."""
+    score = confidence_result.get("confidence", 0.0)
+    signals = confidence_result.get("signals", {})
+    warnings = confidence_result.get("warnings", [])
+    
+    if score >= CONFIDENCE_THRESHOLD:
+        _dbg_print_two(
+            "[REFINER - CONFIDENCE]",
+            f"score={score:.1%} (threshold={CONFIDENCE_THRESHOLD:.0%}) ✓"
+        )
+    else:
+        # Log warning with details
+        low_signals = [f"{k}={v:.1%}" for k, v in signals.items() if v < 0.7]
+        detail = f"score={score:.1%} (threshold={CONFIDENCE_THRESHOLD:.0%}) ⚠"
+        if low_signals:
+            detail += f" | low_signals=[{', '.join(low_signals)}]"
+        if warnings:
+            detail += f" | warnings={len(warnings)}"
+        _dbg_print_two("[REFINER - CONFIDENCE]", detail)
+
+
+def _build_confidence_retry_instruction(confidence_result: dict) -> str:
+    """Build LLM instruction with confidence feedback for retry."""
+    warnings = confidence_result.get("warnings", [])
+    signals = confidence_result.get("signals", {})
+    score = confidence_result.get("confidence", 0.0)
+    
+    lines = [
+        f"⚠ CONFIDENCE RETRY: Previous SQL had low confidence ({score:.0%}).",
+        "Issues detected that need fixing:"
+    ]
+    
+    # Add specific warnings (limit to top 5)
+    for w in warnings[:5]:
+        lines.append(f"  - {w}")
+    
+    # Add signal-specific hints
+    if signals.get("syntax_valid", 1.0) < 0.5:
+        lines.append("  - FIX: SQL has syntax errors. Ensure valid MySQL syntax.")
+    if signals.get("identifiers_valid", 1.0) < 0.8:
+        lines.append("  - FIX: Use ONLY tables/columns from ALLOWED IDENTIFIERS.")
+    if signals.get("entity_coverage", 1.0) < 0.8:
+        lines.append("  - FIX: Include tables mentioned in the question.")
+    if signals.get("join_path_valid", 1.0) < 0.8:
+        lines.append("  - FIX: Ensure JOINs follow valid FK relationships.")
+    if signals.get("structure_plausible", 1.0) < 0.7:
+        lines.append("  - FIX: Match SQL structure to question intent (COUNT/SUM/GROUP BY/ORDER BY).")
+    
+    lines.append("")
+    lines.append("Generate a corrected SQL query that addresses these issues.")
+    
+    return "\n".join(lines)
+
+
+def _attempt_confidence_retry(
+    question: str,
+    ctx: str,
+    current_sql: str,
+    confidence_result: dict,
+    make_prompt_fn,
+) -> dict:
+    """
+    Attempt one retry with 7B model when confidence is below threshold.
+    Returns dict with: used, sql, confidence, accepted
+    """
+    from .generation import regenerate_with_extra_constraint
+    
+    _dbg_print_two("[REFINER - CONFIDENCE]", "Attempting retry with 7B...")
+    
+    instruction = _build_confidence_retry_instruction(confidence_result)
+    llm_7b = build_llm_repair(model=LARGE_MODEL)
+    
+    new_sql, _ = regenerate_with_extra_constraint(
+        llm_7b,
+        make_prompt_fn,
+        ctx,
+        question,
+        instruction,
+    )
+    
+    if not new_sql:
+        _dbg_print_two("[REFINER - CONFIDENCE]", "Retry failed: no SQL generated")
+        return {"used": True, "sql": current_sql, "confidence": confidence_result, "accepted": False}
+    
+    # Normalize and validate new SQL
+    from .helpers_main import normalize_sql_pipeline
+    candidate_sql = normalize_sql_pipeline(str(new_sql).strip(), question, ctx)
+    if not candidate_sql.endswith(";"):
+        candidate_sql += ";"
+    
+    # Compute confidence on new SQL
+    new_confidence = compute_sql_confidence(candidate_sql, question, ctx)
+    new_score = new_confidence.get("confidence", 0.0)
+    old_score = confidence_result.get("confidence", 0.0)
+    
+    _dbg_print_two(
+        "[REFINER - CONFIDENCE]",
+        f"Retry result: {old_score:.1%} → {new_score:.1%}"
+    )
+    
+    # Accept new SQL if confidence improved
+    if new_score > old_score:
+        _dbg_print_two("[REFINER - CONFIDENCE]", "Retry accepted (improved)")
+        return {"used": True, "sql": candidate_sql, "confidence": new_confidence, "accepted": True}
+    else:
+        _dbg_print_two("[REFINER - CONFIDENCE]", "Retry rejected (no improvement)")
+        return {"used": True, "sql": current_sql, "confidence": confidence_result, "accepted": False}
+
+
 from .schema_analyzer import (
     get_all_tables,
     get_singular_form,
@@ -4529,6 +4645,29 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 f"postprocess={postproc_time:.2f}s"
             )
 
+        # Compute confidence score (schema-agnostic)
+        confidence_result = compute_sql_confidence(final_sql, question, ctx)
+        _log_confidence_result(confidence_result)
+        
+        # Confidence-based retry (1x max) if below threshold
+        confidence_retry_used = False
+        if confidence_result["confidence"] < CONFIDENCE_THRESHOLD:
+            retry_result = _attempt_confidence_retry(
+                question=question,
+                ctx=ctx,
+                current_sql=final_sql,
+                confidence_result=confidence_result,
+                make_prompt_fn=make_generation_prompt,
+            )
+            confidence_retry_used = retry_result.get("used", False)
+            if retry_result.get("accepted", False):
+                final_sql = retry_result["sql"]
+                confidence_result = retry_result["confidence"]
+                corrections.append("Confidence retry succeeded (7B)")
+                ir_final_model = LARGE_MODEL
+            else:
+                corrections.append("Confidence retry attempted (no improvement)")
+
         return {
             **state,
             "validation_errors": validation_errors,
@@ -4542,6 +4681,11 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             "ir_semantic_repair_used": bool(ir_semantic_repair_used),
             "ir_semantic_fallback_used": bool(ir_semantic_fallback_used),
             "ir_semantic_fallback_model": ir_semantic_fallback_model,
+            "sql_confidence": confidence_result["confidence"],
+            "confidence_signals": confidence_result["signals"],
+            "confidence_warnings": confidence_result["warnings"],
+            "confidence_low": confidence_result["confidence"] < CONFIDENCE_THRESHOLD,
+            "confidence_retry_used": confidence_retry_used,
         }
 
     # DYNAMIC MODEL SELECTION berdasarkan draft quality
@@ -5818,6 +5962,29 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             f"postprocess={postproc_time:.2f}s"
         )
 
+    # Compute confidence score (schema-agnostic)
+    confidence_result = compute_sql_confidence(final_sql, question, ctx)
+    _log_confidence_result(confidence_result)
+    
+    # Confidence-based retry (1x max) if below threshold
+    confidence_retry_used = False
+    if confidence_result["confidence"] < CONFIDENCE_THRESHOLD:
+        retry_result = _attempt_confidence_retry(
+            question=question,
+            ctx=ctx,
+            current_sql=final_sql,
+            confidence_result=confidence_result,
+            make_prompt_fn=make_generation_prompt,
+        )
+        confidence_retry_used = retry_result.get("used", False)
+        if retry_result.get("accepted", False):
+            final_sql = retry_result["sql"]
+            confidence_result = retry_result["confidence"]
+            corrections.append("Confidence retry succeeded (7B)")
+            final_model = LARGE_MODEL
+        else:
+            corrections.append("Confidence retry attempted (no improvement)")
+
     return {
         **state,
         "validation_errors": final_validation_errors,
@@ -5828,4 +5995,9 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         "final_gate_pass": final_gate_pass,
         "final_gate_reasons": final_gate_reasons,
         "rescue_7b_used": bool(rescue_7b_used),
+        "sql_confidence": confidence_result["confidence"],
+        "confidence_signals": confidence_result["signals"],
+        "confidence_warnings": confidence_result["warnings"],
+        "confidence_low": confidence_result["confidence"] < CONFIDENCE_THRESHOLD,
+        "confidence_retry_used": confidence_retry_used,
     }

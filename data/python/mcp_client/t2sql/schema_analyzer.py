@@ -563,6 +563,149 @@ def is_table_mentioned(question: str, table: str) -> bool:
     return table.lower() in get_all_mentioned_tables(question)
 
 
+def get_all_entity_variants(table: str) -> Set[str]:
+    """
+    Get all variants for entity detection (schema-agnostic synonym expansion).
+    
+    Builds comprehensive set of variants from:
+    1. Table name (exact)
+    2. Singular form
+    3. Spaced forms (for underscore names)
+    4. Table synonyms from metadata
+    5. Column synonyms that reference the table
+    
+    This is used for robust entity detection in questions.
+    
+    Args:
+        table: Table name
+    
+    Returns:
+        Set of all entity variants (lowercase)
+    """
+    analyzer = get_schema_analyzer()
+    t = (table or "").lower().strip()
+    if not t:
+        return set()
+    
+    variants: Set[str] = {t}
+    
+    # Singular form
+    singular = get_singular_form(t)
+    if singular:
+        variants.add(singular)
+    
+    # Spaced forms
+    if "_" in t:
+        variants.add(t.replace("_", " "))
+    if singular and "_" in singular:
+        variants.add(singular.replace("_", " "))
+    
+    # Table synonyms from metadata
+    synonyms = analyzer.get_table_synonyms(t)
+    for syn in synonyms:
+        s = (syn or "").lower().strip()
+        if s and len(s) >= 3:  # Avoid very short synonyms
+            variants.add(s)
+    
+    return {v for v in variants if v}
+
+
+def get_column_entity_variants(table: str, column: str) -> Set[str]:
+    """
+    Get all variants for a column entity detection (schema-agnostic).
+    
+    Builds comprehensive set from:
+    1. Column name (exact)
+    2. Spaced camelCase (customerName -> customer name)
+    3. Spaced snake_case (order_date -> order date)
+    4. Column synonyms from metadata
+    
+    Args:
+        table: Table name
+        column: Column name
+    
+    Returns:
+        Set of all column variants (lowercase)
+    """
+    import re
+    
+    analyzer = get_schema_analyzer()
+    c = (column or "").lower().strip()
+    t = (table or "").lower().strip()
+    if not c:
+        return set()
+    
+    variants: Set[str] = {c}
+    
+    # Spaced camelCase
+    spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', column).lower()
+    if spaced != c:
+        variants.add(spaced)
+    
+    # Spaced snake_case
+    if "_" in c:
+        variants.add(c.replace("_", " "))
+    
+    # Column synonyms from metadata
+    if t:
+        synonyms = analyzer.get_column_synonyms(t, c)
+        for syn in synonyms:
+            s = (syn or "").lower().strip()
+            if s and len(s) >= 2:
+                variants.add(s)
+    
+    return {v for v in variants if v}
+
+
+def get_column_datatype(table: str, column: str) -> str:
+    """
+    Get column datatype from schema metadata.
+    
+    Returns datatype string (e.g., 'VARCHAR', 'INT', 'DECIMAL', 'DATE')
+    or empty string if not found.
+    
+    Schema-agnostic - reads from parsed JSONL metadata.
+    
+    Args:
+        table: Table name
+        column: Column name
+    
+    Returns:
+        Datatype string (uppercase) or empty string
+    """
+    analyzer = get_schema_analyzer()
+    t = (table or "").lower().strip()
+    c = (column or "").lower().strip()
+    
+    datatypes = analyzer._column_datatypes.get(t, {})
+    dtype = datatypes.get(c, "")
+    return str(dtype).upper().strip()
+
+
+def get_column_role(table: str, column: str) -> str:
+    """
+    Get column role from schema metadata.
+    
+    Returns role string (e.g., 'metric', 'dimension', 'id')
+    or empty string if not found.
+    
+    Schema-agnostic - reads from parsed JSONL metadata.
+    
+    Args:
+        table: Table name
+        column: Column name
+    
+    Returns:
+        Role string (lowercase) or empty string
+    """
+    analyzer = get_schema_analyzer()
+    t = (table or "").lower().strip()
+    c = (column or "").lower().strip()
+    
+    roles = analyzer._column_roles.get(t, {})
+    return str(roles.get(c, "")).lower().strip()
+
+
 # Export convenience
 __all__ = [
     'SchemaAnalyzer',
@@ -571,6 +714,7 @@ __all__ = [
     'get_transaction_tables',
     'get_dimension_tables',
     'get_table_synonyms',
+    'get_column_synonyms',
     'get_anchor_columns',
     'is_transaction_table',
     'get_fk_relationships',
@@ -582,4 +726,9 @@ __all__ = [
     'get_name_column',
     'get_all_mentioned_tables',
     'is_table_mentioned',
+    # Synonym expansion utilities
+    'get_all_entity_variants',
+    'get_column_entity_variants',
+    'get_column_datatype',
+    'get_column_role',
 ]

@@ -9,7 +9,8 @@
 # ====================== STANDARD LIBRARY IMPORT =======================
 # ======================================================================
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Pattern, Set, Tuple
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
@@ -35,6 +36,43 @@ from .rulebook import (
     question_wants_split_name_components,
     rule_list,
 )
+# ======================================================================
+# ================== REGEX PATTERN CACHING UTILITIES ===================
+# ======================================================================
+# LRU-cached regex compilation to reduce redundant re.compile() calls
+_REGEX_CACHE_SIZE = 2048
+
+
+@lru_cache(maxsize=_REGEX_CACHE_SIZE)
+def compile_pattern(pattern: str, flags: int = 0) -> Pattern[str]:
+    """LRU-cached regex pattern compilation."""
+    return re.compile(pattern, flags)
+
+
+def cached_search(pattern: str, string: str, flags: int = 0) -> Optional[re.Match[str]]:
+    """Regex search with cached pattern compilation."""
+    return compile_pattern(pattern, flags).search(string)
+
+
+def cached_match(pattern: str, string: str, flags: int = 0) -> Optional[re.Match[str]]:
+    """Regex match with cached pattern compilation."""
+    return compile_pattern(pattern, flags).match(string)
+
+
+def cached_sub(pattern: str, repl: str, string: str, count: int = 0, flags: int = 0) -> str:
+    """Regex substitution with cached pattern compilation."""
+    return compile_pattern(pattern, flags).sub(repl, string, count=count)
+
+
+def cached_findall(pattern: str, string: str, flags: int = 0) -> list:
+    """Regex findall with cached pattern compilation."""
+    return compile_pattern(pattern, flags).findall(string)
+
+
+def cached_split(pattern: str, string: str, maxsplit: int = 0, flags: int = 0) -> list[str]:
+    """Regex split with cached pattern compilation."""
+    return compile_pattern(pattern, flags).split(string, maxsplit=maxsplit)
+
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
@@ -12142,8 +12180,35 @@ def _remove_distinct(sql: str) -> str:
     return re.sub(r"^\s*select\s+distinct\s+", "SELECT ", sql, flags=re.I)
 
 def _ensure_reasonable_distinct(sql: str, question: str) -> str:
+    """
+    Ensure DISTINCT is used when question implies deduplication.
+    
+    Guards (schema-agnostic):
+    - Skip if aggregates present (COUNT/SUM/AVG already dedupe via GROUP BY)
+    - Skip if multiple JOINs (DISTINCT may be legitimately needed or not)
+    - Skip if window functions present (row-level semantics)
+    """
     if not sql:
         return sql
+    
+    s_up = sql.upper()
+    
+    # Guard 1: Aggregates already handle deduplication via GROUP BY
+    if any(agg in s_up for agg in ("COUNT(", "SUM(", "AVG(", "MIN(", "MAX(")):
+        return sql
+    
+    # Guard 2: Multiple JOINs - DISTINCT decision is ambiguous
+    if join_count(sql) > 1:
+        return sql
+    
+    # Guard 3: Window functions have row-level semantics
+    if re.search(r"\b(ROW_NUMBER|RANK|DENSE_RANK|LAG|LEAD|NTILE)\s*\(", s_up):
+        return sql
+    
+    # Guard 4: GROUP BY already provides deduplication semantics
+    if "GROUP BY" in s_up:
+        return sql
+    
     if _question_wants_count_distinct(question):
         return _remove_distinct(sql)
     if _wants_distinct_from_question(question):

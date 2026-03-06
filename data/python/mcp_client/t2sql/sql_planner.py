@@ -200,6 +200,169 @@ def _join_cond_between(
     return None
 
 
+# ======================================================================
+# ================== FK PATH VALIDATION (SCHEMA-AGNOSTIC) ==============
+# ======================================================================
+
+def validate_join_paths(sql: str, ctx: str = "") -> Dict[str, Any]:
+    """
+    Validate that all JOINs in SQL use valid FK relationships.
+    
+    Schema-agnostic - uses FK metadata from schema analyzer.
+    Falls back to shared ID column detection when FK metadata is sparse.
+    
+    Args:
+        sql: SQL query to validate
+        ctx: Context string with ALLOWED IDENTIFIERS
+    
+    Returns:
+        Dict with:
+        - valid: bool - True if all join paths are valid
+        - errors: List[str] - Description of invalid joins
+        - warnings: List[str] - Non-fatal issues
+        - join_count: int - Number of joins found
+        - validated_pairs: List[Tuple[str, str]] - Successfully validated table pairs
+    """
+    result: Dict[str, Any] = {
+        "valid": True,
+        "errors": [],
+        "warnings": [],
+        "join_count": 0,
+        "validated_pairs": [],
+    }
+    
+    if not sql:
+        return result
+    
+    s_up = sql.upper()
+    if "JOIN" not in s_up:
+        return result
+    
+    # Extract tables from SQL
+    table_pattern = r'\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?'
+    matches = list(re.finditer(table_pattern, sql, flags=re.I))
+    
+    if len(matches) < 2:
+        return result
+    
+    # Build table list (table_name, alias)
+    tables: List[Tuple[str, str]] = []
+    for m in matches:
+        table = m.group(1).strip('`').lower()
+        alias = (m.group(2) or table).lower()
+        tables.append((table, alias))
+    
+    # Get FK relationships from schema
+    fk_rels = _safe_get_fk_relationships()
+    
+    # Build adjacency graph (schema-agnostic)
+    adjacent: Set[Tuple[str, str]] = set()
+    
+    # Add explicit FK relationships
+    for src_table, fk_map in fk_rels.items():
+        for fk_col, target_table in fk_map.items():
+            adjacent.add((src_table.lower(), target_table.lower()))
+            adjacent.add((target_table.lower(), src_table.lower()))
+    
+    # Add implicit relationships (shared ID columns)
+    allowed = _parse_allowed_identifiers(ctx)
+    table_names = [t[0] for t in tables]
+    
+    for i, t1 in enumerate(table_names):
+        cols1 = set(c.lower() for c in allowed.get(t1, set()))
+        if not cols1:
+            try:
+                analyzer = get_schema_analyzer()
+                cols1 = set(c.lower() for c in analyzer.get_table_columns(t1))
+            except Exception:
+                pass
+        
+        id_cols1 = {c for c in cols1 if c.endswith(('id', 'number', 'code'))}
+        
+        for t2 in table_names[i+1:]:
+            cols2 = set(c.lower() for c in allowed.get(t2, set()))
+            if not cols2:
+                try:
+                    analyzer = get_schema_analyzer()
+                    cols2 = set(c.lower() for c in analyzer.get_table_columns(t2))
+                except Exception:
+                    pass
+            
+            id_cols2 = {c for c in cols2 if c.endswith(('id', 'number', 'code'))}
+            
+            if id_cols1.intersection(id_cols2):
+                adjacent.add((t1, t2))
+                adjacent.add((t2, t1))
+    
+    # Count actual JOINs
+    join_count = len(re.findall(r'\bJOIN\b', sql, flags=re.I))
+    result["join_count"] = join_count
+    
+    # Validate each consecutive pair of tables
+    errors: List[str] = []
+    warnings: List[str] = []
+    validated_pairs: List[Tuple[str, str]] = []
+    
+    for i in range(len(table_names) - 1):
+        t1 = table_names[i]
+        t2 = table_names[i + 1]
+        
+        # Check if tables are connected
+        if (t1, t2) in adjacent or (t2, t1) in adjacent:
+            validated_pairs.append((t1, t2))
+        else:
+            # Check if there's a path via BFS
+            fk_map, adj = _build_fk_maps(allowed)
+            path = _find_path(t1, t2, adj)
+            
+            if path:
+                if len(path) > 2:
+                    warnings.append(f"Tables {t1} and {t2} require intermediate tables: {' -> '.join(path)}")
+                validated_pairs.append((t1, t2))
+            else:
+                errors.append(f"No FK relationship between {t1} and {t2}")
+    
+    result["errors"] = errors
+    result["warnings"] = warnings
+    result["validated_pairs"] = validated_pairs
+    result["valid"] = len(errors) == 0
+    
+    return result
+
+
+def suggest_join_path(
+    source_table: str,
+    target_table: str,
+    ctx: str = "",
+) -> Optional[List[str]]:
+    """
+    Suggest optimal FK path between two tables.
+    
+    Schema-agnostic - uses FK metadata and shared ID column detection.
+    
+    Args:
+        source_table: Starting table
+        target_table: Ending table
+        ctx: Context string with ALLOWED IDENTIFIERS
+    
+    Returns:
+        List of table names forming the path, or None if no path exists
+    """
+    s = (source_table or "").lower().strip()
+    t = (target_table or "").lower().strip()
+    
+    if not s or not t:
+        return None
+    
+    if s == t:
+        return [s]
+    
+    allowed = _parse_allowed_identifiers(ctx)
+    fk_map, adj = _build_fk_maps(allowed)
+    
+    return _find_path(s, t, adj)
+
+
 def _render_filter_sql(f: Dict[str, Any], alias: str) -> Optional[str]:
     col = str(f.get("column") or "").strip()
     op = str(f.get("op") or "").strip().lower()

@@ -50,6 +50,12 @@ class RAGState(TypedDict, total=False):
     qtype: str
     # Flag apakah pertanyaan ini butuh REGEXP/pattern handling
     requires_regex: bool
+    # === CONFIDENCE SCORING ===
+    sql_confidence: float  # Overall confidence score (0.0 - 1.0)
+    confidence_signals: Dict[str, float]  # Individual signal scores
+    confidence_warnings: List[str]  # Warnings from confidence analysis
+    confidence_low: bool  # True if confidence < threshold (0.70)
+    confidence_retry_used: bool  # True if confidence retry was attempted
     # Catatan dari LLM (Agent 1/2) tentang alasan join, dll.
     agent_notes: str
     # Daftar error whitelist (identifier tidak ada di ALLOWED IDENTIFIERS)
@@ -97,6 +103,11 @@ def make_state(paths, question: str) -> RAGState:
         "ir_semantic_fallback_model": "",
         "qtype": "",
         "requires_regex": False,
+        "sql_confidence": 0.0,
+        "confidence_signals": {},
+        "confidence_warnings": [],
+        "confidence_low": False,
+        "confidence_retry_used": False,
         "agent_notes": "",
         "validation_errors": [],
         "critic_feedback": "",
