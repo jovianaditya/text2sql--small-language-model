@@ -4130,11 +4130,34 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         if ir_gate_reasons:
             ir_gate_reasons = list(dict.fromkeys(ir_gate_reasons))
 
+        base_gate_reasons: List[str] = []
+        if not bool(intent_ir.get("planner_compatible", True)):
+            base_gate_reasons.append("planner_incompatible")
+        if ir_confidence < dynamic_min_conf:
+            base_gate_reasons.append(
+                f"confidence_below_min:{ir_confidence:.2f}<{dynamic_min_conf:.2f}"
+            )
+        if not str(intent_ir.get("subject_entity") or "").strip():
+            base_gate_reasons.append("missing_subject_entity")
+        if not (
+            intent_ir.get("dimensions")
+            or intent_ir.get("metrics")
+            or intent_ir.get("filters")
+            or intent_ir.get("existence")
+        ):
+            base_gate_reasons.append("empty_ir_payload")
+        if base_gate_reasons:
+            base_gate_reasons = list(dict.fromkeys(base_gate_reasons))
+
         base_plannable = is_ir_plannable(intent_ir, dynamic_min_conf)
         ir_plannable = base_plannable and not ir_gate_reasons
+        ir_log_reasons: List[str] = list(
+            dict.fromkeys(list(ir_gate_reasons) + list(base_gate_reasons))
+        )
         state["ir_confidence"] = ir_confidence
         state["ir_plannable"] = bool(ir_plannable)
         state["ir_gate_reasons"] = list(ir_gate_reasons)
+        state["ir_base_gate_reasons"] = list(base_gate_reasons)
         state["ir_table_count"] = int(table_count)
         state["ir_context_table_count"] = int(ctx_table_count)
         state["ir_family_preferred"] = bool(family_ir_preferred)
@@ -4148,7 +4171,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
                 f"table_count={table_count}, "
                 f"context_table_count={ctx_table_count}, "
                 f"min_conf={dynamic_min_conf:.2f}, "
-                f"gate_reasons={ir_gate_reasons or ['none']}"
+                f"gate_reasons={ir_log_reasons or ['none']}"
             )
 
         if ir_plannable:
@@ -4207,8 +4230,10 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             else:
                 if AGENT_IR_DEBUG:
                     print(f"[IR] planner fallback -> LLM. errors={plan_meta.get('errors')}")
-        elif AGENT_IR_DEBUG and ir_gate_reasons:
-            print(f"[IR] gated off -> LLM. reasons={ir_gate_reasons}")
+        elif AGENT_IR_DEBUG and not ir_plannable:
+            print(
+                f"[IR] gated off -> LLM. reasons={ir_log_reasons or ['unknown_ir_gate_reason']}"
+            )
 
     fallback_model = (
         state.get("router_model_candidate")

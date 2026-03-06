@@ -2,7 +2,7 @@ schema_version: 1
 profile: default
 description: >
   Centralized intent lexicon and heuristic rules for Text-to-SQL behavior.
-  This file is configuration-only (no code wiring yet).
+  This file is consumed by runtime rulebook helpers.
 
 meta:
   owners:
@@ -47,6 +47,10 @@ name_intent:
       - full name
       - complete name
       - nama lengkap
+    require_any:
+      - name
+      - names
+      - nama
     any_verbs:
       - combine
       - combined
@@ -60,6 +64,7 @@ name_intent:
       - joining
       - gabung
       - gabungkan
+    verb_name_window_chars: 48
   name_component_column_hints:
     lexical_tokens:
       - name
@@ -79,6 +84,31 @@ name_intent:
       - given name
       - family name
       - surname
+    ordering_priority:
+      first:
+        - first
+        - firstname
+        - given
+        - givenname
+        - forename
+        - depan
+        - nama_depan
+      middle:
+        - middle
+        - middlename
+        - tengah
+      last:
+        - last
+        - lastname
+        - family
+        - familyname
+        - surname
+        - belakang
+        - nama_belakang
+      generic:
+        - name
+        - fullname
+        - full_name
 
 identifier_intent:
   id_like_terms:
@@ -142,6 +172,12 @@ ordering_intent:
     - "\\bpartition\\s+by\\b.*\\b(ascending|descending)\\b"
     - "\\bbased\\s+on\\b.*\\b(ascending|descending)\\s+order\\b"
     - "\\b(cumulative|running)\\b.*\\bordered\\s+by\\b"
+    - "\\b(second|third|fourth|fifth|\\d+(?:st|nd|rd|th))\\b.*\\b(sorted|ordered)\\s+by\\b"
+    - "\\b(sorted|ordered)\\s+by\\b.*\\b(second|third|fourth|fifth|\\d+(?:st|nd|rd|th))\\b"
+  ordering_phrase_regex:
+    - "\\bfrom\\s+(the\\s+)?(highest|lowest|latest|earliest|newest|oldest)"
+    - "\\bfrom\\s+(a\\s+to\\s+z|z\\s+to\\s+a)"
+    - "\\b(sorted|ordered)\\s+from\\b"
 
 grouping_intent:
   for_each_keywords:

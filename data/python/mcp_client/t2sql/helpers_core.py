@@ -24,6 +24,17 @@ from .schema_analyzer import (
     get_singular_form,
 )
 from .config import ALIAS_MAX_LEN
+from .rulebook import (
+    any_phrase_in_text,
+    identifier_id_like_terms,
+    name_component_lexical_tokens,
+    name_component_priority_groups,
+    name_request_terms,
+    name_component_synonym_hints,
+    question_wants_combined_full_name,
+    question_wants_split_name_components,
+    rule_list,
+)
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
@@ -2573,9 +2584,25 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
     q = (question or "").lower()
     q_norm = re.sub(r"\b(total\s+)?number\s+of\b", "", q)
     q_snake = re.sub(r"[^a-z0-9_]+", "_", q_norm).strip("_")
+    name_component_token_hints = name_component_lexical_tokens()
+    name_component_synonym_hint_phrases = name_component_synonym_hints()
+
+    def _terms_to_regex_alternation(terms: List[str]) -> str:
+        pats: List[str] = []
+        for t in terms:
+            s = str(t or "").strip().lower()
+            if not s:
+                continue
+            pats.append(re.escape(s).replace(r"\ ", r"\s+"))
+        if not pats:
+            return ""
+        pats = sorted(set(pats), key=len, reverse=True)
+        return f"(?:{'|'.join(pats)})"
+
+    id_terms = _terms_to_regex_alternation(identifier_id_like_terms()) or r"(?:ids?|numbers?|nomors?|nos?|codes?|kodes?)"
+    name_terms = _terms_to_regex_alternation(name_request_terms()) or r"(?:full\s+names?|names?)"
 
     def _entity_wants_id_like(entity_words: List[str], table_name: str) -> bool:
-        id_terms = r"(?:ids?|numbers?|nomors?|nos?|codes?|kodes?)"
         forms: Set[str] = {table_name.lower(), (get_singular_form(table_name) or table_name).lower()}
         for w in entity_words:
             ww = (w or "").strip().lower()
@@ -2609,13 +2636,12 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
             if re.search(rf"\b{id_terms}\b\s+(?:of|for)\s+\b{p}\b", q_norm, flags=re.I):
                 return True
             # Shorthand list style: "customer name, id" / "customer name and id"
-            if re.search(rf"\b{p}\b\s+(?:full\s+)?names?\b\s*(?:,|\band\b)\s*(?:their\s+)?{id_terms}\b", q_norm, flags=re.I):
+            if re.search(rf"\b{p}\b\s+{name_terms}\b\s*(?:,|\band\b)\s*(?:their\s+)?{id_terms}\b", q_norm, flags=re.I):
                 return True
 
         return False
 
     def _entity_wants_name_like(entity_words: List[str], table_name: str) -> bool:
-        name_terms = r"(?:full\s+names?|names?)"
         forms: Set[str] = {table_name.lower(), (get_singular_form(table_name) or table_name).lower()}
         for w in entity_words:
             ww = (w or "").strip().lower()
@@ -2848,13 +2874,14 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
             if c == name_col_l:
                 return True
             toks = _identifier_tokens(c)
-            # Generic lexical hints (schema-agnostic, not table-specific).
-            if "name" in toks or "fullname" in toks:
+            norm_toks = {tok.replace(" ", "_").lower() for tok in toks if tok}
+            if norm_toks.intersection(name_component_token_hints):
                 return True
-            if {"full", "name"}.issubset(toks):
-                return True
-            if toks.intersection({"first", "last", "given", "family", "surname", "forename", "middle"}):
-                return True
+            col_compact = re.sub(r"[^a-z0-9]", "", c)
+            for hint in name_component_token_hints:
+                h = re.sub(r"[^a-z0-9]", "", str(hint or "").lower())
+                if len(h) >= 4 and h in col_compact:
+                    return True
             if analyzer is not None:
                 try:
                     role = str((analyzer._column_roles.get(t, {}) or {}).get(c, "")).strip().lower()
@@ -2867,11 +2894,7 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
                 except Exception:
                     syns = []
                 syn_blob = " ".join(str(x).lower() for x in syns)
-                if re.search(
-                    r"\b(full\s*name|name|first\s*name|last\s*name|surname|family\s*name|given\s*name)\b",
-                    syn_blob,
-                    flags=re.I,
-                ):
+                if any_phrase_in_text(syn_blob, name_component_synonym_hint_phrases):
                     return True
             return False
 
@@ -3169,24 +3192,11 @@ def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str
     if not sql or not question:
         return sql
 
-    q = (question or "").lower()
-    has_name_word = bool(re.search(r"\bnames?\b", q, flags=re.I))
-    has_first_component = bool(re.search(r"\b(first|given|forename)\b", q, flags=re.I))
-    has_last_component = bool(re.search(r"\b(last|family|surname)\b", q, flags=re.I))
-    wants_split_name_components = has_name_word and has_first_component and has_last_component
-    wants_combined_name = bool(
-        re.search(r"\b(full|complete)\s+names?\b", q, flags=re.I)
-        or re.search(
-            r"\b(?:combin(?:e|ed|ing)|concatenat(?:e|ed|ing)|concat(?:enate)?|join(?:ed|ing)?)\b[\w\s]{0,20}\bnames?\b",
-            q,
-            flags=re.I,
-        )
-        or re.search(
-            r"\bnames?\b[\w\s]{0,20}\b(?:combin(?:e|ed|ing)|concatenat(?:e|ed|ing)|concat(?:enate)?|join(?:ed|ing)?)\b",
-            q,
-            flags=re.I,
-        )
-    )
+    wants_split_name_components = question_wants_split_name_components(question)
+    wants_combined_name = question_wants_combined_full_name(question)
+    name_component_token_hints = name_component_lexical_tokens()
+    name_component_synonym_hint_phrases = name_component_synonym_hints()
+    name_priority_groups = name_component_priority_groups()
 
     parsed = _parse_select_from_groupby(sql)
     if not parsed:
@@ -3286,6 +3296,19 @@ def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str
         s = s.replace("_", " ")
         return {tok.lower() for tok in re.findall(r"[a-z0-9]+", s)}
 
+    def _matches_name_token_hint(col_name: str, toks: Set[str], hints: Set[str]) -> bool:
+        if not hints:
+            return False
+        norm_toks = {str(t).strip().replace(" ", "_").lower() for t in toks if str(t).strip()}
+        if norm_toks.intersection(hints):
+            return True
+        col_compact = re.sub(r"[^a-z0-9]", "", str(col_name or "").lower())
+        for hint in hints:
+            h = re.sub(r"[^a-z0-9]", "", str(hint or "").lower())
+            if len(h) >= 4 and h in col_compact:
+                return True
+        return False
+
     name_cols_cache: Dict[str, Set[str]] = {}
 
     def _table_name_component_cols(table_l: str) -> Set[str]:
@@ -3307,10 +3330,7 @@ def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str
         out: Set[str] = set()
         for c in table_cols:
             toks = _identifier_tokens(c)
-            if "name" in toks or "fullname" in toks or {"full", "name"}.issubset(toks):
-                out.add(c)
-                continue
-            if toks.intersection({"first", "last", "given", "family", "surname", "forename", "middle"}):
+            if _matches_name_token_hint(c, toks, name_component_token_hints):
                 out.add(c)
                 continue
             if analyzer is not None:
@@ -3326,11 +3346,7 @@ def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str
                 except Exception:
                     syns = []
                 syn_blob = " ".join(str(x).lower() for x in syns)
-                if re.search(
-                    r"\b(full\s*name|name|first\s*name|last\s*name|surname|family\s*name|given\s*name)\b",
-                    syn_blob,
-                    flags=re.I,
-                ):
+                if any_phrase_in_text(syn_blob, name_component_synonym_hint_phrases):
                     out.add(c)
         name_cols_cache[t_l] = out
         return out
@@ -3360,22 +3376,20 @@ def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str
                 table_cols = []
             col_order = {c: i for i, c in enumerate(table_cols)}
 
+        first_hints = set(name_priority_groups.get("first", set()))
+        middle_hints = set(name_priority_groups.get("middle", set()))
+        last_hints = set(name_priority_groups.get("last", set()))
+        generic_hints = set(name_priority_groups.get("generic", set()))
+
         def _name_priority(col_name: str) -> int:
-            c_low = str(col_name or "").lower()
             toks = _identifier_tokens(col_name)
-            if any(k in c_low for k in ("firstname", "givenname", "forename")):
+            if _matches_name_token_hint(col_name, toks, first_hints):
                 return 0
-            if toks.intersection({"first", "given", "forename"}):
-                return 0
-            if "middlename" in c_low:
+            if _matches_name_token_hint(col_name, toks, middle_hints):
                 return 1
-            if "middle" in toks:
-                return 1
-            if any(k in c_low for k in ("lastname", "familyname", "surname")):
+            if _matches_name_token_hint(col_name, toks, last_hints):
                 return 2
-            if toks.intersection({"last", "family", "surname"}):
-                return 2
-            if "name" in toks or "fullname" in toks:
+            if _matches_name_token_hint(col_name, toks, generic_hints):
                 return 3
             return 4
 
@@ -13832,86 +13846,155 @@ def _question_requests_ordering(question: str) -> bool:
     IMPORTANT: "descending/ascending order" in context of RANK/ROW_NUMBER 
     refers to window function ordering, NOT final result ORDER BY.
     """
-    q = (question or "").lower()
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    def _phrase_in_question(phrase: str) -> bool:
+        p = str(phrase or "").strip().lower()
+        if not p:
+            return False
+        pat = re.escape(p).replace(r"\ ", r"\s+")
+        return re.search(rf"\b{pat}\b", q, flags=re.I) is not None
     
     # --- Pattern 1: Window function context (NOT final ORDER BY) ---
     # If "ascending/descending order" appears with ranking context, skip it
     # E.g., "rank employees ... based on employee number in descending order"
     # E.g., "cumulative payment amount ... ordered by payment date"
-    window_context_patterns = [
-        r"\brank\b.*\b(ascending|descending)\s+order\b",
-        r"\brow[_\s]?number\b.*\b(ascending|descending)\s+order\b",
-        r"\bdense[_\s]?rank\b.*\b(ascending|descending)\s+order\b",
-        r"\bpartition\s+by\b.*\b(ascending|descending)\b",
-        r"\bbased\s+on\b.*\b(ascending|descending)\s+order\b",  # "based on X in descending order" = window context
-        r"\b(cumulative|running)\b.*\bordered\s+by\b",  # "cumulative X ordered by Y" = window context
-        r"\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b.*\b(sorted|ordered)\s+by\b",
-        r"\b(sorted|ordered)\s+by\b.*\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b",
-    ]
+    window_context_patterns = rule_list(
+        ("ordering_intent", "window_context_regex"),
+        [
+            r"\brank\b.*\b(ascending|descending)\s+order\b",
+            r"\brow[_\s]?number\b.*\b(ascending|descending)\s+order\b",
+            r"\bdense[_\s]?rank\b.*\b(ascending|descending)\s+order\b",
+            r"\bpartition\s+by\b.*\b(ascending|descending)\b",
+            r"\bbased\s+on\b.*\b(ascending|descending)\s+order\b",
+            r"\b(cumulative|running)\b.*\bordered\s+by\b",
+            r"\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b.*\b(sorted|ordered)\s+by\b",
+            r"\b(sorted|ordered)\s+by\b.*\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b",
+        ],
+    )
     
     has_window_context = any(re.search(pat, q) for pat in window_context_patterns)
+    ordinal_row_context = bool(
+        re.search(r"\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b", q, flags=re.I)
+        and re.search(r"\b(row|rows|record|records|payment|payments|order|orders)\b", q, flags=re.I)
+    )
     
     # --- Pattern 2: Explicit final ordering keywords ---
     # These strongly indicate user wants final ORDER BY
     # NOTE: "ordered by" only counts if NOT in window context
-    explicit_sort_keywords = [
-        "order by", "arrange by",
-        "urut berdasarkan", "urutkan berdasarkan", "diurutkan berdasarkan",
-    ]
-    
-    if any(k in q for k in explicit_sort_keywords):
-        return True
-    
-    # "sort by" / "sorted by" / "ordered by" can be ranking/window context.
-    if ("sort by" in q or "sorted by" in q or "ordered by" in q) and not has_window_context:
+    explicit_sort_keywords = rule_list(
+        ("ordering_intent", "explicit_sort_keywords"),
+        [
+            "order by",
+            "arrange by",
+            "urut berdasarkan",
+            "urutkan berdasarkan",
+            "diurutkan berdasarkan",
+        ],
+    )
+    ambiguous_sort_markers = {"sort by", "sorted by", "ordered by"}
+    for kw in explicit_sort_keywords:
+        kw_l = str(kw or "").strip().lower()
+        if not kw_l:
+            continue
+        if kw_l in ambiguous_sort_markers:
+            if _phrase_in_question(kw_l) and not has_window_context and not ordinal_row_context:
+                return True
+            continue
+        if _phrase_in_question(kw_l):
+            return True
+
+    # Fallback for ambiguous sort phrases, even if config changes.
+    if (
+        not has_window_context
+        and not ordinal_row_context
+        and any(_phrase_in_question(k) for k in ambiguous_sort_markers)
+    ):
         return True
 
-    # "ordered by" is ambiguous - only treat as final sort if NOT in window context
-    if "ordered by" in q and not has_window_context:
-        return True
+    winner_like_context = _question_wants_winner_row(question) or ordinal_row_context
     
     # --- Pattern 3: Superlative / ranking output (implies ORDER BY + LIMIT) ---
     # Keep this conservative. Bare "first"/"last" is too ambiguous because it
     # often appears in projection phrases like "first names" / "last names".
     # Treat "first"/"last" as ordering only in bounded row-selection shapes.
-    superlative_keywords = [
-        "top ", "bottom ",
-        "highest", "lowest", "most expensive", "cheapest",
-        "terbesar", "terkecil", "tertinggi", "terendah", 
-        "termahal", "termurah", "terbaru", "terlama",
-    ]
-    
-    if any(k in q for k in superlative_keywords):
-        return True
+    superlative_keywords = rule_list(
+        ("ordering_intent", "superlative_keywords"),
+        [
+            "top ",
+            "bottom ",
+            "highest",
+            "lowest",
+            "most expensive",
+            "cheapest",
+            "terbesar",
+            "terkecil",
+            "tertinggi",
+            "terendah",
+            "termahal",
+            "termurah",
+            "terbaru",
+            "terlama",
+        ],
+    )
 
     first_last_row_selection_patterns = [
         r"\b(?:first|last)\s+\d+\b",
         r"\b(?:first|last)\s+(?:row|rows|record|records|entry|entries|result|results)\b",
         r"\b(?:the\s+)?(?:first|last)\s+page\b",
     ]
-    if any(re.search(pat, q) for pat in first_last_row_selection_patterns):
+    has_first_last_row_selection = any(re.search(pat, q) for pat in first_last_row_selection_patterns)
+
+    has_superlative = any(_phrase_in_question(k) for k in superlative_keywords)
+    has_numeric_selection = bool(
+        re.search(r"\b(?:top|bottom)\s+\d+\b", q, flags=re.I)
+        or re.search(r"\b(?:first|last)\s+\d+\b", q, flags=re.I)
+        or re.search(r"\b\d+\b(?:[\w\s]{0,24})\b(?:highest|lowest|largest|smallest|newest|latest|earliest|oldest|most|least|top|bottom)\b", q, flags=re.I)
+    )
+    if (
+        not winner_like_context
+        and not has_window_context
+        and has_superlative
+        and (has_numeric_selection or has_first_last_row_selection)
+    ):
+        return True
+
+    if has_first_last_row_selection and not winner_like_context:
         return True
     
     # --- Pattern 4: Explicit sort direction (only if NOT in window context) ---
     # "ascending", "descending" without window function context
-    sort_direction_keywords = [
-        "ascending", "descending", "asc", "desc",
-        "alphabetical", "alphabetically",
-        "menaik", "menurun",
-    ]
+    asc_terms = rule_list(
+        ("ordering_intent", "direction_keywords", "asc"),
+        ["ascending", "asc", "menaik"],
+    )
+    desc_terms = rule_list(
+        ("ordering_intent", "direction_keywords", "desc"),
+        ["descending", "desc", "menurun"],
+    )
+    sort_direction_keywords = sorted(set(asc_terms + desc_terms + ["alphabetical", "alphabetically"]))
     
-    if not has_window_context and any(k in q for k in sort_direction_keywords):
+    if (
+        not winner_like_context
+        and not has_window_context
+        and any(_phrase_in_question(k) for k in sort_direction_keywords)
+    ):
         return True
     
     # --- Pattern 5: Phrase-based ordering intent ---
     # "from highest to lowest", "from latest", "from A to Z"
-    ordering_phrases = [
-        r"\bfrom\s+(the\s+)?(highest|lowest|latest|earliest|newest|oldest)",
-        r"\bfrom\s+(a\s+to\s+z|z\s+to\s+a)",
-        r"\b(sorted|ordered)\s+from\b",
-    ]
+    ordering_phrases = rule_list(
+        ("ordering_intent", "ordering_phrase_regex"),
+        [
+            r"\bfrom\s+(the\s+)?(highest|lowest|latest|earliest|newest|oldest)",
+            r"\bfrom\s+(a\s+to\s+z|z\s+to\s+a)",
+            r"\b(sorted|ordered)\s+from\b",
+        ],
+    )
     
-    if any(re.search(pat, q) for pat in ordering_phrases):
+    if not has_window_context and not winner_like_context and any(re.search(pat, q) for pat in ordering_phrases):
         return True
     
     return False
