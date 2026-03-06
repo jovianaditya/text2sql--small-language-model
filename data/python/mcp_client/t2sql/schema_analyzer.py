@@ -706,6 +706,437 @@ def get_column_role(table: str, column: str) -> str:
     return str(roles.get(c, "")).lower().strip()
 
 
+# ==================== ENHANCED COLUMN ROLE DETECTION ===================
+# Schema-agnostic column classification based on datatype + naming patterns
+
+def is_numeric_column(table: str, column: str) -> bool:
+    """
+    Check if column is numeric (for ORDER BY, aggregation, comparison).
+    
+    Detection methods:
+    1. Datatype from metadata (INT, DECIMAL, FLOAT, DOUBLE, NUMERIC)
+    2. Column name patterns (amount, price, quantity, total, count, number)
+    3. Role from metadata (metric)
+    
+    Args:
+        table: Table name
+        column: Column name
+    
+    Returns:
+        True if column is numeric
+    """
+    t = (table or "").lower()
+    c = (column or "").lower()
+    
+    # 1. Check datatype from metadata
+    dtype = get_column_datatype(t, c).upper()
+    numeric_types = {'INT', 'INTEGER', 'DECIMAL', 'FLOAT', 'DOUBLE', 'NUMERIC', 
+                     'SMALLINT', 'BIGINT', 'TINYINT', 'MEDIUMINT', 'REAL'}
+    if any(nt in dtype for nt in numeric_types):
+        return True
+    
+    # 2. Check column name patterns
+    numeric_patterns = ('amount', 'price', 'quantity', 'total', 'count', 
+                       'sum', 'cost', 'value', 'rate', 'percent', 'ratio',
+                       'limit', 'balance', 'fee', 'tax', 'discount', 'msrp',
+                       'buyprice', 'creditlimit', 'quantityinstock')
+    # Use suffix/whole-word matching to avoid 'country' matching 'count'
+    if c in numeric_patterns or any(c.endswith(p) for p in numeric_patterns):
+        return True
+    
+    # 3. Check role from metadata
+    role = get_column_role(t, c)
+    if role in ('metric', 'measure', 'quantity', 'amount'):
+        return True
+    
+    return False
+
+
+def is_date_column(table: str, column: str) -> bool:
+    """
+    Check if column is date/datetime (for temporal filters, ordering).
+    
+    Detection methods:
+    1. Datatype from metadata (DATE, DATETIME, TIMESTAMP, TIME)
+    2. Column name patterns (date, time, timestamp, created, updated)
+    
+    Args:
+        table: Table name
+        column: Column name
+    
+    Returns:
+        True if column is date/datetime type
+    """
+    t = (table or "").lower()
+    c = (column or "").lower()
+    
+    # 1. Check datatype from metadata
+    dtype = get_column_datatype(t, c).upper()
+    date_types = {'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR'}
+    if any(dt in dtype for dt in date_types):
+        return True
+    
+    # 2. Check column name patterns
+    date_patterns = ('date', 'time', 'timestamp', 'created', 'updated', 'modified',
+                    'expired', 'due', 'shipped', 'ordered', 'required', 'paid')
+    if any(p in c for p in date_patterns):
+        return True
+    
+    return False
+
+
+def is_id_column(table: str, column: str) -> bool:
+    """
+    Check if column is ID/key column (for JOIN conditions).
+    
+    Detection methods:
+    1. Column ends with 'id', 'number', 'code' (excluding zip/postal)
+    2. Column is FK (from FK relationships)
+    3. Column matches {table_singular} pattern
+    
+    Args:
+        table: Table name
+        column: Column name
+    
+    Returns:
+        True if column is an ID/key column
+    """
+    t = (table or "").lower()
+    c = (column or "").lower()
+    
+    # Exclusions - these are not ID columns
+    exclude_patterns = ('zipcode', 'postalcode', 'phonenumber', 'faxnumber')
+    if any(c == ep or c.endswith(ep) for ep in exclude_patterns):
+        return False
+    
+    # 1. Check name patterns
+    id_patterns = ('id', 'number', 'code', 'key')
+    if any(c.endswith(p) for p in id_patterns):
+        return True
+    
+    # 2. Check if it's an FK column
+    analyzer = get_schema_analyzer()
+    fk_map = analyzer._fk_relationships.get(t, {})
+    if c in fk_map:
+        return True
+    
+    # 3. Check if column matches singular table name
+    singular = get_singular_form(t)
+    if c == singular or c == singular.replace('_', ''):
+        return True
+    
+    return False
+
+
+def is_name_column(table: str, column: str) -> bool:
+    """
+    Check if column is a name/display column.
+    
+    Detection methods:
+    1. Column ends with 'name' (not 'codename')
+    2. Role from metadata is 'name'
+    3. Datatype is VARCHAR and column has 'name' in synonyms
+    
+    Args:
+        table: Table name
+        column: Column name
+    
+    Returns:
+        True if column is a name column
+    """
+    t = (table or "").lower()
+    c = (column or "").lower()
+    
+    # 1. Check name pattern
+    if c.endswith('name') and not c.endswith('codename'):
+        return True
+    
+    # 2. Check role from metadata
+    role = get_column_role(t, c)
+    if role == 'name':
+        return True
+    
+    # 3. Check synonyms
+    analyzer = get_schema_analyzer()
+    synonyms = analyzer.get_column_synonyms(t, c)
+    if 'name' in [s.lower() for s in synonyms]:
+        return True
+    
+    return False
+
+
+def get_columns_by_role(table: str, role: str) -> List[str]:
+    """
+    Get all columns of a specific role for a table.
+    
+    Roles:
+    - 'numeric': Numeric columns (amount, price, quantity)
+    - 'date': Date/datetime columns
+    - 'id': ID/key columns (for JOINs)
+    - 'name': Name/display columns
+    - 'text': Text/string columns (VARCHAR, TEXT)
+    
+    Args:
+        table: Table name
+        role: Role to filter by
+    
+    Returns:
+        List of column names (original case)
+    """
+    analyzer = get_schema_analyzer()
+    t = (table or "").lower()
+    columns = analyzer._table_columns.get(t, [])
+    result = []
+    
+    for col in columns:
+        match = False
+        if role == 'numeric':
+            match = is_numeric_column(t, col)
+        elif role == 'date':
+            match = is_date_column(t, col)
+        elif role == 'id':
+            match = is_id_column(t, col)
+        elif role == 'name':
+            match = is_name_column(t, col)
+        elif role == 'text':
+            dtype = get_column_datatype(t, col).upper()
+            match = any(tt in dtype for tt in ('VARCHAR', 'CHAR', 'TEXT', 'STRING'))
+        
+        if match:
+            result.append(_get_original_case(t, col))
+    
+    return result
+
+
+def get_orderable_columns(table: str) -> List[str]:
+    """
+    Get columns suitable for ORDER BY (numeric + date columns).
+    
+    These columns make semantic sense for sorting results.
+    
+    Args:
+        table: Table name
+    
+    Returns:
+        List of orderable column names (original case)
+    """
+    numeric_cols = get_columns_by_role(table, 'numeric')
+    date_cols = get_columns_by_role(table, 'date')
+    return list(set(numeric_cols + date_cols))
+
+
+def get_aggregatable_columns(table: str) -> List[str]:
+    """
+    Get columns suitable for aggregation (SUM, AVG, COUNT).
+    
+    Returns numeric columns that make sense to aggregate.
+    
+    Args:
+        table: Table name
+    
+    Returns:
+        List of aggregatable column names (original case)
+    """
+    return get_columns_by_role(table, 'numeric')
+
+
+def get_joinable_columns(table: str) -> List[str]:
+    """
+    Get columns suitable for JOIN conditions (ID columns + FK columns).
+    
+    Args:
+        table: Table name
+    
+    Returns:
+        List of joinable column names (original case)
+    """
+    return get_columns_by_role(table, 'id')
+
+
+def get_filterable_date_columns(table: str) -> List[str]:
+    """
+    Get date columns suitable for temporal filters.
+    
+    Args:
+        table: Table name
+    
+    Returns:
+        List of date column names (original case)
+    """
+    return get_columns_by_role(table, 'date')
+
+
+def infer_best_order_column(table: str, question: str) -> Optional[str]:
+    """
+    Infer the best column to ORDER BY based on question context.
+    
+    Strategy:
+    1. If question mentions 'date', 'time', 'recent', 'latest' → date column
+    2. If question mentions 'amount', 'price', 'revenue', 'sales' → numeric column
+    3. If question asks for 'highest', 'lowest', 'top' → first numeric column
+    4. Fallback: first orderable column
+    
+    Args:
+        table: Table name
+        question: Question text
+    
+    Returns:
+        Best column name for ordering, or None
+    """
+    q = (question or "").lower()
+    
+    # Check for temporal ordering
+    temporal_keywords = ('date', 'time', 'recent', 'latest', 'newest', 'oldest', 
+                        'first', 'last', 'before', 'after')
+    if any(kw in q for kw in temporal_keywords):
+        date_cols = get_filterable_date_columns(table)
+        if date_cols:
+            return date_cols[0]
+    
+    # Check for specific metric mentions
+    metric_keywords = {
+        'amount': ['amount', 'payment'],
+        'price': ['price', 'cost', 'msrp', 'buyprice'],
+        'quantity': ['quantity', 'stock', 'ordered'],
+        'revenue': ['amount', 'price', 'sales'],
+        'sales': ['amount', 'price', 'quantity'],
+    }
+    
+    for intent, col_hints in metric_keywords.items():
+        if intent in q:
+            numeric_cols = get_aggregatable_columns(table)
+            for col in numeric_cols:
+                if any(hint in col.lower() for hint in col_hints):
+                    return col
+    
+    # Generic highest/lowest/top → first numeric column
+    rank_keywords = ('highest', 'lowest', 'top', 'best', 'worst', 'most', 'least')
+    if any(kw in q for kw in rank_keywords):
+        numeric_cols = get_aggregatable_columns(table)
+        if numeric_cols:
+            return numeric_cols[0]
+    
+    # Fallback
+    orderable = get_orderable_columns(table)
+    return orderable[0] if orderable else None
+
+
+def infer_best_aggregate_column(table: str, question: str) -> Optional[str]:
+    """
+    Infer the best column for aggregation based on question context.
+    
+    Strategy:
+    1. If question mentions 'total', 'sum', 'revenue' → amount/sales column
+    2. If question mentions 'average', 'avg' → price/amount column
+    3. If question mentions 'count', 'how many' → ID column (for COUNT)
+    4. Fallback: first numeric column
+    
+    Args:
+        table: Table name
+        question: Question text
+    
+    Returns:
+        Best column name for aggregation, or None
+    """
+    q = (question or "").lower()
+    numeric_cols = get_aggregatable_columns(table)
+    
+    if not numeric_cols:
+        return None
+    
+    # Sum/total intent → prefer amount columns
+    if any(kw in q for kw in ('total', 'sum', 'revenue', 'sales')):
+        for col in numeric_cols:
+            if any(hint in col.lower() for hint in ('amount', 'price', 'quantity', 'total')):
+                return col
+    
+    # Average intent → prefer price/rate columns
+    if any(kw in q for kw in ('average', 'avg', 'mean')):
+        for col in numeric_cols:
+            if any(hint in col.lower() for hint in ('price', 'amount', 'rate', 'cost')):
+                return col
+    
+    # Return first numeric column as fallback
+    return numeric_cols[0]
+
+
+def get_column_semantic_type(table: str, column: str) -> str:
+    """
+    Get comprehensive semantic type for a column.
+    
+    Returns one of:
+    - 'id': Primary key or foreign key
+    - 'metric': Numeric measure (amount, quantity, price)
+    - 'date': Date/datetime/timestamp
+    - 'name': Name/descriptive text field
+    - 'code': Classification code (not PK/FK)
+    - 'text': Other text field
+    - 'unknown': Cannot determine
+    
+    Args:
+        table: Table name
+        column: Column name
+    
+    Returns:
+        Semantic type string
+    """
+    t = (table or "").lower()
+    c = (column or "").lower()
+    
+    # Check in order of specificity
+    if is_id_column(t, c):
+        return 'id'
+    if is_date_column(t, c):
+        return 'date'
+    if is_numeric_column(t, c):
+        return 'metric'
+    if is_name_column(t, c):
+        return 'name'
+    
+    # Check for code columns (not ID but classification)
+    if 'code' in c or 'type' in c or 'status' in c or 'category' in c:
+        return 'code'
+    
+    # Check for text columns
+    dtype = get_column_datatype(t, c).upper()
+    if any(tt in dtype for tt in ('VARCHAR', 'CHAR', 'TEXT', 'STRING')):
+        return 'text'
+    
+    return 'unknown'
+
+
+def get_table_column_profile(table: str) -> Dict[str, List[str]]:
+    """
+    Get complete column profile for a table, organized by semantic type.
+    
+    Returns dict with:
+    - 'id': ID/key columns
+    - 'metric': Numeric columns
+    - 'date': Date columns
+    - 'name': Name columns
+    - 'code': Code/category columns
+    - 'text': Other text columns
+    
+    Args:
+        table: Table name
+    
+    Returns:
+        Dict mapping semantic type to list of column names
+    """
+    analyzer = get_schema_analyzer()
+    t = (table or "").lower()
+    columns = analyzer._table_columns.get(t, [])
+    
+    profile: Dict[str, List[str]] = defaultdict(list)
+    
+    for col in columns:
+        sem_type = get_column_semantic_type(t, col)
+        original_col = _get_original_case(t, col)
+        profile[sem_type].append(original_col)
+    
+    return dict(profile)
+
+
 # Export convenience
 __all__ = [
     'SchemaAnalyzer',
@@ -731,4 +1162,18 @@ __all__ = [
     'get_column_entity_variants',
     'get_column_datatype',
     'get_column_role',
+    # Enhanced column role detection
+    'is_numeric_column',
+    'is_date_column',
+    'is_id_column',
+    'is_name_column',
+    'get_columns_by_role',
+    'get_orderable_columns',
+    'get_aggregatable_columns',
+    'get_joinable_columns',
+    'get_filterable_date_columns',
+    'infer_best_order_column',
+    'infer_best_aggregate_column',
+    'get_column_semantic_type',
+    'get_table_column_profile',
 ]
