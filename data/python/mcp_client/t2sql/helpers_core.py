@@ -6940,18 +6940,22 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
 
     # Trim redundant GROUP BY columns in the aggregated candidate layer.
     #
-    # Common H17-like failure mode:
-    # the model groups by many extra same-table dimension columns
-    # (MSRP, productVendor, productScale, ...) even though the visible grouped
-    # grain is already identified by a key-like column such as productCode.
+    # Common failure mode:
+    # the model groups by extra descriptive/detail columns that fragment the
+    # candidate grain before ROW_NUMBER() ranking is applied.
     #
-    # We only prune when this is very likely safe:
-    # - GROUP BY contains more columns than the visible non-aggregate projection
-    # - the visible grouped projection includes at least one key-like column
-    # - every extra GROUP BY item is a simple column on the same table alias
-    #   as that key-like column
+    # Two conservative trims are allowed here:
+    # 1) same-table descriptive extras on the key table
+    #    e.g. productCode + productName are visible, but MSRP/vendor/scale are
+    #    also grouped even though they are not projected.
+    # 2) child-fact detail columns from tables that appear only inside
+    #    aggregate metrics and are not part of the visible non-aggregate
+    #    projection
+    #    e.g. orderLineNumber / priceEach from orderdetails in a grouped
+    #    product-level winner-row candidate.
     #
-    # If those conditions are not met, keep the original GROUP BY unchanged.
+    # This keeps the visible candidate grain intact while removing detail-level
+    # grouping that would otherwise leak multiple candidates per logical entity.
     candidate_group = candidate_sel.args.get("group")
     if candidate_group and getattr(candidate_group, "expressions", None):
         current_group_exprs = list(candidate_group.expressions or [])
@@ -6959,15 +6963,37 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
 
         visible_group_columns: List[exp.Column] = []
         visible_group_norms: Set[str] = set()
+        visible_nonagg_tables: Set[str] = set()
+        aggregate_only_tables: Set[str] = set()
         for item in candidate_sel.expressions:
             base = item.this if isinstance(item, exp.Alias) else item
             base_norm = _norm_expr(base)
+            contains_aggregate = any(True for _ in base.find_all(exp.AggFunc))
+
+            if contains_aggregate:
+                for col in base.find_all(exp.Column):
+                    tbl = (col.table or "").strip().lower()
+                    if tbl:
+                        aggregate_only_tables.add(tbl)
+                continue
+
             if base_norm in current_group_norms:
                 visible_group_norms.add(base_norm)
                 if isinstance(base, exp.Column):
                     visible_group_columns.append(base)
 
+            for col in base.find_all(exp.Column):
+                tbl = (col.table or "").strip().lower()
+                if tbl:
+                    visible_nonagg_tables.add(tbl)
+
         if len(current_group_exprs) > len(visible_group_norms) and visible_group_columns:
+            extras = [
+                g for g in current_group_exprs
+                if _norm_expr(g) not in visible_group_norms
+            ]
+            trim_group_norms: Set[str] = set()
+
             key_like_cols = [
                 c for c in visible_group_columns
                 if any(tok in (c.name or "").lower() for tok in ["id", "code", "number", "key"])
@@ -6979,23 +7005,33 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
             }
 
             if key_like_cols and key_tables:
-                extras = [
-                    g for g in current_group_exprs
-                    if _norm_expr(g) not in visible_group_norms
+                same_table_extras = [
+                    g for g in extras
+                    if isinstance(g, exp.Column) and ((g.table or "").lower() in key_tables)
                 ]
-                if extras and all(
-                    isinstance(g, exp.Column) and ((g.table or "").lower() in key_tables)
-                    for g in extras
-                ):
-                    trimmed_group_exprs: List[exp.Expression] = []
-                    seen_group_norms: Set[str] = set()
-                    for g in current_group_exprs:
-                        g_norm = _norm_expr(g)
-                        if g_norm in visible_group_norms and g_norm not in seen_group_norms:
-                            trimmed_group_exprs.append(g.copy())
-                            seen_group_norms.add(g_norm)
-                    if trimmed_group_exprs:
-                        candidate_sel.set("group", exp.Group(expressions=trimmed_group_exprs))
+                trim_group_norms.update(_norm_expr(g) for g in same_table_extras)
+
+            child_fact_detail_extras = [
+                g for g in extras
+                if isinstance(g, exp.Column)
+                and (g.table or "").strip().lower() in aggregate_only_tables
+                and (g.table or "").strip().lower() not in visible_nonagg_tables
+            ]
+            trim_group_norms.update(_norm_expr(g) for g in child_fact_detail_extras)
+
+            if trim_group_norms:
+                trimmed_group_exprs: List[exp.Expression] = []
+                seen_group_norms: Set[str] = set()
+                for g in current_group_exprs:
+                    g_norm = _norm_expr(g)
+                    if g_norm in trim_group_norms:
+                        continue
+                    if g_norm in seen_group_norms:
+                        continue
+                    trimmed_group_exprs.append(g.copy())
+                    seen_group_norms.add(g_norm)
+                if trimmed_group_exprs:
+                    candidate_sel.set("group", exp.Group(expressions=trimmed_group_exprs))
 
     candidate_sub = exp.Subquery(
         this=candidate_ast,

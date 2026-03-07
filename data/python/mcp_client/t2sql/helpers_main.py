@@ -2021,6 +2021,100 @@ def _order_tables_by_fk_distance(primary_table: str, tables: List[str]) -> List[
     return sorted_tables
 
 
+def _router_has_escalation_reason(router_decision: Dict[str, Any], reason: str) -> bool:
+    reasons = router_decision.get("escalation_reasons", []) or []
+    reason_l = str(reason or "").strip().lower()
+    return any(str(r or "").strip().lower() == reason_l for r in reasons)
+
+
+def _should_force_required_inner_join_chain(
+    question: str,
+    router_decision: Dict[str, Any],
+    router_tables: List[str],
+    ctx: str = "",
+) -> bool:
+    table_count = len([t for t in (router_tables or []) if str(t).strip()])
+    if table_count <= 1 or _question_wants_include_zero(question, ctx):
+        return False
+    if _router_has_escalation_reason(router_decision, "multi_table_distinct_threshold"):
+        return True
+    if _question_wants_latest_year_scope_with_aggregate(question):
+        return True
+    return False
+
+
+def _shortest_fk_table_path(primary_table: str, target_table: str) -> List[str]:
+    primary = str(primary_table or "").strip().lower()
+    target = str(target_table or "").strip().lower()
+    if not primary or not target:
+        return []
+    if primary == target:
+        return [primary]
+
+    try:
+        schema_fk = get_fk_relationships() or {}
+    except Exception:
+        schema_fk = {}
+
+    graph: Dict[str, Set[str]] = defaultdict(set)
+    for src, rels in (schema_fk or {}).items():
+        src_l = str(src or "").strip().lower()
+        if not src_l:
+            continue
+        for _, tgt in (rels or {}).items():
+            tgt_l = str(tgt or "").strip().lower()
+            if not tgt_l:
+                continue
+            graph[src_l].add(tgt_l)
+            graph[tgt_l].add(src_l)
+
+    if primary not in graph or target not in graph:
+        return []
+
+    queue: List[List[str]] = [[primary]]
+    seen: Set[str] = {primary}
+    q_idx = 0
+    while q_idx < len(queue):
+        path = queue[q_idx]
+        q_idx += 1
+        node = path[-1]
+        for nxt in sorted(graph.get(node, set())):
+            if nxt in seen:
+                continue
+            next_path = path + [nxt]
+            if nxt == target:
+                return next_path
+            seen.add(nxt)
+            queue.append(next_path)
+    return []
+
+
+def _build_connector_path_rules(primary_table: str, ordered_tables: List[str]) -> List[str]:
+    primary = str(primary_table or "").strip().lower()
+    if not primary:
+        return []
+
+    rules: List[str] = []
+    seen_rules: Set[str] = set()
+    for target in ordered_tables:
+        target_l = str(target or "").strip().lower()
+        if not target_l or target_l == primary:
+            continue
+        path = _shortest_fk_table_path(primary, target_l)
+        if len(path) <= 2:
+            continue
+        connector = path[-2]
+        rule = (
+            "CONNECTOR PATH RULE (CRITICAL): "
+            f"Reach {target_l} via {connector}. "
+            f"Do NOT skip {connector} and do NOT join {target_l} directly to {primary}."
+        )
+        if rule not in seen_rules:
+            seen_rules.add(rule)
+            rules.append(rule)
+    return rules
+
+
 def _find_tables_with_implicit_columns(
     question: str,
     ranked_cols: list,
@@ -2601,6 +2695,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             wants_include_zero = _question_wants_include_zero(question, ctx)
             exclusion_tables = {t for t in other_tables if _question_targets_table_exclusion(question, t)}
             existence_tables = {t for t in other_tables if _question_targets_table_existence(question, t)}
+            force_required_inner_chain = _should_force_required_inner_join_chain(
+                question=question,
+                router_decision=router_decision,
+                router_tables=state.get("router_tables", []) or [],
+                ctx=ctx,
+            )
+            connector_path_rules = _build_connector_path_rules(primary_table, other_tables)
             if wants_include_zero and exclusion_tables:
                 # Preserve include-zero semantics:
                 # if a table is explicitly in exclusion/no-data intent, do not also
@@ -2629,22 +2730,25 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             if other_tables:
                 join_steps = []
                 for t in other_tables:
+                    join_target = str(t).strip()
                     if wants_include_zero and t in exclusion_tables:
-                        join_steps.append(f"LEFT JOIN {t}")
+                        join_steps.append(f"LEFT JOIN {join_target}")
+                    elif force_required_inner_chain:
+                        join_steps.append(f"INNER JOIN {join_target}")
                     elif t in mixed_intent_tables:
-                        join_steps.append(f"INNER JOIN {t}")
+                        join_steps.append(f"INNER JOIN {join_target}")
                     elif t in exclusion_tables:
-                        join_steps.append(f"LEFT JOIN {t}")
+                        join_steps.append(f"LEFT JOIN {join_target}")
                     elif t in existence_tables:
-                        join_steps.append(f"INNER JOIN {t}")
+                        join_steps.append(f"INNER JOIN {join_target}")
                     elif force_inner_all:
-                        join_steps.append(f"INNER JOIN {t}")
+                        join_steps.append(f"INNER JOIN {join_target}")
                     elif exclusion_aggregate_prefers_inner_non_target:
                         # In exclusion+aggregate questions, non-target supporting tables
                         # are usually part of required positive slice (e.g., metric fact tables).
-                        join_steps.append(f"INNER JOIN {t}")
+                        join_steps.append(f"INNER JOIN {join_target}")
                     else:
-                        join_steps.append(f"LEFT JOIN {t}")
+                        join_steps.append(f"LEFT JOIN {join_target}")
                 hint_msg += ", then " + ", ".join(join_steps)
             if primary_reason:
                 hint_msg += f". Reason: {primary_reason}"
@@ -2658,6 +2762,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 constraints.append(
                     "JOIN TYPE (CRITICAL): Include-zero intent detected (e.g., 'including ... with no/without'). "
                     "Preserve primary rows with LEFT JOIN for optional related tables; do NOT force INNER JOIN on exclusion-target tables."
+                )
+            elif force_required_inner_chain:
+                constraints.append(
+                    "JOIN TYPE (CRITICAL): This query needs a required INNER JOIN chain for the metric path. "
+                    "Use INNER JOIN for each required supporting table in that path; do NOT weaken it to LEFT JOIN "
+                    "unless the question explicitly asks to preserve unmatched primary rows."
                 )
             elif mixed_intent_tables:
                 constraints.append(
@@ -2702,11 +2812,18 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     "FILTER RULE (CRITICAL): If using LEFT JOIN, filters for the JOINED table MUST be in the **ON** clause, NOT WHERE."
                 )
 
+            for connector_rule in connector_path_rules:
+                constraints.append(connector_rule)
+
         if join_key_hints:
             constraints.append(
                 "JOIN KEY HINTS (CRITICAL): Use only FK-consistent JOIN predicates from this list: "
                 + "; ".join(join_key_hints)
                 + "."
+            )
+            constraints.append(
+                "JOIN PATH RULE (CRITICAL): Use the listed FK edges as an actual connected path. "
+                "Do NOT invent a direct join between two tables unless that direct FK edge is listed."
             )
 
     # [E] REPORTING/AGGREGATION RULES
