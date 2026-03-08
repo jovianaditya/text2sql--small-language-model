@@ -1022,63 +1022,101 @@ def _question_targets_table_existence(question: str, table: str) -> bool:
     return has_positive_existence
 
 
-def _is_productline_lookup(question: str) -> bool:
+def _is_simple_single_table_lookup(question: str, table: str) -> bool:
     """
-    True kalau user lagi minta daftar product lines (bukan agregat).
-    Contoh:
-      - "show all product lines and their descriptions"
-      - "list all product lines"
-    Dipakai bareng qtype == 'lookup' supaya nggak mengganggu query agregasi.
+    Generic non-aggregate lookup detector for a single subject table.
     """
     q = (question or "").lower()
+    t = (table or "").strip().lower()
+    if not q or not t:
+        return False
 
-    if not _table_mentioned(q, "productlines", include_synonyms=True):
-        # Backward-compat fallback for legacy bilingual phrasing.
-        legacy_terms = ["product line", "product lines", "lini produk", "line produk"]
-        if not any(term in q for term in legacy_terms):
-            return False
+    if not _table_mentioned(q, t, include_synonyms=True):
+        return False
 
-    # kalau ada kata-kata agregasi → biar classifier saja yang urus, jangan paksa single table
-    if any(kw in q for kw in ["total", "sum", "avg", "average", "mean", "count", "berapa banyak", "how many"]):
+    aggregate_terms = ["total", "sum", "avg", "average", "mean", "count", "berapa banyak", "how many"]
+    if any(term in q for term in aggregate_terms):
         return False
 
     return True
+
+
+def _related_tables_for(table: str) -> Set[str]:
+    t = (table or "").strip().lower()
+    if not t:
+        return set()
+
+    related: Set[str] = set()
+    try:
+        fk_map = get_fk_relationships() or {}
+    except Exception:
+        fk_map = {}
+
+    for src_table, src_targets in fk_map.items():
+        src = (src_table or "").strip().lower()
+        if not src:
+            continue
+        for target_table in (src_targets or {}).values():
+            tgt = (target_table or "").strip().lower()
+            if not tgt:
+                continue
+            if src == t and tgt != t:
+                related.add(tgt)
+            if tgt == t and src != t:
+                related.add(src)
+
+    return related
+
+
+def _is_simple_table_identifier_lookup(question: str, table: str) -> bool:
+    """
+    Generic identifier-list lookup detector for a single table.
+    """
+    q = (question or "").lower()
+    t = (table or "").strip().lower()
+    if not _is_simple_single_table_lookup(question, t):
+        return False
+
+    id_col = get_id_column(t)
+    id_col_lower = (id_col or "").lower()
+    id_col_spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", id_col or "").replace("_", " ").lower()
+    entity_candidates = _table_mention_candidates(t, include_synonyms=True)
+    entity_alt = "|".join(
+        sorted((re.escape(c).replace(r"\ ", r"\s+") for c in entity_candidates), key=len, reverse=True)
+    )
+    mentions_identifier = bool(
+        (id_col_lower and re.search(rf"\b{re.escape(id_col_lower)}\b", q))
+        or (id_col_spaced and id_col_spaced in q)
+        or (
+            entity_alt
+            and re.search(
+                rf"\b(?:{entity_alt})\b(?:[\s,;:()'\"-]+\w+){{0,2}}[\s,;:()'\"-]+(?:id|ids|number|numbers|code|codes|nomor|kode|no)\b",
+                q,
+                flags=re.I,
+            )
+        )
+    )
+    if not mentions_identifier:
+        return False
+
+    for related_table in _related_tables_for(t):
+        if _table_mentioned(q, related_table, include_synonyms=True):
+            return False
+
+    return True
+
+
+def _is_productline_lookup(question: str) -> bool:
+    """
+    Compatibility wrapper for simple productline lookup detection.
+    """
+    return _is_simple_single_table_lookup(question, "productlines")
 
 def _is_simple_orders_lookup(question: str) -> bool:
     """
-    True kalau user cuma minta daftar order (misal orderNumber) 
-    tanpa ngomong 'order details' / 'line items' dan tanpa agregasi.
-    Contoh:
-      - "show all order numbers between ..."
-      - "list order numbers for 2004"
+    Compatibility wrapper for simple order identifier lookup detection.
     """
-    q = (question or "").lower()
-
-    if not _table_mentioned(q, "orders", include_synonyms=True):
-        return False
-
-    order_id_col = get_id_column("orders")
-    order_id_col_lower = (order_id_col or "").lower()
-    order_id_spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', order_id_col or "").replace("_", " ").lower()
-    mentions_order_identifier = (
-        bool(order_id_col_lower and re.search(rf"\b{re.escape(order_id_col_lower)}\b", q))
-        or bool(order_id_spaced and order_id_spaced in q)
-        or bool(re.search(r"\border(s)?\s+(id|ids|number|numbers|code|codes|nomor|kode|no)\b", q))
-    )
-    if not mentions_order_identifier:
-        return False
-
-    # kalau ngomong detail/line items → biar classifier & join yang urus
-    if _table_mentioned(q, "orderdetails", include_synonyms=True):
-        return False
-
-    # kalau ada kata agregasi → jangan paksa single-table
-    if any(kw in q for kw in ["total", "sum", "avg", "average", "mean", "count", "how many"]):
-        return False
-    if re.search(r"\bberapa\s+banyak\b", q) or re.search(r"\bjumlah\b", q):
-        return False
-
-    return True
+    return _is_simple_table_identifier_lookup(question, "orders")
 # ======================================================================
 # ===================== POSTPROCESS HEURISTIC ==========================
 # ======================================================================
