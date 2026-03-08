@@ -1282,9 +1282,9 @@ def _extract_internal_hint(ctx: str) -> Dict[str, Dict[str, str]]:
 
 def _repair_with_aliases(sql: str, ctx: str) -> str:
     """
-    Perbaiki nama kolom berdasar alias_map dan fallback classicmodels,
-    TAPI jangan menyentuh teks dalam kutip ('...', "...", `...`)
-    supaya alias/label buatan LLM tetap utuh.
+    Repair column names using alias_map plus schema-metadata fallbacks.
+    Do not touch text inside quotes ('...', "...", `...`) so explicit
+    labels and aliases produced by the LLM stay intact.
     """
     alias_map_per_table = _extract_internal_hint(ctx)
 
@@ -1301,7 +1301,8 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
     # Build dynamic fallback from schema metadata
     dynamic_fallback: Dict[str, str] = {}
     allowed_cols_case: Dict[str, str] = {}
-    for _t, _cols in _parse_allowed_identifiers(ctx).items():
+    allowed_identifiers = _parse_allowed_identifiers(ctx)
+    for _t, _cols in allowed_identifiers.items():
         for _c in _cols:
             lc = str(_c).lower()
             if lc not in allowed_cols_case:
@@ -1337,7 +1338,53 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
     try:
         schema_tables = list(get_all_tables())
     except Exception:
-        schema_tables = list(_parse_allowed_identifiers(ctx).keys())
+        schema_tables = list(allowed_identifiers.keys())
+
+    def _semantic_alias_keys(text: str) -> Set[str]:
+        raw = str(text or "").strip().lower()
+        if not raw:
+            return set()
+        return {
+            raw,
+            raw.replace(" ", ""),
+            raw.replace(" ", "_"),
+            raw.replace("-", ""),
+            raw.replace("-", "_"),
+            raw.replace("_", ""),
+        }
+
+    def _add_semantic_column_alias(
+        alias: str,
+        *,
+        include_terms: Set[str],
+        exclude_terms: Optional[Set[str]] = None,
+    ) -> None:
+        if alias in dynamic_fallback:
+            return
+        include_keys = set()
+        for term in include_terms:
+            include_keys.update(_semantic_alias_keys(term))
+        exclude_keys = set()
+        for term in (exclude_terms or set()):
+            exclude_keys.update(_semantic_alias_keys(term))
+
+        for table in schema_tables:
+            try:
+                table_columns = list(analyzer.get_table_columns(table)) if analyzer is not None else list(allowed_identifiers.get(table, ()))
+            except Exception:
+                table_columns = list(allowed_identifiers.get(table, ()))
+            for col in table_columns:
+                semantic_keys = _semantic_alias_keys(col)
+                try:
+                    for syn in get_column_synonyms(table, col) or []:
+                        semantic_keys.update(_semantic_alias_keys(syn))
+                except Exception:
+                    pass
+                if not semantic_keys.intersection(include_keys):
+                    continue
+                if exclude_keys and semantic_keys.intersection(exclude_keys):
+                    continue
+                _put_fallback(alias, col)
 
     for table in schema_tables:
         # Add name column mapping
@@ -1379,14 +1426,17 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
             except Exception:
                 pass
 
-    # Minimal schema-specific fallback for ambiguous generic pricing terms.
-    specific_aliases = {
-        "listprice": "MSRP",
-        "price": "priceEach",
-    }
-    for alias, canon in specific_aliases.items():
-        if alias not in dynamic_fallback:
-            dynamic_fallback[alias] = _canon_col(canon)
+    # Add schema-driven semantic pricing aliases without binding to fixed column names.
+    _add_semantic_column_alias(
+        "listprice",
+        include_terms={"msrp", "list price", "retail price", "catalog price"},
+        exclude_terms={"buy price", "purchase price", "cost", "cogs", "unit price", "selling price", "deal price"},
+    )
+    _add_semantic_column_alias(
+        "price",
+        include_terms={"unit price", "selling price", "deal price", "sale price", "sales price"},
+        exclude_terms={"buy price", "purchase price", "cost", "cogs", "msrp", "list price", "retail price", "catalog price"},
+    )
 
     # Merge: dynamic_fallback only if not already in global_map
     for al, canon in dynamic_fallback.items():
