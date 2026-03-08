@@ -2491,8 +2491,8 @@ def _rewrite_invalid_grouped_existence_subquery_to_join(sql: str, question: str,
 
 def _wants_name_only(question: str, entity_words: List[str]) -> bool:
     """
-    Generic helper: True kalau user ngomongin entity (customer/product/...) 
-    tapi tidak eksplisit minta id/number/code.
+    Return True when the question refers to an entity but does not
+    explicitly ask for an id/number/code form.
     """
     q = (question or "").lower()
     # buang "number of" supaya tidak dianggap id-like
@@ -2564,45 +2564,100 @@ def _entity_words_for_table(table: str) -> List[str]:
         pass
 
     return sorted(words)
-    
+
+
 def _wants_customer_name_only(question: str) -> bool:
     return _wants_name_only(question, _entity_words_for_table("customers"))
 
-# ini belum diterapkan
 def _wants_product_name_only(question: str) -> bool:
     return _wants_name_only(question, _entity_words_for_table("products"))
 
+
+def _display_name_column_for_table(table: str) -> Optional[str]:
+    """
+    Return a table's single-column display name only when it looks like a
+    true entity label, not a split name component such as lastName.
+    """
+    table_l = (table or "").strip().lower()
+    if not table_l:
+        return None
+
+    name_col = get_name_column(table_l)
+    id_col = get_id_column(table_l)
+    if not name_col or not id_col:
+        return None
+    if str(name_col).strip().lower() == str(id_col).strip().lower():
+        return None
+
+    component_terms = {
+        str(tok).strip().lower()
+        for tok in name_component_lexical_tokens()
+        if str(tok).strip().lower() not in {"name", "fullname", "full_name"}
+    }
+    component_phrase_hints = {
+        str(phrase).strip().lower()
+        for phrase in name_component_synonym_hints()
+        if str(phrase).strip().lower() != "full name"
+    }
+
+    def _identifier_tokens(val: str) -> Set[str]:
+        s = str(val or "").strip()
+        if not s:
+            return set()
+        s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+        s = s.replace("_", " ")
+        return {tok.lower() for tok in re.findall(r"[a-z0-9]+", s)}
+
+    col_l = str(name_col).strip().lower()
+    col_tokens = _identifier_tokens(col_l)
+    if col_tokens.intersection(component_terms):
+        return None
+
+    col_compact = re.sub(r"[^a-z0-9]", "", col_l)
+    for term in component_terms:
+        compact_term = re.sub(r"[^a-z0-9]", "", term)
+        if len(compact_term) >= 4 and compact_term in col_compact:
+            return None
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+    if analyzer is not None:
+        try:
+            syns = (analyzer._column_synonyms.get(f"{table_l}.{col_l}", []) or [])
+        except Exception:
+            syns = []
+        syn_blob = " ".join(str(x).lower() for x in syns)
+        if any_phrase_in_text(syn_blob, component_phrase_hints):
+            return None
+
+    return name_col
+
 def _prefer_friendly_names(sql: str, question: str) -> str:
     """
-    DRY: apply rule yang sama untuk beberapa entity sekaligus.
-    - customers: customerNumber -> customerName
-    - products : productCode    -> productName
-    (hanya kalau user tidak minta id/number/code)
-
-    Now uses dynamic column inference from schema metadata.
+    Prefer display-name columns over identifier columns when the question
+    asks for names but not ids/codes, using schema metadata.
     """
-    # customers - dynamic column names
-    customer_name = get_name_column("customers")
-    customer_id = get_id_column("customers")
-    if customer_name and customer_id:
-        sql = _prefer_name_over_id_generic(
-            sql=sql,
-            question=question,
-            wants_name_fn=_wants_customer_name_only,
-            name_column=customer_name,
-            id_columns=[customer_id],
-        )
+    try:
+        schema_tables = list(get_all_tables())
+    except Exception:
+        schema_tables = []
 
-    # products - dynamic column names
-    product_name = get_name_column("products")
-    product_id = get_id_column("products")
-    if product_name and product_id:
+    for table in schema_tables:
+        display_name_col = _display_name_column_for_table(table)
+        id_col = get_id_column(table)
+        if not display_name_col or not id_col:
+            continue
+        entity_words = _entity_words_for_table(table)
+        if not entity_words:
+            continue
         sql = _prefer_name_over_id_generic(
             sql=sql,
             question=question,
-            wants_name_fn=_wants_product_name_only,
-            name_column=product_name,
-            id_columns=[product_id],
+            wants_name_fn=lambda q, words=entity_words: _wants_name_only(q, words),
+            name_column=display_name_col,
+            id_columns=[id_col],
         )
 
     return sql
