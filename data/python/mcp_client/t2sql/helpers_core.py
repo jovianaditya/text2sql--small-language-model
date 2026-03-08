@@ -10333,80 +10333,494 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str, ctx: s
     if not s:
         return sql
 
-    def _fallback_rewrite_customers_payments_latest_year(raw: str) -> Optional[str]:
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    allowed_cols: Dict[str, Set[str]] = {}
+    if not analyzer and ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            allowed_cols = {
+                str(t).strip().lower(): {str(c).strip().lower() for c in cols}
+                for t, cols in (allowed or {}).items()
+            }
+        except Exception:
+            allowed_cols = {}
+
+    def _plain_table_name(table_expr: str) -> str:
+        return (table_expr or "").replace("`", "").split(".")[-1].strip()
+
+    def _table_cols(table_name: str) -> Set[str]:
+        table_lower = _plain_table_name(table_name).lower()
+        if not table_lower:
+            return set()
+        if analyzer:
+            try:
+                return {str(c).strip("`").lower() for c in analyzer.get_table_columns(table_lower)}
+            except Exception:
+                return set()
+        return set(allowed_cols.get(table_lower, set()))
+
+    def _column_role(table_name: str, col_name: str) -> str:
+        table_lower = _plain_table_name(table_name).lower()
+        col_lower = str(col_name or "").strip("`").lower()
+        if not analyzer or not table_lower or not col_lower:
+            return ""
+        try:
+            return str((analyzer._column_roles.get(table_lower, {}) or {}).get(col_lower, "")).strip().lower()
+        except Exception:
+            return ""
+
+    def _is_temporal_column(table_name: str, col_name: str) -> bool:
+        col_lower = str(col_name or "").strip("`").lower()
+        if not col_lower:
+            return False
+        role = _column_role(table_name, col_name)
+        if role in {"date", "datetime", "timestamp", "time"}:
+            return True
+        return (
+            "date" in col_lower
+            or "time" in col_lower
+            or col_lower.endswith("at")
+            or col_lower in {"created", "updated", "posted", "shipped", "ordered"}
+        )
+
+    try:
+        transaction_tables = {str(t).strip().lower() for t in (get_transaction_tables() or []) if str(t).strip()}
+    except Exception:
+        transaction_tables = set()
+
+    def _fallback_rewrite_latest_year_entity_metric(raw: str) -> Optional[str]:
         """
-        Strict salvage path for malformed "customers + payments latest year" SQL.
-        Only triggers for this specific intent/signature.
+        Salvage malformed latest-year derived-subquery SQL into a generic:
+          entity -> latest_year(metric) -> filtered metric rows
+        pattern without assuming specific table or column names.
+
+        This fallback is intentionally limited to the safer single-metric-table
+        shape where the metric table owns both the date column and the aggregated
+        measure expression.
         """
         low_raw = (raw or "").lower()
-        if "from customers" not in low_raw:
-            return None
-        if "payments" not in low_raw:
-            return None
-        if "paymentdate" not in low_raw or "amount" not in low_raw:
-            return None
         if "year(" not in low_raw and "latest_year" not in low_raw:
             return None
         if "sum(" not in low_raw or "max(" not in low_raw:
             return None
+        if "join (" not in low_raw and "join(" not in low_raw:
+            return None
 
-        m_sel = re.search(r"(?is)^\s*SELECT\s+(.*?)\s+FROM\b", raw)
-        select_txt = (m_sel.group(1) if m_sel else "")
-        wants_name = (
-            bool(re.search(r"\bcustomername\b", select_txt, flags=re.I))
-            or bool(re.search(r"\bcustomer\s+name\b", (question or "").lower()))
+        def _safe_alias(a: Optional[str], default_name: str) -> str:
+            if not a:
+                return default_name
+            x = a.strip()
+            if (x.startswith("`") and x.endswith("`")) or (x.startswith("'") and x.endswith("'")) or (x.startswith('"') and x.endswith('"')):
+                x = x[1:-1]
+            x = re.sub(r"\s+", "_", x)
+            x = re.sub(r"[^A-Za-z0-9_]", "", x)
+            if not x or not re.match(r"[A-Za-z_]", x[0]):
+                return default_name
+            return x
+
+        def _extract_table_alias_map(sql_text: str) -> Dict[str, str]:
+            alias_map: Dict[str, str] = {}
+            for m in re.finditer(
+                r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?""",
+                sql_text,
+            ):
+                table_expr = (m.group(1) or "").strip()
+                if not table_expr or table_expr.startswith("("):
+                    continue
+                table_plain = _plain_table_name(table_expr)
+                alias = (m.group(2) or "").strip() or table_plain
+                if alias.lower() in _SQL_KEYWORDS:
+                    alias = table_plain
+                alias_map[alias.lower()] = table_plain
+                alias_map[table_plain.lower()] = table_plain
+            return alias_map
+
+        def _extract_identifier_tokens(expr: str) -> List[str]:
+            if not expr:
+                return []
+            tokens = re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)`?", expr, flags=re.I)
+            out: List[str] = []
+            seen = set()
+            for tok in tokens:
+                tl = tok.lower()
+                if tl in _SQL_KEYWORDS:
+                    continue
+                if tl in {
+                    "year", "month", "day", "case", "when", "then", "else",
+                    "end", "distinct", "null", "coalesce", "ifnull",
+                }:
+                    continue
+                if tl in seen:
+                    continue
+                seen.add(tl)
+                out.append(tok)
+            return out
+
+        def _date_alias_preference(alias_name: Optional[str], col_name: str) -> int:
+            alias_lower = str(alias_name or "").strip().lower()
+            col_lower = str(col_name or "").strip().lower()
+            score = 0
+            if alias_lower:
+                if "date" in alias_lower or "time" in alias_lower:
+                    score += 3
+                if "year" in alias_lower and "date" not in alias_lower and "time" not in alias_lower:
+                    score -= 3
+            if "date" in col_lower or "time" in col_lower:
+                score += 1
+            return score
+
+        m_join_sub = re.search(r"\bJOIN\s*\(\s*SELECT\b", raw, flags=re.I)
+        if not m_join_sub:
+            return None
+
+        open_idx = raw.find("(", m_join_sub.start())
+        if open_idx == -1:
+            return None
+
+        depth = 0
+        close_idx = -1
+        in_sq = False
+        in_dq = False
+        i = open_idx
+        while i < len(raw):
+            ch = raw[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(raw) and raw[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close_idx = i
+                    break
+            i += 1
+        if close_idx == -1:
+            return None
+
+        before = raw[:m_join_sub.start()].strip()
+        after = raw[close_idx + 1:].strip()
+        before = re.sub(r"\b(?:INNER|LEFT|RIGHT|FULL|CROSS)\s*$", "", before, flags=re.I).strip()
+
+        m_after = re.match(
+            r"(?is)^(?:AS\s+)?(?P<sub>[A-Za-z_][A-Za-z0-9_]*)\s+ON\s+(?P<on>.+?)(?P<tail>\s+(?:WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT)\b.*)?$",
+            after,
         )
+        if not m_after:
+            return None
 
-        date_alias = "latest_payment_date"
-        sum_alias = "total_amount_paid"
-        m_date_alias = re.search(
-            r"(?is)\bMAX\s*\(\s*[^)]*paymentDate[^)]*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
+        sub_alias = m_after.group("sub").strip()
+        on_clause = (m_after.group("on") or "").strip()
+
+        m_before = re.match(
+            r"(?is)^SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<t>`?[A-Za-z_][A-Za-z0-9_]*`?)(?:\s+(?:AS\s+)?(?P<a>[A-Za-z_][A-Za-z0-9_]*))?\s*$",
+            before,
+        )
+        if not m_before:
+            return None
+
+        outer_select = m_before.group("select").strip()
+        entity_table = m_before.group("t").strip()
+        entity_table_plain = _plain_table_name(entity_table)
+        entity_alias = (m_before.group("a") or "").strip()
+        if not entity_alias:
+            outer_alias_refs = [
+                a for a in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", outer_select, flags=re.I)
+                if a.lower() != sub_alias.lower()
+            ]
+            uniq_refs: List[str] = []
+            seen_refs = set()
+            for alias in outer_alias_refs:
+                al = alias.lower()
+                if al in seen_refs:
+                    continue
+                seen_refs.add(al)
+                uniq_refs.append(alias)
+            entity_alias = uniq_refs[0] if len(uniq_refs) == 1 else entity_table_plain
+
+        eq1 = re.search(
+            rf"`?{re.escape(entity_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?{re.escape(sub_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            on_clause,
+            flags=re.I,
+        )
+        eq2 = re.search(
+            rf"`?{re.escape(sub_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?{re.escape(entity_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            on_clause,
+            flags=re.I,
+        )
+        entity_key_col = None
+        metric_key_col = None
+        if eq1:
+            entity_key_col = eq1.group(1)
+            metric_key_col = eq1.group(2)
+        elif eq2:
+            metric_key_col = eq2.group(1)
+            entity_key_col = eq2.group(2)
+        if not entity_key_col or not metric_key_col:
+            return None
+
+        max_candidates: List[Tuple[Optional[str], str, Optional[str]]] = []
+        for m in re.finditer(
+            r"(?is)\bMAX\s*\(\s*(?:YEAR\s*\(\s*)?(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)?\s*\)(?:\s+AS\s+([A-Za-z_][A-Za-z0-9_]*))?",
+            raw,
+        ):
+            alias_hint = (m.group(1) or "").strip() or None
+            col_name = (m.group(2) or "").strip()
+            if not col_name:
+                continue
+            max_candidates.append((alias_hint, col_name, m.group(3)))
+        if not max_candidates:
+            return None
+
+        m_sum = re.search(
+            r"(?is)\bSUM\s*\(\s*(.+?)\s*\)(?:\s+AS\s+([A-Za-z_][A-Za-z0-9_]*))?",
             raw,
         )
-        if m_date_alias:
-            date_alias = m_date_alias.group(1)
-        m_sum_alias = re.search(
-            r"(?is)\bSUM\s*\(\s*[^)]*amount[^)]*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
-            raw,
+        if not m_sum:
+            return None
+        sum_expr = (m_sum.group(1) or "").strip()
+        if not sum_expr:
+            return None
+        sum_out_alias = m_sum.group(2)
+
+        raw_alias_map = _extract_table_alias_map(raw)
+        qualified_sum_refs = re.findall(
+            r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            sum_expr,
+            flags=re.I,
         )
-        if m_sum_alias:
-            sum_alias = m_sum_alias.group(1)
+        sum_alias_refs: List[str] = []
+        sum_cols: List[str] = []
+        for alias_ref, col_ref in qualified_sum_refs:
+            if alias_ref.lower() == sub_alias.lower():
+                continue
+            if alias_ref.lower() not in {a.lower() for a in sum_alias_refs}:
+                sum_alias_refs.append(alias_ref)
+            if col_ref.lower() not in {c.lower() for c in sum_cols}:
+                sum_cols.append(col_ref)
+        if len(sum_alias_refs) > 1:
+            return None
 
-        select_cols = ["cust.customerNumber"]
-        if wants_name:
-            select_cols.append("cust.customerName")
-        select_cols.append(f"MAX(pay.paymentDate) AS {date_alias}")
-        select_cols.append(f"SUM(pay.amount) AS {sum_alias}")
+        if not sum_cols:
+            sum_cols = _extract_identifier_tokens(sum_expr)
+        if not sum_cols:
+            return None
 
-        group_cols = ["cust.customerNumber"]
-        if wants_name:
-            group_cols.append("cust.customerName")
-        select_block = ",\n  ".join(select_cols)
+        metric_table: Optional[str] = None
+        alias_hint_tables: Set[str] = set()
+        date_alias_hint_tables: Set[str] = set()
+        for alias_hint, _col_name, _alias_out in max_candidates:
+            if alias_hint and raw_alias_map.get(alias_hint.lower()):
+                date_alias_hint_tables.add(raw_alias_map[alias_hint.lower()])
+        if len(sum_alias_refs) == 1 and raw_alias_map.get(sum_alias_refs[0].lower()):
+            alias_hint_tables.add(raw_alias_map[sum_alias_refs[0].lower()])
+        if len(date_alias_hint_tables) > 1 or len(alias_hint_tables) > 1:
+            return None
+        if date_alias_hint_tables and alias_hint_tables and date_alias_hint_tables != alias_hint_tables:
+            return None
+        alias_hint_tables.update(date_alias_hint_tables)
+        if alias_hint_tables:
+            metric_table = next(iter(alias_hint_tables))
+
+        candidate_tables: List[str] = []
+        seen_tables = set()
+        for table_plain in raw_alias_map.values():
+            tl = table_plain.lower()
+            if tl == entity_table_plain.lower() or tl in seen_tables:
+                continue
+            seen_tables.add(tl)
+            candidate_tables.append(table_plain)
+
+        date_col = None
+        date_out_alias = None
+        if metric_table is None:
+            scored_candidates: List[Tuple[int, str, str, Optional[str]]] = []
+            for table_name in candidate_tables:
+                cols = _table_cols(table_name)
+                if not cols:
+                    continue
+                if metric_key_col.lower() not in cols:
+                    continue
+                if any(col.lower() not in cols for col in sum_cols):
+                    continue
+                for alias_hint, candidate_date_col, candidate_date_alias in max_candidates:
+                    if candidate_date_col.lower() not in cols:
+                        continue
+                    if alias_hint and raw_alias_map.get(alias_hint.lower()) != table_name:
+                        continue
+                    if not _is_temporal_column(table_name, candidate_date_col):
+                        continue
+                    score = 0
+                    if table_name.lower() in transaction_tables:
+                        score += 3
+                    table_id_col = get_id_column(table_name)
+                    if table_id_col and table_id_col.lower() == metric_key_col.lower():
+                        score += 2
+                    if len(candidate_tables) == 1:
+                        score += 2
+                    score += len(sum_cols)
+                    score += _date_alias_preference(candidate_date_alias, candidate_date_col)
+                    scored_candidates.append((score, table_name, candidate_date_col, candidate_date_alias))
+            if not scored_candidates:
+                return None
+            scored_candidates.sort(key=lambda item: item[0], reverse=True)
+            if len(scored_candidates) > 1 and scored_candidates[0][0] == scored_candidates[1][0]:
+                return None
+            metric_table = scored_candidates[0][1]
+            date_col = scored_candidates[0][2]
+            date_out_alias = scored_candidates[0][3]
+        else:
+            metric_cols = _table_cols(metric_table)
+            best_date_candidate: Optional[Tuple[int, str, Optional[str]]] = None
+            for alias_hint, candidate_date_col, candidate_date_alias in max_candidates:
+                if candidate_date_col.lower() not in metric_cols:
+                    continue
+                if alias_hint and raw_alias_map.get(alias_hint.lower()) != metric_table:
+                    continue
+                if not _is_temporal_column(metric_table, candidate_date_col):
+                    continue
+                candidate_score = _date_alias_preference(candidate_date_alias, candidate_date_col)
+                if best_date_candidate is None or candidate_score > best_date_candidate[0]:
+                    best_date_candidate = (candidate_score, candidate_date_col, candidate_date_alias)
+            if not best_date_candidate:
+                return None
+            date_col = best_date_candidate[1]
+            date_out_alias = best_date_candidate[2]
+
+        metric_table_plain = _plain_table_name(metric_table)
+        metric_cols = _table_cols(metric_table_plain)
+        if not metric_cols:
+            return None
+        if date_col.lower() not in metric_cols or metric_key_col.lower() not in metric_cols:
+            return None
+        if any(col.lower() not in metric_cols for col in sum_cols):
+            return None
+
+        outer_items = _split_top_level_commas(outer_select)
+        entity_items = []
+        for item in outer_items:
+            if re.search(rf"\b{re.escape(sub_alias)}\s*\.", item, flags=re.I):
+                continue
+            entity_items.append(item.strip())
+        if not entity_items:
+            entity_items = [f"{entity_alias}.{entity_key_col}"]
+
+        def _strip_as(item: str) -> str:
+            return re.sub(
+                r"""(?is)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+                "",
+                item.strip(),
+            ).strip()
+
+        group_items = []
+        seen_group = set()
+        for item in entity_items:
+            base = _strip_as(item)
+            bl = base.lower()
+            if bl in seen_group:
+                continue
+            seen_group.add(bl)
+            group_items.append(base)
+
+        existing_aliases = {entity_alias.lower(), sub_alias.lower(), metric_table_plain.lower()}
+        existing_aliases.update(k.lower() for k in raw_alias_map.keys())
+
+        def _pick_alias(base: str) -> str:
+            stem = re.sub(r"[^A-Za-z0-9_]", "", base) or "t"
+            if not re.match(r"[A-Za-z_]", stem[0]):
+                stem = f"t_{stem}"
+            cand = stem
+            idx = 2
+            while cand.lower() in existing_aliases:
+                cand = f"{stem}_{idx}"
+                idx += 1
+            existing_aliases.add(cand.lower())
+            return cand
+
+        year_alias = _pick_alias(f"{sub_alias}_latest_years")
+        metric_alias = _pick_alias(f"{metric_table_plain}_rows")
+
+        sum_metric_expr = sum_expr
+        for alias_ref in sum_alias_refs:
+            sum_metric_expr = re.sub(
+                rf"\b(?:{re.escape(alias_ref)}|{re.escape(raw_alias_map.get(alias_ref.lower(), alias_ref))})\s*\.",
+                f"{metric_alias}.",
+                sum_metric_expr,
+                flags=re.I,
+            )
+        if not sum_alias_refs:
+            for col_name in sorted(sum_cols, key=len, reverse=True):
+                sum_metric_expr = re.sub(
+                    rf"(?<!\.)\b{re.escape(col_name)}\b",
+                    f"{metric_alias}.{col_name}",
+                    sum_metric_expr,
+                    flags=re.I,
+                )
+
+        date_alias_out = _safe_alias(date_out_alias, f"latest_{date_col}")
+        sum_alias_out = _safe_alias(sum_out_alias, "total_amount")
+
+        select_lines = list(entity_items)
+        select_lines.append(f"MAX({metric_alias}.{date_col}) AS {date_alias_out}")
+        select_lines.append(f"SUM({sum_metric_expr}) AS {sum_alias_out}")
+        select_block = ",\n  ".join(select_lines)
+
+        order_by_clause = ""
+        m_order = re.search(r"(?is)\bORDER\s+BY\s+(.+?)\s*$", raw)
+        if m_order:
+            order_body = (m_order.group(1) or "").strip().rstrip(";")
+            order_body = re.sub(
+                rf"\b{re.escape(sub_alias)}\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+                r"\1",
+                order_body,
+                flags=re.I,
+            )
+            if order_body:
+                order_by_clause = f"\nORDER BY {order_body}"
+        elif re.search(r"\b(?:latest|most\s+recent|newest|terbaru|terakhir)\b", question or "", flags=re.I):
+            order_by_clause = f"\nORDER BY {date_alias_out} DESC"
 
         return (
             "SELECT\n"
             f"  {select_block}\n"
-            "FROM customers cust\n"
+            f"FROM {entity_table} {entity_alias}\n"
             "JOIN (\n"
-            "  SELECT customerNumber, MAX(YEAR(paymentDate)) AS latest_year\n"
-            "  FROM payments\n"
-            "  GROUP BY customerNumber\n"
-            ") AS pay_latest_years\n"
-            "  ON pay_latest_years.customerNumber = cust.customerNumber\n"
-            "JOIN payments AS pay\n"
-            "  ON pay.customerNumber = cust.customerNumber\n"
-            " AND YEAR(pay.paymentDate) = pay_latest_years.latest_year\n"
-            f"GROUP BY {', '.join(group_cols)}\n"
-            f"ORDER BY {date_alias} DESC;"
+            "  SELECT\n"
+            f"    {metric_key_col},\n"
+            f"    MAX(YEAR({date_col})) AS latest_year\n"
+            f"  FROM {metric_table}\n"
+            f"  GROUP BY {metric_key_col}\n"
+            f") AS {year_alias}\n"
+            f"  ON {year_alias}.{metric_key_col} = {entity_alias}.{entity_key_col}\n"
+            f"JOIN {metric_table} AS {metric_alias}\n"
+            f"  ON {metric_alias}.{metric_key_col} = {entity_alias}.{entity_key_col}\n"
+            f" AND YEAR({metric_alias}.{date_col}) = {year_alias}.latest_year\n"
+            f"GROUP BY {', '.join(group_items)}"
+            f"{order_by_clause};"
         )
 
     # If already using latest_year pattern and SQL is parseable, keep as-is.
     low = s.lower()
-    has_malformed_nested_payments_subquery = bool(
-        re.search(r"(?is)\bFROM\s+payments\b\s+JOIN\s*\(", s)
+    has_nested_join_inside_derived_subquery = bool(
+        re.search(r"(?is)\bJOIN\s*\(\s*SELECT\b[\s\S]*\bFROM\s+[A-Za-z_][A-Za-z0-9_]*\b\s+JOIN\s*\(", s)
     )
-    if has_malformed_nested_payments_subquery:
-        rescued = _fallback_rewrite_customers_payments_latest_year(s)
+    if has_nested_join_inside_derived_subquery:
+        rescued = _fallback_rewrite_latest_year_entity_metric(s)
         if rescued:
             return rescued
 
@@ -10508,7 +10922,7 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str, ctx: s
 
     inner_parsed = _parse_select_from_groupby(inner_sql)
     if not inner_parsed:
-        rescued = _fallback_rewrite_customers_payments_latest_year(s)
+        rescued = _fallback_rewrite_latest_year_entity_metric(s)
         if rescued:
             return rescued
         return sql
@@ -10521,6 +10935,9 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str, ctx: s
         inner_parsed["from_core"].strip(),
     )
     if not m_inner_from:
+        rescued = _fallback_rewrite_latest_year_entity_metric(s)
+        if rescued:
+            return rescued
         return sql
 
     metric_table = m_inner_from.group(1).strip()
@@ -10598,18 +11015,7 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str, ctx: s
         return sql
 
     # Safety: derived metric table must actually own the date column.
-    metric_cols: Set[str] = set()
-    try:
-        analyzer = get_schema_analyzer()
-        metric_cols = {c.lower() for c in analyzer.get_table_columns(metric_table_plain)}
-    except Exception:
-        metric_cols = set()
-    if not metric_cols and ctx:
-        try:
-            allowed = _parse_allowed_identifiers(ctx)
-            metric_cols = {c.lower() for c in allowed.get(metric_table_plain, set())}
-        except Exception:
-            metric_cols = set()
+    metric_cols = _table_cols(metric_table_plain)
     if metric_cols and date_col.lower() not in metric_cols:
         return sql
 
