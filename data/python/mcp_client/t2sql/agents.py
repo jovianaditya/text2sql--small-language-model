@@ -2,7 +2,7 @@
 # ============================ agents.py ===============================
 # ======================================================================
 # Purpose:
-# - Agents 0 --> Guardrail for question validation (hybrid regex + LLM)
+# - Agent 0 --> Guardrail for question validation (hybrid regex + LLM)
 # - Agent 1 --> Router agent to determine query complexity and target model
 # - Agent 2 --> Drafting agent to generate initial SQL
 # - Agent 3 --> Refinement agent to improve SQL based on feedback
@@ -333,6 +333,7 @@ from .helpers_core import (
     _rewrite_malformed_window_winner_clause,
     _question_wants_winner_row,
     _question_wants_anti_existence,
+    _question_wants_entity_orders_payments_rollup,
     _wants_distinct_from_question,
     _question_wants_count_distinct,
     _ensure_reasonable_distinct,
@@ -393,6 +394,72 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         "requires_regex": wants_regex,
         "requires_structural_regex": wants_structural_regex,
     }
+
+
+def _router_has_dual_fact_rollup(question: str, relevant_tables: List[str]) -> bool:
+    """
+    Detect the dual-fact rollup family generically for routing escalation.
+
+    The router should only escalate when both conditions hold:
+    1. the question asks for a count + separate total/status rollup shape
+    2. the routed tables actually contain a base entity with at least two
+       direct child fact tables in the schema graph
+    """
+    q = (question or "").strip()
+    relevant_lower = {
+        str(table or "").strip().lower()
+        for table in (relevant_tables or [])
+        if str(table or "").strip()
+    }
+    if not q or len(relevant_lower) < 3:
+        return False
+    if not _question_wants_entity_orders_payments_rollup(q):
+        return False
+
+    try:
+        fk_map_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_map_raw = {}
+    try:
+        transaction_tables = {
+            str(table).strip().lower()
+            for table in (get_transaction_tables() or [])
+            if str(table).strip()
+        }
+    except Exception:
+        transaction_tables = set()
+
+    direct_children: Dict[str, Set[str]] = {}
+    direct_fact_children: Dict[str, Set[str]] = {}
+    for child_table, fk_targets in fk_map_raw.items():
+        child_l = str(child_table or "").strip().lower()
+        if child_l not in relevant_lower:
+            continue
+        for target_table in (fk_targets or {}).values():
+            target_l = str(target_table or "").strip().lower()
+            if not target_l or target_l not in relevant_lower or target_l == child_l:
+                continue
+            direct_children.setdefault(target_l, set()).add(child_l)
+            if transaction_tables and child_l not in transaction_tables:
+                continue
+            direct_fact_children.setdefault(target_l, set()).add(child_l)
+
+    if any(len(children) >= 2 for children in direct_fact_children.values()):
+        return True
+
+    # Some schemas under-classify operational fact tables in transaction metadata
+    # even though the FK graph clearly shows multiple child facts under one base.
+    # Treat the FK child structure as the primary signal and use transaction-table
+    # metadata only as an additional precision hint, not a hard requirement.
+    if any(len(children) >= 2 for children in direct_children.values()):
+        return True
+
+    if transaction_tables:
+        routed_fact_tables = relevant_lower & transaction_tables
+        routed_non_fact_tables = relevant_lower - transaction_tables
+        return bool(len(routed_fact_tables) >= 2 and routed_non_fact_tables)
+
+    return False
 
 
 def _has_winner_row_shape(sql: str) -> bool:
@@ -2483,34 +2550,8 @@ def router_agent(state: RAGState) -> RAGState:
         and not is_complex_subquery_intent
     )
 
-    # Multi-fact rollup detector (fanout-risk):
-    # customer + orders count + payments total/status in one grouped result.
-    # Example: total orders + total payment amount + payment_status.
-    relevant_tables_lower = {t.lower() for t in relevant_tables}
     has_dual_fact_rollup = bool(
-        is_multi_table
-        and "orders" in relevant_tables_lower
-        and "payments" in relevant_tables_lower
-        and (
-            "customers" in relevant_tables_lower
-            or bool(re.search(r"\bcustomer", question_lower))
-        )
-        and bool(
-            re.search(
-                r"\b(total\s+number\s+of|number\s+of|count\s+of)\s+orders?\b|\btotal_orders?\b",
-                question_lower,
-                flags=re.I,
-            )
-        )
-        and bool(
-            re.search(
-                r"\b(total\s+payment(?:\s+amount)?|sum\s+of\s+payments?|total_payments?|total_payment_amount)\b",
-                question_lower,
-                flags=re.I,
-            )
-            or re.search(r"\bpayment[_\s]*status\b", question_lower, flags=re.I)
-            or ("paid" in question_lower and "unpaid" in question_lower)
-        )
+        is_multi_table and _router_has_dual_fact_rollup(question_raw, relevant_tables)
     )
     
     # ESCALATION LOGIC
