@@ -647,7 +647,7 @@ RETRIEVAL_NAME_ONLY_NUMBER_OF_PATTERN = os.getenv(
 RETRIEVAL_DEBUG_FOCUS_COLUMNS = set(
     _env_json_list(
         "RETRIEVAL_DEBUG_FOCUS_COLUMNS",
-        ["quantityinstock", "buyprice", "msrp"],
+        [],
     )
 )
 
