@@ -60,7 +60,7 @@ from .helpers_core import (
     # phase 2
     _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns, _repair_simple_single_table_column_names,
     # phase 3
-    _wants_customer_name_only, _wants_product_name_only, _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
+    _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
     _normalize_alias_lengths,
@@ -72,7 +72,7 @@ from .helpers_core import (
     _rewrite_winner_row_aggregate_misuse, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
-    _rewrite_customer_orders_payment_fanout,
+    _rewrite_dual_fact_rollup_fanout,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_overall_avg_having,
     _rewrite_employee_latest_payment_customer_identity,
@@ -1193,17 +1193,6 @@ def _is_simple_table_identifier_lookup(question: str, table: str) -> bool:
     return True
 
 
-def _is_productline_lookup(question: str) -> bool:
-    """
-    Compatibility wrapper for simple productline lookup detection.
-    """
-    return _is_simple_single_table_lookup(question, "productlines")
-
-def _is_simple_orders_lookup(question: str) -> bool:
-    """
-    Compatibility wrapper for simple order identifier lookup detection.
-    """
-    return _is_simple_table_identifier_lookup(question, "orders")
 # ======================================================================
 # ===================== POSTPROCESS HEURISTIC ==========================
 # ======================================================================
@@ -3771,8 +3760,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_missing_metric_join_in_rollup(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after hierarchical metric rollup fix:", s)
 
-        s = _rewrite_customer_orders_payment_fanout(s, question, ctx)
-        if DEBUG_WR: print("[REFINER - PH4] after customer-order-payment fanout fix:", s)
+        s = _rewrite_dual_fact_rollup_fanout(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after dual-fact fanout fix:", s)
 
         s = _rewrite_latest_year_same_year_aggregate(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year-sum fix:", s)

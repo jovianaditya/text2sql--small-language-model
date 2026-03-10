@@ -2567,13 +2567,6 @@ def _entity_words_for_table(table: str) -> List[str]:
     return sorted(words)
 
 
-def _wants_customer_name_only(question: str) -> bool:
-    return _wants_name_only(question, _entity_words_for_table("customers"))
-
-def _wants_product_name_only(question: str) -> bool:
-    return _wants_name_only(question, _entity_words_for_table("products"))
-
-
 def _display_name_column_for_table(table: str) -> Optional[str]:
     """
     Return a table's single-column display name only when it looks like a
@@ -7250,8 +7243,8 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
         sql or "",
         flags=re.I,
     )
-    customer_fallbacks = re.findall(
-        r"\b([A-Za-z_][A-Za-z0-9_]*\.(?:customerNumber|customer_id|customerId|customercode|customerCode))\b",
+    identifier_fallbacks = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:id|Id|ID|number|Number|code|Code|key|Key))\b",
         sql or "",
         flags=re.I,
     )
@@ -7315,6 +7308,17 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
         if not items:
             return m.group(0)
 
+        window_sql = m.group(0) or ""
+        window_aliases = {
+            str(alias).lower()
+            for alias in re.findall(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.",
+                window_sql,
+                flags=re.I,
+            )
+            if str(alias).strip()
+        }
+
         has_date_any = any(_is_date_expr(it) for it in items)
         has_amount_any = any(_is_amount_expr(it) for it in items)
         first = (items[0] or "").strip()
@@ -7356,12 +7360,19 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
                 seen_norm.add(_norm_expr(fb_amount))
 
         new_items = date_items + amount_items + other_items
-        # Deterministic tertiary tie-break for customer winner-row queries.
-        wants_customer_tiebreak = bool(re.search(r"\bcustomer\s*(?:id|number|code)?\b", q))
-        if wants_customer_tiebreak:
-            fb_customer = _pick_fallback(customer_fallbacks, {_norm_expr(x) for x in new_items})
-            if fb_customer:
-                new_items.append(_force_dir(fb_customer, desc=False))
+        # Add a deterministic tertiary identifier tie-break when the
+        # question explicitly asks for an id/number/code/key field.
+        wants_identifier_tiebreak = bool(
+            re.search(r"\b(?:id|number|code|key)\b", q, flags=re.I)
+        )
+        if wants_identifier_tiebreak:
+            fb_identifier = _pick_fallback(
+                identifier_fallbacks,
+                {_norm_expr(x) for x in new_items},
+                preferred_aliases=window_aliases or None,
+            )
+            if fb_identifier:
+                new_items.append(_force_dir(fb_identifier, desc=False))
 
         dedup_items = []
         dedup_seen = set()
@@ -9428,14 +9439,6 @@ def _question_wants_entity_orders_payments_rollup(question: str) -> bool:
     return _fallback_dual_fact_rollup_from_question()
 
 
-def _question_wants_customer_orders_payment_rollup(question: str) -> bool:
-    """
-    Backward-compatible wrapper.
-    Kept to avoid breaking older call sites while using generic detector logic.
-    """
-    return _question_wants_entity_orders_payments_rollup(question)
-
-
 def _question_wants_hierarchical_metric_rollup(question: str, ctx: str = "") -> bool:
     """
     Dynamic detector for hierarchical rollup intent:
@@ -10350,13 +10353,6 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
         f"{tail_block};"
     )
     return fixed
-
-
-def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = "") -> str:
-    """
-    Backward-compatible wrapper for the generic dual-fact fanout rewrite.
-    """
-    return _rewrite_dual_fact_rollup_fanout(sql, question, ctx)
 
 
 def _question_wants_latest_year_scope_with_aggregate(question: str) -> bool:

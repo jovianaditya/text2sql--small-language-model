@@ -88,6 +88,42 @@ def parse_difficulty_filter(filter_spec: str | None) -> tuple[str, set[int] | No
     except ValueError:
         return "", None
 
+
+def infer_base_database(
+    base_database: str | None,
+    ts_databases: list[str] | None = None,
+) -> str:
+    """
+    Resolve the VA/EX base database dynamically.
+
+    Priority:
+    1. explicit argument
+    2. T2SQL_BASE_DATABASE environment variable
+    3. inferred base from TS names like foo_2 -> foo
+    4. first TS database as a last fallback
+    """
+    explicit = str(base_database or "").strip()
+    if explicit:
+        return explicit
+
+    env_default = str(os.getenv("T2SQL_BASE_DATABASE") or "").strip()
+    if env_default:
+        return env_default
+
+    ordered_ts = [str(db or "").strip() for db in (ts_databases or []) if str(db or "").strip()]
+    for db_name in ordered_ts:
+        m = re.match(r"^(.*?)(?:[_-]\d+)$", db_name)
+        if m and str(m.group(1) or "").strip():
+            return str(m.group(1)).strip()
+
+    if ordered_ts:
+        return ordered_ts[0]
+
+    raise ValueError(
+        "base_database is not set and could not be inferred. "
+        "Provide --base-database or set T2SQL_BASE_DATABASE."
+    )
+
 def normalize_value(val, tolerance: float = 0.0001) -> str:
     """
     Normalize a single value for comparison.
@@ -606,7 +642,7 @@ async def run_single_case(
     execute_groundtruth: bool = True,
     null_zero_mode: str = "auto",
     ts_databases: list[str] | None = None,
-    base_database: str = "classicmodels",
+    base_database: str | None = None,
 ) -> dict:
     """
     Run a single test case and return evaluation result.
@@ -628,7 +664,7 @@ async def run_single_case(
         db_name = str(db or "").strip()
         if db_name and db_name not in ts_db_list:
             ts_db_list.append(db_name)
-    primary_db = str(base_database or "classicmodels").strip() or "classicmodels"
+    primary_db = infer_base_database(base_database, ts_db_list)
     # TS targets exclude base DB because base is already covered by EX.
     ts_db_targets = [db for db in ts_db_list if db != primary_db]
     eval_db_order: list[str] = [primary_db]
@@ -1049,7 +1085,7 @@ async def run_batch_eval(
     difficulty_filters: dict[str, set[int] | None] | None = None,
     null_zero_mode: str = "auto",
     ts_databases: list[str] | None = None,
-    base_database: str = "classicmodels",
+    base_database: str | None = None,
 ):
     """
     Main batch evaluation function.
@@ -1133,8 +1169,6 @@ async def run_batch_eval(
         else:
             print("[WARN] No JSONL paths found - sparse search may not work!")
     
-    base_db = str(base_database or "classicmodels").strip() or "classicmodels"
-
     ts_db_list: list[str] = []
     for db in (ts_databases or []):
         db_name = str(db or "").strip()
@@ -1142,6 +1176,8 @@ async def run_batch_eval(
             ts_db_list.append(db_name)
     if not ts_db_list:
         ts_db_list = ["classicmodels_2", "classicmodels_3"]
+
+    base_db = infer_base_database(base_database, ts_db_list)
     ts_db_targets = [db for db in ts_db_list if db != base_db]
     print(f"Base database (VA/EX): {base_db}")
     print(f"TS databases (excluding base): {ts_db_targets}")
@@ -1384,8 +1420,11 @@ Examples:
     )
     parser.add_argument(
         "--base-database",
-        default="classicmodels",
-        help="Database for VA/EX checks (default: classicmodels).",
+        default=None,
+        help=(
+            "Database for VA/EX checks. Defaults to T2SQL_BASE_DATABASE or "
+            "is inferred from the TS database list."
+        ),
     )
     # Difficulty filter arguments (supports: --easy, --easy4, --easy4-7, etc.)
     parser.add_argument(
@@ -1413,7 +1452,7 @@ Examples:
     ts_databases = [
         x.strip() for x in str(args.ts_databases or "").split(",") if x.strip()
     ] or ["classicmodels_2", "classicmodels_3"]
-    base_database = str(args.base_database or "classicmodels").strip() or "classicmodels"
+    base_database = str(args.base_database or "").strip() or None
 
     # Build difficulty filter dict with optional ID ranges
     difficulty_filters = {}

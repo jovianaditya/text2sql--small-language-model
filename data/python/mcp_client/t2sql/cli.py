@@ -26,7 +26,7 @@ def main():
         raise RuntimeError(
             "No JSONL inputs found.\n"
             "Set EXPORT_JSONL_OUTPUT to one of:\n"
-            "  • a single file: ./exports/classicmodels.jsonl\n"
+            "  • a single file: ./exports/schema_export.jsonl\n"
             "  • a directory:   ./datahub_metadata\n"
             "  • a glob:        ./datahub_metadata/*.jsonl\n"
         )
