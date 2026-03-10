@@ -9803,20 +9803,23 @@ def _rewrite_missing_metric_join_in_rollup(sql: str, question: str, ctx: str = "
     return rebuilt
 
 
-def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = "") -> str:
+def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> str:
     """
-    Fix row-multiplication anti-pattern:
-      customers JOIN orders JOIN payments + GROUP BY customer
-      with COUNT(order) and SUM(payment).
+    Rewrite a grouped dual-fact rollup query into a fanout-safe shape.
 
-    Rewrites into fanout-safe shape:
-      customers
-      JOIN (orders aggregated by customer)
-      LEFT JOIN (payments aggregated by customer)
+    Target pattern:
+      - one base entity table in FROM
+      - two different child fact tables joined to the base
+      - one child contributes a COUNT(...)
+      - another child contributes SUM(...) and optional CASE status on that SUM
+
+    Output shape:
+      base
+      [LEFT] JOIN (count_fact aggregated by base key)
+      LEFT/JOIN (metric_fact aggregated by base key)
     """
     if not sql or not question:
         return sql
-
     if not _question_wants_entity_orders_payments_rollup(question):
         return sql
 
@@ -9824,7 +9827,7 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
     if not parsed:
         return sql
 
-    # Conservative: only rewrite simple grouped query without WHERE/HAVING.
+    # Conservative: only rewrite straightforward grouped rollups.
     if (parsed.get("where") or "").strip():
         return sql
     if (parsed.get("having") or "").strip():
@@ -9834,15 +9837,19 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
     if not from_core or "join" not in from_core.lower():
         return sql
 
+    reserved_alias_tokens = {
+        "left", "right", "inner", "outer", "full", "cross", "join",
+        "on", "where", "group", "order", "having", "limit",
+    }
+
     alias_map_raw = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
     alias_to_table: Dict[str, str] = {}
-    for a, t in alias_map_raw.items():
-        al = (a or "").strip().lower()
-        tl = (t or "").strip().lower()
-        if not al or not tl:
+    for alias_raw, table_raw in alias_map_raw.items():
+        alias_l = (alias_raw or "").strip().lower()
+        table_l = (table_raw or "").strip().lower()
+        if not alias_l or not table_l:
             continue
-        if al not in alias_to_table:
-            alias_to_table[al] = tl
+        alias_to_table.setdefault(alias_l, table_l)
 
     # Aliasless fallback: map table name -> table name from FROM/JOIN clauses.
     if not alias_to_table:
@@ -9851,16 +9858,9 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
             f"FROM {from_core}",
         ):
             raw_tbl = (m_tbl.group(1) or "").replace("`", "").strip()
-            tbl = raw_tbl.split(".")[-1].lower()
-            if tbl and tbl not in alias_to_table:
-                alias_to_table[tbl] = tbl
-
-    order_aliases = [a for a, t in alias_to_table.items() if t == "orders"]
-    payment_aliases = [a for a, t in alias_to_table.items() if t == "payments"]
-    if not order_aliases or not payment_aliases:
-        return sql
-    order_alias = order_aliases[0]
-    payment_alias = payment_aliases[0]
+            table_l = raw_tbl.split(".")[-1].lower()
+            if table_l and table_l not in alias_to_table:
+                alias_to_table[table_l] = table_l
 
     m_base = re.match(
         r"""(?is)^\s*(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?""",
@@ -9870,22 +9870,15 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
         return sql
 
     base_table_expr = (m_base.group(1) or "").strip()
-    base_table = base_table_expr.replace("`", "").split(".")[-1]
+    base_table = base_table_expr.replace("`", "").split(".")[-1].strip()
     if not base_table:
         return sql
     base_alias_raw = (m_base.group(2) or "").strip()
-    # Guard: do not treat JOIN keywords as aliases in aliasless SQL.
-    reserved_alias_tokens = {
-        "left", "right", "inner", "outer", "full", "cross", "join",
-        "on", "where", "group", "order", "having", "limit",
-    }
     if base_alias_raw.lower() in reserved_alias_tokens:
         base_alias_raw = ""
-
     base_alias = (base_alias_raw or base_table).strip()
     base_alias_l = base_alias.lower()
 
-    # Parse SELECT list.
     def _split_expr_alias(item: str) -> tuple:
         m = re.match(
             r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
@@ -9904,6 +9897,71 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
             return None
         return m.group(1), m.group(2)
 
+    def _extract_sum_inner(expr: str) -> Optional[tuple]:
+        text = (expr or "").strip()
+        patterns = [
+            r"(?is)^SUM\s*\(\s*(.+?)\s*\)$",
+            r"(?is)^COALESCE\s*\(\s*SUM\s*\(\s*(.+?)\s*\)\s*,\s*0(?:\.0+)?\s*\)$",
+            r"(?is)^IFNULL\s*\(\s*SUM\s*\(\s*(.+?)\s*\)\s*,\s*0(?:\.0+)?\s*\)$",
+        ]
+        for idx, pattern in enumerate(patterns):
+            m = re.match(pattern, text)
+            if m:
+                return (m.group(1) or "").strip(), bool(idx > 0)
+        return None
+
+    def _table_mentions(table_name: str) -> bool:
+        for word in _entity_words_for_table(table_name):
+            ww = (word or "").strip().lower()
+            if not ww:
+                continue
+            pattern = re.escape(ww).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pattern}\b", question, flags=re.I):
+                return True
+        return False
+
+    def _count_request_mentions(table_name: str) -> bool:
+        alts = []
+        for word in _entity_words_for_table(table_name):
+            ww = (word or "").strip().lower()
+            if not ww:
+                continue
+            alts.append(re.escape(ww).replace(r"\ ", r"\s+"))
+        if not alts:
+            return False
+        alt = "|".join(sorted(set(alts), key=len, reverse=True))
+        return bool(
+            re.search(
+                rf"\b(?:total\s+number\s+of|number\s+of|count\s+of|count|how\s+many|jumlah)\s+(?:the\s+)?(?:{alt})\b",
+                question,
+                flags=re.I,
+            )
+        ) or bool(
+            re.search(
+                rf"\btotal[_\s-]+(?:{alt})\b",
+                question,
+                flags=re.I,
+            )
+        )
+
+    join_kind_by_alias: Dict[str, str] = {}
+    for m_join in re.finditer(
+        r"""(?is)\b(?:(LEFT|RIGHT|FULL|INNER|CROSS)\s+)?JOIN\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?""",
+        from_core,
+    ):
+        table_expr = (m_join.group(2) or "").replace("`", "").strip()
+        table_name = table_expr.split(".")[-1].strip()
+        alias_raw = (m_join.group(3) or "").strip()
+        if alias_raw.lower() in reserved_alias_tokens:
+            alias_raw = ""
+        alias_name = (alias_raw or table_name).strip().lower()
+        if not alias_name:
+            continue
+        join_kw = ((m_join.group(1) or "") + " JOIN").strip().upper()
+        if join_kw == "CROSS JOIN":
+            return sql
+        join_kind_by_alias[alias_name] = "LEFT JOIN" if join_kw == "LEFT JOIN" else "JOIN"
+
     select_items = _split_top_level_commas(parsed["select"])
     if not select_items:
         return sql
@@ -9912,12 +9970,14 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
     count_alias_out: Optional[str] = None
     count_inner: Optional[str] = None
     count_distinct = False
+    count_fact_alias: Optional[str] = None
     sum_alias_out: Optional[str] = None
     sum_inner: Optional[str] = None
+    sum_fact_alias: Optional[str] = None
+    sum_zero_fill = False
     case_items: List[tuple] = []
 
     count_pat = re.compile(r"(?is)^COUNT\s*\(\s*(DISTINCT\s+)?(.+?)\s*\)$")
-    sum_pat = re.compile(r"(?is)^SUM\s*\(\s*(.+?)\s*\)$")
 
     for raw_item in select_items:
         expr, out_alias = _split_expr_alias(raw_item)
@@ -9926,212 +9986,247 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
         m_count = count_pat.match(expr)
         if m_count:
             inner_expr = (m_count.group(2) or "").strip()
-            # Accept COUNT(*) or COUNT(order_alias.col)
-            if inner_expr == "*":
-                count_inner = "*"
-                count_distinct = bool((m_count.group(1) or "").strip())
-                count_alias_out = (out_alias or "total_orders").strip("`'\"")
-                continue
-            ref = _parse_simple_col(inner_expr)
-            if ref and ref[0] and ref[0].lower() == order_alias:
-                count_inner = inner_expr
-                count_distinct = bool((m_count.group(1) or "").strip())
-                count_alias_out = (out_alias or "total_orders").strip("`'\"")
-                continue
+            ref = None if inner_expr == "*" else _parse_simple_col(inner_expr)
+            count_inner = inner_expr
+            count_distinct = bool((m_count.group(1) or "").strip())
+            if ref and ref[0]:
+                count_fact_alias = ref[0].lower()
+            count_alias_out = (out_alias or "").strip("`'\"") or None
+            continue
 
-        m_sum = sum_pat.match(expr)
-        if m_sum:
-            inner_expr = (m_sum.group(1) or "").strip()
+        sum_info = _extract_sum_inner(expr)
+        if sum_info:
+            inner_expr, zero_fill = sum_info
             ref = _parse_simple_col(inner_expr)
-            if ref and ref[0] and ref[0].lower() == payment_alias:
-                sum_inner = inner_expr
-                sum_alias_out = (out_alias or "total_payments").strip("`'\"")
-                continue
+            if not ref or not ref[0]:
+                return sql
+            sum_inner = inner_expr
+            sum_fact_alias = ref[0].lower()
+            sum_alias_out = (out_alias or "").strip("`'\"") or None
+            sum_zero_fill = sum_zero_fill or zero_fill
+            continue
 
-        # CASE item that depends on SUM(payment_alias.*) -> rewrite later.
         if expr_l.startswith("case") and re.search(
-            rf"\bSUM\s*\(\s*(?:DISTINCT\s+)?`?{re.escape(payment_alias)}`?\s*\.",
+            r"\bSUM\s*\(\s*(?:DISTINCT\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.",
             expr,
             flags=re.I,
         ):
             case_items.append((expr, out_alias))
             continue
 
-        # Keep base-table simple columns only.
         pcol = _parse_simple_col(expr)
         if pcol:
-            qf, _col = pcol
-            if qf and qf.lower() == base_alias_l:
+            qualifier, _col = pcol
+            if qualifier and qualifier.lower() == base_alias_l:
                 base_select_items.append(raw_item.strip())
                 continue
-            if not qf:
+            if not qualifier:
                 base_select_items.append(raw_item.strip())
                 continue
 
-        # Unsupported/complex projection: abort rewrite for safety.
         return sql
 
-    if not base_select_items or not count_inner or not sum_inner:
+    if not base_select_items or not count_inner or not sum_inner or not sum_fact_alias:
         return sql
-    if not count_alias_out:
-        count_alias_out = "total_orders"
-    if not sum_alias_out:
-        sum_alias_out = "total_payments"
 
-    # Deduplicate base projection columns conservatively.
-    # Keep duplicates when aliases differ (e.g., customerNumber AS customer_id
-    # and customerNumber AS customer_number are both explicitly requested).
-    dedup_base: List[str] = []
-    seen_base_expr: Set[str] = set()
-    for it in base_select_items:
-        base_expr, item_alias = _split_expr_alias(it)
-        expr_norm = re.sub(r"\s+", "", (base_expr or "").lower())
-        alias_norm = (item_alias or "").strip("`'\"").lower()
-        k = f"{expr_norm}__as__{alias_norm}" if alias_norm else expr_norm
-        if not k or k in seen_base_expr:
-            continue
-        seen_base_expr.add(k)
-        dedup_base.append(it)
-    base_select_items = dedup_base
-
-    # GROUP BY must not depend on orders/payments aliases.
-    for g in _split_top_level_commas(parsed.get("groupby", "")):
-        g0 = (g or "").strip().lower()
-        if re.search(rf"\b{re.escape(order_alias)}\s*\.", g0) or re.search(rf"\b{re.escape(payment_alias)}\s*\.", g0):
-            return sql
-
-    # Infer join key pairs between base<->orders and base<->payments.
     eq_pat = re.compile(
         r"""`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?""",
         flags=re.I,
     )
-    order_pairs: List[tuple] = []
-    payment_pairs: List[tuple] = []
-    for m in eq_pat.finditer(from_core):
-        a1, c1, a2, c2 = m.group(1).lower(), m.group(2), m.group(3).lower(), m.group(4)
-        if {a1, a2} == {base_alias_l, order_alias}:
-            if a1 == base_alias_l:
-                order_pairs.append((c1, c2))
-            else:
-                order_pairs.append((c2, c1))
-        if {a1, a2} == {base_alias_l, payment_alias}:
-            if a1 == base_alias_l:
-                payment_pairs.append((c1, c2))
-            else:
-                payment_pairs.append((c2, c1))
+    pairs_by_alias: Dict[str, List[tuple]] = {}
+    for m_eq in eq_pat.finditer(from_core):
+        a1, c1, a2, c2 = m_eq.group(1).lower(), m_eq.group(2), m_eq.group(3).lower(), m_eq.group(4)
+        if {a1, a2} != {base_alias_l, a1 if a1 == a2 else a2}:
+            pass
+        if a1 == base_alias_l and a2 != base_alias_l:
+            pairs_by_alias.setdefault(a2, []).append((c1, c2))
+        elif a2 == base_alias_l and a1 != base_alias_l:
+            pairs_by_alias.setdefault(a1, []).append((c2, c1))
+
+    direct_child_aliases = {
+        alias for alias in pairs_by_alias
+        if alias in alias_to_table and alias != base_alias_l
+    }
+    if sum_fact_alias not in direct_child_aliases:
+        return sql
+
+    if not count_fact_alias:
+        try:
+            transaction_tables = {
+                str(t).strip().lower()
+                for t in (get_transaction_tables() or [])
+                if str(t).strip()
+            }
+        except Exception:
+            transaction_tables = set()
+
+        count_candidates = [alias for alias in sorted(direct_child_aliases) if alias != sum_fact_alias]
+        if not count_candidates:
+            return sql
+
+        scored_candidates: List[tuple] = []
+        for alias in count_candidates:
+            table_name = alias_to_table.get(alias, alias)
+            score = 0
+            if table_name in transaction_tables:
+                score += 3
+            if _count_request_mentions(table_name):
+                score += 3
+            if _table_mentions(table_name):
+                score += 1
+            scored_candidates.append((score, alias))
+        scored_candidates.sort(key=lambda item: (-item[0], item[1]))
+        count_fact_alias = scored_candidates[0][1]
+        if len(scored_candidates) > 1 and scored_candidates[0][0] == scored_candidates[1][0] == 0:
+            return sql
+    elif count_fact_alias not in direct_child_aliases:
+        return sql
+
+    if count_fact_alias == sum_fact_alias:
+        return sql
+
+    count_table = alias_to_table.get(count_fact_alias, count_fact_alias)
+    sum_table = alias_to_table.get(sum_fact_alias, sum_fact_alias)
+    if not count_table or not sum_table:
+        return sql
+
+    if not count_alias_out:
+        count_alias_out = f"total_{count_table}"
+    if not sum_alias_out:
+        sum_alias_out = f"total_{sum_table}"
+
+    # Deduplicate base projection conservatively.
+    dedup_base: List[str] = []
+    seen_base_expr: Set[str] = set()
+    for item in base_select_items:
+        base_expr, item_alias = _split_expr_alias(item)
+        expr_norm = re.sub(r"\s+", "", (base_expr or "").lower())
+        alias_norm = (item_alias or "").strip("`'\"").lower()
+        key = f"{expr_norm}__as__{alias_norm}" if alias_norm else expr_norm
+        if not key or key in seen_base_expr:
+            continue
+        seen_base_expr.add(key)
+        dedup_base.append(item)
+    base_select_items = dedup_base
+
+    for group_item in _split_top_level_commas(parsed.get("groupby", "")):
+        g0 = (group_item or "").strip().lower()
+        if re.search(rf"\b{re.escape(count_fact_alias)}\s*\.", g0):
+            return sql
+        if re.search(rf"\b{re.escape(sum_fact_alias)}\s*\.", g0):
+            return sql
 
     def _pick_pair(pairs: List[tuple]) -> Optional[tuple]:
         if not pairs:
             return None
 
-        def _score(p: tuple) -> int:
-            b, c = (p[0] or "").lower(), (p[1] or "").lower()
-            s = 0
-            for x in (b, c):
-                if x.endswith("id") or x.endswith("number") or x.endswith("code"):
-                    s += 4
-                if "customer" in x:
-                    s += 3
-            if b == c:
-                s += 2
-            return s
+        def _score(pair: tuple) -> int:
+            base_col, fact_col = (pair[0] or "").lower(), (pair[1] or "").lower()
+            score = 0
+            for name in (base_col, fact_col):
+                if name.endswith(("id", "number", "code", "key")):
+                    score += 4
+                if "customer" in name:
+                    score += 3
+            if base_col == fact_col:
+                score += 2
+            return score
 
         return sorted(pairs, key=_score, reverse=True)[0]
 
-    order_pair = _pick_pair(order_pairs)
-    payment_pair = _pick_pair(payment_pairs)
-    if not order_pair or not payment_pair:
+    count_pair = _pick_pair(pairs_by_alias.get(count_fact_alias, []))
+    sum_pair = _pick_pair(pairs_by_alias.get(sum_fact_alias, []))
+    if not count_pair or not sum_pair:
         return sql
 
-    base_order_key, order_key = order_pair
-    base_payment_key, payment_key = payment_pair
+    base_count_key, count_key = count_pair
+    base_sum_key, sum_key = sum_pair
 
-    # If question explicitly asks for identifier slots, ensure projection stability.
     q_low = (question or "").lower()
-    # Treat ORDER BY mention as sorting intent, not projection requirement.
     q_low_output = re.split(r"\b(?:sort(?:ed)?\s+by|order\s+by)\b", q_low, maxsplit=1, flags=re.I)[0]
     entity_words = _entity_words_for_table(base_table)
     if not entity_words:
         entity_words = [base_table, (base_table[:-1] if base_table.endswith("s") else base_table)]
 
     def _mentions_entity_attr(attr: str) -> bool:
-        for w in entity_words:
-            ww = (w or "").strip().lower()
+        for word in entity_words:
+            ww = (word or "").strip().lower()
             if not ww:
                 continue
-            pat = re.escape(ww).replace(r"\ ", r"\s+")
-            if re.search(rf"\b{pat}\s+{re.escape(attr)}\b", q_low_output):
+            pattern = re.escape(ww).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pattern}\s+{re.escape(attr)}\b", q_low_output):
                 return True
         return False
 
-    wants_customer_number = _mentions_entity_attr("number") or bool(re.search(rf"\b{re.escape(base_table)}number\b", q_low_output))
-    wants_customer_id = _mentions_entity_attr("id")
+    entity_slug = re.sub(r"[^a-z0-9_]+", "_", (get_singular_form(base_table) or base_table).lower()).strip("_")
+    wants_entity_number = _mentions_entity_attr("number") or bool(re.search(rf"\b{re.escape(base_table.lower())}number\b", q_low_output))
+    wants_entity_code = _mentions_entity_attr("code") or bool(re.search(rf"\b{re.escape(base_table.lower())}code\b", q_low_output))
+    wants_entity_id = _mentions_entity_attr("id")
     wants_entity_name = _mentions_entity_attr("name")
-    id_col = get_id_column(base_table) or base_order_key
+    id_col = get_id_column(base_table) or base_count_key
     name_col = get_name_column(base_table)
 
     def _base_has_col(col_name: str) -> bool:
-        for it in base_select_items:
-            e0, _a0 = _split_expr_alias(it)
-            p0 = _parse_simple_col(e0)
-            if not p0:
+        for item in base_select_items:
+            expr0, _alias0 = _split_expr_alias(item)
+            parsed_col = _parse_simple_col(expr0)
+            if not parsed_col:
                 continue
-            _qf, c0 = p0
-            if c0 and c0.lower() == col_name.lower():
+            _qualifier, col0 = parsed_col
+            if col0 and col0.lower() == col_name.lower():
                 return True
         return False
 
     def _base_has_alias(alias_name: str) -> bool:
-        for it in base_select_items:
-            _e0, a0 = _split_expr_alias(it)
-            if a0 and a0.strip("`'\"").lower() == alias_name.lower():
+        for item in base_select_items:
+            _expr0, alias0 = _split_expr_alias(item)
+            if alias0 and alias0.strip("`'\"").lower() == alias_name.lower():
                 return True
         return False
 
-    if id_col and (wants_customer_number or wants_customer_id):
+    if id_col and (wants_entity_number or wants_entity_code or wants_entity_id):
         if not _base_has_col(id_col):
             base_select_items.insert(0, f"{base_alias}.{id_col}")
-        # If question explicitly says "customer id", expose a stable alias.
-        if wants_customer_id and not _base_has_alias("customer_id"):
-            base_select_items.append(f"{base_alias}.{id_col} AS customer_id")
+        entity_id_alias = f"{entity_slug}_id" if entity_slug else "entity_id"
+        if wants_entity_id and not _base_has_alias(entity_id_alias):
+            base_select_items.append(f"{base_alias}.{id_col} AS {entity_id_alias}")
 
-    # Normalize duplicate identifier projections.
-    # If question explicitly asks both identifier slots (id + number), keep both.
-    # Otherwise collapse accidental duplicates; if name is explicitly requested,
-    # we can promote one duplicate slot to name when available.
     if id_col:
         id_item_idxs: List[int] = []
         removed_aliases: List[str] = []
-        for idx, it in enumerate(base_select_items):
-            e0, a0 = _split_expr_alias(it)
-            p0 = _parse_simple_col(e0)
-            if not p0:
+        for idx, item in enumerate(base_select_items):
+            expr0, _alias0 = _split_expr_alias(item)
+            parsed_col = _parse_simple_col(expr0)
+            if not parsed_col:
                 continue
-            qf0, c0 = p0
-            if c0 and c0.lower() == id_col.lower() and (not qf0 or qf0.lower() == base_alias_l):
+            qualifier0, col0 = parsed_col
+            if col0 and col0.lower() == id_col.lower() and (not qualifier0 or qualifier0.lower() == base_alias_l):
                 id_item_idxs.append(idx)
 
         if len(id_item_idxs) > 1:
-            wants_dual_identifier_slots = wants_customer_id and wants_customer_number
+            wants_dual_identifier_slots = sum(int(flag) for flag in [wants_entity_id, wants_entity_number, wants_entity_code]) >= 2
             if not wants_dual_identifier_slots:
                 def _alias_pref_score(idx: int) -> int:
                     _expr_i, alias_i = _split_expr_alias(base_select_items[idx])
-                    a = (alias_i or "").strip("`'\"").lower()
+                    alias_name = (alias_i or "").strip("`'\"").lower()
                     score = 0
-                    if wants_customer_number and not wants_customer_id:
-                        if "number" in a:
+                    if wants_entity_number and not wants_entity_id and not wants_entity_code:
+                        if "number" in alias_name:
                             score += 6
-                        if "id" in a and "number" not in a:
+                        if "id" in alias_name or "code" in alias_name:
                             score -= 2
-                    elif wants_customer_id and not wants_customer_number:
-                        if "id" in a:
+                    elif wants_entity_code and not wants_entity_id and not wants_entity_number:
+                        if "code" in alias_name:
                             score += 6
-                        if "number" in a and "id" not in a:
+                        if "id" in alias_name or "number" in alias_name:
                             score -= 2
-                    # Slightly prefer explicit aliases over bare columns on ties.
-                    if a:
+                    elif wants_entity_id and not wants_entity_number and not wants_entity_code:
+                        if "id" in alias_name:
+                            score += 6
+                        if "number" in alias_name or "code" in alias_name:
+                            score -= 2
+                    if alias_name:
                         score += 1
-                    # Stable fallback: keep earliest projection on exact tie.
                     score -= idx
                     return score
 
@@ -10146,9 +10241,9 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
 
                 if wants_entity_name and name_col and not _base_has_col(name_col):
                     name_alias: Optional[str] = None
-                    for a in removed_aliases:
-                        if "name" in a.lower():
-                            name_alias = a
+                    for alias_name in removed_aliases:
+                        if "name" in alias_name.lower():
+                            name_alias = alias_name
                             break
                     name_item = f"{base_alias}.{name_col}"
                     if name_alias:
@@ -10156,55 +10251,61 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
                     insert_at = min(keep_idx + 1, len(base_select_items))
                     base_select_items.insert(insert_at, name_item)
 
-    # If question explicitly asks for entity name, ensure it is projected.
-    # This must be independent from duplicate-id collapse (both id+number may be requested).
     if wants_entity_name and name_col and not _base_has_col(name_col):
         base_select_items.append(f"{base_alias}.{name_col}")
 
-    used_aliases = {base_alias_l, order_alias, payment_alias, *alias_to_table.keys()}
+    used_aliases = {base_alias_l, count_fact_alias, sum_fact_alias, *alias_to_table.keys()}
 
-    def _pick_alias(base: str) -> str:
-        b = re.sub(r"[^A-Za-z0-9_]", "", base) or "t"
-        if not re.match(r"[A-Za-z_]", b[0]):
-            b = f"t_{b}"
-        cand = b
-        i = 2
-        while cand.lower() in used_aliases:
-            cand = f"{b}_{i}"
-            i += 1
-        used_aliases.add(cand.lower())
-        return cand
+    def _pick_alias(base_name: str) -> str:
+        base_clean = re.sub(r"[^A-Za-z0-9_]", "", base_name) or "t"
+        if not re.match(r"[A-Za-z_]", base_clean[0]):
+            base_clean = f"t_{base_clean}"
+        candidate = base_clean
+        idx = 2
+        while candidate.lower() in used_aliases:
+            candidate = f"{base_clean}_{idx}"
+            idx += 1
+        used_aliases.add(candidate.lower())
+        return candidate
 
-    orders_agg_alias = _pick_alias("orders_agg")
-    payments_agg_alias = _pick_alias("payments_agg")
+    count_agg_alias = _pick_alias(f"{count_table}_agg")
+    sum_agg_alias = _pick_alias(f"{sum_table}_agg")
 
     count_inner_clean = count_inner
     if count_inner_clean != "*":
         count_inner_clean = re.sub(
-            rf"(?is)\b`?{re.escape(order_alias)}`?\s*\.\s*",
+            rf"(?is)\b`?{re.escape(count_fact_alias)}`?\s*\.\s*",
             "",
             count_inner_clean,
         )
     count_expr = f"COUNT({'DISTINCT ' if count_distinct else ''}{count_inner_clean})"
 
     sum_inner_clean = re.sub(
-        rf"(?is)\b`?{re.escape(payment_alias)}`?\s*\.\s*",
+        rf"(?is)\b`?{re.escape(sum_fact_alias)}`?\s*\.\s*",
         "",
         sum_inner,
     )
 
-    # Build SELECT projection.
+    include_zero_intent = _question_wants_include_zero(question, ctx)
+    count_join_keyword = "LEFT JOIN" if (include_zero_intent or join_kind_by_alias.get(count_fact_alias) == "LEFT JOIN") else "JOIN"
+    metric_join_keyword = "LEFT JOIN"
+    if not (include_zero_intent or case_items or sum_zero_fill or join_kind_by_alias.get(sum_fact_alias) == "LEFT JOIN"):
+        metric_join_keyword = "JOIN"
+
     projected_items: List[str] = []
     projected_items.extend(base_select_items)
-    projected_items.append(f"{orders_agg_alias}.{count_alias_out} AS {count_alias_out}")
-    projected_items.append(
-        f"COALESCE({payments_agg_alias}.{sum_alias_out}, 0) AS {sum_alias_out}"
-    )
+    count_projection = f"{count_agg_alias}.{count_alias_out} AS {count_alias_out}"
+    if count_join_keyword == "LEFT JOIN":
+        count_projection = f"COALESCE({count_agg_alias}.{count_alias_out}, 0) AS {count_alias_out}"
+    projected_items.append(count_projection)
+    projected_items.append(f"COALESCE({sum_agg_alias}.{sum_alias_out}, 0) AS {sum_alias_out}")
 
+    case_sum_pat = re.compile(
+        rf"(?is)SUM\s*\(\s*(?:DISTINCT\s+)?`?{re.escape(sum_fact_alias)}`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*\)"
+    )
     for case_expr, case_alias in case_items:
-        rewritten_case = re.sub(
-            rf"(?is)SUM\s*\(\s*(?:DISTINCT\s+)?`?{re.escape(payment_alias)}`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*\)",
-            f"COALESCE({payments_agg_alias}.{sum_alias_out}, 0)",
+        rewritten_case = case_sum_pat.sub(
+            f"COALESCE({sum_agg_alias}.{sum_alias_out}, 0)",
             case_expr,
         )
         if case_alias:
@@ -10213,19 +10314,20 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
             projected_items.append(rewritten_case)
 
     tail_clause = (parsed.get("tail") or "").strip()
-    # Stabilize ORDER BY customer_id when alias may be missing.
-    if tail_clause and id_col and re.search(r"\bcustomer_id\b", tail_clause, flags=re.I):
-        has_customer_id_alias = any(
-            (_split_expr_alias(it)[1] or "").strip("`'\"").lower() == "customer_id"
-            for it in projected_items
+    entity_id_alias = f"{entity_slug}_id" if entity_slug else "entity_id"
+    if tail_clause and id_col and re.search(rf"\b{re.escape(entity_id_alias)}\b", tail_clause, flags=re.I):
+        has_entity_id_alias = any(
+            (_split_expr_alias(item)[1] or "").strip("`'\"").lower() == entity_id_alias.lower()
+            for item in projected_items
         )
-        if not has_customer_id_alias:
+        if not has_entity_id_alias:
             tail_clause = re.sub(
-                r"\bcustomer_id\b",
+                rf"\b{re.escape(entity_id_alias)}\b",
                 f"{base_alias}.{id_col}",
                 tail_clause,
                 flags=re.I,
             )
+
     tail_block = f"\n{tail_clause}" if tail_clause else ""
     select_block = ",\n  ".join(projected_items)
 
@@ -10233,21 +10335,28 @@ def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = 
         "SELECT\n"
         f"  {select_block}\n"
         f"FROM {base_table_expr} {base_alias}\n"
-        "JOIN (\n"
-        f"  SELECT {order_key}, {count_expr} AS {count_alias_out}\n"
-        f"  FROM orders\n"
-        f"  GROUP BY {order_key}\n"
-        f") AS {orders_agg_alias}\n"
-        f"  ON {orders_agg_alias}.{order_key} = {base_alias}.{base_order_key}\n"
-        "LEFT JOIN (\n"
-        f"  SELECT {payment_key}, SUM({sum_inner_clean}) AS {sum_alias_out}\n"
-        f"  FROM payments\n"
-        f"  GROUP BY {payment_key}\n"
-        f") AS {payments_agg_alias}\n"
-        f"  ON {payments_agg_alias}.{payment_key} = {base_alias}.{base_payment_key}"
+        f"{count_join_keyword} (\n"
+        f"  SELECT {count_key}, {count_expr} AS {count_alias_out}\n"
+        f"  FROM {count_table}\n"
+        f"  GROUP BY {count_key}\n"
+        f") AS {count_agg_alias}\n"
+        f"  ON {count_agg_alias}.{count_key} = {base_alias}.{base_count_key}\n"
+        f"{metric_join_keyword} (\n"
+        f"  SELECT {sum_key}, SUM({sum_inner_clean}) AS {sum_alias_out}\n"
+        f"  FROM {sum_table}\n"
+        f"  GROUP BY {sum_key}\n"
+        f") AS {sum_agg_alias}\n"
+        f"  ON {sum_agg_alias}.{sum_key} = {base_alias}.{base_sum_key}"
         f"{tail_block};"
     )
     return fixed
+
+
+def _rewrite_customer_orders_payment_fanout(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Backward-compatible wrapper for the generic dual-fact fanout rewrite.
+    """
+    return _rewrite_dual_fact_rollup_fanout(sql, question, ctx)
 
 
 def _question_wants_latest_year_scope_with_aggregate(question: str) -> bool:
