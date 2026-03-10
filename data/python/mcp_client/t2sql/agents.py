@@ -317,6 +317,7 @@ from .schema_analyzer import (
     get_singular_form,
     get_schema_analyzer,
     get_id_column,
+    get_name_column,
     get_fk_relationships,
     get_transaction_tables,
 )
@@ -326,7 +327,10 @@ from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_
 from .helpers_core import (
     has_join,
     _ast_guardrails,
+    _fix_winner_row_metric_order_priority,
     _rewrite_grouped_winner_row_ranked_aggregate,
+    _rewrite_joined_ranked_subquery_to_outer_winner,
+    _rewrite_malformed_window_winner_clause,
     _question_wants_winner_row,
     _question_wants_anti_existence,
     _wants_distinct_from_question,
@@ -471,10 +475,22 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
             violations.append("missing_count_distinct")
 
     if contract["requires_winner_row"] and not _has_winner_row_shape(out_sql):
+        fixed = _rewrite_joined_ranked_subquery_to_outer_winner(out_sql, question, ctx)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: lifted child-ranked join to parent winner-row")
+        fixed = _rewrite_malformed_window_winner_clause(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: repaired malformed WINDOW winner-row clause")
         fixed = _rewrite_grouped_winner_row_ranked_aggregate(out_sql, question)
         if fixed != out_sql:
             out_sql = fixed
             corrections.append("Semantic contract: enforced winner-row pattern")
+        fixed = _fix_winner_row_metric_order_priority(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: normalized winner-row metric priority")
         if not _has_winner_row_shape(out_sql):
             violations.append("missing_winner_row")
 
@@ -613,6 +629,28 @@ def _table_entity_pattern(table: str) -> str:
 
     escaped = [re.escape(v).replace(r"\ ", r"\s+") for v in variants]
     return "(?:" + "|".join(escaped) + ")"
+
+
+def _question_mentions_entity_display_name(question_lower: str, table: str) -> bool:
+    """
+    Return True only when the question locally ties a display-name request to
+    a specific entity, e.g. "product name" or "name of the customer".
+
+    This avoids treating a generic "name" mention elsewhere in the question as
+    evidence that every mentioned entity needs its display-name column.
+    """
+    q = (question_lower or "").strip().lower()
+    entity_pattern = _table_entity_pattern(table)
+    if not q or not entity_pattern:
+        return False
+
+    name_pat = r"(?:name|names|full\s+name)"
+    patterns = [
+        rf"\b{entity_pattern}\b(?:\s+\w+){{0,2}}\s+{name_pat}\b",
+        rf"\b{name_pat}\b(?:\s+\w+){{0,2}}\s+\bof\s+{entity_pattern}\b",
+        rf"\b{name_pat}\b(?:\s+\w+){{0,2}}\s+\bfor\s+{entity_pattern}\b",
+    ]
+    return any(re.search(p, q, flags=re.I) for p in patterns)
 
 
 def _instantiate_entity_patterns(templates: List[str], entity_pattern: str) -> List[str]:
@@ -1552,6 +1590,10 @@ def router_agent(state: RAGState) -> RAGState:
     # AND another table has the FK column linking to it, skip the parent table.
     # Example: "per customer" + payments.has(customerNumber) → skip customers table
     tables_to_remove = []
+    try:
+        schema_analyzer = get_schema_analyzer()
+    except Exception:
+        schema_analyzer = None
     for tbl_lower in list(evidence_tables):
         evidence_list = evidence_details.get(tbl_lower, [])
         weak_evidence = AGENT_ROUTER_WEAK_EVIDENCE_TAGS
@@ -1626,6 +1668,28 @@ def router_agent(state: RAGState) -> RAGState:
             if col_low in question_lower or spaced in question_lower:
                 non_fk_mentioned = True
                 break
+
+        if not non_fk_mentioned and schema_analyzer is not None:
+            try:
+                schema_cols = sorted(schema_analyzer.get_table_columns(tbl_lower))
+            except Exception:
+                schema_cols = []
+            for col in schema_cols:
+                col_low = str(col).lower()
+                if col_low in fk_cols:
+                    continue
+                if _question_mentions_column(question_lower, str(col)):
+                    non_fk_mentioned = True
+                    break
+
+        if not non_fk_mentioned:
+            name_col = (get_name_column(tbl_lower) or "").strip()
+            if (
+                name_col
+                and str(name_col).lower() not in fk_cols
+                and _question_mentions_entity_display_name(question_lower, tbl_lower)
+            ):
+                non_fk_mentioned = True
 
         # If the entity is explicitly mentioned in non-ID form and evidence comes
         # from FK columns, keep it only when:

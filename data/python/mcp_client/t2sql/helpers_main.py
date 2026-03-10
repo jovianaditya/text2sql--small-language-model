@@ -32,11 +32,15 @@ from .schema_analyzer import (
     get_transaction_tables,
     get_anchor_columns,
     get_all_tables,
+    get_aggregatable_columns,
+    get_filterable_date_columns,
     get_fk_relationships,
     get_id_column,
     get_name_column,
     get_table_synonyms,
     get_column_synonyms,
+    get_column_entity_variants,
+    get_column_role,
     get_schema_analyzer,
     get_singular_form,
 )
@@ -65,7 +69,7 @@ from .helpers_core import (
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _preexecute_sql_safety_pass,
-    _rewrite_winner_row_aggregate_misuse, _fix_winner_row_window_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _rewrite_winner_row_aggregate_misuse, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _rewrite_customer_orders_payment_fanout,
@@ -497,17 +501,29 @@ def _mentions_id_like_for_probe(text: str) -> bool:
 
 def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: int = 16) -> str:
     """
-    Bangun dense probe untuk embedding query, tapi:
-    - Tail dibuat SESINGKAT mungkin.
-    - Token ekstra hanya yang benar-benar relevan dengan pertanyaan.
-    - Tidak lagi hardcode list panjang 'id date status sum total amount revenue ...'.
+    Build a compact probe tail for embedding retrieval.
+
+    Design goals:
+    - Keep the tail short.
+    - Add only schema-grounded tokens that are relevant to the question.
+    - Avoid ClassicModels-specific table branching.
     """
     q_raw = question or ""
     q = q_raw.lower()
     toks_q = q.split()
-    # Strict table mention detection for probe expansion.
-    # Do NOT use broad schema synonyms here; they can introduce false positives
-    # (e.g., generic words like "name" accidentally implying customers table).
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    transaction_tables = {
+        str(t).strip().lower()
+        for t in (get_transaction_tables() or [])
+        if str(t).strip()
+    }
+
+    # Keep mention detection conservative for probe expansion.
     def _strict_table_mentioned(q_text: str, table: str) -> bool:
         t = (table or "").strip().lower()
         if not t:
@@ -538,8 +554,16 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
 
         for cand in candidates:
             pattern = re.escape(cand).replace(r"\ ", r"\s+")
-            if re.search(rf"\b{pattern}\b", q_text):
-                return True
+            m = re.search(rf"\b{pattern}\b", q_text)
+            if not m:
+                continue
+            if cand == "order":
+                tail = q_text[m.end(): m.end() + 12]
+                if re.match(r"\s+by\b", tail):
+                    continue
+            return True
+        if _iter_inflected_entity_mentions(q_text, t):
+            return True
         return False
 
     mentioned_tables_dynamic = {
@@ -547,10 +571,179 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         if _strict_table_mentioned(q, t)
     }
 
-    # fitur dasar
+    def _display_name_column_for_probe(table: str) -> Optional[str]:
+        name_col = get_name_column(table)
+        if not name_col:
+            return None
+        col_lower = name_col.lower()
+        role = get_column_role(table, name_col)
+        if role == "name":
+            return name_col
+        if any(part in col_lower for part in ("firstname", "lastname", "surname", "givenname")):
+            return None
+        return name_col
+
+    def _column_mentioned_in_question(table: str, column: str) -> bool:
+        for variant in get_column_entity_variants(table, column):
+            pattern = re.escape(str(variant).strip().lower()).replace(r"\ ", r"\s+")
+            if pattern and re.search(rf"\b{pattern}\b", q):
+                return True
+        return False
+
+    def _rank_columns_for_probe(
+        table: str,
+        columns: List[str],
+        *,
+        prefer_metric: bool = False,
+        prefer_temporal: bool = False,
+    ) -> List[str]:
+        ranked: List[Tuple[int, int, str]] = []
+        for idx, column in enumerate(columns):
+            col = str(column or "").strip()
+            if not col:
+                continue
+            col_lower = col.lower()
+            role = get_column_role(table, col)
+            score = 0
+            if _column_mentioned_in_question(table, col):
+                score += 5
+            if prefer_metric:
+                if role in {"metric", "measure", "amount", "quantity"}:
+                    score += 3
+                if any(
+                    token in col_lower
+                    for token in ("amount", "price", "quantity", "total", "sales", "revenue", "gross", "net", "cost", "value", "count")
+                ):
+                    score += 2
+            if prefer_temporal:
+                if role in {"date", "datetime", "timestamp", "time"}:
+                    score += 3
+                if ("date" in col_lower) or ("time" in col_lower) or col_lower.endswith("at"):
+                    score += 2
+            ranked.append((score, idx, col))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [col for _, _, col in ranked]
+
+    def _is_semantic_metric_column(table: str, column: str) -> bool:
+        col = str(column or "").strip()
+        if not col:
+            return False
+        col_lower = col.lower()
+        role = get_column_role(table, col)
+        if role in {"metric", "measure", "amount", "quantity"}:
+            return True
+        return any(
+            token in col_lower
+            for token in (
+                "amount",
+                "price",
+                "quantity",
+                "total",
+                "sales",
+                "revenue",
+                "gross",
+                "net",
+                "cost",
+                "value",
+                "count",
+            )
+        )
+
+    def _table_probe_label(table: str) -> Optional[str]:
+        singular = get_singular_form(table)
+        if singular:
+            label = singular.replace("_", " ").strip()
+            if label:
+                return label
+        return str(table or "").replace("_", " ").strip() or None
+
+    def _table_has_geo_variant(table: str, targets: Set[str]) -> bool:
+        if not analyzer:
+            return False
+        table_lower = str(table or "").strip().lower()
+        if not table_lower:
+            return False
+        try:
+            columns = analyzer.get_table_columns(table_lower)
+        except Exception:
+            columns = []
+        wanted = {str(t).strip().lower() for t in targets if str(t).strip()}
+        for column in columns:
+            variants = get_column_entity_variants(table_lower, column)
+            for variant in variants:
+                tokens = re.split(r"[\s_]+", str(variant or "").strip().lower())
+                if any(tok in wanted for tok in tokens):
+                    return True
+        return False
+
+    def _append_table_probe_tokens(table: str, tokens: List[str]) -> None:
+        table_lower = str(table or "").strip().lower()
+        if not table_lower:
+            return
+
+        label = _table_probe_label(table_lower)
+        if label:
+            tokens.append(label)
+
+        id_col = get_id_column(table_lower)
+        name_col = _display_name_column_for_probe(table_lower)
+        if id_like:
+            if id_col:
+                tokens.append(id_col)
+        else:
+            if name_col:
+                tokens.append(name_col)
+            elif id_col:
+                tokens.append(id_col)
+
+        metric_candidates = [
+            col
+            for col in get_aggregatable_columns(table_lower)
+            if _is_semantic_metric_column(table_lower, col)
+        ]
+        explicit_metric_match = any(
+            _column_mentioned_in_question(table_lower, col)
+            for col in metric_candidates
+        )
+        if explicit_metric_match:
+            metric_cols = _rank_columns_for_probe(
+                table_lower,
+                metric_candidates,
+                prefer_metric=True,
+            )
+            for col in metric_cols[:2]:
+                col_lower = col.lower()
+                role = get_column_role(table_lower, col)
+                if col in {id_col, name_col}:
+                    continue
+                if role == "id":
+                    continue
+                if col_lower.endswith("id") or col_lower.endswith("number") or col_lower.endswith("code"):
+                    continue
+                tokens.append(col)
+
+        date_candidates = get_filterable_date_columns(table_lower)
+        explicit_temporal_match = any(
+            _column_mentioned_in_question(table_lower, col)
+            for col in date_candidates
+        )
+        wants_temporal_columns = explicit_temporal_match or (
+            table_lower in transaction_tables and qtype != "lookup"
+        )
+        if wants_temporal_columns:
+            date_cols = _rank_columns_for_probe(
+                table_lower,
+                date_candidates,
+                prefer_temporal=True,
+            )
+            for col in date_cols[:1]:
+                if col not in {id_col, name_col}:
+                    tokens.append(col)
+
+    # Base lexical signals.
     has_metric_word = any(k in q for k in [
-    "amount", "revenue", "sales", "omset", "price", "harga",
-    "gross", "net"
+        "amount", "revenue", "sales", "omset", "price", "harga",
+        "gross", "net"
     ])
     has_count_word = any(k in q for k in [
         "count", "berapa banyak", "how many"
@@ -561,54 +754,14 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         "mingguan", "bulanan", "202", "201"
     ])
 
-    # entity utama classicmodels
-    mentions_customer = any(k in q for k in ["customer", "customers", "pelanggan"]) or ("customers" in mentioned_tables_dynamic)
-    mentions_product  = any(k in q for k in ["product", "products", "produk"]) or ("products" in mentioned_tables_dynamic)
-    mentions_order    = any(k in q for k in ["order", "orders", "pesanan"]) or ("orders" in mentioned_tables_dynamic)
-    mentions_employee = any(k in q for k in ["employee", "employees", "karyawan"]) or ("employees" in mentioned_tables_dynamic)
-
-    # entity tambahan (tabel lain)
-    mentions_productline = any(
-        k in q
-        for k in [
-            "product line", "product lines",
-            "lini produk", "line produk",
-            "kategori", "category"
-        ]
-    ) or ("productlines" in mentioned_tables_dynamic)
-    mentions_office = any(
-        k in q
-        for k in [
-            "office", "offices", "kantor",
-            "territory", "territories", "region", "regional"
-        ]
-    ) or ("offices" in mentioned_tables_dynamic)
-    mentions_payment = any(
-        k in q
-        for k in [
-            "payment", "payments", "pembayaran",
-            "check ", "cheque", "cheques"
-        ]
-    ) or ("payments" in mentioned_tables_dynamic)
-    mentions_orderdetails = any(
-        k in q
-        for k in [
-            "order detail", "order details",
-            "line item", "line items",
-            "item pesanan", "detail pesanan"
-        ]
-    ) or ("orderdetails" in mentioned_tables_dynamic)
-
     id_like = _mentions_id_like_for_probe(q)
+
     # ---------------------------------------------------------------------------
-    # 1) Tentukan base tokens
+    # 1) Build seed tokens
     # ---------------------------------------------------------------------------
     base: List[str] = []
-    # a) Untuk lookup murni → jangan banyak tambahan
     if qtype == "lookup":
-        # Biasanya cukup entity hints saja (di bawah)
         base = []
-    # b) Untuk agregasi → tambahkan sedikit metric/time hints
     elif qtype in {"aggregate_by", "aggregate_all"}:
         if has_metric_word:
             base += ["amount", "revenue", "price"]
@@ -617,125 +770,59 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         if has_time_word:
             base += ["date", "year", "month"]
     else:
-        # qtype other: minimal hints
         if has_time_word:
             base += ["date"]
+
     # ---------------------------------------------------------------------------
-    # 2) Entity-specific hints (now using dynamic column inference)
+    # 2) Schema-driven table and column hints
     # ---------------------------------------------------------------------------
-    if mentions_customer:
-        base += ["customer"]
-        if not id_like:
-            name_col = get_name_column("customers")
-            if name_col:
-                base.append(name_col)
-        else:
-            id_col = get_id_column("customers")
-            if id_col:
-                base.append(id_col)
-
-    if mentions_product:
-        base += ["product"]
-        if not id_like:
-            name_col = get_name_column("products")
-            if name_col:
-                base.append(name_col)
-        else:
-            id_col = get_id_column("products")
-            if id_col:
-                base.append(id_col)
-
-    if mentions_order:
-        base += ["order"]
-        id_col = get_id_column("orders")
-        if id_col:
-            base.append(id_col)
-
-    if mentions_employee:
-        base += ["employee"]
-        id_col = get_id_column("employees")
-        if id_col:
-            base.append(id_col)
-
-    if mentions_productline:
-        id_col = get_id_column("productlines")
-        if id_col:
-            base.append(id_col)
-
-    if mentions_office:
-        id_col = get_id_column("offices")
-        if id_col:
-            base.append(id_col)
-        base += ["city", "country", "territory"]
-
-    if mentions_payment:
-        base += ["payments", "amount", "paymentDate"]
-
-    if mentions_orderdetails:
-        base += ["orderdetails", "quantityOrdered", "priceEach"]
-    # Generic table coverage for non-classicmodels schemas:
-    # add lightweight hints for any other mentioned table.
-    static_tables = {
-        "customers", "products", "orders", "employees",
-        "productlines", "offices", "payments", "orderdetails"
-    }
     for table in sorted(mentioned_tables_dynamic):
-        if table in static_tables:
-            continue
-        singular = get_singular_form(table)
-        if singular:
-            base.append(singular)
-        id_col = get_id_column(table)
-        if id_col:
-            base.append(id_col)
-        if not id_like:
-            name_col = get_name_column(table)
-            if name_col:
-                base.append(name_col)
+        _append_table_probe_tokens(table, base)
+
     # ---------------------------------------------------------------------------
-    # 2b) Geo hints (lebih dinamis)
+    # 2b) Geography hints
     # ---------------------------------------------------------------------------
     mentions_country_word = any(k in q for k in ["country", "negara"])
-    mentions_city_word    = any(k in q for k in ["city", "kota"])
-    mentions_region_word  = any(k in q for k in ["region", "wilayah", "territory", "territories"])
+    mentions_city_word = any(k in q for k in ["city", "kota"])
+    mentions_region_word = any(k in q for k in ["region", "wilayah", "territory", "territories"])
+    has_country_column = any(
+        _table_has_geo_variant(table, {"country", "nation"})
+        for table in mentioned_tables_dynamic
+    )
+    has_city_column = any(
+        _table_has_geo_variant(table, {"city", "municipality", "town"})
+        for table in mentioned_tables_dynamic
+    )
     geo_tokens: List[str] = []
 
-    # CASE A: query sebut "country" tapi tidak sebut "city" → fokus ke country saja
     if mentions_country_word and not mentions_city_word:
         geo_tokens.append("country")
-
-    # CASE B: query sebut "city" tapi tidak sebut "country" → fokus ke city saja
     elif mentions_city_word and not mentions_country_word:
         geo_tokens.append("city")
-
-    # CASE C: sebut dua-duanya → boleh tambahin dua-duanya
     elif mentions_country_word and mentions_city_word:
         geo_tokens += ["country", "city"]
+    elif mentions_region_word:
+        if has_city_column:
+            geo_tokens.append("city")
+        if has_country_column:
+            geo_tokens.append("country")
 
-    # CASE D: nggak sebut city/country, tapi konteks-nya offices / region
-    elif mentions_office or mentions_region_word:
-        # offices biasanya lebih nyambung ke city, tapi country juga masih relevan
-        geo_tokens += ["city", "country"]
+    if re.search(r"\bfrom\s+\w+\b", q_raw, flags=re.I) and has_country_column:
+        if "country" not in geo_tokens:
+            geo_tokens.append("country")
 
-    # CASE E: query tentang customers + ada pola "from <negara>"
-    # misal: "customers from Japan", "pelanggan dari USA"
-    if mentions_customer:
-        if re.search(r"\bfrom\s+\w+\b", q_raw, flags=re.I):
-            if "country" not in geo_tokens:
-                geo_tokens.append("country")
-
-    # Tambahkan ke base, tapi tetap hormati max_tokens di bawah
     base += geo_tokens
 
-    # Name-specific hints (generic)
+    # Generic name hint.
     if any(k in q for k in ["name", "nama"]):
         base += ["name"]
 
-    # Super pendek → beri sedikit “bumbu” supaya embedding nggak terlalu kosong
+    # Very short questions still need a tiny semantic tail.
     if len(toks_q) <= 2 and not base:
         base += ["amount", "date"]
+
     # ---------------------------------------------------------------------------
-    # 3) Dedup + truncate
+    # 3) Deduplicate and truncate
     # ---------------------------------------------------------------------------
     seen = set()
     tokens: List[str] = []
@@ -3669,6 +3756,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _fix_winner_row_window_order_priority(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after winner-row window order fix:", s)
 
+        s = _fix_winner_row_metric_order_priority(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after winner-row metric priority fix:", s)
+
         s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after metric-agg-column fix:", s)
 
@@ -3695,6 +3785,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _canonicalize_latest_year_same_year_pattern(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year canonical pattern fix:", s)
+
+        s = _rewrite_latest_year_tuple_in_filter(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year tuple-IN fix:", s)
 
         s = _move_latest_year_filter_where_to_inner_on(s)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year WHERE->ON style fix:", s)
