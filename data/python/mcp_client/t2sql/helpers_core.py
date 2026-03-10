@@ -20,6 +20,7 @@ from .schema_analyzer import (
     get_all_tables,
     get_transaction_tables,
     get_fk_relationships,
+    get_column_role,
     get_schema_analyzer,
     get_table_synonyms,
     get_singular_form,
@@ -9131,15 +9132,142 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
 
 def _question_wants_entity_orders_payments_rollup(question: str) -> bool:
     """
-    Detect intent like:
-    - customers with at least one order
-    - total number of orders
-    - total payment amount
-    - paid/unpaid style status
+    Detect dual-fact rollup intent dynamically from schema metadata.
+
+    Target semantic shape:
+    - a base entity table is explicitly mentioned
+    - at least two directly connected transaction tables are also mentioned
+    - one transaction family is requested as a count
+    - another transaction family is requested as a total / summed metric
+      or a status derived from that transaction family
     """
     q = (question or "").lower().strip()
     if not q:
         return False
+
+    def _fallback_dual_fact_rollup_from_question() -> bool:
+        """
+        Conservative question-only fallback for environments where schema
+        metadata is unavailable. This stays generic by extracting lexical
+        families from the question instead of relying on specific table names.
+        """
+        family_stopwords = {
+            "a", "an", "the", "of", "for", "per", "each", "every", "such",
+            "total", "number", "count", "sum", "combined", "aggregate",
+            "aggregated", "and", "or", "with", "without", "show", "return",
+            "list", "display", "give", "find", "who", "have", "has", "had",
+            "at", "least", "one", "all",
+        }
+        metric_words = {
+            "amount", "value", "revenue", "sales", "price", "quantity",
+            "qty", "volume", "balance", "cost", "spend", "paid",
+        }
+
+        def _normalize_family(raw: str) -> str:
+            tokens = [
+                tok for tok in re.findall(r"[a-z0-9]+", (raw or "").lower())
+                if tok and tok not in family_stopwords
+            ]
+            if not tokens:
+                return ""
+
+            def _singularize(token: str) -> str:
+                if token.endswith("ies") and len(token) > 3:
+                    return token[:-3] + "y"
+                if (
+                    token.endswith("s")
+                    and len(token) > 3
+                    and not token.endswith(("ss", "us", "is"))
+                ):
+                    return token[:-1]
+                return token
+
+            normalized = [_singularize(tok) for tok in tokens[:3]]
+            return " ".join(normalized).strip()
+
+        def _collect(pattern: str, text: str = q) -> Set[str]:
+            families: Set[str] = set()
+            for match in re.finditer(pattern, text, flags=re.I):
+                fam = _normalize_family(match.group(1))
+                if fam:
+                    families.add(fam)
+            return families
+
+        base_families = set()
+        base_families |= _collect(
+            r"\b(?:for\s+each|for\s+every|per|each\s+such)\s+([a-z_][a-z0-9_]*(?:\s+[a-z_][a-z0-9_]*){0,2})\b"
+        )
+        base_families |= _collect(
+            r"\b([a-z_][a-z0-9_]*(?:\s+[a-z_][a-z0-9_]*){0,2})\s+(?:id|name|number|code)\b"
+        )
+
+        count_families = _collect(
+            r"\b(?:total\s+number\s+of|number\s+of|count\s+of|count|how\s+many)\s+(?:the\s+)?([a-z_][a-z0-9_]*(?:\s+[a-z_][a-z0-9_]*){0,2})\b"
+        )
+        count_families |= _collect(
+            r"\btotal[_\s-]+([a-z_][a-z0-9_]*(?:\s+[a-z_][a-z0-9_]*){0,2})\b"
+        )
+
+        metric_families = set()
+        for metric_word in metric_words:
+            metric_families |= _collect(
+                rf"\b(?:total|sum(?:\s+of)?|combined|aggregate(?:d)?)\s+([a-z_][a-z0-9_]*(?:\s+[a-z_][a-z0-9_]*){{0,2}})\s+{metric_word}\b"
+            )
+            metric_families |= _collect(
+                rf"\b{metric_word}\s+(?:for|of)\s+(?:the\s+)?([a-z_][a-z0-9_]*(?:\s+[a-z_][a-z0-9_]*){{0,2}})\b"
+            )
+        metric_families |= _collect(
+            r"\b([a-z_][a-z0-9_]*(?:\s+[a-z_][a-z0-9_]*){0,2})[_\s-]*status\b"
+        )
+
+        if not base_families or not count_families or not metric_families:
+            return False
+
+        for base_family in base_families:
+            for count_family in count_families:
+                if count_family == base_family:
+                    continue
+                for metric_family in metric_families:
+                    if metric_family in {base_family, count_family}:
+                        continue
+                    return True
+        return False
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    try:
+        all_tables = sorted(str(t).strip().lower() for t in (get_all_tables() or []) if str(t).strip())
+    except Exception:
+        all_tables = []
+    try:
+        transaction_tables = {
+            str(t).strip().lower()
+            for t in (get_transaction_tables() or [])
+            if str(t).strip()
+        }
+    except Exception:
+        transaction_tables = set()
+    try:
+        fk_map_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_map_raw = {}
+
+    if not all_tables or len(transaction_tables) < 2:
+        return _fallback_dual_fact_rollup_from_question()
+
+    direct_txn_children: Dict[str, Set[str]] = {}
+    for child_table, fk_targets in fk_map_raw.items():
+        child_l = str(child_table or "").strip().lower()
+        if child_l not in transaction_tables:
+            continue
+        for target_table in (fk_targets or {}).values():
+            target_l = str(target_table or "").strip().lower()
+            if not target_l:
+                continue
+            direct_txn_children.setdefault(target_l, set()).add(child_l)
 
     def _entity_alt(table_name: str) -> str:
         words = _entity_words_for_table(table_name)
@@ -9152,36 +9280,152 @@ def _question_wants_entity_orders_payments_rollup(question: str) -> bool:
         escaped = sorted(set(escaped), key=len, reverse=True)
         return "|".join(escaped)
 
-    cust_alt = _entity_alt("customers")
-    ord_alt = _entity_alt("orders")
-    pay_alt = _entity_alt("payments")
-
     def _has_alt(alt: str) -> bool:
         return bool(alt and re.search(rf"\b(?:{alt})\b", q, flags=re.I))
 
-    has_customer = _has_alt(cust_alt)
-    has_orders = _has_alt(ord_alt)
-    has_payments = _has_alt(pay_alt) or bool(re.search(r"\bpaid\b", q))
+    def _table_has_entity_identity(table_name: str) -> bool:
+        try:
+            if get_id_column(table_name) or get_name_column(table_name):
+                return True
+        except Exception:
+            pass
+        if analyzer is not None:
+            try:
+                return analyzer.get_table_type(table_name) in {"dimension", "reference"}
+            except Exception:
+                return False
+        return False
 
-    has_order_count = bool(
-        re.search(
-            rf"\b(?:total\s+number\s+of|number\s+of|count\s+of|jumlah)\s+(?:{ord_alt})\b",
-            q,
-            flags=re.I,
+    def _metric_terms_for_table(table_name: str) -> Set[str]:
+        metric_terms: Set[str] = set()
+        generic_terms = {
+            "amount", "value", "price", "prices", "revenue", "sale", "sales",
+            "quantity", "qty", "volume", "balance", "cost", "total",
+        }
+        if analyzer is None:
+            return metric_terms
+
+        try:
+            table_columns = analyzer.get_table_columns(table_name)
+        except Exception:
+            table_columns = []
+
+        for col in table_columns:
+            role = ""
+            try:
+                role = get_column_role(table_name, col)
+            except Exception:
+                role = ""
+
+            candidate_texts = [str(col or "")]
+            try:
+                candidate_texts.extend(analyzer.get_column_synonyms(table_name, col) or [])
+            except Exception:
+                pass
+
+            if role in {"metric", "measure", "amount"}:
+                metric_terms.add("total")
+
+            for text in candidate_texts:
+                text_l = str(text or "").strip().lower()
+                if not text_l:
+                    continue
+                for term in generic_terms:
+                    if term in text_l:
+                        metric_terms.add(term)
+        return metric_terms
+
+    def _count_request_for(table_name: str) -> bool:
+        alt = _entity_alt(table_name)
+        if not alt:
+            return False
+        return bool(
+            re.search(
+                rf"\b(?:total\s+number\s+of|number\s+of|count\s+of|count|how\s+many|jumlah)\s+(?:the\s+)?(?:{alt})\b",
+                q,
+                flags=re.I,
+            )
+        ) or bool(
+            re.search(
+                rf"\btotal[_\s-]+(?:{alt})\b",
+                q,
+                flags=re.I,
+            )
         )
-    ) or bool(re.search(r"\btotal_orders?\b", q, flags=re.I))
 
-    has_payment_total = bool(
-        re.search(
-            rf"\b(?:total\s+(?:{pay_alt})|total\s+amount\s+paid|sum\s+of\s+(?:{pay_alt})|(?:{pay_alt})\s+amount|jumlah\s+pembayaran)\b",
-            q,
-            flags=re.I,
+    def _metric_total_request_for(table_name: str) -> bool:
+        alt = _entity_alt(table_name)
+        metric_terms = sorted(_metric_terms_for_table(table_name), key=len, reverse=True)
+        if not alt or not metric_terms:
+            return False
+        metric_alt = "|".join(re.escape(t).replace(r"\ ", r"\s+") for t in metric_terms if t)
+        if not metric_alt:
+            return False
+
+        has_total_phrase = bool(
+            re.search(
+                rf"\b(?:total|sum(?:\s+of)?|combined|aggregate(?:d)?)\s+(?:the\s+)?(?:{alt})\b",
+                q,
+                flags=re.I,
+            )
         )
-    ) or bool(re.search(r"\btotal_payments?\b|\btotal_payment_amount\b", q, flags=re.I))
+        has_metric_phrase = bool(
+            re.search(
+                rf"\b(?:{alt})\s+(?:{metric_alt})\b",
+                q,
+                flags=re.I,
+            )
+            or re.search(
+                rf"\b(?:{metric_alt})\s+(?:for|of)\s+(?:the\s+)?(?:{alt})\b",
+                q,
+                flags=re.I,
+            )
+            or re.search(
+                rf"\b(?:total|sum(?:\s+of)?|combined|aggregate(?:d)?)\s+(?:{metric_alt})\b",
+                q,
+                flags=re.I,
+            )
+        )
+        has_specific_metric_hint = any(term != "total" for term in metric_terms)
+        return has_total_phrase and (has_metric_phrase or has_specific_metric_hint)
 
-    asks_status = bool(re.search(r"\bpayment[_\s]*status\b", q, flags=re.I)) or ("paid" in q and "unpaid" in q)
+    def _status_request_for(table_name: str) -> bool:
+        alt = _entity_alt(table_name)
+        if not alt:
+            return False
+        return bool(
+            re.search(
+                rf"\b(?:{alt})[_\s-]*status\b",
+                q,
+                flags=re.I,
+            )
+        )
 
-    return has_customer and has_orders and (has_payments or has_payment_total or asks_status) and has_order_count and (has_payment_total or asks_status)
+    for base_table in all_tables:
+        if base_table in transaction_tables:
+            continue
+        if not _table_has_entity_identity(base_table):
+            continue
+        if not _has_alt(_entity_alt(base_table)):
+            continue
+
+        child_txn_tables = sorted(direct_txn_children.get(base_table, set()))
+        if len(child_txn_tables) < 2:
+            continue
+
+        mentioned_child_txns = [t for t in child_txn_tables if _has_alt(_entity_alt(t))]
+        if len(mentioned_child_txns) < 2:
+            continue
+
+        count_tables = [t for t in mentioned_child_txns if _count_request_for(t)]
+        metric_tables = [
+            t for t in mentioned_child_txns
+            if _metric_total_request_for(t) or _status_request_for(t)
+        ]
+        if any(ct != mt for ct in count_tables for mt in metric_tables):
+            return True
+
+    return _fallback_dual_fact_rollup_from_question()
 
 
 def _question_wants_customer_orders_payment_rollup(question: str) -> bool:
