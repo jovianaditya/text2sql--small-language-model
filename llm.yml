@@ -36,14 +36,14 @@ services:
       retries: 5 
       start_period: 30s
 
-  chroma: 
-    build: 
-      context: ./data/chroma 
-      dockerfile: chroma 
+  chroma:
+    build:
+      context: ./data/chroma
+      dockerfile: chroma
+    image: local-chroma:latest
     container_name: chroma
-    image: chroma
-    ports: 
-      - "8000:8000" 
+    ports:
+      - "8000:8000"
     deploy:
       resources:
         limits:
@@ -51,10 +51,10 @@ services:
     networks:
       - default
       - datahub_network
-    healthcheck: 
-      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"] 
-      interval: 30s 
-      timeout: 5s 
-      retries: 3 
-    volumes: 
-      - ./data/python/mcp_client/chroma_db:/data:rw 
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - ./data/python/mcp_client/chroma_db:/data:rw
