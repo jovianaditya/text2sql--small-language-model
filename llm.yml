@@ -8,7 +8,7 @@ networks:
 
 services:
   ollama: 
-    image: ollama/ollama 
+    image: ollama/ollama:0.18.1
     container_name: ollama
     environment:
       - OLLAMA_KEEP_ALIVE=180s
@@ -40,7 +40,7 @@ services:
     build:
       context: ./data/chroma
       dockerfile: chroma
-    image: local-chroma:latest
+    image: chroma:1.5.5
     container_name: chroma
     ports:
       - "8000:8000"

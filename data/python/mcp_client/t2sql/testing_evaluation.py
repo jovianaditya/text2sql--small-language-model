@@ -696,7 +696,7 @@ async def run_single_case(
         "gt_row_count": "",
         "ts_success": False,            # Test Suite: match across all configured DBs
         "ts_match_count": 0,            # Number of DBs that match for this case
-        "ts_total_databases": 0,        # Number of DBs evaluated for TS
+        "ts_total_databases": len(ts_db_targets),  # Configured TS DB count for this case
         "ts_failed_databases": "",      # Newline-separated DBs that mismatched/failed
         "latency_s": 0,            # Primary: warm prompt->final SQL latency (seconds)
         "error": None,
@@ -819,11 +819,15 @@ async def run_single_case(
         result["exec_success"] = False
         result["exec_notes"] = "Skipped: blocked by acceptance gate"
         result["result_match"] = False
+        result["ts_match_count"] = 0
+        result["ts_failed_databases"] = "\n".join(ts_db_targets)
         result["match_reason"] = "Predicted SQL blocked by deterministic acceptance gate"
         result["error"] = "Predicted SQL blocked by deterministic acceptance gate"
         _refresh_row_count_fields()
         print("[VA] Invalid SQL: FINAL_GATE_BLOCKED")
         print("[EX] Skipped execution: blocked by acceptance gate")
+        if ts_db_targets:
+            print("[TS] Skipped: blocked by acceptance gate (counted as FAIL)")
         return result
     
 
@@ -838,11 +842,14 @@ async def run_single_case(
         result["exec_success"] = False
         result["exec_notes"] = f"Skipped: invalid SQL (EXPLAIN): {va_error}"
         result["result_match"] = False
+        result["ts_match_count"] = 0
+        result["ts_failed_databases"] = "\n".join(ts_db_targets)
         result["match_reason"] = f"Invalid SQL (EXPLAIN): {va_error}"
         result["error"] = f"Predicted SQL invalid (EXPLAIN): {va_error}"
         _refresh_row_count_fields()
         print("[EX] Skipped execution: VA failed")
-        print("[TS] Skipped: VA failed")
+        if ts_db_targets:
+            print("[TS] Skipped: VA failed (counted as FAIL)")
         return result
 
     # 2b. Execute predicted SQL (base DB)
@@ -942,6 +949,18 @@ async def run_single_case(
                     f"Predicted SQL failed: {pred_error}; Groundtruth SQL failed: {gt_error}"
                 )
                 result["exec_notes"] = result["match_reason"]
+
+        # TS is evaluated hierarchically: the prediction must first match on the
+        # base database. If EX fails, TS is counted as failed for this case.
+        if not result["result_match"]:
+            result["ts_match_count"] = 0
+            result["ts_failed_databases"] = "\n".join(ts_db_targets)
+            _refresh_row_count_fields()
+            if ts_db_targets:
+                print("[TS] Skipped: EX failed on base database (counted as FAIL)")
+            else:
+                print("[TS] No target TS databases configured; TS will be marked as N/A for this case.")
+            return result
 
         # 4. Test Suite (TS): evaluate on distilled databases only
         ts_rows = []
