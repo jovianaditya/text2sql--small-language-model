@@ -684,6 +684,7 @@ async def run_single_case(
         "ir_confidence": 0.0,
         "ir_plannable": False,
         "ir_gate_reasons": "",
+        "ir_hint_passed": False,
         "initial_model_used": "",  # Initial model chosen by router (3b/7b)
         "final_model_used": "",    # Standardized route label: ir_planner | llm_3b | llm_7b
         "va_success": False,       # Valid SQL (EXPLAIN)
@@ -735,6 +736,7 @@ async def run_single_case(
         result["ir_plannable"] = bool(state.get("ir_plannable", False))
         gate_reasons = state.get("ir_gate_reasons", []) or []
         result["ir_gate_reasons"] = "|".join(str(x) for x in gate_reasons if str(x).strip())
+        result["ir_hint_passed"] = bool(state.get("ir_hint_passed", False))
         
         # Primary latency metric for thesis:
         # Warm prompt->final SQL (model receives prompt -> final SQL ready).
@@ -935,6 +937,9 @@ async def run_single_case(
                     result["exec_notes"] = f"MISMATCH ({base_count_notes})"
 
             status = "MATCH" if result["result_match"] else "MISMATCH"
+            # exec_success reflects execution accuracy: SQL must run AND match
+            if not result["result_match"]:
+                result["exec_success"] = False
             print(f"[EVALUATION] {status} - {result['match_reason']}")
             print(f"       (pred: {pred_base_rows_count} rows, gt: {gt_base_rows_count} rows)")
         else:
@@ -1235,6 +1240,7 @@ async def run_batch_eval(
     ts_total_cases = len(ts_evaluable_cases)
     ts_success_cases = sum(1 for r in ts_evaluable_cases if bool(r.get("ts_success", False)))
     ir_used_count = sum(1 for r in results if bool(r.get("ir_used", False)))
+    ir_hint_passed_count = sum(1 for r in results if bool(r.get("ir_hint_passed", False)))
     llm_fallback_count = total - ir_used_count
 
     # Metrics by difficulty
@@ -1276,7 +1282,8 @@ async def run_batch_eval(
         print("Test Suite (TS): N/A")
     print(
         f"Route Split: IR={ir_used_count}/{total} ({100*ir_used_count/total:.1f}%), "
-        f"LLM fallback={llm_fallback_count}/{total} ({100*llm_fallback_count/total:.1f}%)"
+        f"LLM fallback={llm_fallback_count}/{total} ({100*llm_fallback_count/total:.1f}%), "
+        f"IR hint passed={ir_hint_passed_count}/{llm_fallback_count}"
     )
 
     print("\nBy Difficulty:")

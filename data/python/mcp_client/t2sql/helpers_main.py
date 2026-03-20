@@ -2551,6 +2551,135 @@ Question: {question}
 Return JSON object with keys: complexity (simple/complex), qtype (lookup/aggregate/rank).
 """
 
+# ======================================================================
+# ================ INTENT IR SOFT HINT (IR-INFORMED LLM) ===============
+# ======================================================================
+def _build_intent_ir_hint(state: "RAGState") -> str:
+    """
+    Build a soft intent IR hint for the LLM when IR was built but not used
+    as the planner path. This allows the LLM to benefit from structured
+    intent analysis even when the deterministic planner cannot be used.
+
+    Safety guards:
+    - Skip if confidence < 0.50 (too unreliable)
+    - Skip if IR payload is empty or planner-incompatible
+    - Require at least one structural field (dimensions/metrics/filters)
+      beyond just subject_entity + qtype
+    """
+    if not state:
+        return ""
+
+    intent_ir = state.get("intent_ir") or {}
+    ir_used = state.get("ir_used", False)
+
+    # Only add hint when IR was built but not used as planner path
+    if ir_used or not intent_ir:
+        return ""
+
+    confidence = float(intent_ir.get("confidence", 0.0) or 0.0)
+
+    # Guard: skip hint if confidence is too low to be useful
+    if confidence < 0.50:
+        return ""
+
+    # Guard: skip if IR explicitly flagged as incompatible or empty
+    base_gate_reasons = set(state.get("ir_base_gate_reasons") or [])
+    if "empty_ir_payload" in base_gate_reasons or "planner_incompatible" in base_gate_reasons:
+        return ""
+
+    # Guard: skip if IR couldn't resolve a HAVING-like threshold —
+    # the filter (and often the metric) will be wrong, misleading the LLM.
+    gate_reasons = set(state.get("ir_gate_reasons") or [])
+    if "having_like_threshold_unresolved" in gate_reasons:
+        return ""
+
+    subject = str(intent_ir.get("subject_entity") or "").strip()
+    qtype = str(intent_ir.get("qtype") or "").strip()
+
+    parts = []
+    if subject:
+        parts.append(f"Subject entity: {subject}")
+    if qtype:
+        parts.append(f"Query type: {qtype}")
+
+    # Dimensions
+    has_structural = False
+    dims = intent_ir.get("dimensions") or []
+    if dims:
+        dim_strs = []
+        for d in dims:
+            if not isinstance(d, dict):
+                continue
+            t = str(d.get("table") or "").strip()
+            c = str(d.get("column") or "").strip()
+            if t and c:
+                dim_strs.append(f"{t}.{c}")
+        if dim_strs:
+            parts.append(f"Dimensions: {', '.join(dim_strs)}")
+            has_structural = True
+
+    # Metrics
+    metrics = intent_ir.get("metrics") or []
+    if metrics:
+        met_strs = []
+        for m in metrics:
+            if not isinstance(m, dict):
+                continue
+            agg = str(m.get("agg") or "").strip().upper()
+            t = str(m.get("table") or "").strip()
+            c = str(m.get("column") or "*").strip()
+            # Skip bogus metrics like SUM(*), AVG(*) — only COUNT(*) is valid
+            if c == "*" and agg != "COUNT":
+                continue
+            if agg:
+                met_strs.append(f"{agg}({t}.{c})")
+        if met_strs:
+            parts.append(f"Metrics: {', '.join(met_strs)}")
+            has_structural = True
+
+    # Filters
+    filters = intent_ir.get("filters") or []
+    if filters:
+        filt_strs = []
+        for f in filters:
+            if not isinstance(f, dict):
+                continue
+            t = str(f.get("table") or "").strip()
+            c = str(f.get("column") or "").strip()
+            op = str(f.get("op") or "").strip()
+            val = f.get("value")
+            if t and c and op:
+                filt_strs.append(f"{t}.{c} {op} {val}")
+        if filt_strs:
+            parts.append(f"Filters: {', '.join(filt_strs)}")
+            has_structural = True
+
+    # Limit
+    limit = intent_ir.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        parts.append(f"Limit: {limit}")
+        has_structural = True
+
+    # Guard: require at least one structural field beyond subject+qtype
+    if not has_structural:
+        return ""
+
+    # Guard: aggregate qtype with no metrics is likely a misclassification
+    # (e.g. window/cumulative query mislabeled as aggregate) - dims-only
+    # hint biases LLM to treat columns as grouping-only, not SELECT targets.
+    has_valid_metrics = any(f"Metrics:" in p for p in parts)
+    if qtype.lower() == "aggregate" and not has_valid_metrics:
+        return ""
+
+    hint = (
+        f"\n[CANDIDATE INTENT SUMMARY] (confidence={confidence:.2f}):\n"
+        + "\n".join(f"  - {p}" for p in parts)
+        + "\nUse this intent only as a reference. "
+        "Prioritize schema context and the question if any conflict appears."
+    )
+    return hint
+
+
 def make_generation_prompt(ctx: str, question: str, router_decision: dict = None, state: "RAGState" = None) -> str:
     """
     Dynamic Prompt Builder.
@@ -3199,6 +3328,38 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     if constraints:
         constraint_block = "\n[STRICT CONSTRAINTS & HEURISTICS]:\n" + "\n".join([f"- {c}" for c in constraints])
 
+    # --- 3.5. INTENT IR SOFT HINT (IR-informed LLM) ---
+    intent_hint = ""
+    if state:
+        intent_hint = _build_intent_ir_hint(state)
+        if intent_hint:
+            state["ir_hint_passed"] = True
+            ir_conf = float((state.get("intent_ir") or {}).get("confidence", 0.0) or 0.0)
+            ir_reasons = state.get("ir_gate_reasons") or state.get("ir_base_gate_reasons") or []
+            print(
+                f"[IR-HINT] Intent IR passed as soft hint to LLM "
+                f"(confidence={ir_conf:.2f}, "
+                f"gate_reasons={ir_reasons or ['planner_fallback']})"
+            )
+            print(f"[IR-HINT] Content:{intent_hint}")
+        else:
+            ir_data = state.get("intent_ir") or {}
+            ir_conf = float(ir_data.get("confidence", 0.0) or 0.0)
+            ir_used = state.get("ir_used", False)
+            base_reasons = set(state.get("ir_base_gate_reasons") or [])
+            gate_reasons = set(state.get("ir_gate_reasons") or [])
+            skip_reason = (
+                "ir_used_as_planner" if ir_used
+                else "no_intent_ir" if not ir_data
+                else f"low_confidence({ir_conf:.2f}<0.50)" if ir_conf < 0.50
+                else "empty_ir_payload" if "empty_ir_payload" in base_reasons
+                else "planner_incompatible" if "planner_incompatible" in base_reasons
+                else "having_like_threshold_unresolved" if "having_like_threshold_unresolved" in gate_reasons
+                else "aggregate_without_valid_metrics" if str(ir_data.get("qtype") or "").lower() == "aggregate"
+                else "no_structural_fields"
+            )
+            print(f"[IR-HINT] Skipped: {skip_reason}")
+
     # --- 4. RETURN PROMPT LENGKAP ---
     return fr"""
 You are a senior SQL assistant for MySQL 8.0.
@@ -3219,6 +3380,7 @@ Context:
 Question:
 {question}
 {constraint_block}
+{intent_hint}
 """.strip()
 # ======================================================================
 # =========================== MAIN PIPELINE ============================

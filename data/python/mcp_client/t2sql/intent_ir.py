@@ -338,6 +338,10 @@ def _phrase_pos(text: str, phrase: str) -> int:
 
 
 def _is_numeric_column(col: str) -> bool:
+    cl = (col or "").lower()
+    # ID-like columns (*Number, *Id, *Code) are identifiers, not numeric measures
+    if cl.endswith("number") or cl.endswith("id") or cl.endswith("code"):
+        return False
     words = _camel_to_words(col or "")
     tokens = {t for t in re.findall(r"[a-z0-9]+", words) if t}
     return any(k in tokens for k in _NUMERIC_HINTS)
@@ -595,7 +599,7 @@ def _find_best_date_column(table: str, allowed: Dict[str, Set[str]]) -> Optional
     return date_like[0]
 
 
-def _best_id_column(table: str, allowed: Dict[str, Set[str]]) -> Optional[str]:
+def _best_id_column(table: str, allowed: Dict[str, Set[str]], question: str = "") -> Optional[str]:
     t = (table or "").lower()
     cols = list(allowed.get(t, set()))
     if not cols:
@@ -607,6 +611,20 @@ def _best_id_column(table: str, allowed: Dict[str, Set[str]]) -> Optional[str]:
         f"{table_root}number",
         f"{table_root}code",
     }
+
+    q_low = (question or "").lower()
+    _GENERIC_SUFFIXES = {"number", "id", "code", "key", "num"}
+
+    def _mentioned_bonus(col: str) -> int:
+        """Prefer columns whose distinguishing camelCase words appear in the question."""
+        if not q_low:
+            return 0
+        tokens = _camel_to_words(col or "").lower().split()
+        # Keep only semantically meaningful words (drop generic ID suffixes)
+        significant = [w for w in tokens if w and w not in _GENERIC_SUFFIXES]
+        if not significant:
+            return 0
+        return 1 if any(w in q_low for w in significant) else 0
 
     def score(col: str) -> int:
         cl = (col or "").lower().replace("_", "")
@@ -628,7 +646,7 @@ def _best_id_column(table: str, allowed: Dict[str, Set[str]]) -> Optional[str]:
         if c.lower().endswith("id") or c.lower().endswith("number") or c.lower().endswith("code")
     ]
     if id_like:
-        id_like.sort(key=lambda c: (score(c), -len(c)), reverse=True)
+        id_like.sort(key=lambda c: (score(c), _mentioned_bonus(c), -len(c)), reverse=True)
         return id_like[0]
 
     id_col = _safe_get_id_column(table)
@@ -885,7 +903,7 @@ def _detect_metrics(
                 return resolved_col
             resolved_table = _resolve_table_from_phrase(phrase)
             if resolved_table:
-                id_col = _best_id_column(resolved_table, allowed) or "*"
+                id_col = _best_id_column(resolved_table, allowed, question) or "*"
                 return (resolved_table, id_col)
 
         return None
@@ -960,7 +978,7 @@ def _detect_metrics(
                 resolved = _resolve_table_from_phrase(m_count_of.group(1))
                 if resolved:
                     count_table = resolved
-            id_col = _best_id_column(count_table, allowed) or "*"
+            id_col = _best_id_column(count_table, allowed, question) or "*"
             alias = _safe_alias(f"{_safe_get_singular_form(count_table)}_count", "row_count")
             add_metric(IRMetric(agg="count", table=count_table, column=id_col, alias=alias))
 
@@ -1100,7 +1118,7 @@ def _detect_dimensions(
         )
         if direct_subject_id or reverse_subject_id:
             subject_id_requested = True
-            id_col = _best_id_column(subject, allowed)
+            id_col = _best_id_column(subject, allowed, question)
             if id_col:
                 add_dim(IRDimension(table=subject, column=id_col))
         if re.search(rf"\b(?:{subj_pat})\s+name\b", q):
@@ -1137,11 +1155,14 @@ def _detect_dimensions(
                     and not _explicit_group_dim_requested(table, col)
                 ):
                     continue
-                if _is_numeric_column(col):
-                    continue
                 cl = col.lower()
+                # Check ID-like BEFORE numeric filter: explicitly requested IDs
+                # (e.g. "customer number") should survive even if _is_numeric_column
+                # would otherwise discard them.
                 is_id_like = cl.endswith("id") or cl.endswith("number") or cl.endswith("code")
                 if is_id_like and not subject_id_requested:
+                    continue
+                if not is_id_like and _is_numeric_column(col):
                     continue
                 if _is_date_column(col) and not date_day_group_requested:
                     continue
@@ -1182,7 +1203,7 @@ def _detect_dimensions(
             has_numeric_dim = True
         if has_numeric_dim and not has_identity_dim:
             name_col = _best_name_column(subject, allowed)
-            id_col = _best_id_column(subject, allowed)
+            id_col = _best_id_column(subject, allowed, question)
             if name_col:
                 add_dim(IRDimension(table=subject, column=name_col))
             elif id_col:
@@ -1205,7 +1226,7 @@ def _detect_dimensions(
     # Lookup fallback.
     if not dims and (qtype or "").lower() == "lookup":
         name_col = _best_name_column(subject, allowed)
-        id_col = _best_id_column(subject, allowed)
+        id_col = _best_id_column(subject, allowed, question)
         if name_col:
             add_dim(IRDimension(table=subject, column=name_col))
         elif id_col:
@@ -1639,7 +1660,7 @@ def _detect_filters(
                 t, c, _ = min(id_like_mentions, key=lambda x: abs(x[2] - id_anchor))
                 target = (t, c)
             if not target:
-                id_col = _best_id_column(subject, allowed)
+                id_col = _best_id_column(subject, allowed, question)
                 if id_col:
                     target = (subject, id_col)
             if target:

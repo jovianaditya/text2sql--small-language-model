@@ -9218,6 +9218,14 @@ def _question_wants_entity_orders_payments_rollup(question: str) -> bool:
         count_families |= _collect(
             r"\btotal[_\s-]+([a-z_][a-z0-9_]*(?:\s+[a-z_][a-z0-9_]*){0,2})\b"
         )
+        # "total payment amount" is a metric SUM, not a count.  Remove
+        # count_families entries that contain a metric word in any position
+        # so that a single metric phrase (even with trailing sort words like
+        # "descending") is not double-counted as both count and metric.
+        count_families -= {
+            fam for fam in count_families
+            if metric_words & set(fam.split())
+        }
 
         metric_families = set()
         for metric_word in metric_words:

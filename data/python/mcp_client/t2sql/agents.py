@@ -4498,7 +4498,12 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # Segala aturan heuristik (Anti-MAX, Anti-1055, Anti-Inner Join) sudah diurus di sana.
     # Pass state for dynamic join context from retrieval results
     prompt = make_generation_prompt(ctx, question, decision, state)
-    
+
+    if state.get("ir_hint_passed"):
+        print("[DRAFTER] IR-informed LLM: intent IR hint injected into prompt")
+    else:
+        print("[DRAFTER] Pure LLM: no intent IR hint available")
+
     # ===== TIMED INFERENCE (model already loaded) =====
     _t0 = _time.perf_counter()
     obj = try_llm_json(llm, prompt, max_attempts=AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS, oom_retry_wait=OOM_WAIT_TIME)
