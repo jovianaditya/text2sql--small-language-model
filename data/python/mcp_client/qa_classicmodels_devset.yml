@@ -1,7 +1,7 @@
 cases:
     - id: E1
       difficulty: easy
-      question: "List all customers in Japan, showing their names and cities, sorted by city."
+      question: "Can you list the customers in Japan and show their names and cities, sorted by city?"
       groundtruth_sql: |
         SELECT customerName, city 
         FROM customers 
@@ -9,7 +9,7 @@ cases:
         ORDER BY city; 
     - id: E2
       difficulty: easy
-      question: "Show the 10 products with the highest stock levels. Display the product code, name, and quantity in stock."
+      question: "Show the 10 products with the highest stock levels. Include the product code, name, and quantity in stock."
       groundtruth_sql: |
         SELECT productCode, productName, quantityInStock 
         FROM products 
@@ -17,7 +17,7 @@ cases:
         DESC LIMIT 10;
     - id: E3
       difficulty: easy
-      question: "List all orders placed in the year 2004. Show the order number and order date, ordered by order date from the latest."
+      question: "Pull all orders placed in 2004 and show the order number and order date, starting from the latest order date."
       groundtruth_sql: |
         SELECT orderNumber, orderDate 
         FROM orders 
@@ -25,7 +25,7 @@ cases:
         ORDER BY orderDate DESC;
     - id: E4
       difficulty: easy
-      question: "Find all payments with an amount greater than 10,000. Show the customer number, check number, and amount, ordered by amount from highest to lowest."
+      question: "Give me all payments above 10,000, along with the customer number, check number, and amount, sorted from highest amount to lowest."
       groundtruth_sql: |
         SELECT customerNumber, checkNumber, amount 
         FROM payments 
@@ -33,49 +33,49 @@ cases:
         ORDER BY amount DESC;
     - id: E5
       difficulty: easy
-      question: "Find offices where the state information is missing. Show the office code, city, country, and state."
+      question: "Find the offices where the state information is missing, and show the office code, city, country, and state."
       groundtruth_sql: |
         SELECT officeCode, city, country, state 
         FROM offices 
         WHERE (state IS NULL OR state = '');
     - id: E6
       difficulty: easy
-      question: "Find all products whose names start with “196”. Show their product codes and names."
+      question: "Find all products whose names start with '196'. Return the product codes and names."
       groundtruth_sql: |
         SELECT productCode, productName 
         FROM products 
         WHERE productName LIKE '196%';
     - id: E7
       difficulty: easy
-      question: "Find employees who work in offices with codes 1, 2, or 3. Show their employee numbers, first names, last names, and office codes."
+      question: "Which employees work in offices 1, 2, or 3? Show the employee number, first name, last name, and office code."
       groundtruth_sql: |
         SELECT employeeNumber, firstName, lastName, officeCode 
         FROM employees 
         WHERE officeCode IN ('1', '2', '3');
     - id: E8
       difficulty: easy
-      question: "Find employees whose phone extension starts with the letter ”x” followed by exactly three digits. Show their employee numbers, first names, last names, and extensions."
+      question: "Find employees whose phone extension starts with 'x' and is followed by exactly three digits. Show the employee number, first name, last name, and extension."
       groundtruth_sql: |
         SELECT employeeNumber, firstName, lastName, extension 
         FROM employees 
         WHERE extension REGEXP '^x[0-9]{3}$';
     - id: E9
       difficulty: easy
-      question: "Show orders that are either in status “Cancelled” or “On Hold”. Display the order number, order date, and status."
+      question: "Show orders that are either in status 'Cancelled' or 'On Hold'. Return the order number, order date, and status."
       groundtruth_sql: |
         SELECT orderNumber, orderDate, status 
         FROM orders 
         WHERE status IN('Cancelled','On Hold');
     - id: E10
       difficulty: easy
-      question: "Find products whose stock quantity is at least 500 and at most 1000 units. Show their product codes, names, and stock quantities."
+      question: "I want to see the products with stock between 500 and 1000 units, inclusive. Show the product code, name, and quantity in stock."
       groundtruth_sql: |
         SELECT productCode, productName, quantityInStock 
         FROM products 
         WHERE quantityInStock BETWEEN 500 AND 1000;
     - id: E11
       difficulty: easy
-      question: "What countries do we currently have customers in? Return one row per country, sorted alphabetically."
+      question: "Which countries do we currently have customers in? Return one row per country, sorted alphabetically."
       groundtruth_sql: |
         SELECT DISTINCT
           country
@@ -84,7 +84,7 @@ cases:
           country ASC;
     - id: E12
       difficulty: easy
-      question: "Show all offices and display the state as 'N/A' whenever the state information is missing. Return office code, city, country, and the displayed state value. Sort by office code ascending."
+      question: "Show all offices, and if the state information is missing, display it as 'N/A'. Return office code, city, country, and the displayed state value. Sort by office code ascending."
       groundtruth_sql: |
         SELECT
           officeCode,
@@ -96,7 +96,7 @@ cases:
           officeCode ASC;
     - id: E13
       difficulty: easy
-      question: "Show orders that were shipped after their required date. Return order number, required date, and shipped date. Sort by shipped date descending, then order number ascending."
+      question: "Can you show the orders that were shipped after their required date? Return order number, required date, and shipped date. Sort by shipped date descending, then order number ascending."
       groundtruth_sql: |
         SELECT
           orderNumber,
@@ -109,7 +109,7 @@ cases:
           orderNumber ASC;
     - id: M1
       difficulty: medium
-      question: "For each month in 2004, show the month name and the number of orders placed in that month, ordered from the latest month to the earliest."
+      question: "Break 2004 orders down by month. Return the month name and number of orders, listing the months from latest to earliest."
       groundtruth_sql: |
         SELECT 
           DATE_FORMAT(orderDate, '%M') AS month_name,
@@ -120,7 +120,7 @@ cases:
         ORDER BY MONTH(orderDate) DESC
     - id: M2
       difficulty: medium
-      question: "Classify products into three MSRP bands (Low: < 50, Mid: 50–150, High: > 150) and show the number of products in each band, ordered by product count in descending order."
+      question: "Classify products into three MSRP bands (Low: < 50, Mid: 50-150, High: > 150), then show how many products fall into each band, ordered by product count descending."
       groundtruth_sql: |
         SELECT
           CASE
@@ -139,7 +139,7 @@ cases:
         ORDER BY product_count DESC;
     - id: M3
       difficulty: medium
-      question: "For each customer id, return the payment record with the largest payment amount. If multiple payments have the same amount, choose the one with the latest payment date. Include the payment amount and the payment date in the result."
+      question: "For each customer ID, return the payment row with the highest payment amount. If there is a tie, choose the one with the latest payment date. Include the payment amount and payment date."
       groundtruth_sql: |
           SELECT
             pmt.customerNumber,
@@ -155,7 +155,7 @@ cases:
           WHERE pmt.rn = 1;
     - id: M4
       difficulty: medium
-      question: "For each order status, show the total number of orders and the earliest order date associated with that status." 
+      question: "By order status, show the total number of orders and the earliest order date for that status." 
       groundtruth_sql: |
         SELECT
           status,
@@ -165,7 +165,7 @@ cases:
         GROUP BY status;
     - id: M5
       difficulty: medium
-      question: "Compute the average payment amount per customer and return the customer ID, and average payment for customers with an average payment above 50,000."
+      question: "Work out the average payment amount per customer. Return the customer ID and average payment, but only for customers whose average is above 50,000."
       groundtruth_sql: |
         SELECT
           customerNumber,
@@ -175,7 +175,7 @@ cases:
         HAVING AVG(amount) > 50000;
     - id: M6
       difficulty: medium
-      question: "Return the customer name and customer ID for customers with a credit limit greater than the average credit limit across all customers."
+      question: "List the customer name and customer ID for customers whose credit limit is greater than the overall average credit limit."
       groundtruth_sql: |
         SELECT
           customerName,
@@ -184,7 +184,7 @@ cases:
         WHERE creditLimit > (SELECT AVG(creditLimit) FROM customers);
     - id: M7
       difficulty: medium
-      question: "For each order status, calculate the percentage of orders in that status with a non-null shipped date. Return the status and the calculated percentage, ordered by percentage in descending order."
+      question: "For each order status, calculate what percentage of orders in that status have a non-null shipped date. Return the status and percentage, ordered from highest percentage to lowest."
       groundtruth_sql: |  
         SELECT
           status,
@@ -194,7 +194,7 @@ cases:
         ORDER BY shipped_percentage DESC;
     - id: M8
       difficulty: medium
-      question: "For each product line, count the total number of products and return only product lines with more than 5 products."
+      question: "Count the total number of products in each product line, and return only the lines with more than 5 products."
       groundtruth_sql: |  
         SELECT
           productLine,
@@ -204,7 +204,7 @@ cases:
         HAVING COUNT(*) > 5;
     - id: M9
       difficulty: medium
-      question: "For each office territory, show the number of offices located in that territory, ordered by the office count in descending order."
+      question: "Show how many offices are located in each territory, ordered by office count descending."
       groundtruth_sql: |
         SELECT
           territory,
@@ -214,7 +214,7 @@ cases:
         ORDER BY office_count DESC;
     - id: M10
       difficulty: medium
-      question: "Return the employee number, job title, and a rank of employees within each job title based on employee number in descending order."
+      question: "Return the employee number, job title, and the rank of each employee within the same job title when employee numbers are ordered in descending order."
       groundtruth_sql: |
         SELECT
           employeeNumber,
@@ -226,7 +226,7 @@ cases:
         FROM employees;
     - id: M11
       difficulty: medium
-      question: "For each customer, return the customer ID and the payment amount from their second payment row when that customer's payments are sorted by amount in descending order. Exclude customers who have fewer than two payment records."
+      question: "For each customer, return the customer ID and the payment amount from that customer's second payment row after sorting that customer's payments by amount descending. Exclude customers who have fewer than two payment records."
       groundtruth_sql: |
         SELECT
           pmt.customerNumber,
@@ -253,7 +253,7 @@ cases:
         FROM payments;
     - id: M13
       difficulty: medium
-      question: "For each employee, return the employee number, job title, and the total number of employees within the same office."
+      question: "For every employee, return the employee number, job title, and how many employees work in that same office."
       groundtruth_sql: |
         SELECT
           employeeNumber,
@@ -264,7 +264,7 @@ cases:
         FROM employees;
     - id: M14
       difficulty: medium
-      question: "For each product, return the product code, buy price, and the average buy price within the same product line."
+      question: "For each product, return the product code, buy price, and the average buy price for products in the same product line."
       groundtruth_sql: |
         SELECT
           productCode,
@@ -275,7 +275,7 @@ cases:
         FROM products; 
     - id: M15
       difficulty: medium
-      question: "For each product, return the product code, quantity in stock, and the percentage contribution of its quantity in stock to the total quantity in stock across all products."
+      question: "For each product, return the product code, quantity in stock, and what percentage of the total stock across all products that quantity accounts for."
       groundtruth_sql: |
         SELECT
           productCode,
@@ -284,7 +284,7 @@ cases:
         FROM products;
     - id: M16
       difficulty: medium
-      question: "Show orders from 2003 and 2004 in one result. Return order number and a year label ('2003' or '2004'). Remove duplicate rows and sort by year label ascending, then order number ascending."
+      question: "Put orders from 2003 and 2004 into one result set. Return the order number and a year label ('2003' or '2004'). Remove duplicate rows and sort by year label ascending, then order number ascending."
       groundtruth_sql: |
         SELECT
           orderNumber,
@@ -302,7 +302,7 @@ cases:
           orderNumber ASC;
     - id: M17
       difficulty: medium
-      question: "For each order year, show how many distinct order statuses appear in that year. Return the year and the distinct status count, ordered by year ascending."
+      question: "For each order year, show how many distinct order statuses appear in that year. Return the year and distinct status count, ordered by year ascending."
       groundtruth_sql: |
         SELECT
           YEAR(orderDate) AS order_year,
@@ -314,7 +314,7 @@ cases:
           order_year ASC;
     - id: M18
       difficulty: medium
-      question: "For each payment record, return the customer number, payment date, amount, and the previous payment amount in that customer's payment-date sequence. Sort the final result by customer number ascending, then payment date descending."
+      question: "For every payment record, return the customer number, payment date, amount, and the previous payment amount in that customer's payment-date sequence. Sort the final result by customer number ascending, then payment date descending."
       groundtruth_sql: |
         SELECT
           customerNumber,
@@ -330,7 +330,7 @@ cases:
           paymentDate DESC;
     - id: M19
       difficulty: medium
-      question: "Show all orders placed on the most recent order date in the dataset. Return order number, order date, and status. Sort by order number ascending."
+      question: "Return the orders placed on the most recent order date in the dataset. Show order number, order date, and status, then sort by order number ascending."
       groundtruth_sql: |
         SELECT
           orderNumber,
@@ -345,7 +345,7 @@ cases:
           orderNumber ASC;
     - id: M20
       difficulty: medium
-      question: "For each country, show how many different customer cities we have in that country. Return only countries that have customers in more than 3 distinct cities. Show the country and distinct city count, ordered by distinct city count descending, then country ascending."
+      question: "For each country, count how many distinct customer cities we have there. Return only countries with customers in more than 3 distinct cities, and show the country plus distinct city count, ordered by distinct city count descending and then country ascending."
       groundtruth_sql: |
         SELECT
           country,
@@ -360,7 +360,7 @@ cases:
           country ASC;
     - id: H1
       difficulty: hard
-      question: "For each customer, show their customer name, id and total payment amount in 2004, and only include customers whose total is greater than 50,000."
+      question: "For each customer, return the customer name, customer ID, and total payment amount in 2004, but only include customers whose total is greater than 50,000."
       groundtruth_sql: |
         SELECT
           cust.customerNumber,
@@ -372,7 +372,7 @@ cases:
         HAVING SUM(pmt.amount) > 50000;
     - id: H2
       difficulty: hard
-      question: "Show only customers who have placed orders, and for each such customer display the customer number, customer name, and total number of orders they have placed."
+      question: "Only include customers who have placed orders, and for each such customer return the customer number, customer name, and total number of orders they have placed."
       groundtruth_sql: |
         SELECT
           cust.customerNumber,
@@ -383,7 +383,7 @@ cases:
         GROUP BY cust.customerNumber, cust.customerName;
     - id: H3
       difficulty: hard
-      question: "Show only products that have been ordered at least once, and for each such product display the product code, product name, and total quantity ordered."
+      question: "List only products that have been ordered at least once, and for each such product return the product code, product name, and total quantity ordered."
       groundtruth_sql: |
         SELECT
           p.productCode,
@@ -395,7 +395,7 @@ cases:
         GROUP BY p.productCode, p.productName;
     - id: H4
       difficulty: hard
-      question: "Show only customers who have placed orders, and for each such customer display the customer number, customer name, and total order amount calculated as the sum of quantity ordered multiplied by price each."
+      question: "For customers who have placed orders, return the customer number, customer name, and total order amount, where total order amount is the sum of quantity ordered multiplied by price each."
       groundtruth_sql: |
         SELECT
           cust.customerNumber,
@@ -409,7 +409,7 @@ cases:
         GROUP BY cust.customerNumber, cust.customerName;
     - id: H5
       difficulty: hard
-      question: "For each employee, including employees who do not manage any customers and customers who have never made any payments, show the employee number, employee name, and the total payment amount collected by their customers."
+      question: "For every employee, including employees who do not manage any customers and customers who have never made any payments, return the employee number, employee name, and the total payment amount collected from their customers."
       groundtruth_sql: |
         SELECT
           emp.employeeNumber,
@@ -426,7 +426,7 @@ cases:
           emp.lastName;
     - id: H6
       difficulty: hard
-      question: "Show only products that have been ordered, and for each such product display the product code, product name, and rank the products by total sales value calculated using the actual price charged on each order line, in descending order."
+      question: "Show only products that have been ordered, and for each such product return the product code, product name, and the rank based on total sales value calculated using the actual price charged on each order line, in descending order."
       groundtruth_sql: |
         SELECT
           p.productCode,
@@ -440,7 +440,7 @@ cases:
         GROUP BY p.productCode, p.productName;
     - id: H7
       difficulty: hard
-      question: "Show customers with payments, and for each customer return customer id, customer name, latest payment date in their most recent payment year, and total amount paid in that year. Order by latest payment date descending"
+      question: "For customers with payments, return the customer ID, customer name, the latest payment date in their most recent payment year, and the total amount paid in that year. Order by latest payment date descending."
       groundtruth_sql: |
         SELECT
           c.customerNumber,
@@ -463,7 +463,7 @@ cases:
         ORDER BY MAX(p.paymentDate) DESC;
     - id: H8
       difficulty: hard
-      question: "For each product that has been ordered at least once, find the year of its most recent order. Return the product code, product name, that latest order year, and the total quantity ordered for the product in that same year. Order the results by total quantity (in the latest year) descending, then by product code ascending."
+      question: "For each product that has been ordered at least once, find the year of its most recent order. Return the product code, product name, that latest order year, and the total quantity ordered for the product in that same year. Order the results by total quantity in the latest year descending, then by product code ascending."
       groundtruth_sql: |
         SELECT
           p.productCode,
@@ -495,7 +495,7 @@ cases:
           p.productCode ASC;
     - id: H9
       difficulty: hard
-      question: "Show product lines that have at least one product with MSRP greater than the average MSRP of all products. For each such product line, display the product line name and the number of products in that line that satisfy that MSRP condition. Sort it so product lines with more qualifying products appear first; if there’s a tie, sort by product line name A–Z."
+      question: "Find product lines that have at least one product with MSRP greater than the average MSRP of all products. For each qualifying product line, return the product line name and the number of products in that line that satisfy that MSRP condition. Sort so product lines with more qualifying products appear first; if there is a tie, sort by product line name A-Z."
       groundtruth_sql: |
         SELECT
           pl.productLine,
@@ -514,7 +514,7 @@ cases:
           pl.productLine ASC;
     - id: H10
       difficulty: hard
-      question: "For each office, show the office code, city, total number of employees, and how many of them are Sales Reps (jobTitle = 'Sales Rep'). Only include offices that have at least one Sales Rep, and where at least one employee in that office reports to someone (reportsTo is not NULL). Sort by Sales Rep count (highest first), then by office code."
+      question: "For each office, return the office code, city, total number of employees, and how many of them are Sales Reps (jobTitle = 'Sales Rep'). Only include offices that have at least one Sales Rep and at least one employee in that office who reports to someone (reportsTo is not NULL). Sort by Sales Rep count descending, then by office code."
       groundtruth_sql: |
         SELECT
           o.officeCode,
@@ -540,7 +540,7 @@ cases:
           o.officeCode ASC;
     - id: H11
       difficulty: hard
-      question: "Show customers who have made at least one payment but have never placed any orders. Return customer id, customer name, and total payment amount. Sort by total payment amount descending, then customer id ascending."
+      question: "Return customers who have made at least one payment but have never placed any orders. Show customer ID, customer name, and total payment amount. Sort by total payment amount descending, then customer ID ascending."
       groundtruth_sql: |
         SELECT
           c.customerNumber,
@@ -561,7 +561,7 @@ cases:
           c.customerNumber ASC;
     - id: H12
       difficulty: hard
-      question: "Show offices where the average credit limit of customers assigned to employees in that office is higher than the overall average credit limit across all customers (ignore NULL credit limit). Return office code, city, and average credit limit. Sort by average credit limit descending, then office code ascending."
+      question: "Find offices where the average credit limit of customers assigned to employees in that office is higher than the overall average credit limit across all customers, ignoring NULL credit limits. Return office code, city, and average credit limit. Sort by average credit limit descending, then office code ascending."
       groundtruth_sql: |
         SELECT
           o.officeCode,
@@ -586,7 +586,7 @@ cases:
           o.officeCode ASC;
     - id: H13
       difficulty: hard
-      question: "For each employee (including employees who have no customers and customers who have no payments), show the employee id and full name, plus the most recent payment made by any of their customers. Return employee id, employee name, customer id, payment date, and amount. If there are multiple payments on the same most recent date, pick the largest amount. Sort by payment date descending, then employee number ascending."
+      question: "For every employee, including employees who have no customers and customers who have no payments, return the employee ID and full name plus the most recent payment made by any of their customers. Show employee ID, employee name, customer ID, payment date, and amount. If there are multiple payments on that same most recent date, pick the largest amount. Sort by payment date descending, then employee number ascending."
       groundtruth_sql: |
         SELECT
           t.employeeNumber,
@@ -617,7 +617,7 @@ cases:
           t.employeeNumber ASC;
     - id: H14
       difficulty: hard
-      question: "Show customers who have placed at least one order. For each such customer, return customer id, customer name, total number of orders, total payment amount, and a payment_status flag ('Paid' if total payments > 0 else 'Unpaid'). Sort by total orders descending, then customer id."
+      question: "Show customers who have placed at least one order. For each such customer, return customer ID, customer name, total number of orders, total payment amount, and a payment_status flag ('Paid' if total payments > 0 else 'Unpaid'). Sort by total orders descending, then customer ID."
       groundtruth_sql: |
         SELECT
           c.customerNumber,
@@ -650,7 +650,7 @@ cases:
           c.customerNumber ASC;
     - id: H15
       difficulty: hard
-      question: "Show products that were ordered in 2004 but never ordered in 2005. For each product, return product code, product name, and total quantity ordered in 2004. Sort by total quantity descending, then product code ascending."
+      question: "Find products that were ordered in 2004 but never ordered in 2005. For each such product, return product code, product name, and total quantity ordered in 2004. Sort by total quantity descending, then product code ascending."
       groundtruth_sql: |
         SELECT
           p.productCode,
@@ -678,7 +678,7 @@ cases:
           p.productCode ASC;
     - id: H16
       difficulty: hard
-      question: "Show customers who have ordered more than 20 distinct products. Return customer id, customer name, and the number of distinct products they have ordered. Sort by distinct product count descending, then customer id ascending."
+      question: "Show customers who have ordered more than 20 distinct products. Return customer ID, customer name, and the number of distinct products they have ordered. Sort by distinct product count descending, then customer ID ascending."
       groundtruth_sql: |
         SELECT
           c.customerNumber,
@@ -699,7 +699,7 @@ cases:
           c.customerNumber ASC;
     - id: H17
       difficulty: hard
-      question: "For each product line, show the best-selling product based on total quantity ordered. If multiple products tie on quantity, choose the one with the higher total sales amount calculated using the actual price charged on each order line; if there is still a tie, choose the product with the smaller product code. Return product line, product code, product name, total quantity ordered, and total sales value. Sort by product line ascending."
+      question: "Within each product line, return the best-selling product based on total quantity ordered. If multiple products tie on quantity, choose the one with the higher total sales amount calculated using the actual price charged on each order line; if there is still a tie, choose the product with the smaller product code. Return product line, product code, product name, total quantity ordered, and total sales value. Sort by product line ascending."
       groundtruth_sql: |
         SELECT
           ranked.productLine,

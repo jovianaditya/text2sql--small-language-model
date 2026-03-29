@@ -62,6 +62,7 @@ _FUNCTION_WORD_TOKENS = {
     "that", "this", "those", "these",
     "their", "its", "his", "her", "our", "your",
     "of", "to", "for", "with", "without", "and", "or",
+    "each", "every", "all", "per",
 }
 _LEXICAL_MATCH_STOP_TOKENS = _FUNCTION_WORD_TOKENS.union(
     {
@@ -761,8 +762,29 @@ def _detect_metrics(
         )
     )
     wants_avg = bool(re.search(r"\b(avg|average|mean|rata)\b", q))
-    wants_max = bool(re.search(r"\b(max(?:imum)?|highest|largest)\b", q))
-    wants_min = bool(re.search(r"\b(min(?:imum)?|lowest|smallest)\b", q))
+    has_explicit_max = bool(re.search(r"\bmax(?:imum)?\b", q))
+    has_explicit_min = bool(re.search(r"\bmin(?:imum)?\b", q))
+    has_upper_superlative = bool(re.search(r"\b(highest|largest)\b", q))
+    has_lower_superlative = bool(re.search(r"\b(lowest|smallest)\b", q))
+    directional_superlative_sort = bool(
+        re.search(
+            r"\b(?:order(?:ed)?|sort(?:ed)?)\b[^.]{0,120}\b(?:highest|largest|lowest|smallest)\b",
+            q,
+            flags=re.I,
+        )
+        or re.search(
+            r"\b(?:highest|largest)\b[^.]{0,40}\b(?:to|-)\b[^.]{0,40}\b(?:lowest|smallest)\b",
+            q,
+            flags=re.I,
+        )
+        or re.search(
+            r"\b(?:lowest|smallest)\b[^.]{0,40}\b(?:to|-)\b[^.]{0,40}\b(?:highest|largest)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    wants_max = has_explicit_max or (has_upper_superlative and not directional_superlative_sort)
+    wants_min = has_explicit_min or (has_lower_superlative and not directional_superlative_sort)
     wants_percentage = bool(re.search(r"\b(percent|percentage|ratio|rate)\b|%\s*of", q))
     wants_count_distinct = _wants_count_distinct(q)
 
@@ -1287,6 +1309,7 @@ def _detect_filters(
         r"\bmaximum\b",
         r"\bgreater\s+than\b",
         r"\bmore\s+than\b",
+        r"\babove\b",
         r"\bover\b",
         r"\bless\s+than\b",
         r"\bunder\b",
@@ -1345,7 +1368,7 @@ def _detect_filters(
         if v is not None:
             add_filter(IRFilter(table=t, column=c, op="lte", value=v))
 
-    m_gt = re.search(rf"\b(?:greater\s+than|more\s+than|over)\s+({_NUMBER_TOKEN_PATTERN})\b", q)
+    m_gt = re.search(rf"\b(?:greater\s+than|more\s+than|above|over)\s+({_NUMBER_TOKEN_PATTERN})\b", q)
     if m_gt and numeric_col:
         v = _to_float_token(m_gt.group(1))
         t, c = numeric_col
@@ -1444,7 +1467,8 @@ def _detect_filters(
     # "customers in Japan", "customers from USA".
     location_match = re.search(
         r"\b(?:in|from)\s+([A-Za-z][A-Za-z\s-]{1,40}?)"
-        r"(?=\s+(?:ordered|sorted|grouped|having|where|with|without|show|return|list)\b|[.,;:!?]|\s*$)",
+        r"(?=\s+(?:ordered|sorted|grouped|having|where|with|without|show|return|list|display|include|give)\b"
+        r"|\s+and\s+(?:show|return|list|display|include|give)\b|[.,;:!?]|\s*$)",
         q_raw,
         flags=re.I,
     )
@@ -1456,6 +1480,7 @@ def _detect_filters(
             "latest", "earliest", "highest", "lowest",
             "year", "month", "week", "day",
         }
+        quantifier_starts = ("each ", "every ", "all ", "per ")
         is_deictic_ref = bool(re.search(r"^(?:that|this|those|these|their|its)\b", loc_low))
         loc_tokens = [t for t in re.findall(r"[a-z0-9]+", loc_low) if t]
         content_tokens = [t for t in loc_tokens if t not in _FUNCTION_WORD_TOKENS]
@@ -1474,6 +1499,7 @@ def _detect_filters(
             and loc_low not in stop_loc
             and not re.search(r"\d", loc_low)
             and not is_deictic_ref
+            and not any(loc_low.startswith(prefix) for prefix in quantifier_starts)
             and not is_schema_reference_phrase
         ):
             # Prefer country column, fallback city.
@@ -1638,6 +1664,29 @@ def _detect_filters(
                 add_filter(IRFilter(table=subject, column=target_col, op="in", value=nums))
                 in_applied = True
 
+    # Pattern: bare entity + enumerated code list
+    # Example: "employees work in offices 1, 2, or 3"
+    m_entity_bare_list = re.search(
+        r"\b([a-z][a-z_]{2,})\s+(?P<tail>\d+(?:\s*,\s*\d+)*(?:\s*,?\s*(?:or|and)\s+\d+)+)\b",
+        q,
+    )
+    if m_entity_bare_list and not in_applied:
+        ent_raw = (m_entity_bare_list.group(1) or "").lower()
+        tail = m_entity_bare_list.group("tail") or ""
+        nums = re.findall(r"\b\d+\b", tail)
+        if len(nums) >= 2:
+            ent = _safe_get_singular_form(ent_raw).replace("_", "").lower()
+            subj_cols = list(allowed.get(subject, set()))
+            id_like = [
+                c for c in subj_cols
+                if c.lower().endswith("id") or c.lower().endswith("code") or c.lower().endswith("number")
+            ]
+            ent_hits = [c for c in id_like if ent and ent in c.lower().replace("_", "")]
+            if ent_hits:
+                ent_hits.sort(key=len)
+                add_filter(IRFilter(table=subject, column=ent_hits[0], op="in", value=nums))
+                in_applied = True
+
     id_context = re.search(r"\b(?:id|ids|code|codes|number|numbers)\b(?P<tail>[^.]{0,80})", q)
     if id_context and not in_applied:
         tail = id_context.group("tail") or ""
@@ -1684,6 +1733,20 @@ def _detect_existence(
             continue
         pat = _table_entity_pattern(table)
         if not pat:
+            continue
+
+        # Guard against FK / attribute mentions such as "customer number" or
+        # "office code", which refer to a subject-table column rather than an
+        # existence request over related rows.
+        entity_attr_ref = bool(
+            re.search(
+                rf"\b(?:{pat})\b(?:[\s,;:()'\"-]+\w+){{0,2}}[\s,;:()'\"-]+"
+                r"(?:id|ids|code|codes|number|numbers|name|names|date|dates|status)\b",
+                q,
+                flags=re.I,
+            )
+        )
+        if entity_attr_ref:
             continue
 
         has_none = bool(
@@ -1940,8 +2003,14 @@ def _detect_ordering_and_limit(
             return "ASC"
         return direction
 
-    # Explicit ORDER BY phrase.
-    m_order = re.search(r"\b(?:order(?:ed)?\s+by|sort(?:ed)?\s+by)\s+(.+?)(?:[.;]|$)", q)
+    # Explicit ordering phrase.
+    # Also support more natural directional wording such as:
+    #   "ordered from highest percentage to lowest"
+    #   "sorted from latest to earliest"
+    m_order = re.search(
+        r"\b(?:order(?:ed)?\s+by|sort(?:ed)?\s+by|order(?:ed)?\s+from|sort(?:ed)?\s+from)\s+(.+?)(?:[.;]|$)",
+        q,
+    )
     if m_order:
         phrase = m_order.group(1).strip()
         segments = [
@@ -2007,9 +2076,44 @@ def _detect_ordering_and_limit(
         ordering.append(IROrder(kind="expression", by="MONTH", direction=d))
         return ordering, limit
 
+    # Temporal lookup fallback:
+    # "starting from the latest order date", "latest payment date first", etc.
+    temporal_desc = bool(re.search(r"\b(?:latest|newest|most\s+recent)\b", q, flags=re.I))
+    temporal_asc = bool(re.search(r"\b(?:earliest|oldest)\b", q, flags=re.I))
+    if not ordering and not metrics and (temporal_desc or temporal_asc):
+        date_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_date_column(c)]
+        if date_mentions:
+            temporal_anchor = min(
+                (
+                    m.start()
+                    for m in re.finditer(
+                        r"\b(?:latest|newest|most\s+recent|earliest|oldest)\b",
+                        q,
+                        flags=re.I,
+                    )
+                ),
+                default=-1,
+            )
+            if temporal_anchor >= 0:
+                t, c, _ = min(date_mentions, key=lambda x: abs(x[2] - temporal_anchor))
+            else:
+                t, c, _ = date_mentions[0]
+            add_order(
+                IROrder(
+                    kind="column",
+                    by=c,
+                    table=t,
+                    direction="DESC" if temporal_desc and not temporal_asc else "ASC",
+                )
+            )
+
     # Ranking-style fallback: if question implies extremum and no explicit ORDER BY phrase,
     # sort by first numeric column mention.
-    if not ordering and re.search(r"\b(highest|lowest|largest|smallest|newest|oldest|latest|earliest|top|bottom)\b", q):
+    if (
+        not ordering
+        and not metrics
+        and re.search(r"\b(highest|lowest|largest|smallest|newest|oldest|latest|earliest|top|bottom)\b", q)
+    ):
         numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c)]
         if numeric_mentions:
             t, c, _ = numeric_mentions[0]

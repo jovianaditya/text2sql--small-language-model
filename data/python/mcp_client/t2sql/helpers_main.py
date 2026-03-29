@@ -81,6 +81,7 @@ from .helpers_core import (
     _drop_unrequested_exists_filters,
     _drop_unrequested_temporal_filters,
     _prefer_not_exists_for_simple_exclusion,
+    _repair_temporal_not_exists_scope,
     _question_wants_latest_year_scope_with_aggregate,
     # phase 4b - Aggregate in WHERE fix
     _fix_aggregate_in_where,
@@ -2702,6 +2703,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     is_winner_row = router_decision.get("is_winner_row", False)
     is_set_operation_intent = router_decision.get("is_set_operation_intent", False)
     is_simple_set_operation = router_decision.get("is_simple_set_operation", False)
+    is_simple_scalar_subquery_single_table = router_decision.get("is_simple_scalar_subquery_single_table", False)
     router_tables = state.get("router_tables", []) if state else []
     
     # Detect tiebreaker pattern: "if multiple...choose the one with latest/earliest"
@@ -2826,6 +2828,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     # === [NEW] EXPLICIT RANK() FUNCTION RULE ===
     # Detect "a rank of X" / "rank employees" -> use RANK() OVER window function
     if is_explicit_rank_function:
+        partition_rank_hint = ""
+        if partition_hint:
+            partition_rank_hint = (
+                f" The grouping phrase is '{partition_hint}', so partition by the column representing {partition_hint}. "
+                f"Do NOT partition by an unrelated descriptive column."
+            )
         constraints.append(
             "RANK FUNCTION RULE (CRITICAL): The question asks for a 'rank' of items. "
             "You MUST use the RANK() or DENSE_RANK() window function. "
@@ -2833,6 +2841,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "WRONG: Using COUNT(*) - that gives a total count, NOT a rank. "
             "WRONG: Using ROW_NUMBER() - use RANK() for tied values. "
             "IMPORTANT: RANK() assigns the same rank to equal values and skips ranks for ties."
+            f"{partition_rank_hint}"
         )
 
     # === [NEW] WINDOW AGGREGATE RULE: "within the same X" pattern ===
@@ -2840,7 +2849,11 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         partition_col_hint = ""
         if partition_hint:
             # Try to infer column name from hint (e.g., "office" -> "officeCode")
-            partition_col_hint = f" Look for a column like `{partition_hint}Code` or `{partition_hint}Number` or `{partition_hint}Id` to use as the PARTITION BY column."
+            partition_col_hint = (
+                f" The grouping phrase is '{partition_hint}'. Look for the schema column that represents {partition_hint}, "
+                f"such as `{partition_hint}Code`, `{partition_hint}Number`, `{partition_hint}Id`, or the exact descriptive column. "
+                f"Do NOT partition by another selected attribute just because it also appears in the output."
+            )
         constraints.append(
             f"WINDOW AGGREGATE RULE (CRITICAL): The phrase 'within the same' or 'in the same' means you MUST use a WINDOW FUNCTION with PARTITION BY. "
             f"CORRECT: `SELECT col1, col2, COUNT(*) OVER (PARTITION BY groupColumn) AS total FROM table` "
@@ -2884,6 +2897,19 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 "AGGREGATE RULE: When computing aggregates (COUNT, SUM, AVG, MIN, MAX) 'per each X', "
                 "you MUST use GROUP BY on the grouping column. Use HAVING for filters on aggregates, NOT WHERE."
             )
+
+    if is_simple_scalar_subquery_single_table:
+        constraints.append(
+            "SIMPLE SCALAR SUBQUERY RULE (CRITICAL): This question compares rows to a single-table scalar baseline such as "
+            "the overall average, MAX(date), or MIN(date). "
+            "You MUST keep the base table as the main FROM table and use a scalar subquery in WHERE. "
+            "Example: `WHERE orderDate = (SELECT MAX(orderDate) FROM orders)` or "
+            "`WHERE creditLimit > (SELECT AVG(creditLimit) FROM customers)`."
+        )
+        constraints.append(
+            "SIMPLE SCALAR SUBQUERY RULE (CRITICAL): Do NOT replace the scalar subquery with only ORDER BY/LIMIT on the outer query. "
+            "If the question asks for all rows on the latest or earliest date, filter to that date first, then apply any requested final ORDER BY."
+        )
 
     # [C] RANKING RULES
     # Check winner-row pattern FIRST (before qtype check)
@@ -3971,6 +3997,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _prefer_not_exists_for_simple_exclusion(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after NOT EXISTS anti-join preference: {s}")
+        s = _repair_temporal_not_exists_scope(s, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after temporal NOT EXISTS scope repair: {s}")
 
         s = _rewrite_having_alias_to_expr(s)
         s = _winner_row_final_sanity(s, question)

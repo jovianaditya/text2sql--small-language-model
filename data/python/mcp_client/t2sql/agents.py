@@ -328,12 +328,13 @@ from .helpers_core import (
     has_join,
     _ast_guardrails,
     _fix_winner_row_metric_order_priority,
+    _question_wants_latest_year_scope_with_aggregate,
     _rewrite_grouped_winner_row_ranked_aggregate,
     _rewrite_joined_ranked_subquery_to_outer_winner,
     _rewrite_malformed_window_winner_clause,
     _question_wants_winner_row,
     _question_wants_anti_existence,
-    _question_wants_entity_orders_payments_rollup,
+    _question_wants_dual_fact_rollup,
     _wants_distinct_from_question,
     _question_wants_count_distinct,
     _ensure_reasonable_distinct,
@@ -370,7 +371,21 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
     """
     wants_count_distinct = _question_wants_count_distinct(question)
     wants_projection_distinct = _wants_distinct_from_question(question) and not wants_count_distinct
-    wants_winner_row = _question_wants_winner_row(question)
+    q_lower = str(question or "").strip().lower()
+    ordinal_row_contract = bool(
+        re.search(
+            r"\b(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b"
+            r"(?:\s+\w+){0,8}\s+\b(?:row|record|entry)\b",
+            q_lower,
+            flags=re.I,
+        )
+        and re.search(
+            r"\b(?:sort(?:ed|ing)?|order(?:ed|ing)?)\b[^.]{0,96}\bby\b",
+            q_lower,
+            flags=re.I,
+        )
+    )
+    wants_winner_row = _question_wants_winner_row(question) or ordinal_row_contract
     try:
         allowed_ids = _parse_allowed_identifiers(ctx or "")
         context_table_count = len(allowed_ids or {})
@@ -383,6 +398,8 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
     wants_boundary_regex = _question_requires_word_boundary_regex(question)
     wants_regex = _question_requires_regex(question)
     wants_structural_regex = _question_requires_structural_regex(question)
+    wants_scalar_extrema_date_filter = _question_requires_scalar_extrema_date_filter(question)
+    required_window_partition_col = _resolve_required_window_partition_column(question, ctx)
     return {
         "requires_projection_distinct": wants_projection_distinct,
         "requires_count_distinct": wants_count_distinct,
@@ -393,6 +410,9 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         "requires_boundary_regex": wants_boundary_regex,
         "requires_regex": wants_regex,
         "requires_structural_regex": wants_structural_regex,
+        "requires_scalar_extrema_date_filter": wants_scalar_extrema_date_filter,
+        "requires_window_partition": bool(required_window_partition_col),
+        "required_window_partition_col": required_window_partition_col,
     }
 
 
@@ -413,7 +433,7 @@ def _router_has_dual_fact_rollup(question: str, relevant_tables: List[str]) -> b
     }
     if not q or len(relevant_lower) < 3:
         return False
-    if not _question_wants_entity_orders_payments_rollup(q):
+    if not _question_wants_dual_fact_rollup(q):
         return False
 
     try:
@@ -487,11 +507,450 @@ def _has_top_level_order_by(sql: str) -> bool:
         return bool(re.search(r"\bORDER\s+BY\b", s, flags=re.I))
 
 
+def _question_requires_scalar_extrema_date_filter(question: str) -> bool:
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    if _question_wants_winner_row(question):
+        return False
+
+    if re.search(
+        r"\b(?:starting|beginning|going)\s+from\s+the\s+"
+        r"(?:most\s+recent|latest|newest|earliest|oldest)\b",
+        q,
+        flags=re.I,
+    ):
+        return False
+
+    if re.search(
+        r"\bif\s+(?:there\s+is\s+a\s+tie|there\s+are\s+ties|multiple|same)\b",
+        q,
+        flags=re.I,
+    ) and re.search(
+        r"\b(?:latest|most\s+recent|newest|earliest|oldest)\b[^.]{0,24}\bdate\b",
+        q,
+        flags=re.I,
+    ):
+        return False
+
+    return bool(
+        re.search(
+            r"\b(?:on|for|with|from)\s+the\s+"
+            r"(?:most\s+recent|latest|newest|earliest|oldest)\s+"
+            r"(?:[a-z][a-z0-9_]*\s+){0,3}date\b",
+            q,
+            flags=re.I,
+        )
+    )
+
+
+def _extract_same_group_phrase(question: str) -> str:
+    q = (question or "").strip().lower()
+    if not q:
+        return ""
+
+    # Tie-scoped temporal phrases like "that same most recent date" are
+    # winner-row tie-break cues, not PARTITION BY hints.
+    if re.search(
+        r"\b(?:if\s+(?:there\s+are\s+)?multiple|if\s+there\s+is\s+a\s+tie|"
+        r"if\s+there\s+are\s+ties|tie|tied|pick|choose)\b",
+        q,
+        flags=re.I,
+    ) and re.search(
+        r"\bsame\s+(?:(?:most\s+recent|latest|newest|earliest|oldest)\s+)?"
+        r"(?:date|payment\s+date|order\s+date|time)\b",
+        q,
+        flags=re.I,
+    ):
+        return ""
+    if re.search(r"\bsame\s+year\b", q, flags=re.I) and re.search(
+        r"\b(?:latest|most\s+recent|newest|earliest|oldest)\b[^.]{0,40}\byear\b",
+        q,
+        flags=re.I | re.S,
+    ):
+        return ""
+
+    patterns = [
+        r"\b(?:within|in)\s+the\s+same\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:when|where|after|before|ordered|sorted|with|and|then|that|which|who|whose)\b|[.,;]|$)",
+        r"\b(?:that|the)\s+same\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:when|where|after|before|ordered|sorted|with|and|then|that|which|who|whose)\b|[.,;]|$)",
+        r"\bsame\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:when|where|after|before|ordered|sorted|with|and|then|that|which|who|whose)\b|[.,;]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, q, flags=re.I)
+        if match:
+            return re.sub(r"\s+", " ", (match.group(1) or "").strip())
+    return ""
+
+
+def _semantic_phrase_tokens(text: str) -> List[str]:
+    raw = re.sub(AGENT_COLUMN_CAMEL_SPLIT_PATTERN, r"\1 \2", str(text or ""))
+    tokens = re.findall(r"[a-z0-9]+", raw.lower())
+    stop_words = {
+        "a", "an", "the", "that", "this", "those", "these", "same",
+        "within", "in", "of", "for", "to", "by", "on", "from",
+    }
+    return [tok for tok in tokens if tok and tok not in stop_words]
+
+
+def _split_top_level_csv(text: str) -> List[str]:
+    items: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    in_sq = False
+    in_dq = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'" and not in_dq:
+            if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                buf.append(ch)
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            in_sq = not in_sq
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            buf.append(ch)
+            i += 1
+            continue
+        if not in_sq and not in_dq:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch == "," and depth == 0:
+                item = "".join(buf).strip()
+                if item:
+                    items.append(item)
+                buf = []
+                i += 1
+                continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def _resolve_required_window_partition_column(question: str, ctx: str = "", sql: str = "") -> str:
+    hint = _extract_same_group_phrase(question)
+    if not hint:
+        return ""
+
+    allowed_ids = _parse_allowed_identifiers(ctx or "")
+    if not allowed_ids:
+        return ""
+
+    primary_table = ""
+    from_match = re.search(
+        r"\bFROM\s+`?([A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?\b",
+        sql or "",
+        flags=re.I,
+    )
+    if from_match:
+        primary_table = (from_match.group(1) or "").strip("`").lower()
+
+    candidate_tables: List[Tuple[str, Set[str]]] = []
+    if primary_table:
+        for table_name, cols in allowed_ids.items():
+            if table_name.lower() == primary_table:
+                candidate_tables.append((table_name, cols))
+                break
+    if not candidate_tables:
+        candidate_tables = list(allowed_ids.items())
+
+    hint_norm = " ".join(_semantic_phrase_tokens(hint))
+    hint_tokens = set(_semantic_phrase_tokens(hint))
+    if not hint_tokens:
+        return ""
+
+    best_col = ""
+    best_score = 0
+    q_lower = (question or "").lower()
+
+    for _, cols in candidate_tables:
+        for col in cols:
+            col_spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_PATTERN, r"\1 \2", str(col or "")).replace("_", " ").lower()
+            col_tokens = set(_semantic_phrase_tokens(col_spaced))
+            if not col_tokens:
+                continue
+
+            score = 0
+            if col_spaced == hint_norm:
+                score += 100
+            if hint_norm and hint_norm in col_spaced:
+                score += 60
+            if hint_tokens.issubset(col_tokens):
+                score += 45 + (5 * len(hint_tokens))
+            if len(hint_tokens) == 1:
+                only_hint = next(iter(hint_tokens))
+                if only_hint in col_tokens:
+                    score += 35
+                if col_spaced.startswith(f"{only_hint} ") and any(
+                    suffix in col_tokens for suffix in {"code", "id", "number", "key"}
+                ):
+                    score += 20
+            if _question_mentions_column(q_lower, str(col)):
+                score += 25
+
+            if score > best_score:
+                best_score = score
+                best_col = str(col)
+
+    return best_col if best_score > 0 else ""
+
+
+def _has_required_window_partition(sql: str, partition_col: str) -> bool:
+    if not sql or not partition_col:
+        return False
+    return bool(
+        re.search(
+            rf"\bOVER\s*\([^)]*\bPARTITION\s+BY\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?{re.escape(partition_col)}`?\b",
+            sql,
+            flags=re.I | re.S,
+        )
+    )
+
+
+def _rewrite_required_window_partition(sql: str, partition_col: str) -> str:
+    s = (sql or "").strip()
+    if not s or not partition_col or "OVER" not in s.upper():
+        return sql
+
+    def _rewrite_inner(inner_text: str) -> str:
+        inner = (inner_text or "").strip()
+        if not inner:
+            return f"PARTITION BY {partition_col}"
+
+        without_partition = re.sub(
+            r"(?is)^\s*PARTITION\s+BY\s+.+?(?=(?:\bORDER\s+BY\b)|$)",
+            "",
+            inner,
+            count=1,
+        ).strip()
+        if without_partition:
+            return f"PARTITION BY {partition_col} {without_partition}".strip()
+        return f"PARTITION BY {partition_col}"
+
+    rewritten, count = re.subn(
+        r"(?is)OVER\s*\(([^()]*)\)",
+        lambda m: f"OVER ({_rewrite_inner(m.group(1))})",
+        s,
+        count=1,
+    )
+    return rewritten if count else sql
+
+
+def _rewrite_grouped_aggregate_to_window_partition(sql: str, partition_col: str, question: str) -> str:
+    s = (sql or "").strip().rstrip(";")
+    if not s or not partition_col:
+        return sql
+    if "OVER" in s.upper() or "GROUP BY" not in s.upper():
+        return sql
+    if re.search(r"\b(?:JOIN|HAVING|UNION|INTERSECT|EXCEPT)\b", s, flags=re.I):
+        return sql
+
+    match = re.match(
+        r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)"
+        r"(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?"
+        r"(?:\s+WHERE\s+(?P<where>.*?))?"
+        r"\s+GROUP\s+BY\s+(?P<group>.*?)(?:\s+ORDER\s+BY\s+(?P<order>.*?))?\s*$",
+        s,
+    )
+    if not match:
+        return sql
+
+    select_clause = (match.group("select") or "").strip()
+    table = (match.group("table") or "").strip()
+    alias = (match.group("alias") or "").strip()
+    where_clause = (match.group("where") or "").strip()
+    order_clause = (match.group("order") or "").strip()
+    if not select_clause or not table:
+        return sql
+
+    select_items = _split_top_level_csv(select_clause)
+    if not select_items:
+        return sql
+
+    aggregate_idx = -1
+    aggregate_func = ""
+    aggregate_arg = ""
+    aggregate_alias = ""
+    aggregate_expr = ""
+
+    for idx, item in enumerate(select_items):
+        agg_match = re.match(
+            r"(?is)^\s*(?P<func>AVG|COUNT|SUM|MIN|MAX)\s*\(\s*(?P<arg>[^)]*?)\s*\)"
+            r"(?:\s+AS\s+(?P<alias>`?[A-Za-z_][A-Za-z0-9_]*`?|'[^']+'|\"[^\"]+\"))?\s*$",
+            item,
+        )
+        if agg_match:
+            if aggregate_idx >= 0:
+                return sql
+            aggregate_idx = idx
+            aggregate_func = (agg_match.group("func") or "").upper()
+            aggregate_arg = (agg_match.group("arg") or "").strip()
+            aggregate_alias = (agg_match.group("alias") or "").strip()
+            aggregate_expr = item.strip()
+
+    if aggregate_idx < 0 or not aggregate_func:
+        return sql
+
+    projection_items = [
+        item.strip()
+        for idx, item in enumerate(select_items)
+        if idx != aggregate_idx and item.strip()
+    ]
+
+    simple_arg_match = re.match(
+        r"(?is)^(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)$",
+        aggregate_arg,
+    )
+    arg_col = (simple_arg_match.group(1) if simple_arg_match else "").strip()
+    if arg_col and _question_mentions_column((question or "").lower(), arg_col):
+        projection_tokens = " ".join(projection_items).lower()
+        if arg_col.lower() not in projection_tokens:
+            projection_items.append(arg_col)
+
+    window_expr = f"{aggregate_func}({aggregate_arg}) OVER (PARTITION BY {partition_col})"
+    if aggregate_alias:
+        window_expr += f" AS {aggregate_alias}"
+    elif aggregate_expr:
+        inferred_alias_match = re.search(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b", aggregate_expr, flags=re.I)
+        if inferred_alias_match:
+            window_expr += f" AS {inferred_alias_match.group(1)}"
+    projection_items.append(window_expr)
+
+    if not projection_items:
+        return sql
+
+    out = f"SELECT {', '.join(projection_items)} FROM {table}"
+    if alias:
+        out += f" AS {alias}"
+    if where_clause:
+        out += f" WHERE {where_clause}"
+    if order_clause:
+        out += f" ORDER BY {order_clause}"
+    return out + ";"
+
+
+def _has_scalar_extrema_date_filter_shape(sql: str) -> bool:
+    s = (sql or "").strip()
+    if not s:
+        return False
+    return bool(
+        re.search(
+            r"\bWHERE\b[^;]*\b[a-zA-Z_][a-zA-Z0-9_.`]*date[a-zA-Z0-9_.`]*\s*=\s*"
+            r"\(\s*SELECT\s+(?:MAX|MIN)\s*\(\s*[a-zA-Z_][a-zA-Z0-9_.`]*date[a-zA-Z0-9_.`]*\s*\)",
+            s,
+            flags=re.I | re.S,
+        )
+    )
+
+
+def _rewrite_scalar_extrema_date_filter(sql: str, question: str) -> str:
+    if not sql or not _question_requires_scalar_extrema_date_filter(question):
+        return sql
+    if _has_scalar_extrema_date_filter_shape(sql):
+        return sql
+
+    s = (sql or "").strip().rstrip(";")
+    if not s:
+        return sql
+
+    if re.search(r"\b(?:JOIN|GROUP\s+BY|HAVING|UNION|INTERSECT|EXCEPT)\b", s, flags=re.I):
+        return sql
+
+    m = re.match(
+        r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)"
+        r"(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?"
+        r"(?:\s+WHERE\s+(?P<where>.*?))?"
+        r"(?:\s+ORDER\s+BY\s+(?P<order>.*?))?\s*$",
+        s,
+    )
+    if not m:
+        return sql
+
+    select_clause = (m.group("select") or "").strip()
+    table = (m.group("table") or "").strip()
+    alias = (m.group("alias") or "").strip()
+    where_clause = (m.group("where") or "").strip()
+    existing_order = (m.group("order") or "").strip()
+    if not select_clause or not table:
+        return sql
+
+    agg_func = "MAX"
+    if re.search(r"\b(?:earliest|oldest)\b", (question or "").lower(), flags=re.I):
+        agg_func = "MIN"
+
+    date_candidates = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*?(?:Date|Time|Timestamp|date|time|timestamp))\b",
+        s,
+        flags=re.I,
+    )
+    if not date_candidates:
+        return sql
+    date_col = date_candidates[0]
+
+    outer_date_ref = f"{alias}.{date_col}" if alias else date_col
+    inner_date_ref = date_col
+    extrema_filter = f"{outer_date_ref} = (SELECT {agg_func}({inner_date_ref}) FROM {table})"
+    final_where = extrema_filter
+    if where_clause:
+        final_where = f"{where_clause} AND {extrema_filter}"
+
+    requested_order = ""
+    sort_m = re.search(
+        r"\b(?:sort(?:ed)?\s+by|order(?:ed)?\s+by)\s+(.+?)(?:[.;]|$)",
+        question or "",
+        flags=re.I,
+    )
+    if sort_m:
+        sort_clause = sort_m.group(1).strip()
+        select_identifiers = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", select_clause)
+        unique_identifiers = []
+        for ident in select_identifiers:
+            if ident.lower() in {"select", "from", "as"}:
+                continue
+            if ident not in unique_identifiers:
+                unique_identifiers.append(ident)
+
+        def _to_words(text: str) -> str:
+            return re.sub(r"\s+", " ", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text.replace("_", " "))).strip().lower()
+
+        for ident in unique_identifiers:
+            words = _to_words(ident)
+            if words and words in sort_clause.lower():
+                direction = "DESC" if re.search(r"\b(?:descending|desc)\b", sort_clause, flags=re.I) else "ASC"
+                requested_order = f"{ident} {direction}"
+                break
+
+    final_order = requested_order or existing_order
+
+    out = f"SELECT {select_clause} FROM {table}"
+    if alias:
+        out += f" AS {alias}"
+    out += f" WHERE {final_where}"
+    if final_order:
+        out += f" ORDER BY {final_order}"
+    return out + ";"
+
+
 def _has_anti_existence_shape(sql: str) -> bool:
     s = (sql or "").strip()
     if not s:
         return False
+    qcol = r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?"
     if re.search(r"\bNOT\s+EXISTS\s*\(", s, flags=re.I):
+        return True
+    if re.search(rf"\b{qcol}\s+NOT\s+IN\s*\(", s, flags=re.I):
+        return True
+    if re.search(rf"\bNOT\s+{qcol}\s+IN\s*\(", s, flags=re.I):
         return True
     if re.search(r"\bNOT\s+IN\s*\(", s, flags=re.I):
         return True
@@ -577,6 +1036,35 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         if not _has_top_level_order_by(out_sql):
             violations.append("missing_final_order")
 
+    if bool(contract.get("requires_scalar_extrema_date_filter")):
+        fixed = _rewrite_scalar_extrema_date_filter(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: enforced scalar extrema-date filter")
+        if not _has_scalar_extrema_date_filter_shape(out_sql):
+            violations.append("missing_scalar_extrema_date_filter")
+
+    required_window_partition_col = str(contract.get("required_window_partition_col") or "").strip()
+    if required_window_partition_col:
+        fixed = _rewrite_grouped_aggregate_to_window_partition(
+            out_sql,
+            required_window_partition_col,
+            question,
+        )
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append(
+                f"Semantic contract: rewrote grouped aggregate to window PARTITION BY {required_window_partition_col}"
+            )
+        fixed = _rewrite_required_window_partition(out_sql, required_window_partition_col)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append(
+                f"Semantic contract: enforced window PARTITION BY {required_window_partition_col}"
+            )
+        if not _has_required_window_partition(out_sql, required_window_partition_col):
+            violations.append("missing_required_window_partition")
+
     requires_boundary_regex = bool(contract.get("requires_boundary_regex"))
     requires_regex = bool(contract.get("requires_regex"))
     requires_structural_regex = bool(contract.get("requires_structural_regex"))
@@ -602,6 +1090,10 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         active_contracts.append("include_zero")
     if contract["requires_final_order"]:
         active_contracts.append("final_order")
+    if bool(contract.get("requires_scalar_extrema_date_filter")):
+        active_contracts.append("scalar_extrema_date_filter")
+    if required_window_partition_col:
+        active_contracts.append(f"window_partition:{required_window_partition_col}")
     if requires_regex or requires_boundary_regex or requires_structural_regex:
         active_contracts.append("regex")
 
@@ -1344,6 +1836,12 @@ def router_agent(state: RAGState) -> RAGState:
                     search_scope,
                 )
             )
+            if (
+                inflected_entity_match
+                and table_singular_token == "order"
+                and re.search(r"\bordered\s+(?:by|in)\b", search_scope, flags=re.I)
+            ):
+                inflected_entity_match = False
 
         if direct_entity_match or inflected_entity_match:
 
@@ -2014,6 +2512,49 @@ def router_agent(state: RAGState) -> RAGState:
                 return True
         return False
 
+    temporal_column_mentioned = any(
+        _question_mentions_table_temporal_column(question_lower, tbl)
+        for tbl in relevant_tables
+    )
+    current_temporal_tables = [
+        tbl for tbl in relevant_tables
+        if _table_has_temporal_column(tbl)
+    ]
+
+    # Generic temporal bridge enrichment:
+    # if the question clearly expresses a year/date intent but none of the
+    # currently kept tables expose temporal columns, pull in a uniquely
+    # connected temporal table so the LLM has the right date source.
+    # This stays schema-agnostic and avoids per-question/per-table hardcoding.
+    if has_temporal_intent and len(relevant_tables) >= 2 and not current_temporal_tables:
+        relevant_lowers_now = {t.lower() for t in relevant_tables}
+        temporal_connector_candidates: List[str] = []
+        for tbl in allowed_identifiers.keys():
+            tbl_lower = str(tbl or "").lower()
+            if not tbl_lower or tbl_lower in relevant_lowers_now:
+                continue
+            if not _table_has_temporal_column(tbl):
+                continue
+
+            directly_connected = any(
+                tbl_lower in fk_graph.get(rel_lower, {})
+                or rel_lower in fk_graph.get(tbl_lower, {})
+                for rel_lower in relevant_lowers_now
+            )
+            if not directly_connected:
+                continue
+
+            temporal_connector_candidates.append(tbl)
+
+        if len(temporal_connector_candidates) == 1:
+            temporal_tbl = temporal_connector_candidates[0]
+            relevant_tables.append(temporal_tbl)
+            if RETRIEVE_DEBUG:
+                print(
+                    f"[ROUTER] Including {temporal_tbl}: unique connected temporal table "
+                    f"for time/year intent"
+                )
+
     tables_to_remove = []
     for tbl in relevant_tables:
         tbl_lower = tbl.lower()
@@ -2062,9 +2603,17 @@ def router_agent(state: RAGState) -> RAGState:
         # Temporal recency/year/date questions may need a date-bearing table
         # that is not part of the minimal FK connector among seed tables.
         if has_temporal_intent and _table_has_temporal_column(tbl):
+            temporal_bridge_to_evidence = bool(
+                any(target in evidence_tables for target in fk_graph.get(tbl_lower, {}))
+                or any(tbl_lower in fk_graph.get(src, {}) for src in evidence_tables)
+            )
             if (
                 _question_mentions_table_entity(question_lower, tbl)
                 or _question_mentions_table_temporal_column(question_lower, tbl)
+                or (
+                    temporal_bridge_to_evidence
+                    and not temporal_column_mentioned
+                )
             ):
                 if RETRIEVE_DEBUG:
                     print(f"[ROUTER] Keeping {tbl}: temporal intent + date-bearing table")
@@ -2232,6 +2781,24 @@ def router_agent(state: RAGState) -> RAGState:
             break
 
     is_ranking_value = bool(rank_hits)
+    has_percentage_family = bool(
+        re.search(r"\b(percent|percentage|ratio|rate|share)\b", question_lower, flags=re.I)
+    )
+    percentage_ordering_only = bool(
+        has_percentage_family
+        and re.search(
+            r"\b(?:highest|lowest|largest|smallest|most|least)\s+"
+            r"(?:[a-z][a-z0-9_]*\s+){0,2}"
+            r"(?:percentage|percent|ratio|rate|share)\b",
+            question_lower,
+            flags=re.I,
+        )
+        and not re.search(AGENT_ROUTER_WINNER_ROW_RECORD_PATTERN, question_lower)
+        and not re.search(AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN, question_lower)
+        and not re.search(AGENT_ROUTER_TIEBREAKER_PATTERN, question_lower)
+    )
+    if percentage_ordering_only:
+        is_ranking_value = False
     is_ranking_time = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in time_ranks)
     is_ranking = is_ranking_value or is_ranking_time
     
@@ -2248,19 +2815,64 @@ def router_agent(state: RAGState) -> RAGState:
     ordinal_targets = AGENT_ROUTER_ORDINAL_TARGET_TERMS
     ordinal_pattern = rf"\b({'|'.join(re.escape(w) for w in ordinal_words)})\s+({'|'.join(re.escape(w) for w in ordinal_targets)})\b"
     ordinal_row_pattern = rf"\b({'|'.join(re.escape(w) for w in ordinal_words)})\b(?:\s+\w+){{0,8}}\s+(?:row|record|entry)\b"
-    has_explicit_sort_sequence = bool(re.search(r"\b(?:sorted|ordered)\s+by\b", question_lower))
+    has_explicit_sort_sequence = bool(
+        re.search(
+            r"\b(?:sort(?:ed|ing)?|order(?:ed|ing)?)\b[^.]{0,96}\bby\b",
+            question_lower,
+            flags=re.I,
+        )
+    )
     is_ordinal_ranking = bool(
         re.search(ordinal_pattern, question_lower)
         or (re.search(ordinal_row_pattern, question_lower) and has_explicit_sort_sequence)
     )
+    if not is_ordinal_ranking:
+        is_ordinal_ranking = bool(
+            re.search(
+                r"\b(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b"
+                r"[^.]{0,40}\b(?:row|record|entry)\b",
+                question_lower,
+                flags=re.I,
+            )
+            and has_explicit_sort_sequence
+        )
     
     # WINDOW AGGREGATE DETECTION: "within the same X" / "in the same X" pattern
     # This pattern requires COUNT(*) OVER (PARTITION BY X), NOT GROUP BY
     # E.g., "total employees within the same office" → PARTITION BY officeCode
-    within_same_pattern = AGENT_ROUTER_WITHIN_SAME_PATTERN
-    within_same_match = re.search(within_same_pattern, question_lower)
+    within_same_match = re.search(
+        r"\b(?:within|in)\s+the\s+same\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:when|where|after|before|ordered|sorted|with|and|then|that|which|who|whose)\b|[.,;]|$)",
+        question_lower,
+        flags=re.I,
+    )
+    if not within_same_match:
+        within_same_pattern = AGENT_ROUTER_WITHIN_SAME_PATTERN
+        within_same_match = re.search(within_same_pattern, question_lower)
+    if not within_same_match:
+        same_group_fallback = re.search(
+            r"\b(?:that\s+same|the\s+same|same)\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:when|where|after|before|ordered|sorted|with|and|then|that|which|who|whose)\b|[.,;]|$)",
+            question_lower,
+            flags=re.I,
+        )
+        has_window_agg_cue = bool(
+            re.search(r"\b(?:how\s+many|count|number\s+of|total|average|avg|mean)\b", question_lower, flags=re.I)
+        )
+        if same_group_fallback and has_window_agg_cue:
+            within_same_match = same_group_fallback
     is_window_aggregate = bool(within_same_match)
-    partition_hint = within_same_match.group(2) if within_same_match else None
+    partition_hint = None
+    if within_same_match:
+        partition_hint = _extract_same_group_phrase(question_lower)
+        if not partition_hint:
+            try:
+                partition_hint = within_same_match.group(2)
+            except Exception:
+                partition_hint = None
+            if not partition_hint:
+                try:
+                    partition_hint = within_same_match.group(1)
+                except Exception:
+                    partition_hint = None
     
     explicit_sort = AGENT_ROUTER_EXPLICIT_SORT_TERMS
     is_sorting = any(re.search(rf"\b{re.escape(kw)}\b", question_lower) for kw in explicit_sort) or is_ranking
@@ -2390,6 +3002,67 @@ def router_agent(state: RAGState) -> RAGState:
 
     if RETRIEVE_DEBUG:
         print(f"[ROUTER] Primary Table: {primary_table} (reason: {primary_reason})")
+
+    compact_single_table_family = bool(
+        primary_table
+        and len(relevant_tables) > 1
+        and (
+            is_explicit_rank_function
+            or is_window_aggregate
+            or is_ordinal_ranking
+            or percentage_ordering_only
+        )
+    )
+    if compact_single_table_family:
+        weak_evidence = AGENT_ROUTER_WEAK_EVIDENCE_TAGS
+        retained_tables: List[str] = [primary_table]
+
+        for tbl in relevant_tables:
+            if tbl == primary_table:
+                continue
+
+            tbl_lower = tbl.lower()
+            evidence_list = evidence_details.get(tbl_lower, [])
+            evidence_is_compact_safe = bool(evidence_list) and all(
+                e in weak_evidence
+                or e == AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT
+                or e.startswith(AGENT_ROUTER_FK_EVIDENCE_PREFIX)
+                for e in evidence_list
+            )
+            if not evidence_is_compact_safe:
+                retained_tables.append(tbl)
+                continue
+
+            if _question_mentions_table_entity(question_lower, tbl):
+                retained_tables.append(tbl)
+                continue
+
+            table_id_col = (get_id_column(tbl_lower) or "").lower()
+            fk_cols = set()
+            for col in _get_table_cols(tbl):
+                col_lower = str(col).lower()
+                if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(get_singular_form(tbl_lower), col_lower):
+                    fk_cols.add(col_lower)
+
+            non_fk_mentioned = False
+            for col in _get_table_cols(tbl):
+                col_lower = str(col).lower()
+                if col_lower in fk_cols:
+                    continue
+                if _question_mentions_column(question_lower, str(col)):
+                    non_fk_mentioned = True
+                    break
+
+            if non_fk_mentioned:
+                retained_tables.append(tbl)
+                continue
+
+            if RETRIEVE_DEBUG:
+                print(f"[ROUTER] Compact family prune: dropping {tbl} in favor of primary table {primary_table}")
+
+        relevant_tables = list(dict.fromkeys(retained_tables))
+        if RETRIEVE_DEBUG and relevant_tables == [primary_table]:
+            print(f"[ROUTER] Compact family prune: keeping only primary table {primary_table}")
 
     # ═══════════════════════════════════════════════════════════════════
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
@@ -2524,7 +3197,7 @@ def router_agent(state: RAGState) -> RAGState:
     has_set_operation_cue = bool(
         re.search(r"\bunion\b", question_lower, flags=re.I)
         or re.search(r"\b(?:combine|combined|merge)\b", question_lower, flags=re.I)
-        or re.search(r"\bin\s+one\s+result\b", question_lower, flags=re.I)
+        or re.search(r"\b(?:in|into)\s+one\s+result(?:\s+set)?\b", question_lower, flags=re.I)
     )
     has_set_labeling_shape = bool(
         len(quoted_literals) >= 2
@@ -2552,6 +3225,35 @@ def router_agent(state: RAGState) -> RAGState:
 
     has_dual_fact_rollup = bool(
         is_multi_table and _router_has_dual_fact_rollup(question_raw, relevant_tables)
+    )
+    has_latest_year_same_year_aggregate_intent = bool(
+        is_multi_table
+        and _question_wants_latest_year_scope_with_aggregate(question)
+        and re.search(
+            r"\b(?:latest|most\s+recent|newest|earliest|oldest)\b[^.]{0,64}\bdate\b",
+            question_lower,
+            flags=re.I | re.S,
+        )
+    )
+    has_conditioned_subgroup_group_metric = bool(
+        is_multi_table
+        and has_grouping
+        and re.search(
+            r"\b(?:how\s+many(?:\s+of\s+(?:them|those|these))?|count|number\s+of)\b"
+            r"[^.]{0,120}\b(?:are|have|with|whose|where)\b",
+            question_lower,
+            flags=re.I | re.S,
+        )
+        and re.search(
+            r"\bonly\s+include\b[^.]{0,180}\bat\s+least\s+one\b",
+            question_lower,
+            flags=re.I | re.S,
+        )
+        and (
+            re.search(r"\b(?:is\s+not\s+null|not\s+null|is\s+null)\b", question_lower, flags=re.I)
+            or bool(re.findall(r"""['"“”][^'"“”]+['"“”]""", question or ""))
+            or bool(re.search(r"=\s*['\"“”]", question or ""))
+        )
     )
     
     # ESCALATION LOGIC
@@ -2584,6 +3286,10 @@ def router_agent(state: RAGState) -> RAGState:
         escalation_reasons.append("set_operation")
     if has_dual_fact_rollup:
         escalation_reasons.append("multi_fact_rollup_fanout_risk")
+    if has_latest_year_same_year_aggregate_intent:
+        escalation_reasons.append("latest_year_same_year_aggregate")
+    if has_conditioned_subgroup_group_metric:
+        escalation_reasons.append("conditioned_subgroup_group_metric")
 
     # keep order, remove duplicates
     escalation_reasons = list(dict.fromkeys(escalation_reasons))
@@ -2944,10 +3650,8 @@ def _deterministic_sql_acceptance_gate(
         def _is_nested_subquery_column(col_expr: "exp.Column") -> bool:
             anc = getattr(col_expr, "parent", None)
             while anc is not None:
-                if anc is sel:
-                    return False
-                if isinstance(anc, exp.Subquery):
-                    return True
+                if isinstance(anc, exp.Select):
+                    return anc is not sel
                 anc = getattr(anc, "parent", None)
             return False
 
@@ -3488,6 +4192,76 @@ _IR_SEMANTIC_FALLBACK_FAILURES = {
     "missing_agg_sum",
     "missing_agg_avg",
 }
+
+
+def _is_supported_pct_non_null_semantic_false_positive(
+    *,
+    sql: str,
+    question: str,
+    gate: Dict[str, Any],
+    intent_ir: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    Detect false-positive semantic gate failures for deterministic percentage-
+    of-non-null aggregate queries.
+
+    This keeps a planner-safe IR family in the deterministic lane when the SQL
+    already has the expected grouped percentage shape, but the semantic gate
+    still reports missing aggregate/order requirements.
+    """
+    if not sql or not gate or bool(gate.get("accepted", False)):
+        return False
+
+    reasons = {str(r) for r in (gate.get("reasons") or []) if str(r).strip()}
+    if not reasons or not reasons.issubset({"semantic_contract_mismatch"}):
+        return False
+
+    ir_payload = dict(intent_ir or {})
+    metrics = [m for m in (ir_payload.get("metrics") or []) if isinstance(m, dict)]
+    if not metrics:
+        return False
+    if not all(str(m.get("agg") or "").strip().lower() == "pct_non_null" for m in metrics):
+        return False
+    if ir_payload.get("existence"):
+        return False
+
+    subject = str(ir_payload.get("subject_entity") or "").strip().lower()
+    if not subject:
+        return False
+    if any(str(m.get("table") or subject).strip().lower() != subject for m in metrics):
+        return False
+
+    dims = [d for d in (ir_payload.get("dimensions") or []) if isinstance(d, dict)]
+    if not dims:
+        return False
+    if any(str(d.get("table") or subject).strip().lower() != subject for d in dims):
+        return False
+
+    low_sql = str(sql or "").lower()
+    if "group by" not in low_sql:
+        return False
+    if "case when" not in low_sql:
+        return False
+    if (
+        "is not null" not in low_sql
+        and "not " not in low_sql
+        and " is null" not in low_sql
+    ):
+        return False
+    if "sum(" not in low_sql or "count(" not in low_sql:
+        return False
+    if "/" not in low_sql:
+        return False
+
+    semantic_contract = gate.get("semantic_contract") or {}
+    if semantic_contract.get("requires_order_by") and not _has_top_level_order_by(sql):
+        return False
+
+    failures = {str(f) for f in (gate.get("semantic_failures") or []) if str(f).strip()}
+    if failures and not failures.issubset({"missing_order_by", "missing_agg_count", "missing_agg_sum"}):
+        return False
+
+    return True
 
 
 def _is_ir_semantic_fallback_gate(gate: Dict[str, Any]) -> bool:
@@ -4169,6 +4943,8 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 
         if bool(decision.get("has_dual_fact_rollup", False)):
             ir_gate_reasons.append("router_hard:dual_fact_rollup")
+        if str(decision.get("complexity") or "").strip().lower() == AGENT_ROUTER_COMPLEXITY_COMPLEX:
+            ir_gate_reasons.append("router_complex_prefers_llm")
 
         hard_router_flags = {
             "is_winner_row": "winner_row",
@@ -4256,7 +5032,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             and not ir_existence
             and bool(re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or ""))
             and bool(re.search(r"\b(?:display|show|return)\b", q_low, flags=re.I))
-            and bool(re.search(r"\b(?:when|whenever)\b", q_low, flags=re.I))
+            and bool(re.search(r"\b(?:if|when|whenever)\b", q_low, flags=re.I))
             and bool(re.search(r"\b(?:missing|null|empty|blank)\b", q_low, flags=re.I))
         ):
             ir_gate_reasons.append("projection_null_fill_ir_unsupported")
@@ -4271,11 +5047,33 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         ):
             ir_gate_reasons.append("column_to_column_compare_ir_unsupported")
 
+        has_temporal_display_order_cue = bool(
+            re.search(
+                r"\b(?:starting|beginning|going)\s+from\s+the\s+"
+                r"(?:most\s+recent|latest|newest|earliest|oldest)\b",
+                q_low,
+                flags=re.I,
+            )
+            or re.search(
+                r"\b(?:sorted|ordered)\s+from\s+the\s+"
+                r"(?:most\s+recent|latest|newest|earliest|oldest)\b",
+                q_low,
+                flags=re.I,
+            )
+            or re.search(
+                r"\b(?:ordered|sorted)\s+by\b[^.;]{0,96}\bfrom\s+the\s+"
+                r"(?:most\s+recent|latest|newest|earliest|oldest)\b",
+                q_low,
+                flags=re.I,
+            )
+        )
+
         if (
             qtype == AGENT_ROUTER_QTYPE_LOOKUP
             and not ir_metrics
             and not ir_existence
             and len(mentioned_tables) <= 1
+            and not has_temporal_display_order_cue
             and bool(
                 re.search(
                     r"\b(?:on|for|with|from)\s+the\s+"
@@ -4318,7 +5116,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         has_set_operation_cue = bool(
             re.search(r"\bunion\b", q_low, flags=re.I)
             or re.search(r"\b(?:combine|combined|merge)\b", q_low, flags=re.I)
-            or re.search(r"\bin\s+one\s+result\b", q_low, flags=re.I)
+            or re.search(r"\b(?:in|into)\s+one\s+result(?:\s+set)?\b", q_low, flags=re.I)
         )
         has_set_labeling_shape = bool(
             len(quoted_literals) >= 2
@@ -4654,6 +5452,25 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 corrections.append(
                     f"Deterministic IR semantic repair did not clear gate: {semantic_repair.get('error') or (semantic_repair.get('gate') or {}).get('reasons')}"
                 )
+
+        if (
+            not current_gate.get("accepted", False)
+            and _is_supported_pct_non_null_semantic_false_positive(
+                sql=semantic_seed_sql,
+                question=question,
+                gate=current_gate,
+                intent_ir=state.get("intent_ir") or {},
+            )
+        ):
+            final_sql = str(semantic_seed_sql or final_sql).strip() or final_sql
+            current_gate = {
+                **dict(current_gate or {}),
+                "accepted": True,
+                "reasons": [],
+                "semantic_failures": [],
+            }
+            corrections.append("Accepted deterministic pct_non_null IR shape")
+            print("[IR] Semantic fallback: not needed for supported pct_non_null family")
 
         semantic_fallback_eligible = _is_ir_semantic_fallback_gate(current_gate)
         if not current_gate.get("accepted", False) and semantic_fallback_eligible:
@@ -5005,6 +5822,20 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             extra_instruction = (
                 "STRICT REQUIREMENT: The question explicitly requests final result ordering. "
                 "You MUST include a top-level ORDER BY in the final query with the requested sort direction."
+            )
+        elif "missing_scalar_extrema_date_filter" in contract_violations:
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question asks for all rows on the latest or earliest date, not just one row. "
+                "You MUST filter with a scalar subquery such as "
+                "`WHERE orderDate = (SELECT MAX(orderDate) FROM orders)` "
+                "or the MIN(...) equivalent, then apply any requested final ORDER BY."
+            )
+        elif "missing_required_window_partition" in contract_violations:
+            required_partition_col = _resolve_required_window_partition_column(question, ctx, final_sql)
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question asks for a window calculation within the same group, "
+                "so you MUST use a window function with the correct PARTITION BY column. "
+                f"Use `PARTITION BY {required_partition_col}` and do NOT partition by an unrelated display column."
             )
         elif "missing_regex_semantics" in contract_violations:
             extra_instruction = (
