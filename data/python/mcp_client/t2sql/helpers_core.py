@@ -7417,6 +7417,115 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
     if not sql or "ROW_NUMBER" not in (sql or "").upper():
         return sql
     q = (question or "").lower()
+
+    alias_to_table = _parse_from_join_aliases(sql)
+    for m_tbl in re.finditer(
+        r"\b(?:from|join)\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)",
+        sql or "",
+        flags=re.I,
+    ):
+        table_raw = str(m_tbl.group("table") or "").replace("`", "")
+        table_name = table_raw.split(".")[-1].strip()
+        if not table_name:
+            continue
+        alias_to_table.setdefault(table_name, table_name)
+        alias_to_table.setdefault(table_name.lower(), table_name)
+
+    table_universe = {
+        str(table or "").strip().lower()
+        for table in alias_to_table.values()
+        if str(table or "").strip()
+    }
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    entity_noise_terms: Set[str] = set()
+    for table_name in table_universe:
+        base_terms = {table_name, _to_singular(table_name)}
+        for base_term in base_terms:
+            if not base_term:
+                continue
+            entity_noise_terms.update(
+                tok for tok in re.findall(r"[a-z0-9]+", base_term.replace("_", " ").lower()) if tok
+            )
+
+    metric_term_universe = _dual_fact_metric_term_universe(table_universe, analyzer=analyzer)
+    metric_candidate_terms = {
+        term
+        for term in (metric_term_universe | HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+        if term and term not in entity_noise_terms and term not in HELPERS_METRIC_AGG_IDLIKE_TOKENS
+    }
+    if not metric_candidate_terms:
+        metric_candidate_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+
+    metric_query_alt = _regex_alt_from_terms(
+        metric_candidate_terms,
+        r"(?:amount|payment|total|quantity|qty|price|sales|revenue|value)",
+    )
+    date_semantic_terms = {
+        "date", "dates", "time", "times", "timestamp", "timestamps",
+        "year", "years", "month", "months", "day", "days",
+        "tanggal", "waktu",
+    }
+    identifier_terms = {"id", "identifier", "code", "number", "key"}
+
+    column_term_cache: Dict[Tuple[str, str], Set[str]] = {}
+
+    def _column_semantic_terms(table_l: str, col_l: str) -> Set[str]:
+        key = (table_l, col_l)
+        if key in column_term_cache:
+            return column_term_cache[key]
+
+        terms: Set[str] = set()
+        candidate_texts = [col_l]
+        try:
+            if analyzer is not None:
+                candidate_texts.extend(analyzer.get_column_synonyms(table_l, col_l) or [])
+        except Exception:
+            pass
+
+        for text in candidate_texts:
+            normalized = re.sub(
+                r"([a-z0-9])([A-Z])",
+                r"\1 \2",
+                str(text or "").replace("_", " ").lower(),
+            )
+            terms.update(tok for tok in re.findall(r"[a-z0-9]+", normalized) if tok)
+
+        try:
+            role = str(get_column_role(table_l, col_l) or "").strip().lower()
+        except Exception:
+            role = ""
+        if role:
+            terms.add(role)
+
+        column_term_cache[key] = {term for term in terms if term}
+        return column_term_cache[key]
+
+    def _expr_terms(item: str) -> Set[str]:
+        item_l = str(item or "").strip().lower()
+        terms: Set[str] = set(re.findall(r"[a-z0-9]+", item_l))
+        for qual, col in re.findall(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+            item or "",
+            flags=re.I,
+        ):
+            table_l = str(alias_to_table.get(qual) or alias_to_table.get(qual.lower()) or qual).strip().lower()
+            col_l = str(col or "").strip().lower()
+            if not table_l or not col_l:
+                continue
+            terms.update(_column_semantic_terms(table_l, col_l))
+            try:
+                id_col = str(get_id_column(table_l) or "").strip().lower()
+            except Exception:
+                id_col = ""
+            if id_col and col_l == id_col:
+                terms.add("id")
+                terms.add("identifier")
+        return {term for term in terms if term}
+
     wants_latest_date = bool(
         re.search(r"\b(?:latest|most\s+recent|newest|terbaru|terakhir)\b", q)
         and re.search(r"\b(?:date|time|tanggal)\b", q)
@@ -7429,7 +7538,7 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
     # - date-first:   "most recent/latest date ... if same date then largest amount"
     same_amount_tie = bool(
         re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|tie|tied|same)\b", q)
-        and re.search(r"\b(?:same|equal)\s+(?:payment\s+)?amount\b", q)
+        and re.search(rf"\b(?:same|equal)\b.{0,40}\b{metric_query_alt}\b", q, flags=re.I | re.S)
     )
     same_date_tie = bool(
         re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|tie|tied|same)\b", q)
@@ -7437,7 +7546,7 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
     )
     amount_superlative = bool(
         re.search(r"\b(?:largest|highest|max(?:imum)?|biggest|top)\b", q)
-        and re.search(r"\b(?:amount|price|quantity|value|payment\s+amount)\b", q)
+        and re.search(rf"\b{metric_query_alt}\b", q, flags=re.I)
     )
 
     # Conservative rule:
@@ -7452,7 +7561,7 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
     wants_amount_tiebreak = bool(
         re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|same\s+most\s+recent\s+date|tie)\b", q)
         and re.search(r"\b(?:largest|highest|max|terbesar|tertinggi)\b", q)
-        and re.search(r"\b(?:amount|payment|total|quantity|qty|price)\b", q)
+        and re.search(rf"\b{metric_query_alt}\b", q, flags=re.I)
     )
 
     # NOTE:
@@ -7463,29 +7572,21 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
     )
 
     # Fallback candidates (used when window ORDER BY misses required fields).
-    date_fallbacks = re.findall(
-        r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:Date|date|Time|time|Timestamp|timestamp))\b",
+    qualified_refs = list(dict.fromkeys(re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\b",
         sql or "",
         flags=re.I,
-    )
-    amount_fallbacks = re.findall(
-        r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:amount|price|quantity|total|sales|revenue))\b",
-        sql or "",
-        flags=re.I,
-    )
-    identifier_fallbacks = re.findall(
-        r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:id|Id|ID|number|Number|code|Code|key|Key))\b",
-        sql or "",
-        flags=re.I,
-    )
+    )))
+
+    date_fallbacks = [ref for ref in qualified_refs if _expr_terms(ref) & date_semantic_terms]
+    amount_fallbacks = [ref for ref in qualified_refs if _expr_terms(ref) & metric_candidate_terms]
+    identifier_fallbacks = [ref for ref in qualified_refs if _expr_terms(ref) & identifier_terms]
 
     def _is_date_expr(item: str) -> bool:
-        x = (item or "").lower()
-        return ("date" in x) or ("time" in x) or ("tanggal" in x)
+        return bool(_expr_terms(item) & date_semantic_terms)
 
     def _is_amount_expr(item: str) -> bool:
-        x = (item or "").lower()
-        return any(tok in x for tok in ("amount", "payment", "total", "quantity", "qty", "price", "sales", "revenue"))
+        return bool(_expr_terms(item) & metric_candidate_terms)
 
     def _force_dir(item: str, desc: bool) -> str:
         base = re.sub(r"(?is)\s+(ASC|DESC)\s*$", "", (item or "").strip()).strip()
