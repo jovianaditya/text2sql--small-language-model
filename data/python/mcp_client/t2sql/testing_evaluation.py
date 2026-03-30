@@ -18,7 +18,7 @@ import os
 import re
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import yaml
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
@@ -40,6 +40,34 @@ from .graph import build_app
 from .mcp_execution import query_db_full, _mcp_call  # Pakai FULL query tanpa LIMIT dan _mcp_call helper
 from .helpers_core import _preexecute_sql_safety_pass
 from .utils import resolve_jsonl_paths
+
+JAKARTA_TZ = timezone(timedelta(hours=7), name="UTC+07:00")
+
+
+def _jakarta_now() -> datetime:
+    return datetime.now(JAKARTA_TZ)
+
+
+def _format_jakarta_timestamp(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC+07:00")
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _print_run_timestamp_block(label: str, dt: datetime, *, status: str | None = None, elapsed_seconds: float | None = None) -> None:
+    print("\n" + "=" * 120)
+    print(f"{label}: {_format_jakarta_timestamp(dt)}")
+    print("Timezone: Asia/Jakarta (UTC+07:00)")
+    if status:
+        print(f"Status: {status}")
+    if elapsed_seconds is not None:
+        print(f"Elapsed: {_format_duration(elapsed_seconds)} ({elapsed_seconds:.2f}s)")
+    print("=" * 120)
 
 def load_testset(yaml_path: str) -> list[dict]:
     """Load test cases dari file YAML."""
@@ -1509,16 +1537,37 @@ Examples:
             suffix = ""
         args.output = f"eval_results{suffix}_{timestamp}{ext}"
 
-    asyncio.run(run_batch_eval(
-        testset_path=args.testset,
-        output_path=args.output,
-        execute_groundtruth=not args.no_groundtruth_exec,
-        skip_warmup=args.skip_warmup,
-        difficulty_filters=difficulty_filters if difficulty_filters else None,
-        null_zero_mode=null_zero_mode,
-        ts_databases=ts_databases,
-        base_database=base_database,
-    ))
+    started_at = _jakarta_now()
+    started_perf = time.perf_counter()
+    run_status = "SUCCESS"
+    _print_run_timestamp_block("RUN START", started_at)
+
+    try:
+        asyncio.run(run_batch_eval(
+            testset_path=args.testset,
+            output_path=args.output,
+            execute_groundtruth=not args.no_groundtruth_exec,
+            skip_warmup=args.skip_warmup,
+            difficulty_filters=difficulty_filters if difficulty_filters else None,
+            null_zero_mode=null_zero_mode,
+            ts_databases=ts_databases,
+            base_database=base_database,
+        ))
+    except KeyboardInterrupt:
+        run_status = "INTERRUPTED"
+        raise
+    except Exception:
+        run_status = "FAILED"
+        raise
+    finally:
+        finished_at = _jakarta_now()
+        elapsed_seconds = time.perf_counter() - started_perf
+        _print_run_timestamp_block(
+            "RUN END",
+            finished_at,
+            status=run_status,
+            elapsed_seconds=elapsed_seconds,
+        )
 
 if __name__ == "__main__":
     main()
