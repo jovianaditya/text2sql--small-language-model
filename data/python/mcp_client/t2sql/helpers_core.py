@@ -9858,17 +9858,6 @@ def _rewrite_missing_metric_join_in_rollup(sql: str, question: str, ctx: str = "
         rebuilt += ";"
     return rebuilt
 
-
-def _question_wants_entity_orders_payments_rollup(question: str) -> bool:
-    """
-    Backward-compatible alias for older internal call sites.
-
-    Canonical name:
-      _question_wants_dual_fact_rollup
-    """
-    return _question_wants_dual_fact_rollup(question)
-
-
 def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> str:
     """
     Rewrite a grouped dual-fact rollup query into a fanout-safe shape.

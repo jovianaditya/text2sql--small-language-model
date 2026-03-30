@@ -1541,17 +1541,26 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
             except Exception:
                 pass
 
-    # Add schema-driven semantic pricing aliases without binding to fixed column names.
-    _add_semantic_column_alias(
-        "listprice",
-        include_terms={"msrp", "list price", "retail price", "catalog price"},
-        exclude_terms={"buy price", "purchase price", "cost", "cogs", "unit price", "selling price", "deal price"},
-    )
-    _add_semantic_column_alias(
-        "price",
-        include_terms={"unit price", "selling price", "deal price", "sale price", "sales price"},
-        exclude_terms={"buy price", "purchase price", "cost", "cogs", "msrp", "list price", "retail price", "catalog price"},
-    )
+    # Keep semantic alias seeds centralized so they can be externalized or
+    # replaced with richer schema metadata later without changing call sites.
+    semantic_alias_specs = [
+        (
+            "listprice",
+            {"msrp", "list price", "retail price", "catalog price"},
+            {"buy price", "purchase price", "cost", "cogs", "unit price", "selling price", "deal price"},
+        ),
+        (
+            "price",
+            {"unit price", "selling price", "deal price", "sale price", "sales price"},
+            {"buy price", "purchase price", "cost", "cogs", "msrp", "list price", "retail price", "catalog price"},
+        ),
+    ]
+    for alias, include_terms, exclude_terms in semantic_alias_specs:
+        _add_semantic_column_alias(
+            alias,
+            include_terms=include_terms,
+            exclude_terms=exclude_terms,
+        )
 
     # Merge: dynamic_fallback only if not already in global_map
     for al, canon in dynamic_fallback.items():
@@ -2721,8 +2730,14 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     q_lower = question.lower()
     # Pattern: "10 highest", "top 10", "10 largest", "10 products with the highest"
     top_n_pattern = re.search(r'\b(top\s+\d+|\d+\s+(highest|lowest|largest|smallest|most|least|tertinggi|terendah|terbesar|terkecil))\b', q_lower)
-    # Also check for "N products/highest/largest" followed by "stock/amount/etc"
-    top_n_context = re.search(r'\b\d+\s+(products|customers|items?|entities?).+?(highest|largest|most)\b', q_lower, re.IGNORECASE)
+    # Also check for generic noun-phrase variants like:
+    # "10 products with the highest ...", "5 territories with the most ...",
+    # "3 result rows with the lowest ..."
+    top_n_context = re.search(
+        r"\b\d+\s+(?:[a-z_][a-z0-9_]*\s+){0,4}(?:with\s+(?:the\s+)?)?(highest|lowest|largest|smallest|most|least)\b",
+        q_lower,
+        re.IGNORECASE,
+    )
 
     is_top_n_global_ranking = bool(top_n_pattern or top_n_context) and not is_ordinal_ranking
 
@@ -2730,7 +2745,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         constraints.append(
             "TOP N QUERY (HIGHEST PRIORITY): This question asks for 'Top N' or 'N highest/lowest'. "
             "YOU MUST USE: ORDER BY column DESC LIMIT N. "
-            "EXAMPLE: 'Show 10 products with highest stock' → SELECT productCode, productName, quantityInStock FROM products ORDER BY quantityInStock DESC LIMIT 10. "
+            "EXAMPLE SHAPE: SELECT <requested columns> FROM <main table> ORDER BY <requested metric> DESC LIMIT N. "
             "FORBIDDEN: Do NOT use MAX() in WHERE clause. Do NOT use subquery with LIMIT. "
             "FORBIDDEN: WHERE col = (SELECT MAX(col) ...). "
             "CORRECT: Just ORDER BY and LIMIT directly on the main table."

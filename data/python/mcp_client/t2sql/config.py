@@ -340,7 +340,7 @@ RETRIEVAL_NUMERIC_SQL_TYPES = set(
 RETRIEVAL_BM25_STEM_EXCEPTIONS_BASE = set(
     _env_json_list(
         "RETRIEVAL_BM25_STEM_EXCEPTIONS_BASE",
-        ["status", "address", "business", "sales"],
+        ["status", "address", "business"],
     )
 )
 
