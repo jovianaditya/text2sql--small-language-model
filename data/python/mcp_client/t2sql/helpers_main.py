@@ -512,6 +512,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     q_raw = question or ""
     q = q_raw.lower()
     toks_q = q.split()
+    q_tokens = re.findall(r"[a-z0-9]+", q)
 
     try:
         analyzer = get_schema_analyzer()
@@ -572,6 +573,82 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         if _strict_table_mentioned(q, t)
     }
 
+    semantic_stopwords = {
+        "a", "an", "the", "of", "for", "to", "in", "on", "at", "by", "with",
+        "and", "or", "from", "per", "each", "every", "all", "any", "this",
+        "that", "these", "those", "show", "list", "return", "display", "give",
+        "find", "fetch", "get", "table", "column", "data", "value", "values",
+    }
+    generic_metric_fallback_terms = {
+        "amount", "price", "quantity", "total", "count", "cost", "rate", "ratio", "percent",
+    }
+    metric_roles = {"metric", "measure", "amount", "quantity"}
+
+    def _semantic_tokens(text: str) -> Set[str]:
+        tokens = {
+            tok
+            for tok in re.findall(r"[a-z0-9]+", str(text or "").lower())
+            if tok and len(tok) >= 2 and tok not in semantic_stopwords and not tok.isdigit()
+        }
+        return tokens
+
+    def _column_semantic_terms(table: str, column: str) -> Set[str]:
+        terms = set()
+        col = str(column or "").strip()
+        if not col:
+            return terms
+        terms.update(_semantic_tokens(col))
+        try:
+            for syn in get_column_synonyms(table, col) or []:
+                terms.update(_semantic_tokens(syn))
+        except Exception:
+            pass
+        try:
+            for variant in get_column_entity_variants(table, col) or []:
+                terms.update(_semantic_tokens(variant))
+        except Exception:
+            pass
+        return terms
+
+    def _is_metric_id_like(column: str) -> bool:
+        col_lower = str(column or "").strip().lower()
+        if not col_lower:
+            return False
+        return bool(
+            col_lower.endswith("id")
+            or col_lower.endswith("number")
+            or col_lower.endswith("code")
+            or col_lower.endswith("key")
+        )
+
+    def _ordered_unique(items: List[str]) -> List[str]:
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for item in items:
+            tok = str(item or "").strip().lower()
+            if not tok or tok in seen:
+                continue
+            seen.add(tok)
+            ordered.append(tok)
+        return ordered
+
+    schema_metric_terms: List[str] = []
+    metric_scope_tables = sorted(mentioned_tables_dynamic) or sorted(get_all_tables())
+    for table in metric_scope_tables:
+        anchor_cols = {str(c or "").strip().lower() for c in (get_anchor_columns(table) or [])}
+        for col in get_aggregatable_columns(table):
+            col_l = str(col or "").strip().lower()
+            role = get_column_role(table, col)
+            if role not in metric_roles and col_l not in anchor_cols and _is_metric_id_like(col):
+                continue
+            terms = _column_semantic_terms(table, col)
+            if not terms:
+                continue
+            schema_metric_terms.extend(sorted(terms))
+    schema_metric_terms = _ordered_unique(schema_metric_terms)
+    metric_query_terms = set(schema_metric_terms) | generic_metric_fallback_terms | {"omset", "harga", "jumlah"}
+    metric_terms_in_question = _ordered_unique([tok for tok in q_tokens if tok in metric_query_terms])
+
     def _display_name_column_for_probe(table: str) -> Optional[str]:
         name_col = get_name_column(table)
         if not name_col:
@@ -603,22 +680,24 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
             col = str(column or "").strip()
             if not col:
                 continue
-            col_lower = col.lower()
             role = get_column_role(table, col)
+            anchor_cols = {str(c or "").strip().lower() for c in (get_anchor_columns(table) or [])}
+            semantic_terms = _column_semantic_terms(table, col)
+            overlap_terms = semantic_terms.intersection(metric_terms_in_question)
             score = 0
             if _column_mentioned_in_question(table, col):
                 score += 5
             if prefer_metric:
-                if role in {"metric", "measure", "amount", "quantity"}:
+                if role in metric_roles or str(col).strip().lower() in anchor_cols:
                     score += 3
-                if any(
-                    token in col_lower
-                    for token in ("amount", "price", "quantity", "total", "sales", "revenue", "gross", "net", "cost", "value", "count")
-                ):
-                    score += 2
+                if overlap_terms:
+                    score += min(len(overlap_terms), 2) * 2
+                elif semantic_terms.intersection(metric_query_terms):
+                    score += 1
             if prefer_temporal:
                 if role in {"date", "datetime", "timestamp", "time"}:
                     score += 3
+                col_lower = col.lower()
                 if ("date" in col_lower) or ("time" in col_lower) or col_lower.endswith("at"):
                     score += 2
             ranked.append((score, idx, col))
@@ -629,26 +708,16 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         col = str(column or "").strip()
         if not col:
             return False
-        col_lower = col.lower()
         role = get_column_role(table, col)
-        if role in {"metric", "measure", "amount", "quantity"}:
+        if role in metric_roles:
             return True
-        return any(
-            token in col_lower
-            for token in (
-                "amount",
-                "price",
-                "quantity",
-                "total",
-                "sales",
-                "revenue",
-                "gross",
-                "net",
-                "cost",
-                "value",
-                "count",
-            )
-        )
+        col_l = col.lower()
+        anchor_cols = {str(c or "").strip().lower() for c in (get_anchor_columns(table) or [])}
+        if col_l in anchor_cols:
+            return True
+        if _is_metric_id_like(col):
+            return False
+        return bool(_column_semantic_terms(table, col).intersection(metric_query_terms))
 
     def _table_probe_label(table: str) -> Optional[str]:
         singular = get_singular_form(table)
@@ -742,10 +811,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
                     tokens.append(col)
 
     # Base lexical signals.
-    has_metric_word = any(k in q for k in [
-        "amount", "revenue", "sales", "omset", "price", "harga",
-        "gross", "net"
-    ])
+    has_metric_word = bool(metric_terms_in_question)
     has_count_word = any(k in q for k in [
         "count", "berapa banyak", "how many"
     ])
@@ -765,7 +831,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         base = []
     elif qtype in {"aggregate_by", "aggregate_all"}:
         if has_metric_word:
-            base += ["amount", "revenue", "price"]
+            base += metric_terms_in_question[:3] or schema_metric_terms[:3] or ["amount", "price"]
         if has_count_word:
             base += ["count"]
         if has_time_word:
@@ -1476,6 +1542,7 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
     ) -> None:
         if alias in dynamic_fallback:
             return
+        alias_keys = _semantic_alias_keys(alias)
         include_keys = set()
         for term in include_terms:
             include_keys.update(_semantic_alias_keys(term))
@@ -1483,23 +1550,47 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
         for term in (exclude_terms or set()):
             exclude_keys.update(_semantic_alias_keys(term))
 
+        candidates: List[Tuple[int, int, int, str]] = []
         for table in schema_tables:
             try:
                 table_columns = list(analyzer.get_table_columns(table)) if analyzer is not None else list(allowed_identifiers.get(table, ()))
             except Exception:
                 table_columns = list(allowed_identifiers.get(table, ()))
-            for col in table_columns:
+            for col_idx, col in enumerate(table_columns):
                 semantic_keys = _semantic_alias_keys(col)
                 try:
                     for syn in get_column_synonyms(table, col) or []:
                         semantic_keys.update(_semantic_alias_keys(syn))
                 except Exception:
                     pass
-                if not semantic_keys.intersection(include_keys):
+                overlap_keys = semantic_keys.intersection(include_keys)
+                if not overlap_keys:
                     continue
                 if exclude_keys and semantic_keys.intersection(exclude_keys):
                     continue
-                _put_fallback(alias, col)
+                score = len(overlap_keys) * 10
+                score += len(semantic_keys.intersection(alias_keys)) * 20
+                role = get_column_role(table, col)
+                if role in {"metric", "measure", "amount", "quantity"}:
+                    score += 5
+                if str(col or "").strip().lower() == str(alias or "").strip().lower():
+                    score += 20
+                candidates.append((score, len(candidates), col_idx, col))
+
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        best_score, _, _, best_col = candidates[0]
+        best_canon = _canon_col(best_col)
+        tied_best = {
+            _canon_col(col)
+            for score, _, _, col in candidates
+            if score == best_score
+        }
+        if len(tied_best) > 1:
+            return
+        _put_fallback(alias, best_canon)
 
     for table in schema_tables:
         # Add name column mapping
