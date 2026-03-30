@@ -406,6 +406,72 @@ HELPERS_ROLLUP_LEGACY_METRIC_TERMS = set(
     )
 )
 
+HELPERS_DUAL_FACT_FAMILY_STOPWORDS = set(
+    _env_json_list(
+        "HELPERS_DUAL_FACT_FAMILY_STOPWORDS",
+        [
+            "a",
+            "an",
+            "the",
+            "of",
+            "for",
+            "per",
+            "each",
+            "every",
+            "such",
+            "total",
+            "number",
+            "count",
+            "sum",
+            "combined",
+            "aggregate",
+            "aggregated",
+            "and",
+            "or",
+            "with",
+            "without",
+            "show",
+            "return",
+            "list",
+            "display",
+            "give",
+            "find",
+            "who",
+            "have",
+            "has",
+            "had",
+            "at",
+            "least",
+            "one",
+            "all",
+        ],
+    )
+)
+
+HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS = set(
+    _env_json_list(
+        "HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS",
+        [
+            "amount",
+            "value",
+            "revenue",
+            "sale",
+            "sales",
+            "price",
+            "prices",
+            "quantity",
+            "qty",
+            "volume",
+            "balance",
+            "cost",
+            "total",
+            "spend",
+            "paid",
+            "payment",
+        ],
+    )
+)
+
 # ======================================================================
 # ======================== RETRIEVE HEURISTICS ==========================
 # ======================================================================

@@ -27,6 +27,8 @@ from .schema_analyzer import (
 )
 from .config import (
     ALIAS_MAX_LEN,
+    HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS,
+    HELPERS_DUAL_FACT_FAMILY_STOPWORDS,
     HELPERS_EXISTENCE_COMPAT_VERBS,
     HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
     HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS,
@@ -417,6 +419,91 @@ def _inner_join_action_terms(ctx: str = "") -> Set[str]:
     for table in _inner_join_object_tables(ctx):
         verbs.update(_table_support_action_terms(table))
     return {verb for verb in verbs if verb and verb not in HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC}
+
+
+def _dual_fact_normalize_family(raw: str) -> str:
+    tokens = [
+        tok for tok in re.findall(r"[a-z0-9]+", str(raw or "").lower())
+        if tok and tok not in HELPERS_DUAL_FACT_FAMILY_STOPWORDS
+    ]
+    if not tokens:
+        return ""
+
+    normalized = [_to_singular(tok) for tok in tokens[:3]]
+    return " ".join(tok for tok in normalized if tok).strip()
+
+
+def _dual_fact_collect_families(pattern: str, text: str) -> Set[str]:
+    families: Set[str] = set()
+    for match in re.finditer(pattern, text or "", flags=re.I):
+        fam = _dual_fact_normalize_family(match.group(1))
+        if fam:
+            families.add(fam)
+    return families
+
+
+def _dual_fact_metric_terms_for_table(table_name: str, analyzer: Any = None) -> Set[str]:
+    metric_terms: Set[str] = set()
+    compat_terms = set(HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS)
+    if analyzer is None:
+        return metric_terms
+
+    try:
+        table_columns = analyzer.get_table_columns(table_name)
+    except Exception:
+        table_columns = []
+
+    noise_terms = {
+        "id", "ids", "code", "codes", "key", "keys", "name", "names",
+        "number", "numbers", "date", "dates", "year", "years",
+        "month", "months", "day", "days", "type", "types",
+        "status", "record", "records", "row", "rows",
+    }
+
+    for col in table_columns:
+        role = ""
+        try:
+            role = str(get_column_role(table_name, col) or "").strip().lower()
+        except Exception:
+            role = ""
+
+        candidate_texts = [str(col or "")]
+        try:
+            candidate_texts.extend(analyzer.get_column_synonyms(table_name, col) or [])
+        except Exception:
+            pass
+
+        col_tokens: Set[str] = set()
+        for text in candidate_texts:
+            normalized = re.sub(
+                r"([a-z0-9])([A-Z])",
+                r"\1 \2",
+                str(text or "").replace("_", " ").lower(),
+            )
+            col_tokens.update(
+                tok for tok in re.findall(r"[a-z0-9]+", normalized)
+                if tok and tok not in noise_terms
+            )
+
+        if role in {"metric", "measure", "amount", "quantity"}:
+            metric_terms.add("total")
+            metric_terms.update(tok for tok in col_tokens if len(tok) >= 3)
+
+        metric_terms.update(col_tokens.intersection(compat_terms))
+
+    return metric_terms
+
+
+def _dual_fact_metric_term_universe(
+    table_names: Set[str],
+    analyzer: Any = None,
+) -> Set[str]:
+    metric_words: Set[str] = set()
+    for table_name in sorted(table_names):
+        metric_words.update(_dual_fact_metric_terms_for_table(table_name, analyzer=analyzer))
+    if not metric_words:
+        metric_words.update(HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS)
+    return metric_words
 
 def _canonicalize_table_names(sql: str, ctx: str) -> str:
     """
@@ -9314,53 +9401,38 @@ def _question_wants_dual_fact_rollup(question: str) -> bool:
     if not q:
         return False
 
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    try:
+        all_tables = sorted(str(t).strip().lower() for t in (get_all_tables() or []) if str(t).strip())
+    except Exception:
+        all_tables = []
+    try:
+        transaction_tables = {
+            str(t).strip().lower()
+            for t in (get_transaction_tables() or [])
+            if str(t).strip()
+        }
+    except Exception:
+        transaction_tables = set()
+    try:
+        fk_map_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_map_raw = {}
+
     def _fallback_dual_fact_rollup_from_question() -> bool:
         """
         Conservative question-only fallback for environments where schema
         metadata is unavailable. This stays generic by extracting lexical
         families from the question instead of relying on specific table names.
         """
-        family_stopwords = {
-            "a", "an", "the", "of", "for", "per", "each", "every", "such",
-            "total", "number", "count", "sum", "combined", "aggregate",
-            "aggregated", "and", "or", "with", "without", "show", "return",
-            "list", "display", "give", "find", "who", "have", "has", "had",
-            "at", "least", "one", "all",
-        }
-        metric_words = {
-            "amount", "value", "revenue", "sales", "price", "quantity",
-            "qty", "volume", "balance", "cost", "spend", "paid",
-        }
-
-        def _normalize_family(raw: str) -> str:
-            tokens = [
-                tok for tok in re.findall(r"[a-z0-9]+", (raw or "").lower())
-                if tok and tok not in family_stopwords
-            ]
-            if not tokens:
-                return ""
-
-            def _singularize(token: str) -> str:
-                if token.endswith("ies") and len(token) > 3:
-                    return token[:-3] + "y"
-                if (
-                    token.endswith("s")
-                    and len(token) > 3
-                    and not token.endswith(("ss", "us", "is"))
-                ):
-                    return token[:-1]
-                return token
-
-            normalized = [_singularize(tok) for tok in tokens[:3]]
-            return " ".join(normalized).strip()
+        metric_words = _dual_fact_metric_term_universe(transaction_tables, analyzer=analyzer)
 
         def _collect(pattern: str, text: str = q) -> Set[str]:
-            families: Set[str] = set()
-            for match in re.finditer(pattern, text, flags=re.I):
-                fam = _normalize_family(match.group(1))
-                if fam:
-                    families.add(fam)
-            return families
+            return _dual_fact_collect_families(pattern, text)
 
         base_families = set()
         base_families |= _collect(
@@ -9410,28 +9482,6 @@ def _question_wants_dual_fact_rollup(question: str) -> bool:
                     return True
         return False
 
-    try:
-        analyzer = get_schema_analyzer()
-    except Exception:
-        analyzer = None
-
-    try:
-        all_tables = sorted(str(t).strip().lower() for t in (get_all_tables() or []) if str(t).strip())
-    except Exception:
-        all_tables = []
-    try:
-        transaction_tables = {
-            str(t).strip().lower()
-            for t in (get_transaction_tables() or [])
-            if str(t).strip()
-        }
-    except Exception:
-        transaction_tables = set()
-    try:
-        fk_map_raw = get_fk_relationships() or {}
-    except Exception:
-        fk_map_raw = {}
-
     if not all_tables or len(transaction_tables) < 2:
         return _fallback_dual_fact_rollup_from_question()
 
@@ -9473,45 +9523,6 @@ def _question_wants_dual_fact_rollup(question: str) -> bool:
                 return False
         return False
 
-    def _metric_terms_for_table(table_name: str) -> Set[str]:
-        metric_terms: Set[str] = set()
-        generic_terms = {
-            "amount", "value", "price", "prices", "revenue", "sale", "sales",
-            "quantity", "qty", "volume", "balance", "cost", "total",
-        }
-        if analyzer is None:
-            return metric_terms
-
-        try:
-            table_columns = analyzer.get_table_columns(table_name)
-        except Exception:
-            table_columns = []
-
-        for col in table_columns:
-            role = ""
-            try:
-                role = get_column_role(table_name, col)
-            except Exception:
-                role = ""
-
-            candidate_texts = [str(col or "")]
-            try:
-                candidate_texts.extend(analyzer.get_column_synonyms(table_name, col) or [])
-            except Exception:
-                pass
-
-            if role in {"metric", "measure", "amount"}:
-                metric_terms.add("total")
-
-            for text in candidate_texts:
-                text_l = str(text or "").strip().lower()
-                if not text_l:
-                    continue
-                for term in generic_terms:
-                    if term in text_l:
-                        metric_terms.add(term)
-        return metric_terms
-
     def _count_request_for(table_name: str) -> bool:
         alt = _entity_alt(table_name)
         if not alt:
@@ -9532,7 +9543,11 @@ def _question_wants_dual_fact_rollup(question: str) -> bool:
 
     def _metric_total_request_for(table_name: str) -> bool:
         alt = _entity_alt(table_name)
-        metric_terms = sorted(_metric_terms_for_table(table_name), key=len, reverse=True)
+        metric_terms = sorted(
+            _dual_fact_metric_terms_for_table(table_name, analyzer=analyzer),
+            key=len,
+            reverse=True,
+        )
         if not alt or not metric_terms:
             return False
         metric_alt = "|".join(re.escape(t).replace(r"\ ", r"\s+") for t in metric_terms if t)
