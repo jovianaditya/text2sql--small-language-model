@@ -472,6 +472,49 @@ HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS = set(
     )
 )
 
+HELPERS_METRIC_AGG_INTENT_TERMS = set(
+    _env_json_list(
+        "HELPERS_METRIC_AGG_INTENT_TERMS",
+        [
+            "total",
+            "sum",
+            "average",
+            "avg",
+            "mean",
+            "combined",
+            "aggregate",
+            "aggregated",
+            "jumlah",
+            "rata",
+            "rata-rata",
+        ],
+    )
+)
+
+HELPERS_METRIC_AGG_IDLIKE_TOKENS = set(
+    _env_json_list(
+        "HELPERS_METRIC_AGG_IDLIKE_TOKENS",
+        [
+            "id",
+            "identifier",
+            "code",
+            "number",
+            "name",
+            "date",
+            "time",
+            "status",
+            "email",
+            "phone",
+            "address",
+            "city",
+            "country",
+            "zip",
+            "postal",
+            "check",
+        ],
+    )
+)
+
 # ======================================================================
 # ======================== RETRIEVE HEURISTICS ==========================
 # ======================================================================

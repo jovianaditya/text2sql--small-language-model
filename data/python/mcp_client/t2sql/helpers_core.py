@@ -34,6 +34,8 @@ from .config import (
     HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS,
     HELPERS_INNER_JOIN_GENERIC_OBJECT_TERMS,
     HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES,
+    HELPERS_METRIC_AGG_IDLIKE_TOKENS,
+    HELPERS_METRIC_AGG_INTENT_TERMS,
     HELPERS_ROLLUP_LEGACY_METRIC_TERMS,
 )
 from .rulebook import (
@@ -9198,14 +9200,6 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
         return sql
 
     q = question.lower()
-    has_metric_intent = bool(
-        re.search(
-            r"\b(total|sum|average|avg|amount|paid|payment|quantity|qty|price|cost|sales|revenue|msrp|value)\b",
-            q,
-        )
-    )
-    if not has_metric_intent:
-        return sql
 
     m = re.match(r"(?is)^\s*select\s+(?P<select>.*?)\s+from\s+(?P<after>.*)$", sql.strip())
     if not m:
@@ -9239,23 +9233,106 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
         analyzer = get_schema_analyzer()
     except Exception:
         return sql
-    metric_tokens = {"amount", "price", "cost", "qty", "quantity", "revenue", "sales", "msrp", "value", "total"}
-    id_like_tokens = {"id", "code", "number", "name", "date", "status", "email", "phone", "address", "city", "country", "zip", "postal", "check"}
+    metric_term_universe = _dual_fact_metric_term_universe(table_universe, analyzer=analyzer)
+    query_tokens = {tok for tok in re.findall(r"[a-z0-9]+", q) if tok}
+    entity_noise_terms: Set[str] = set()
+    for table_name in table_universe:
+        table_l = str(table_name or "").strip().lower()
+        base_terms = {table_l, _to_singular(table_l)}
+        for base_term in base_terms:
+            if not base_term:
+                continue
+            entity_noise_terms.update(
+                tok for tok in re.findall(r"[a-z0-9]+", base_term.replace("_", " ").lower()) if tok
+            )
+    metric_candidate_terms = {
+        term
+        for term in (metric_term_universe | HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+        if term and term not in entity_noise_terms and term not in HELPERS_METRIC_AGG_IDLIKE_TOKENS
+    }
+    has_metric_intent = bool(query_tokens & (metric_term_universe | HELPERS_METRIC_AGG_INTENT_TERMS))
+    if not has_metric_intent:
+        return sql
 
-    prefer_amount = bool(re.search(r"\b(amount|paid|payment)\b", q))
-    prefer_quantity = bool(re.search(r"\b(quantity|qty)\b", q))
-    prefer_price = bool(re.search(r"\b(price|cost|msrp)\b", q))
-    prefer_sales = bool(re.search(r"\b(sales|revenue)\b", q))
-    strong_metric_intent = prefer_amount or prefer_quantity or prefer_price or prefer_sales
+    metric_query_terms = query_tokens & metric_candidate_terms
+    strong_metric_intent = bool(query_tokens & metric_term_universe)
+
+    role_cache: Dict[Tuple[str, str], str] = {}
+    term_cache: Dict[Tuple[str, str], Set[str]] = {}
+    identity_cache: Dict[str, Set[str]] = {}
 
     def _clean_ident(s: str) -> str:
         return (s or "").replace("`", "").strip().lower()
 
-    def _is_metric_like(col_l: str) -> bool:
-        return any(tok in col_l for tok in metric_tokens)
+    def _column_role_cached(table_l: str, col_l: str) -> str:
+        key = (table_l, col_l)
+        if key not in role_cache:
+            try:
+                role_cache[key] = str(get_column_role(table_l, col_l) or "").strip().lower()
+            except Exception:
+                role_cache[key] = ""
+        return role_cache[key]
 
-    def _is_id_like(col_l: str) -> bool:
-        return any(tok in col_l for tok in id_like_tokens)
+    def _identity_columns(table_l: str) -> Set[str]:
+        if table_l not in identity_cache:
+            ids: Set[str] = set()
+            try:
+                id_col = str(get_id_column(table_l) or "").strip().lower()
+            except Exception:
+                id_col = ""
+            try:
+                name_col = str(get_name_column(table_l) or "").strip().lower()
+            except Exception:
+                name_col = ""
+            if id_col:
+                ids.add(id_col)
+            if name_col:
+                ids.add(name_col)
+            identity_cache[table_l] = ids
+        return identity_cache[table_l]
+
+    def _column_semantic_terms(table_l: str, col_l: str) -> Set[str]:
+        key = (table_l, col_l)
+        if key in term_cache:
+            return term_cache[key]
+
+        terms: Set[str] = set()
+        candidate_texts = [col_l]
+        try:
+            candidate_texts.extend(analyzer.get_column_synonyms(table_l, col_l) or [])
+        except Exception:
+            pass
+
+        for text in candidate_texts:
+            normalized = re.sub(
+                r"([a-z0-9])([A-Z])",
+                r"\1 \2",
+                str(text or "").replace("_", " ").lower(),
+            )
+            terms.update(tok for tok in re.findall(r"[a-z0-9]+", normalized) if tok)
+
+        role = _column_role_cached(table_l, col_l)
+        if role in {"metric", "measure", "amount", "quantity"}:
+            terms.add("total")
+        if role:
+            terms.add(role)
+
+        term_cache[key] = {term for term in terms if term}
+        return term_cache[key]
+
+    def _is_metric_like(table_l: str, col_l: str) -> bool:
+        role = _column_role_cached(table_l, col_l)
+        if role in {"metric", "measure", "amount", "quantity"}:
+            return True
+        return bool(_column_semantic_terms(table_l, col_l) & metric_candidate_terms)
+
+    def _is_id_like(table_l: str, col_l: str) -> bool:
+        if col_l in _identity_columns(table_l):
+            return True
+        role = _column_role_cached(table_l, col_l)
+        if role in {"date", "datetime", "timestamp", "time", "identifier", "id", "name"}:
+            return True
+        return bool(_column_semantic_terms(table_l, col_l) & HELPERS_METRIC_AGG_IDLIKE_TOKENS)
 
     def _pick_metric_col(table_l: str, current_col_l: str) -> Optional[str]:
         try:
@@ -9270,25 +9347,21 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
         except Exception:
             anchor_cols = set()
 
-        candidates = [c for c in cols if c != current_col_l and (_is_metric_like(c) or c in anchor_cols)]
+        candidates = [c for c in cols if c != current_col_l and (_is_metric_like(table_l, c) or c in anchor_cols)]
         if not candidates:
             return None
 
         def _score(c: str) -> int:
             score = 0
+            candidate_terms = _column_semantic_terms(table_l, c)
+            term_overlap = candidate_terms & metric_query_terms
             if c in anchor_cols:
                 score += 20
-            if _is_metric_like(c):
+            if _is_metric_like(table_l, c):
                 score += 8
-            if prefer_amount and "amount" in c:
-                score += 12
-            if prefer_quantity and ("quantity" in c or "qty" in c):
-                score += 12
-            if prefer_price and any(x in c for x in ["price", "cost", "msrp"]):
-                score += 12
-            if prefer_sales and any(x in c for x in ["sales", "revenue"]):
-                score += 12
-            if _is_id_like(c):
+            if term_overlap:
+                score += 10 + (4 * len(term_overlap))
+            if _is_id_like(table_l, c):
                 score -= 8
             return score
 
@@ -9315,9 +9388,6 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
             col_raw = m_agg.group("c") or ""
 
             col_l = _clean_ident(col_raw)
-            if _is_metric_like(col_l) or not _is_id_like(col_l):
-                return m_agg.group(0)
-
             table_l = None
             if qual_raw:
                 q_clean = _clean_ident(qual_raw)
@@ -9326,6 +9396,9 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
                 table_l = next(iter(table_universe))
 
             if not table_l:
+                return m_agg.group(0)
+
+            if _is_metric_like(table_l, col_l) or not _is_id_like(table_l, col_l):
                 return m_agg.group(0)
 
             replacement = _pick_metric_col(table_l, col_l)
