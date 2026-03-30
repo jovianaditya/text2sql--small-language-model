@@ -19,3 +19,4 @@ data/python/mcp_client/results.xlsx
 **/run_medium.log
 **/run_hard.log
 **/run_full.log
+**/.codex
