@@ -90,6 +90,9 @@ from .config import (
     AGENT_COLUMN_CAMEL_SPLIT_PATTERN,
     AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN,
     AGENT_COLUMN_TOKEN_PATTERN,
+    AGENT_CONTRACT_BASE_METRIC_TERMS,
+    AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS,
+    AGENT_CONTRACT_GENERIC_COUNT_NOUNS,
     AGENT_ROUTER_FK_SUFFIX_TERMS,
     AGENT_ROUTER_IGNORE_PATTERNS,
     AGENT_ROUTER_WEAK_EVIDENCE_TAGS,
@@ -3360,6 +3363,100 @@ def router_agent(state: RAGState) -> RAGState:
 import time as _time  # For inference timing
 # Track last warmup time per model
 _last_model_warmup = {}
+_CONTRACT_METRIC_TERMS_CACHE: Optional[Set[str]] = None
+_CONTRACT_ENTITY_TERMS_CACHE: Optional[Set[str]] = None
+
+
+def _contract_normalize_token(token: str) -> str:
+    t = str(token or "").strip().lower()
+    if not t:
+        return ""
+    if t.endswith("ies") and len(t) > 3:
+        return t[:-3] + "y"
+    if t.endswith("s") and len(t) > 2 and not t.endswith(("ss", "us")):
+        return t[:-1]
+    return t
+
+
+def _contract_tokenize(text: str) -> Set[str]:
+    return {
+        tok
+        for tok in (
+            _contract_normalize_token(raw)
+            for raw in re.findall(r"[a-z0-9]+", str(text or "").lower())
+        )
+        if tok and not tok.isdigit()
+    }
+
+
+def _contract_identifier_terms(name: str) -> Set[str]:
+    words = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(name or ""))
+    words = words.replace("_", " ")
+    return _contract_tokenize(words)
+
+
+def _contract_metric_terms() -> Set[str]:
+    global _CONTRACT_METRIC_TERMS_CACHE
+    if _CONTRACT_METRIC_TERMS_CACHE is not None:
+        return set(_CONTRACT_METRIC_TERMS_CACHE)
+
+    terms: Set[str] = set(AGENT_CONTRACT_BASE_METRIC_TERMS)
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    schema_enriched = False
+    for table in get_all_tables() or []:
+        t = str(table or "").strip().lower()
+        if not t:
+            continue
+        try:
+            cols = list(analyzer.get_table_columns(t)) if analyzer is not None else []
+        except Exception:
+            cols = []
+        for col in cols:
+            c = str(col or "").strip()
+            if not c:
+                continue
+            c_low = c.lower()
+            if c_low.endswith(("id", "number", "code", "key")):
+                continue
+            role = ""
+            try:
+                if analyzer is not None:
+                    role = str(analyzer._column_roles.get(t, {}).get(c_low, "") or "").lower()
+            except Exception:
+                role = ""
+            col_terms = _contract_identifier_terms(c)
+            if role in {"metric", "measure", "amount", "quantity"} or col_terms.intersection(terms):
+                schema_enriched = True
+                terms.update(col_terms)
+
+    if not schema_enriched:
+        terms.update(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
+
+    _CONTRACT_METRIC_TERMS_CACHE = set(terms)
+    return set(_CONTRACT_METRIC_TERMS_CACHE)
+
+
+def _contract_entity_terms() -> Set[str]:
+    global _CONTRACT_ENTITY_TERMS_CACHE
+    if _CONTRACT_ENTITY_TERMS_CACHE is not None:
+        return set(_CONTRACT_ENTITY_TERMS_CACHE)
+
+    terms: Set[str] = set(AGENT_CONTRACT_GENERIC_COUNT_NOUNS)
+    for table in get_all_tables() or []:
+        t = str(table or "").strip().lower()
+        if not t:
+            continue
+        singular = str(get_singular_form(t) or t).strip().lower()
+        for variant in {t, singular, t.replace("_", " "), singular.replace("_", " ")}:
+            terms.update(_contract_tokenize(variant))
+
+    _CONTRACT_ENTITY_TERMS_CACHE = set(terms)
+    return set(_CONTRACT_ENTITY_TERMS_CACHE)
 
 
 def _collect_hard_identifier_errors(errors: List[str]) -> List[str]:
@@ -3475,21 +3572,23 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     # - explicit "sum"/"sum of"
     # - "total" only when attached to quantity/value-like metrics.
     has_explicit_sum = bool(re.search(r"\bsum(?:\s+of)?\b", q))
-    has_total_metric = bool(
-        re.search(
-            r"\btotal\s+"
-            r"(?:amount|payment(?:\s+amount)?|order(?:\s+amount)?|sales?|revenue|"
-            r"quantity|stock|value|cost|price|credit(?:\s+limit)?)\b",
-            q,
-        )
+    metric_terms = _contract_metric_terms()
+    entity_terms = _contract_entity_terms()
+    total_phrases = [
+        str(m.group(1) or "").strip()
+        for m in re.finditer(r"\btotal\s+([a-z][a-z0-9_ ]{0,48})\b", q)
+    ]
+    has_total_metric = any(
+        _contract_tokenize(phrase).intersection(metric_terms)
+        for phrase in total_phrases
     )
-    looks_like_count_phrase = bool(
-        re.search(
-            r"\b(total\s+(number|count|orders?|customers?|items?|rows?|records?))\b",
-            q,
-        )
-        or re.search(r"\btotal\s+number\s+of\b", q)
-    )
+    looks_like_count_phrase = bool(re.search(r"\btotal\s+(?:number|count)\b", q) or re.search(r"\btotal\s+number\s+of\b", q))
+    if not looks_like_count_phrase:
+        for phrase in total_phrases:
+            phrase_tokens = _contract_tokenize(phrase)
+            if phrase_tokens.intersection(entity_terms) and not phrase_tokens.intersection(metric_terms):
+                looks_like_count_phrase = True
+                break
     if (has_explicit_sum or has_total_metric) and not looks_like_count_phrase:
         required_aggs.add("SUM")
 

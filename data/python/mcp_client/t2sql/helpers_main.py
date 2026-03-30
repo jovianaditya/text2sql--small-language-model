@@ -27,6 +27,8 @@ from .config import (
     AGENT_AST_SEMANTIC_FIRST,
     AGENT_NORMALIZE_REWRITE_BUDGET,
     AGENT_NORMALIZE_EARLY_STOP,
+    HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
+    HELPERS_EXISTENCE_COMPAT_VERBS,
 )
 from .schema_analyzer import (
     get_transaction_tables,
@@ -48,6 +50,7 @@ from .helpers_core import (
     _parse_allowed_identifiers, _question_requires_word_boundary_regex, _question_requires_structural_regex, _question_requires_regex, has_join,
     _question_requires_inner_join,
     _question_wants_include_zero,
+    _question_wants_dual_fact_rollup,
     _SQL_KEYWORDS,  # SQL keywords constant
     # phase 0
     _fix_bad_backticks, _canonicalize_table_names, _escape_reserved_column_aliases,
@@ -1011,6 +1014,41 @@ def _table_inflected_mention_terms(table: str) -> Set[str]:
     return {term for term in terms if term and len(term) >= 4}
 
 
+def _base_form_from_inflected(term: str) -> str:
+    t = str(term or "").strip().lower()
+    if not t:
+        return ""
+    if t == "paid":
+        return "pay"
+    if t.endswith("ied") and len(t) > 4:
+        return t[:-3] + "y"
+    if t.endswith("ing") and len(t) > 5:
+        base = t[:-3]
+        if base.endswith(base[-1:] * 2):
+            base = base[:-1]
+        return base
+    if t.endswith("ed") and len(t) > 4:
+        base = t[:-2]
+        if base.endswith("i") and len(base) > 1:
+            return base[:-1] + "y"
+        return base
+    return t
+
+
+def _entity_support_verb_terms(table: str) -> Set[str]:
+    verbs: Set[str] = set(HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC)
+    inflected_terms = _table_inflected_mention_terms(table)
+    verbs.update(inflected_terms)
+    verbs.update(
+        base
+        for base in (_base_form_from_inflected(term) for term in inflected_terms)
+        if base and len(base) >= 3
+    )
+    # Backward-compatible fallback to preserve existing behavior on legacy phrasing.
+    verbs.update(HELPERS_EXISTENCE_COMPAT_VERBS)
+    return {verb for verb in verbs if verb}
+
+
 def _is_locally_negated(q_text: str, start_idx: int, window_chars: int = 56) -> bool:
     left = (q_text or "")[max(0, start_idx - window_chars):start_idx]
     if not left:
@@ -1156,8 +1194,10 @@ def _question_targets_table_existence(question: str, table: str) -> bool:
     )
 
     # Verb-based existence mention.
+    support_verbs = sorted(_entity_support_verb_terms(table), key=len, reverse=True)
+    support_verb_alt = "|".join(re.escape(v) for v in support_verbs if v)
     verb_pattern = (
-        rf"\b(?:have|has|had|made|placed|paid|ordered|purchased|bought)\b"
+        rf"\b(?:{support_verb_alt})\b"
         rf"(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b"
     )
     has_verb_existence = _has_non_negated_pattern_match(q_sem, verb_pattern)
@@ -1174,6 +1214,51 @@ def _question_targets_table_existence(question: str, table: str) -> bool:
         return False
 
     return has_positive_existence
+
+
+def _question_has_direct_entity_existence_signal(question: str, table: str) -> bool:
+    """
+    Narrower existence detector used only for join-hint guidance.
+    It captures explicit row-presence intent ("with payments", "at least one order")
+    but intentionally ignores metric/status-only mentions such as
+    "total payment amount" or "payment_status".
+    """
+    q = (question or "").lower()
+    if not q:
+        return False
+    q_sem = re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"", " ", q)
+
+    candidates = _table_mention_candidates(table, include_synonyms=True)
+    if not candidates:
+        return False
+
+    entity_alt = "|".join(
+        sorted((re.escape(c).replace(r"\ ", r"\s+") for c in candidates), key=len, reverse=True)
+    )
+
+    quantified_pattern = (
+        rf"\b(?:at\s+least\s+one|one\s+or\s+more|any)\b"
+        rf"(?:[\s,;:()'\"-]+\w+){{0,8}}[\s,;:()'\"-]+(?:{entity_alt})\b"
+    )
+    if _has_non_negated_pattern_match(q_sem, quantified_pattern):
+        return True
+
+    metric_connector_match = re.search(
+        rf"\b(?:with|having)\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
+        rf"\b(?:total|sum|count|average|avg|amount|number|status)\b"
+        rf"(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+(?:{entity_alt})\b",
+        q_sem,
+        flags=re.I,
+    )
+    connector_pattern = (
+        rf"\b(?:with|having)\b"
+        rf"(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+(?:{entity_alt})\b"
+    )
+    if not metric_connector_match and _has_non_negated_pattern_match(q_sem, connector_pattern):
+        return True
+
+    inflected_mentions = _iter_inflected_entity_mentions(q_sem, table)
+    return any(not is_negated for _, is_negated in inflected_mentions)
 
 
 def _is_simple_single_table_lookup(question: str, table: str) -> bool:
@@ -3120,6 +3205,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             wants_include_zero = _question_wants_include_zero(question, ctx)
             exclusion_tables = {t for t in other_tables if _question_targets_table_exclusion(question, t)}
             existence_tables = {t for t in other_tables if _question_targets_table_existence(question, t)}
+            if _question_wants_dual_fact_rollup(question) and len(other_tables) >= 2:
+                direct_existence_tables = {
+                    t for t in other_tables
+                    if _question_has_direct_entity_existence_signal(question, t)
+                }
+                if direct_existence_tables:
+                    existence_tables = {t for t in existence_tables if t in direct_existence_tables}
             force_required_inner_chain = _should_force_required_inner_join_chain(
                 question=question,
                 router_decision=router_decision,

@@ -285,6 +285,83 @@ AGENT_REGEX_TRIGGERS = _env_json_list(
     ],
 )
 
+AGENT_CONTRACT_BASE_METRIC_TERMS = set(
+    _env_json_list(
+        "AGENT_CONTRACT_BASE_METRIC_TERMS",
+        [
+            "amount",
+            "total",
+            "price",
+            "quantity",
+            "cost",
+            "rate",
+            "count",
+            "number",
+            "value",
+            "percent",
+            "ratio",
+            "limit",
+        ],
+    )
+)
+
+AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS = set(
+    _env_json_list(
+        "AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS",
+        ["payment", "sales", "revenue", "stock", "credit"],
+    )
+)
+
+AGENT_CONTRACT_GENERIC_COUNT_NOUNS = set(
+    _env_json_list(
+        "AGENT_CONTRACT_GENERIC_COUNT_NOUNS",
+        [
+            "row",
+            "rows",
+            "record",
+            "records",
+            "result",
+            "results",
+            "item",
+            "items",
+            "entry",
+            "entries",
+        ],
+    )
+)
+
+HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC = set(
+    _env_json_list(
+        "HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC",
+        ["have", "has", "had", "made"],
+    )
+)
+
+HELPERS_EXISTENCE_COMPAT_VERBS = set(
+    _env_json_list(
+        "HELPERS_EXISTENCE_COMPAT_VERBS",
+        ["placed", "paid", "ordered", "purchased", "bought"],
+    )
+)
+
+HELPERS_ROLLUP_LEGACY_METRIC_TERMS = set(
+    _env_json_list(
+        "HELPERS_ROLLUP_LEGACY_METRIC_TERMS",
+        [
+            "amount",
+            "value",
+            "revenue",
+            "sales",
+            "price",
+            "quantity",
+            "cost",
+            "spend",
+            "paid",
+            "payment",
+        ],
+    )
+)
+
 # ======================================================================
 # ======================== RETRIEVE HEURISTICS ==========================
 # ======================================================================

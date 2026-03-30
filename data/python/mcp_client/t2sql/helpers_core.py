@@ -25,7 +25,7 @@ from .schema_analyzer import (
     get_table_synonyms,
     get_singular_form,
 )
-from .config import ALIAS_MAX_LEN
+from .config import ALIAS_MAX_LEN, HELPERS_ROLLUP_LEGACY_METRIC_TERMS
 from .rulebook import (
     any_phrase_in_text,
     identifier_id_like_terms,
@@ -243,6 +243,53 @@ def _entity_terms_from_ctx(ctx: str = "") -> Set[str]:
 
         terms.update(v for v in variants if v)
 
+    return terms
+
+
+def _ctx_metric_terms(ctx: str = "") -> Set[str]:
+    allowed = _parse_allowed_identifiers(ctx)
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    source_tables = list(allowed.keys()) if allowed else list(get_all_tables() or [])
+    terms: Set[str] = set()
+
+    for table in source_tables:
+        t = str(table or "").strip().lower().strip("`")
+        if not t:
+            continue
+        if allowed:
+            cols = list(allowed.get(table, set()) or [])
+        else:
+            try:
+                cols = list(analyzer.get_table_columns(t)) if analyzer is not None else []
+            except Exception:
+                cols = []
+
+        for col in cols:
+            c = str(col or "").strip().strip("`")
+            if not c:
+                continue
+            c_low = c.lower()
+            if c_low.endswith(("id", "number", "code", "key")):
+                continue
+            role = str(get_column_role(t, c) or "").strip().lower()
+            col_terms = {
+                tok
+                for tok in re.findall(
+                    r"[a-z0-9]+",
+                    re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", c).replace("_", " ").lower(),
+                )
+                if tok
+            }
+            if role in {"metric", "measure", "amount", "quantity"} or col_terms.intersection(HELPERS_ROLLUP_LEGACY_METRIC_TERMS):
+                terms.update(col_terms)
+
+    if not terms:
+        terms.update(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
     return terms
 
 def _build_entity_kw(ctx: str = "") -> str:
@@ -9515,14 +9562,17 @@ def _question_wants_hierarchical_metric_rollup(question: str, ctx: str = "") -> 
     asks_for_each = bool(
         re.search(r"\b(?:for\s+each|per|every)\b", q, flags=re.I)
     )
-    asks_total_metric = bool(
-        re.search(r"\b(?:total|sum|jumlah)\b", q, flags=re.I)
-        and re.search(
-            r"\b(?:amount|value|revenue|sales|price|quantity|cost|spend|paid|payment)\b",
-            q,
-            flags=re.I,
-        )
-    )
+    metric_terms = sorted(_ctx_metric_terms(ctx), key=len, reverse=True)
+    asks_total_metric = False
+    if re.search(r"\b(?:total|sum|jumlah)\b", q, flags=re.I):
+        for term in metric_terms:
+            tt = str(term or "").strip()
+            if not tt:
+                continue
+            pat = re.escape(tt).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pat}\b", q, flags=re.I):
+                asks_total_metric = True
+                break
     if not (asks_for_each and asks_total_metric):
         return False
 
