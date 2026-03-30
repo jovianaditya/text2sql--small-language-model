@@ -7602,7 +7602,17 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
         cands: List[str],
         seen_norm: Set[str],
         preferred_aliases: Optional[Set[str]] = None,
+        prefer_functions: bool = False,
     ) -> Optional[str]:
+        if prefer_functions:
+            for c in cands:
+                c0 = (c or "").strip()
+                if not c0:
+                    continue
+                if _norm_expr(c0) in seen_norm:
+                    continue
+                if "(" in c0:
+                    return c0
         preferred_hits: List[str] = []
         for c in cands:
             c0 = (c or "").strip()
@@ -7763,23 +7773,213 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
     if date_primary_same_date_tie:
         return sql
 
-    def _family_from_question(prefix_pat: str) -> Optional[str]:
-        if re.search(prefix_pat + r".{0,64}\b(?:quantity|qty|unit|units|volume)\b", q, flags=re.I | re.S):
-            return "quantity"
-        if re.search(prefix_pat + r".{0,64}\b(?:sales|revenue|amount|value|price)\b", q, flags=re.I | re.S):
+    alias_to_table = _parse_from_join_aliases(sql)
+    for m_tbl in re.finditer(
+        r"\b(?:from|join)\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)",
+        sql or "",
+        flags=re.I,
+    ):
+        table_raw = str(m_tbl.group("table") or "").replace("`", "")
+        table_name = table_raw.split(".")[-1].strip()
+        if not table_name:
+            continue
+        alias_to_table.setdefault(table_name, table_name)
+        alias_to_table.setdefault(table_name.lower(), table_name)
+
+    table_universe = {
+        str(table or "").strip().lower()
+        for table in alias_to_table.values()
+        if str(table or "").strip()
+    }
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    entity_noise_terms: Set[str] = set()
+    for table_name in table_universe:
+        base_terms = {table_name, _to_singular(table_name)}
+        for base_term in base_terms:
+            if not base_term:
+                continue
+            entity_noise_terms.update(
+                tok for tok in re.findall(r"[a-z0-9]+", base_term.replace("_", " ").lower()) if tok
+            )
+
+    column_term_cache: Dict[Tuple[str, str], Set[str]] = {}
+
+    def _text_semantic_terms(text: str) -> Set[str]:
+        normalized = re.sub(
+            r"([a-z0-9])([A-Z])",
+            r"\1 \2",
+            str(text or "").replace("_", " "),
+        ).lower()
+        return {tok for tok in re.findall(r"[a-z0-9]+", normalized) if tok}
+
+    def _column_semantic_terms(table_l: str, col_l: str) -> Set[str]:
+        key = (table_l, col_l)
+        if key in column_term_cache:
+            return column_term_cache[key]
+
+        terms: Set[str] = set()
+        candidate_texts = [col_l]
+        try:
+            if analyzer is not None:
+                candidate_texts.extend(analyzer.get_column_synonyms(table_l, col_l) or [])
+        except Exception:
+            pass
+
+        for text in candidate_texts:
+            terms.update(_text_semantic_terms(text))
+
+        try:
+            role = str(get_column_role(table_l, col_l) or "").strip().lower()
+        except Exception:
+            role = ""
+        if role:
+            terms.add(role)
+
+        column_term_cache[key] = {term for term in terms if term}
+        return column_term_cache[key]
+
+    def _expr_terms(item: str) -> Set[str]:
+        terms: Set[str] = set(_text_semantic_terms(item))
+        for qual, col in re.findall(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+            item or "",
+            flags=re.I,
+        ):
+            table_l = str(alias_to_table.get(qual) or alias_to_table.get(qual.lower()) or qual).strip().lower()
+            col_l = str(col or "").strip().lower()
+            if not table_l or not col_l:
+                continue
+            terms.update(_column_semantic_terms(table_l, col_l))
+            try:
+                id_col = str(get_id_column(table_l) or "").strip().lower()
+            except Exception:
+                id_col = ""
+            if id_col and col_l == id_col:
+                terms.add("id")
+                terms.add("identifier")
+        return {term for term in terms if term}
+
+    family_terms: Dict[str, Set[str]] = {
+        "quantity": {"quantity", "quantities", "qty", "unit", "units", "volume", "stock", "stocked"},
+        "value": {
+            "sales", "sale", "revenue", "revenues", "amount", "amounts",
+            "value", "values", "price", "prices", "cost", "costs",
+            "gross", "net", "paid", "payment", "payments",
+        },
+        "count": {"count", "counts", "num", "number", "numbers", "frequency", "frequencies"},
+    }
+    metric_term_universe = _dual_fact_metric_term_universe(table_universe, analyzer=analyzer)
+    for term in (metric_term_universe | HELPERS_ROLLUP_LEGACY_METRIC_TERMS):
+        tokenized = _text_semantic_terms(term)
+        tokenized = {
+            tok for tok in tokenized
+            if tok and tok not in entity_noise_terms and tok not in HELPERS_METRIC_AGG_IDLIKE_TOKENS
+        }
+        if not tokenized:
+            continue
+        for family_name, base_terms in family_terms.items():
+            if tokenized & base_terms:
+                family_terms[family_name].update(tokenized)
+
+    identifier_terms = {"id", "identifier", "code", "number", "numbers", "key"}
+
+    def _family_from_terms(item: str, terms: Set[str]) -> Optional[str]:
+        item_l = str(item or "").lower()
+        if "*" in item_l and (terms & family_terms["value"]) and (terms & family_terms["quantity"]):
             return "value"
-        if re.search(prefix_pat + r".{0,64}\b(?:count|number\s+of)\b", q, flags=re.I | re.S):
-            return "count"
-        return None
+        scores = {
+            family_name: len(terms & term_set)
+            for family_name, term_set in family_terms.items()
+        }
+        best_family, best_score = max(scores.items(), key=lambda kv: kv[1])
+        if best_score <= 0:
+            return None
+        if sum(1 for score in scores.values() if score == best_score) > 1:
+            if (terms & family_terms["value"]) and re.search(r"[*\/+-]", item_l):
+                return "value"
+            return None
+        return best_family
+
+    def _family_from_question(prefix_pat: str) -> Optional[str]:
+        m = re.search(prefix_pat + r"(?P<seg>.{0,96})", q, flags=re.I | re.S)
+        if not m:
+            return None
+        segment_terms = _text_semantic_terms(m.group("seg") or "")
+        return _family_from_terms(m.group("seg") or "", segment_terms)
+
+    def _family_from_superlative(segment: str) -> Optional[str]:
+        seg = str(segment or "")
+        if not seg:
+            return None
+        return _family_from_terms(seg, _text_semantic_terms(seg))
+
+    def _family_pattern(term_set: Set[str], default: str) -> str:
+        return _regex_alt_from_terms(term_set, default)
+
+    quantity_alt = _family_pattern(
+        family_terms["quantity"],
+        r"(?:quantity|qty|unit|units|volume|stock)",
+    )
+    value_alt = _family_pattern(
+        family_terms["value"],
+        r"(?:sales|revenue|amount|value|price|cost)",
+    )
+    count_alt = _family_pattern(
+        family_terms["count"],
+        r"(?:count|number(?:\s+of)?|num|frequency)",
+    )
+
+    def _qualified_refs() -> List[str]:
+        return list(dict.fromkeys(re.findall(
+            r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\b",
+            sql or "",
+            flags=re.I,
+        )))
+
+    qualified_refs = _qualified_refs()
+    aggregate_exprs = list(dict.fromkeys(re.findall(
+        r"\b(?:SUM|COUNT|AVG|MIN|MAX)\s*\([^)]*\)",
+        sql or "",
+        flags=re.I,
+    )))
+    metric_fallbacks = {
+        family_name: (
+            [
+                expr for expr in aggregate_exprs
+                if _family_from_terms(expr, _expr_terms(expr)) == family_name
+            ]
+            + [
+                ref for ref in qualified_refs
+                if _family_from_terms(ref, _expr_terms(ref)) == family_name
+            ]
+        )
+        for family_name in ("quantity", "value", "count")
+    }
+    identifier_fallbacks = [
+        ref for ref in qualified_refs
+        if _expr_terms(ref) & identifier_terms
+    ]
+
+    def _metric_family(item: str) -> Optional[str]:
+        return _family_from_terms(item, _expr_terms(item))
+
+    def _is_identifier_expr(item: str) -> bool:
+        return bool(_expr_terms(item) & identifier_terms)
 
     primary_family = _family_from_question(r"\b(?:based\s+on|according\s+to|ranked\s+by|sorted\s+by)\b")
     if primary_family is None:
-        if re.search(r"\b(?:best[-\s]?selling|top|highest|largest|most)\b.{0,64}\b(?:quantity|qty|unit|units|volume)\b", q, flags=re.I | re.S):
+        if re.search(rf"\b(?:best[-\s]?selling|top|highest|largest|most)\b.{0,64}\b{quantity_alt}\b", q, flags=re.I | re.S):
             primary_family = "quantity"
-        elif re.search(r"\b(?:best|top|highest|largest|most)\b.{0,64}\b(?:sales|revenue|amount|value|price)\b", q, flags=re.I | re.S):
+        elif re.search(rf"\b(?:best|top|highest|largest|most)\b.{0,64}\b{value_alt}\b", q, flags=re.I | re.S):
             primary_family = "value"
-        elif re.search(r"\b(?:most|highest|largest)\b.{0,64}\b(?:count|number\s+of)\b", q, flags=re.I | re.S):
+        elif re.search(rf"\b(?:most|highest|largest)\b.{0,64}\b{count_alt}\b", q, flags=re.I | re.S):
             primary_family = "count"
+        else:
+            primary_family = _family_from_superlative(q)
     if primary_family is None:
         return sql
 
@@ -7787,43 +7987,6 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
     wants_smaller_identifier = bool(
         re.search(r"\b(?:smaller|lowest|smallest|lower)\b.{0,32}\b(?:code|id|number|key)\b", q, flags=re.I | re.S)
     )
-
-    rownum_pat = re.compile(
-        r"(?is)ROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*(?:PARTITION\s+BY\s+.*?\b)?ORDER\s+BY\s+(?P<ob>[^)]*?)\)"
-    )
-
-    metric_fallbacks = {
-        "quantity": re.findall(
-            r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:quantity|qty|unit|units|volume)[A-Za-z0-9_]*)\b",
-            sql or "",
-            flags=re.I,
-        ),
-        "value": re.findall(
-            r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:sales|revenue|amount|value|price)[A-Za-z0-9_]*)\b",
-            sql or "",
-            flags=re.I,
-        ),
-        "count": re.findall(
-            r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z0-9_]*(?:count|total_count|num|number)[A-Za-z0-9_]*)\b",
-            sql or "",
-            flags=re.I,
-        ),
-    }
-    identifier_fallbacks = re.findall(
-        r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:code|id|number|key)[A-Za-z0-9_]*)\b",
-        sql or "",
-        flags=re.I,
-    )
-
-    def _metric_family(item: str) -> Optional[str]:
-        x = (item or "").lower()
-        if any(tok in x for tok in ("quantity", "qty", " unit", ".unit", "units", "volume")):
-            return "quantity"
-        if any(tok in x for tok in ("sales", "revenue", "amount", "value", "price")):
-            return "value"
-        if any(tok in x for tok in ("count", "num", "number")):
-            return "count"
-        return None
 
     def _force_dir(item: str, desc: bool) -> str:
         base = re.sub(r"(?is)\s+(ASC|DESC)\s*$", "", (item or "").strip()).strip()
@@ -7839,7 +8002,17 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
         cands: List[str],
         seen_norm: Set[str],
         preferred_aliases: Optional[Set[str]] = None,
+        prefer_functions: bool = False,
     ) -> Optional[str]:
+        if prefer_functions:
+            for c in cands:
+                c0 = (c or "").strip()
+                if not c0:
+                    continue
+                if _norm_expr(c0) in seen_norm:
+                    continue
+                if "(" in c0:
+                    return c0
         preferred_hits: List[str] = []
         for c in cands:
             c0 = (c or "").strip()
@@ -7867,14 +8040,14 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
                 return c0
         return None
 
-    def _repl(m: re.Match) -> str:
-        ob = (m.group("ob") or "").strip()
+    def _rewrite_order_by(ob: str, window_sql: str) -> Optional[str]:
+        ob = (ob or "").strip()
         if not ob:
-            return m.group(0)
+            return None
 
         items = _split_top_level_commas(ob)
         if not items:
-            return m.group(0)
+            return None
 
         current_families = [_metric_family(it) for it in items]
         needs_rewrite = False
@@ -7894,11 +8067,11 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
             needs_rewrite = True
 
         if not needs_rewrite:
-            return m.group(0)
+            return None
 
         current_aliases = {
             alias.lower()
-            for alias in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", ob, flags=re.I)
+            for alias in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", window_sql, flags=re.I)
             if alias
         }
 
@@ -7914,7 +8087,7 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
                 primary_items.append(_force_dir(it0, desc=True))
             elif tie_family and fam == tie_family:
                 secondary_items.append(_force_dir(it0, desc=True))
-            elif any(tok in it0.lower() for tok in ("code", "id", "number", "key")):
+            elif _is_identifier_expr(it0):
                 id_items.append(_force_dir(it0, desc=False if wants_smaller_identifier else False))
             else:
                 other_items.append(it0)
@@ -7925,9 +8098,10 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
                 metric_fallbacks.get(primary_family, []),
                 seen_norm,
                 current_aliases,
+                prefer_functions=True,
             )
             if not fb_primary:
-                return m.group(0)
+                return None
             primary_items.append(_force_dir(fb_primary, desc=True))
             seen_norm.add(_norm_expr(fb_primary))
 
@@ -7936,6 +8110,7 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
                 metric_fallbacks.get(tie_family, []),
                 seen_norm,
                 current_aliases,
+                prefer_functions=True,
             )
             if fb_secondary:
                 secondary_items.append(_force_dir(fb_secondary, desc=True))
@@ -7956,15 +8131,72 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
             dedup_seen.add(k)
             dedup_items.append(it)
         if not dedup_items:
-            return m.group(0)
+            return None
         if [_norm_expr(x) for x in dedup_items] == [_norm_expr(x) for x in items]:
-            return m.group(0)
+            return None
 
-        new_ob = ", ".join(dedup_items)
-        full = m.group(0)
-        return full.replace(ob, new_ob, 1)
+        return ", ".join(dedup_items)
 
-    return rownum_pat.sub(_repl, sql)
+    rownum_start_pat = re.compile(r"(?is)ROW_NUMBER\s*\(\s*\)\s*OVER\s*\(")
+
+    def _find_matching_paren(text: str, open_idx: int) -> Optional[int]:
+        depth = 0
+        for idx in range(open_idx, len(text)):
+            ch = text[idx]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return idx
+        return None
+
+    def _find_top_level_order_by(inner: str) -> Optional[Tuple[int, int]]:
+        lower_inner = inner.lower()
+        depth = 0
+        idx = 0
+        while idx < len(inner):
+            ch = inner[idx]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif depth == 0 and lower_inner.startswith("order by", idx):
+                return idx, idx + len("order by")
+            idx += 1
+        return None
+
+    parts: List[str] = []
+    cursor = 0
+    while True:
+        m = rownum_start_pat.search(sql, cursor)
+        if not m:
+            parts.append(sql[cursor:])
+            break
+
+        over_open_idx = m.end() - 1
+        over_close_idx = _find_matching_paren(sql, over_open_idx)
+        if over_close_idx is None:
+            parts.append(sql[cursor:])
+            break
+
+        window_sql = sql[m.start():over_close_idx + 1]
+        inner_sql = sql[over_open_idx + 1:over_close_idx]
+        order_bounds = _find_top_level_order_by(inner_sql)
+        rewritten_window = window_sql
+        if order_bounds is not None:
+            order_start, order_kw_end = order_bounds
+            ob = inner_sql[order_kw_end:].strip()
+            new_ob = _rewrite_order_by(ob, window_sql)
+            if new_ob:
+                new_inner = inner_sql[:order_kw_end] + " " + new_ob
+                rewritten_window = sql[m.start():over_open_idx + 1] + new_inner + ")"
+
+        parts.append(sql[cursor:m.start()])
+        parts.append(rewritten_window)
+        cursor = over_close_idx + 1
+
+    return "".join(parts)
 
 def _force_restore_groupby_if_aggregate_without_groupby(sql_before, sql_after):
     """
