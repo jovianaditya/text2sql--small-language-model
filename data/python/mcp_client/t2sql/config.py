@@ -344,6 +344,50 @@ HELPERS_EXISTENCE_COMPAT_VERBS = set(
     )
 )
 
+HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES = tuple(
+    _env_json_list(
+        "HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES",
+        [
+            "including",
+            "with no",
+            "without any",
+            "without",
+            "never paid",
+            "even if no",
+            "include those without",
+            "termasuk",
+            "meskipun tidak",
+            "walaupun tidak",
+            "yang tidak punya",
+            "tanpa",
+            "belum",
+        ],
+    )
+)
+
+HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS = set(
+    _env_json_list(
+        "HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS",
+        [
+            "order",
+            "orders",
+            "payment",
+            "payments",
+            "transaction",
+            "transactions",
+            "purchase",
+            "purchases",
+        ],
+    )
+)
+
+HELPERS_INNER_JOIN_GENERIC_OBJECT_TERMS = set(
+    _env_json_list(
+        "HELPERS_INNER_JOIN_GENERIC_OBJECT_TERMS",
+        ["record", "records", "row", "rows", "entry", "entries"],
+    )
+)
+
 HELPERS_ROLLUP_LEGACY_METRIC_TERMS = set(
     _env_json_list(
         "HELPERS_ROLLUP_LEGACY_METRIC_TERMS",

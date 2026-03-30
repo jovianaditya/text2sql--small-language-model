@@ -25,7 +25,15 @@ from .schema_analyzer import (
     get_table_synonyms,
     get_singular_form,
 )
-from .config import ALIAS_MAX_LEN, HELPERS_ROLLUP_LEGACY_METRIC_TERMS
+from .config import (
+    ALIAS_MAX_LEN,
+    HELPERS_EXISTENCE_COMPAT_VERBS,
+    HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
+    HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS,
+    HELPERS_INNER_JOIN_GENERIC_OBJECT_TERMS,
+    HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES,
+    HELPERS_ROLLUP_LEGACY_METRIC_TERMS,
+)
 from .rulebook import (
     any_phrase_in_text,
     identifier_id_like_terms,
@@ -304,6 +312,112 @@ def _build_entity_kw(ctx: str = "") -> str:
     escaped = sorted((re.escape(t) for t in terms), key=len, reverse=True)
     return f"(?:{'|'.join(escaped)})"
 
+
+def _regex_alt_from_terms(terms: Set[str], default: str) -> str:
+    escaped: List[str] = []
+    for term in sorted((t for t in terms if t), key=len, reverse=True):
+        pattern = re.escape(term)
+        pattern = pattern.replace(r"\ ", r"\s+")
+        escaped.append(pattern)
+    return f"(?:{'|'.join(escaped)})" if escaped else default
+
+
+def _table_object_terms(table: str) -> Set[str]:
+    t = (table or "").strip().lower().strip("`")
+    if not t:
+        return set()
+
+    terms: Set[str] = set()
+    singular = _to_singular(t)
+    for base in {t, singular}:
+        if not base:
+            continue
+        terms.add(base)
+        if "_" in base:
+            terms.add(base.replace("_", " "))
+
+    try:
+        synonyms = get_table_synonyms(t)
+    except Exception:
+        synonyms = []
+
+    for syn in synonyms:
+        s = str(syn or "").strip().lower()
+        if not s:
+            continue
+        singular_syn = _to_singular(s)
+        for base in {s, singular_syn}:
+            if not base:
+                continue
+            terms.add(base)
+            if "_" in base:
+                terms.add(base.replace("_", " "))
+
+    return {term for term in terms if term}
+
+
+def _table_support_action_terms(table: str) -> Set[str]:
+    stems: Set[str] = set()
+    for term in _table_object_terms(table):
+        compact = re.sub(r"[^a-z]", "", str(term or "").lower())
+        if not compact or len(compact) < 3:
+            continue
+        stems.add(compact)
+        if compact.endswith("s") and len(compact) >= 4:
+            stems.add(compact[:-1])
+        if compact.endswith("ment") and len(compact) >= 6:
+            stems.add(compact[:-4])
+
+    actions: Set[str] = set()
+    for stem in list(stems):
+        if not stem or len(stem) < 3:
+            continue
+        if stem.endswith("e"):
+            actions.add(f"{stem}d")
+            if len(stem) > 1:
+                actions.add(f"{stem[:-1]}ing")
+        else:
+            actions.add(f"{stem}ed")
+            actions.add(f"{stem}ing")
+        if stem.endswith("y") and len(stem) > 3:
+            actions.add(f"{stem[:-1]}ied")
+
+    if "pay" in stems:
+        actions.add("paid")
+
+    return {action for action in actions if action and len(action) >= 4}
+
+
+def _inner_join_object_tables(ctx: str = "") -> Set[str]:
+    allowed = _parse_allowed_identifiers(ctx)
+    scoped_tables = {t.lower() for t in allowed.keys()} if allowed else set()
+    try:
+        tx_tables = {t.lower() for t in get_transaction_tables()}
+    except Exception:
+        tx_tables = set()
+
+    if scoped_tables and tx_tables:
+        return scoped_tables.intersection(tx_tables)
+    if tx_tables:
+        return tx_tables
+    return set()
+
+
+def _inner_join_specific_object_terms(ctx: str = "") -> Set[str]:
+    obj_terms: Set[str] = set()
+    for table in _inner_join_object_tables(ctx):
+        obj_terms.update(_table_object_terms(table))
+    if not obj_terms:
+        obj_terms.update(HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS)
+    return {term for term in obj_terms if term}
+
+
+def _inner_join_action_terms(ctx: str = "") -> Set[str]:
+    verbs: Set[str] = set(HELPERS_EXISTENCE_COMPAT_VERBS)
+    for table in _inner_join_object_tables(ctx):
+        verbs.update(_table_support_action_terms(table))
+    return {verb for verb in verbs if verb and verb not in HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC}
+
 def _canonicalize_table_names(sql: str, ctx: str) -> str:
     """
     Rewrite nama table di FROM/JOIN agar sesuai persis dengan ALLOWED IDENTIFIERS (termasuk casing).
@@ -421,13 +535,7 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
     entity_terms = _entity_terms_from_ctx(ctx)
 
     # include-zero intent should win over inner-join filtering
-    include_zero_overrides = [
-        "including", "with no", "without any", "without",
-        "never paid", "even if no", "include those without",
-        "termasuk", "meskipun tidak", "walaupun tidak", "yang tidak punya",
-        "tanpa", "belum",
-    ]
-    if any(s in q for s in include_zero_overrides):
+    if any(s in q for s in HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES):
         if re.search(rf"\b{entity_kw}\b", q, flags=re.I):
             return False
 
@@ -445,53 +553,18 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
     #
     # Build candidate "existence object" terms from transaction-like tables
     # in schema metadata, narrowed by ALLOWED IDENTIFIERS when available.
-    allowed = _parse_allowed_identifiers(ctx)
-    scoped_tables = {t.lower() for t in allowed.keys()} if allowed else set()
-    try:
-        tx_tables = {t.lower() for t in get_transaction_tables()}
-    except Exception:
-        tx_tables = set()
-
-    if scoped_tables and tx_tables:
-        obj_tables = scoped_tables.intersection(tx_tables)
-    elif tx_tables:
-        obj_tables = tx_tables
-    else:
-        obj_tables = set()
-
-    obj_terms: Set[str] = set()
-    for t in obj_tables:
-        t0 = (t or "").strip().strip("`")
-        if not t0:
-            continue
-        singular = _to_singular(t0)
-        variants = {t0, singular}
-        if "_" in t0:
-            variants.add(t0.replace("_", " "))
-        if "_" in singular:
-            variants.add(singular.replace("_", " "))
-        obj_terms.update(v for v in variants if v)
-        try:
-            for syn in get_table_synonyms(t0):
-                s = (syn or "").lower().strip()
-                if not s:
-                    continue
-                obj_terms.add(s)
-                obj_terms.add(_to_singular(s))
-        except Exception:
-            pass
-
-    # Conservative lexical fallback if metadata is unavailable.
-    if not obj_terms:
-        obj_terms = {"order", "orders", "payment", "payments", "transaction", "transactions", "purchase", "purchases"}
-
-    # Generic row-record words are useful for prompts like:
-    # "have at least one row in the payments table"
-    generic_obj_terms = {"record", "records", "row", "rows", "entry", "entries"}
-    obj_terms.update(generic_obj_terms)
-
-    escaped_obj = sorted((re.escape(t) for t in obj_terms if t), key=len, reverse=True)
-    existence_object = f"(?:{'|'.join(escaped_obj)})" if escaped_obj else r"(?:records?|rows?)"
+    specific_obj_terms = _inner_join_specific_object_terms(ctx)
+    obj_terms = set(specific_obj_terms)
+    obj_terms.update(HELPERS_INNER_JOIN_GENERIC_OBJECT_TERMS)
+    existence_object = _regex_alt_from_terms(obj_terms, r"(?:records?|rows?)")
+    specific_existence_object = _regex_alt_from_terms(
+        specific_obj_terms,
+        r"(?:orders?|payments?|transactions?|purchases?)",
+    )
+    support_action = _regex_alt_from_terms(
+        _inner_join_action_terms(ctx),
+        r"(?:ordered|placed|made|paid|purchased|bought)",
+    )
     has_entity_mention = re.search(rf"\b{entity_kw}\b", q, flags=re.I) is not None
     has_existence_object = re.search(rf"\b{existence_object}\b", q, flags=re.I) is not None
     has_existence_connector = (
@@ -564,7 +637,7 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
         \b(?:have|has|had)\b
         (?:\s+\w+){{0,4}}
         \s+
-        \b(?:ordered|placed|made|paid|purchased|bought|orders?|payments?|transactions?|purchases?)\b
+        \b(?:{support_action}|{specific_existence_object})\b
     """
     if re.search(pat_relative_clause, q, flags=re.I | re.X):
         return True
@@ -575,7 +648,7 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
         .*?
         \b(?:with|having)\b
         (?:\s+\w+){{0,4}}
-        \b(?:orders?|payments?|transactions?|purchases?)\b
+        \b{specific_existence_object}\b
     """
     if re.search(pat_with_having, q, flags=re.I | re.X):
         return True
@@ -594,14 +667,7 @@ def _question_wants_include_zero(question: str, ctx: str = "") -> bool:
         return False
 
     # --- LOGIKA SIGNALS (Tetap sama) ---
-    explicit_signals = [
-        "including", "with no", "without any", "without",
-        "never paid", "even if no", "include those without",
-        "termasuk", "meskipun tidak", "walaupun tidak", "yang tidak punya",
-        "tanpa", "belum",
-    ]
-
-    if any(s in q for s in explicit_signals):
+    if any(s in q for s in HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES):
         # Require at least one entity mention for generic terms
         if re.search(rf"\b{entity_kw}\b", q, flags=re.I):
             return True
