@@ -16529,6 +16529,9 @@ def _question_requests_ordering(question: str) -> bool:
             return False
         pat = re.escape(p).replace(r"\ ", r"\s+")
         return re.search(rf"\b{pat}\b", q, flags=re.I) is not None
+
+    ordinal_token_pattern = r"(?:second|third|fourth|fifth|\d+(?:st|nd|rd|th))"
+    row_container_pattern = r"(?:row|rows|record|records|entry|entries|result|results|item|items|tuple|tuples)"
     
     # --- Pattern 1: Window function context (NOT final ORDER BY) ---
     # If "ascending/descending order" appears with ranking context, skip it
@@ -16543,15 +16546,25 @@ def _question_requests_ordering(question: str) -> bool:
             r"\bpartition\s+by\b.*\b(ascending|descending)\b",
             r"\bbased\s+on\b.*\b(ascending|descending)\s+order\b",
             r"\b(cumulative|running)\b.*\bordered\s+by\b",
-            r"\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b.*\b(sorted|ordered)\s+by\b",
-            r"\b(sorted|ordered)\s+by\b.*\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b",
+            rf"\b{ordinal_token_pattern}\b.*\b(sorted|ordered)\s+by\b",
+            rf"\b(sorted|ordered)\s+by\b.*\b{ordinal_token_pattern}\b",
         ],
     )
-    
-    has_window_context = any(re.search(pat, q) for pat in window_context_patterns)
+
+    sequence_window_patterns = [
+        r"\b(?:previous|next|prior|following|lag|lead)\b.*\b(?:sorted|ordered)\s+by\b",
+        r"\b(?:sorted|ordered)\s+by\b.*\b(?:previous|next|prior|following|lag|lead)\b",
+    ]
+
+    has_window_context = any(re.search(pat, q) for pat in window_context_patterns) or any(
+        re.search(pat, q, flags=re.I) for pat in sequence_window_patterns
+    )
     ordinal_row_context = bool(
-        re.search(r"\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b", q, flags=re.I)
-        and re.search(r"\b(row|rows|record|records|payment|payments|order|orders)\b", q, flags=re.I)
+        re.search(rf"\b{ordinal_token_pattern}\b", q, flags=re.I)
+        and (
+            re.search(rf"\b{row_container_pattern}\b", q, flags=re.I)
+            or re.search(r"\b(?:sorted|ordered)\s+by\b", q, flags=re.I)
+        )
     )
     
     # --- Pattern 2: Explicit final ordering keywords ---
@@ -16615,7 +16628,7 @@ def _question_requests_ordering(question: str) -> bool:
 
     first_last_row_selection_patterns = [
         r"\b(?:first|last)\s+\d+\b",
-        r"\b(?:first|last)\s+(?:row|rows|record|records|entry|entries|result|results)\b",
+        rf"\b(?:first|last)\s+{row_container_pattern}\b",
         r"\b(?:the\s+)?(?:first|last)\s+page\b",
     ]
     has_first_last_row_selection = any(re.search(pat, q) for pat in first_last_row_selection_patterns)

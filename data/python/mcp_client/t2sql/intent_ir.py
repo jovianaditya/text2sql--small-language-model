@@ -25,21 +25,21 @@ from .schema_analyzer import (
 )
 
 
-_NUMERIC_HINTS = (
+_BASE_NUMERIC_HINTS = (
     "amount",
     "total",
     "price",
     "quantity",
-    "stock",
-    "msrp",
-    "revenue",
-    "sales",
     "cost",
     "rate",
     "count",
     "number",
+    "value",
+    "percent",
+    "ratio",
     "limit",
 )
+_LEGACY_NUMERIC_FALLBACK_HINTS = {"stock", "msrp", "revenue", "sales"}
 _DATE_HINTS = ("date", "time", "timestamp", "year", "month", "day")
 _NUMBER_TOKEN_PATTERN = r"-?\d[\d,]*(?:\.\d+)?"
 _NUMBER_WORDS = {
@@ -76,6 +76,7 @@ _LEXICAL_MATCH_STOP_TOKENS = _FUNCTION_WORD_TOKENS.union(
         "more", "less", "least", "most", "minimum", "maximum",
     }
 )
+_NUMERIC_HINT_TERMS_CACHE: Optional[Set[str]] = None
 
 
 def _fallback_singular(table: str) -> str:
@@ -345,7 +346,7 @@ def _is_numeric_column(col: str) -> bool:
         return False
     words = _camel_to_words(col or "")
     tokens = {t for t in re.findall(r"[a-z0-9]+", words) if t}
-    return any(k in tokens for k in _NUMERIC_HINTS)
+    return any(k in tokens for k in _numeric_hint_terms())
 
 
 def _is_date_column(col: str) -> bool:
@@ -438,6 +439,59 @@ def _column_semantic_tokens(table: str, column: str) -> Set[str]:
     return tokens
 
 
+def _numeric_hint_terms() -> Set[str]:
+    global _NUMERIC_HINT_TERMS_CACHE
+    if _NUMERIC_HINT_TERMS_CACHE is not None:
+        return set(_NUMERIC_HINT_TERMS_CACHE)
+
+    hints: Set[str] = {str(tok).lower() for tok in _BASE_NUMERIC_HINTS if str(tok).strip()}
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    try:
+        schema_tables = list(get_all_tables() or [])
+    except Exception:
+        schema_tables = []
+
+    numeric_roles = {"metric", "measure", "amount", "quantity"}
+    schema_enriched = False
+    for table in schema_tables:
+        t = str(table or "").strip().lower()
+        if not t:
+            continue
+        try:
+            table_columns = list(analyzer.get_table_columns(t)) if analyzer is not None else []
+        except Exception:
+            table_columns = []
+        for col in table_columns:
+            c = str(col or "").strip()
+            if not c:
+                continue
+            c_low = c.lower()
+            if c_low.endswith(("id", "number", "code", "key")):
+                continue
+
+            role = ""
+            try:
+                if analyzer is not None:
+                    role = str(analyzer._column_roles.get(t, {}).get(c_low, "") or "").lower()
+            except Exception:
+                role = ""
+
+            semantic_terms = _column_semantic_tokens(t, c)
+            if role in numeric_roles or semantic_terms.intersection(hints):
+                schema_enriched = True
+                hints.update(semantic_terms)
+
+    if not schema_enriched:
+        hints.update(_LEGACY_NUMERIC_FALLBACK_HINTS)
+
+    _NUMERIC_HINT_TERMS_CACHE = set(hints)
+    return set(_NUMERIC_HINT_TERMS_CACHE)
+
+
 def _best_semantic_column_match(
     text: str,
     table: str,
@@ -471,7 +525,7 @@ def _best_semantic_column_match(
 
         score = float(len(overlap))
         score += (len(overlap) / max(len(col_tokens), 1)) * 0.5
-        if any(tok in _NUMERIC_HINTS for tok in overlap):
+        if any(tok in _numeric_hint_terms() for tok in overlap):
             score += 0.35
 
         if score > best_score or (score == best_score and best_col is not None and len(col) < len(best_col)):
@@ -755,12 +809,7 @@ def _detect_metrics(
     metrics: List[IRMetric] = []
 
     wants_count = bool(re.search(r"\b(how\s+many|number\s+of|count|total\s+number)\b", q))
-    wants_sum = bool(
-        re.search(
-            r"\b(sum|total\s+(?:amount|paid|payment|payments|quantity|value|sales?|revenue|cost|price|stock)|jumlah)\b",
-            q,
-        )
-    )
+    has_explicit_sum_signal = bool(re.search(r"\b(?:sum(?:\s+of)?|jumlah)\b", q))
     wants_avg = bool(re.search(r"\b(avg|average|mean|rata)\b", q))
     has_explicit_max = bool(re.search(r"\bmax(?:imum)?\b", q))
     has_explicit_min = bool(re.search(r"\bmin(?:imum)?\b", q))
@@ -818,6 +867,47 @@ def _detect_metrics(
 
     mentioned_tables = [t for t, _ in table_mentions]
     first_mentioned = mentioned_tables[0] if mentioned_tables else subject
+
+    column_mentioned_tables = [t for t, _, _ in column_mentions]
+    metric_target_tables = list(
+        dict.fromkeys(mentioned_tables + column_mentioned_tables + [subject])
+    )
+    if not metric_target_tables:
+        metric_target_tables = [subject]
+
+    def _question_requests_total_metric() -> bool:
+        if not re.search(r"\btotal\b", q, flags=re.I):
+            return False
+        if re.search(r"\btotal\s+(?:number|count)(?:\s+of)?\b", q, flags=re.I):
+            return False
+
+        candidate_phrases = [question]
+        candidate_phrases.extend(
+            str(m.group(1) or "").strip()
+            for m in re.finditer(r"\btotal\s+([a-z][a-z0-9_ ]{1,48})\b", q, flags=re.I)
+        )
+        candidate_phrases = [p for p in candidate_phrases if p]
+        if not candidate_phrases:
+            return False
+
+        for phrase in candidate_phrases:
+            for table_name in metric_target_tables:
+                matched = _best_semantic_column_match(
+                    text=phrase,
+                    table=table_name,
+                    allowed=allowed,
+                    numeric_only=True,
+                    min_score=1.0,
+                )
+                if matched:
+                    return True
+
+        return any(
+            t in metric_target_tables and _is_numeric_column(c)
+            for (t, c, _) in column_mentions
+        )
+
+    wants_sum = bool(has_explicit_sum_signal or _question_requests_total_metric())
 
     def _resolve_table_from_phrase(phrase: str) -> Optional[str]:
         p = (phrase or "").lower().strip()
@@ -1281,13 +1371,67 @@ def _detect_filters(
                 return
         filters.append(f)
 
-    def _pick_text_target_column() -> Optional[Tuple[str, str]]:
+    def _pick_text_target_column(anchor_pos: Optional[int] = None) -> Optional[Tuple[str, str]]:
         # Prefer explicit "check number" mention when present.
         if re.search(r"\bcheck\s+number\b", q):
             for c in allowed.get(subject, set()):
                 cl = c.lower()
                 if "check" in cl and "number" in cl:
                     return (subject, c)
+        if anchor_pos is not None:
+            window_start = max(0, anchor_pos - 80)
+            window_end = min(len(q), anchor_pos + 24)
+            anchor_window = q[window_start:window_end]
+            anchor_tokens = set(
+                _tokenize_for_match(
+                    anchor_window,
+                    stop_tokens=_LEXICAL_MATCH_STOP_TOKENS.union(
+                        {
+                            "start",
+                            "starts",
+                            "begin",
+                            "begins",
+                            "followed",
+                            "exactly",
+                            "digit",
+                            "digits",
+                            "letter",
+                            "letters",
+                        }
+                    ),
+                )
+            )
+
+            best_local: Optional[Tuple[str, str]] = None
+            best_score = float("-inf")
+            best_distance = 10**9
+            for t, c, pos in column_mentions:
+                if _is_date_column(c):
+                    continue
+                cl = c.lower()
+                is_id_like = cl.endswith(("id", "number", "code", "key"))
+                semantic_tokens = _column_semantic_tokens(t, c)
+                overlap = anchor_tokens.intersection(semantic_tokens)
+                distance = abs(pos - anchor_pos)
+
+                score = float(len(overlap) * 3)
+                if pos <= anchor_pos:
+                    score += 0.6
+                score += max(0.0, 1.5 - (distance / 40.0))
+                if not _is_numeric_column(c) and not is_id_like:
+                    score += 1.0
+                elif is_id_like:
+                    score -= 1.0
+
+                if overlap and (
+                    score > best_score or (score == best_score and distance < best_distance)
+                ):
+                    best_local = (t, c)
+                    best_score = score
+                    best_distance = distance
+
+            if best_local is not None:
+                return best_local
         # Fallback to first non-numeric/non-date mention.
         for t, c, _ in column_mentions:
             if not _is_numeric_column(c) and not _is_date_column(c):
@@ -1575,7 +1719,7 @@ def _detect_filters(
                 regex = f"^[A-Z]{{{n_letters}}}[0-9]{{{n_digits}}}[0-9]$"
             else:
                 regex = f"^[A-Z]{{{n_letters}}}[0-9]{{{n_digits}}}$"
-            target = _pick_text_target_column()
+            target = _pick_text_target_column(anchor_pos=m_upper_start.start())
             if target:
                 add_filter(IRFilter(table=target[0], column=target[1], op="regexp", value=regex))
                 strict_regex_applied = True
@@ -1619,7 +1763,7 @@ def _detect_filters(
                 if name_col:
                     target = (subject, name_col)
             if not target:
-                target = _pick_text_target_column()
+                target = _pick_text_target_column(anchor_pos=m_prefix.start())
             if target and token:
                 exact_digits = re.search(
                     r"\bexactly\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+digits?\b",
