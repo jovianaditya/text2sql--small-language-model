@@ -520,6 +520,71 @@ HELPERS_ORDERING_ALPHABETIC_TERMS = set(
     )
 )
 
+HELPERS_ENTITY_GENERIC_FALLBACK_TERMS = set(
+    _env_json_list(
+        "HELPERS_ENTITY_GENERIC_FALLBACK_TERMS",
+        [
+            "entity",
+            "entities",
+            "record",
+            "records",
+            "row",
+            "rows",
+            "entry",
+            "entries",
+            "item",
+            "items",
+            "result",
+            "results",
+        ],
+    )
+)
+
+HELPERS_WINNER_ROW_GENERIC_OBJECT_TERMS = set(
+    _env_json_list(
+        "HELPERS_WINNER_ROW_GENERIC_OBJECT_TERMS",
+        [
+            "entity",
+            "entities",
+            "record",
+            "records",
+            "row",
+            "rows",
+            "entry",
+            "entries",
+            "item",
+            "items",
+            "result",
+            "results",
+            "tuple",
+            "tuples",
+        ],
+    )
+)
+
+HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS = set(
+    _env_json_list(
+        "HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS",
+        [
+            "amount",
+            "total",
+            "price",
+            "quantity",
+            "cost",
+            "value",
+            "rate",
+            "count",
+            "number",
+            "percent",
+            "ratio",
+            "limit",
+            "average",
+            "avg",
+            "mean",
+        ],
+    )
+)
+
 HELPERS_METRIC_AGG_INTENT_TERMS = set(
     _env_json_list(
         "HELPERS_METRIC_AGG_INTENT_TERMS",

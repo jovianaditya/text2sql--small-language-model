@@ -27,8 +27,10 @@ from .schema_analyzer import (
 )
 from .config import (
     ALIAS_MAX_LEN,
+    HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS,
     HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS,
     HELPERS_DUAL_FACT_FAMILY_STOPWORDS,
+    HELPERS_ENTITY_GENERIC_FALLBACK_TERMS,
     HELPERS_EXISTENCE_COMPAT_VERBS,
     HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
     HELPERS_HIERARCHICAL_COLLECTION_POSSESSIVES,
@@ -273,6 +275,8 @@ def _ctx_metric_terms(ctx: str = "") -> Set[str]:
 
     source_tables = list(allowed.keys()) if allowed else list(get_all_tables() or [])
     terms: Set[str] = set()
+    generic_metric_terms = set(HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS)
+    numeric_roles = {"metric", "measure", "amount", "quantity"}
 
     for table in source_tables:
         t = str(table or "").strip().lower().strip("`")
@@ -294,19 +298,27 @@ def _ctx_metric_terms(ctx: str = "") -> Set[str]:
             if c_low.endswith(("id", "number", "code", "key")):
                 continue
             role = str(get_column_role(t, c) or "").strip().lower()
-            col_terms = {
-                tok
-                for tok in re.findall(
-                    r"[a-z0-9]+",
-                    re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", c).replace("_", " ").lower(),
+            candidate_texts = [c]
+            try:
+                if analyzer is not None:
+                    candidate_texts.extend(analyzer.get_column_synonyms(t, c) or [])
+            except Exception:
+                pass
+            col_terms: Set[str] = set()
+            for text in candidate_texts:
+                col_terms.update(
+                    tok
+                    for tok in re.findall(
+                        r"[a-z0-9]+",
+                        re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or "")).replace("_", " ").lower(),
+                    )
+                    if tok
                 )
-                if tok
-            }
-            if role in {"metric", "measure", "amount", "quantity"} or col_terms.intersection(HELPERS_ROLLUP_LEGACY_METRIC_TERMS):
+            if role in numeric_roles or col_terms.intersection(generic_metric_terms):
                 terms.update(col_terms)
 
     if not terms:
-        terms.update(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+        terms.update(generic_metric_terms)
     return terms
 
 def _build_entity_kw(ctx: str = "") -> str:
@@ -316,7 +328,7 @@ def _build_entity_kw(ctx: str = "") -> str:
     """
     terms = _entity_terms_from_ctx(ctx)
     if not terms:
-        terms = {"customer", "product", "employee", "order", "office", "payment"}
+        terms = set(HELPERS_ENTITY_GENERIC_FALLBACK_TERMS)
 
     escaped = sorted((re.escape(t) for t in terms), key=len, reverse=True)
     return f"(?:{'|'.join(escaped)})"

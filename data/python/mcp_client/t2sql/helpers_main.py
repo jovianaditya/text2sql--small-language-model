@@ -35,6 +35,7 @@ from .config import (
     HELPERS_SEMANTIC_ALIAS_LISTPRICE_EXCLUDE_TERMS,
     HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS,
     HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS,
+    HELPERS_WINNER_ROW_GENERIC_OBJECT_TERMS,
 )
 from .schema_analyzer import (
     get_transaction_tables,
@@ -400,6 +401,46 @@ def validate_identifiers(sql: str, ctx: str) -> List[str]:
 
     return errs
 
+def _question_asks_for_winner_row_object(q_text: str) -> bool:
+    q = (q_text or "").lower().strip()
+    if not q:
+        return False
+
+    generic_object_alt = "|".join(
+        sorted((re.escape(t) for t in HELPERS_WINNER_ROW_GENERIC_OBJECT_TERMS if t), key=len, reverse=True)
+    )
+    if generic_object_alt and re.search(rf"\b(?:{generic_object_alt})\b", q, flags=re.I):
+        return True
+
+    superlative_pattern = re.compile(r"\b(?:largest|highest|latest|best|most|max|min|top)\b", flags=re.I)
+    windows = [
+        q[m.end(): m.end() + 96]
+        for m in superlative_pattern.finditer(q)
+    ] or [q]
+
+    try:
+        schema_tables = list(get_all_tables() or [])
+    except Exception:
+        schema_tables = []
+
+    for table in schema_tables:
+        candidates = _table_mention_candidates(table, include_synonyms=True)
+        candidates.update(_table_inflected_mention_terms(table))
+        patterns = [
+            re.escape(cand).replace(r"\ ", r"\s+")
+            for cand in candidates
+            if cand
+        ]
+        if not patterns:
+            continue
+        entity_alt = "|".join(sorted(patterns, key=len, reverse=True))
+        for window in windows:
+            if re.search(rf"\b(?:{entity_alt})\b", window, flags=re.I):
+                return True
+
+    return False
+
+
 def classify_query(question: str) -> str:
     q = " " + (question or "").strip().lower() + " "
     # ---------------------------------------------------------------------------
@@ -419,8 +460,9 @@ def classify_query(question: str) -> str:
     # ---------------------------------------------------------------------------
     has_group = re.search(r"\b(per|each|every|within|partition)\b", q)
     has_superlative = re.search(r"\b(largest|highest|latest|best|most|max|min|top)\b", q)
-    # Mencari objek (record/payment), bukan mencari jumlah angka (total/count)
-    asks_for_object = re.search(r"\b(record|entry|row|payment|order|details|info)\b", q)
+    # Mencari objek row/entity secara generic, atau entity mention yang
+    # muncul dekat superlative, bukan noun bisnis yang di-hardcode.
+    asks_for_object = _question_asks_for_winner_row_object(q)
     is_math_agg = re.search(r"\b(count|sum|total|average|avg|number of)\b", q)
 
     if has_group and has_superlative and asks_for_object and not is_math_agg:
