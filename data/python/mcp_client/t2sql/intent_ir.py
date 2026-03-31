@@ -479,9 +479,6 @@ def _numeric_hint_terms(question_tokens: Optional[Set[str]] = None) -> Set[str]:
                     schema_enriched = True
                     hints.update(semantic_terms)
 
-        if not schema_enriched:
-            hints.update(INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS)
-
         _NUMERIC_HINT_TERMS_CACHE = set(hints)
         base_hints = set(_NUMERIC_HINT_TERMS_CACHE)
 

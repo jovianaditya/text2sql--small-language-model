@@ -3437,9 +3437,6 @@ def _contract_metric_terms(question_tokens: Optional[Set[str]] = None) -> Set[st
                     schema_enriched = True
                     terms.update(col_terms)
 
-        if not schema_enriched:
-            terms.update(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
-
         _CONTRACT_METRIC_TERMS_CACHE = set(terms)
         base_terms = set(_CONTRACT_METRIC_TERMS_CACHE)
 

@@ -966,6 +966,72 @@ def get_filterable_date_columns(table: str) -> List[str]:
     return get_columns_by_role(table, 'date')
 
 
+def _question_semantic_tokens(question: str) -> Set[str]:
+    q = (question or "").lower()
+    return {
+        tok
+        for tok in re.findall(r"[a-z0-9]+", q)
+        if tok and tok not in {
+            "the", "a", "an", "of", "for", "to", "by", "in", "on", "at",
+            "with", "without", "and", "or", "show", "list", "find", "give",
+            "return", "display", "each", "every", "per", "all",
+        }
+    }
+
+
+def _column_semantic_tokens(table: str, column: str) -> Set[str]:
+    t = (table or "").lower()
+    c = (column or "").strip()
+    if not t or not c:
+        return set()
+
+    phrases: Set[str] = {c, c.replace("_", " ")}
+    for syn in get_column_synonyms(t, c):
+        s = str(syn or "").strip()
+        if s:
+            phrases.add(s)
+            phrases.add(s.replace("_", " "))
+            phrases.add(s.replace("-", " "))
+
+    role = str(get_column_role(t, c) or "").strip().lower()
+    if role:
+        phrases.add(role)
+
+    tokens: Set[str] = set()
+    for text in phrases:
+        normalized = re.sub(
+            r"([a-z0-9])([A-Z])",
+            r"\1 \2",
+            str(text or "").replace("_", " ").lower(),
+        )
+        tokens.update(tok for tok in re.findall(r"[a-z0-9]+", normalized) if tok and not tok.isdigit())
+    return tokens
+
+
+def _best_semantic_numeric_column(table: str, question: str, columns: List[str]) -> Optional[str]:
+    q_tokens = _question_semantic_tokens(question)
+    if not q_tokens or not columns:
+        return None
+
+    best_col: Optional[str] = None
+    best_score = 0.0
+    for col in columns:
+        col_tokens = _column_semantic_tokens(table, col)
+        if not col_tokens:
+            continue
+        overlap = q_tokens.intersection(col_tokens)
+        if not overlap:
+            continue
+        score = float(len(overlap))
+        role = str(get_column_role(table, col) or "").strip().lower()
+        if role in {"metric", "measure", "amount", "quantity"}:
+            score += 0.5
+        if score > best_score:
+            best_col = col
+            best_score = score
+    return best_col
+
+
 def infer_best_order_column(table: str, question: str) -> Optional[str]:
     """
     Infer the best column to ORDER BY based on question context.
@@ -993,26 +1059,14 @@ def infer_best_order_column(table: str, question: str) -> Optional[str]:
         if date_cols:
             return date_cols[0]
     
-    # Check for specific metric mentions
-    metric_keywords = {
-        'amount': ['amount', 'payment'],
-        'price': ['price', 'cost', 'msrp', 'buyprice'],
-        'quantity': ['quantity', 'stock', 'ordered'],
-        'revenue': ['amount', 'price', 'sales'],
-        'sales': ['amount', 'price', 'quantity'],
-    }
-    
-    for intent, col_hints in metric_keywords.items():
-        if intent in q:
-            numeric_cols = get_aggregatable_columns(table)
-            for col in numeric_cols:
-                if any(hint in col.lower() for hint in col_hints):
-                    return col
+    numeric_cols = get_aggregatable_columns(table)
+    semantic_numeric = _best_semantic_numeric_column(table, question, numeric_cols)
+    if semantic_numeric:
+        return semantic_numeric
     
     # Generic highest/lowest/top → first numeric column
     rank_keywords = ('highest', 'lowest', 'top', 'best', 'worst', 'most', 'least')
     if any(kw in q for kw in rank_keywords):
-        numeric_cols = get_aggregatable_columns(table)
         if numeric_cols:
             return numeric_cols[0]
     
@@ -1044,17 +1098,9 @@ def infer_best_aggregate_column(table: str, question: str) -> Optional[str]:
     if not numeric_cols:
         return None
     
-    # Sum/total intent → prefer amount columns
-    if any(kw in q for kw in ('total', 'sum', 'revenue', 'sales')):
-        for col in numeric_cols:
-            if any(hint in col.lower() for hint in ('amount', 'price', 'quantity', 'total')):
-                return col
-    
-    # Average intent → prefer price/rate columns
-    if any(kw in q for kw in ('average', 'avg', 'mean')):
-        for col in numeric_cols:
-            if any(hint in col.lower() for hint in ('price', 'amount', 'rate', 'cost')):
-                return col
+    semantic_numeric = _best_semantic_numeric_column(table, question, numeric_cols)
+    if semantic_numeric:
+        return semantic_numeric
     
     # Return first numeric column as fallback
     return numeric_cols[0]
