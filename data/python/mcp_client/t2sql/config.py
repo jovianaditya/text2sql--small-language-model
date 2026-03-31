@@ -515,6 +515,58 @@ HELPERS_METRIC_AGG_IDLIKE_TOKENS = set(
     )
 )
 
+HELPERS_PROBE_GENERIC_METRIC_TERMS = set(
+    _env_json_list(
+        "HELPERS_PROBE_GENERIC_METRIC_TERMS",
+        [
+            "amount",
+            "price",
+            "quantity",
+            "total",
+            "count",
+            "cost",
+            "rate",
+            "ratio",
+            "percent",
+        ],
+    )
+)
+
+HELPERS_PROBE_LOCALIZED_METRIC_TERMS = set(
+    _env_json_list(
+        "HELPERS_PROBE_LOCALIZED_METRIC_TERMS",
+        ["omset", "harga", "jumlah"],
+    )
+)
+
+HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS = set(
+    _env_json_list(
+        "HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS",
+        ["msrp", "list price", "retail price", "catalog price"],
+    )
+)
+
+HELPERS_SEMANTIC_ALIAS_LISTPRICE_EXCLUDE_TERMS = set(
+    _env_json_list(
+        "HELPERS_SEMANTIC_ALIAS_LISTPRICE_EXCLUDE_TERMS",
+        ["buy price", "purchase price", "cost", "cogs", "unit price", "selling price", "deal price"],
+    )
+)
+
+HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS = set(
+    _env_json_list(
+        "HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS",
+        ["unit price", "selling price", "deal price", "sale price", "sales price"],
+    )
+)
+
+HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS = set(
+    _env_json_list(
+        "HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS",
+        ["buy price", "purchase price", "cost", "cogs", "msrp", "list price", "retail price", "catalog price"],
+    )
+)
+
 # ======================================================================
 # ======================== RETRIEVE HEURISTICS ==========================
 # ======================================================================

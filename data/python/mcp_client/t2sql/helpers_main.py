@@ -29,6 +29,12 @@ from .config import (
     AGENT_NORMALIZE_EARLY_STOP,
     HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
     HELPERS_EXISTENCE_COMPAT_VERBS,
+    HELPERS_PROBE_GENERIC_METRIC_TERMS,
+    HELPERS_PROBE_LOCALIZED_METRIC_TERMS,
+    HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS,
+    HELPERS_SEMANTIC_ALIAS_LISTPRICE_EXCLUDE_TERMS,
+    HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS,
+    HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS,
 )
 from .schema_analyzer import (
     get_transaction_tables,
@@ -582,9 +588,6 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         "that", "these", "those", "show", "list", "return", "display", "give",
         "find", "fetch", "get", "table", "column", "data", "value", "values",
     }
-    generic_metric_fallback_terms = {
-        "amount", "price", "quantity", "total", "count", "cost", "rate", "ratio", "percent",
-    }
     metric_roles = {"metric", "measure", "amount", "quantity"}
 
     def _semantic_tokens(text: str) -> Set[str]:
@@ -649,7 +652,16 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
                 continue
             schema_metric_terms.extend(sorted(terms))
     schema_metric_terms = _ordered_unique(schema_metric_terms)
-    metric_query_terms = set(schema_metric_terms) | generic_metric_fallback_terms | {"omset", "harga", "jumlah"}
+    schema_metric_term_set = set(schema_metric_terms)
+    question_metric_fallback_terms = {
+        tok for tok in q_tokens
+        if tok in (HELPERS_PROBE_GENERIC_METRIC_TERMS | HELPERS_PROBE_LOCALIZED_METRIC_TERMS)
+    }
+    metric_query_terms = set(schema_metric_term_set)
+    metric_query_terms.update(question_metric_fallback_terms)
+    if not metric_query_terms:
+        metric_query_terms.update(HELPERS_PROBE_GENERIC_METRIC_TERMS)
+        metric_query_terms.update(HELPERS_PROBE_LOCALIZED_METRIC_TERMS)
     metric_terms_in_question = _ordered_unique([tok for tok in q_tokens if tok in metric_query_terms])
 
     def _display_name_column_for_probe(table: str) -> Optional[str]:
@@ -1635,6 +1647,29 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
         for term in (exclude_terms or set()):
             exclude_keys.update(_semantic_alias_keys(term))
 
+        def _expand_keys_from_schema(seed_keys: Set[str]) -> Set[str]:
+            if not seed_keys:
+                return set()
+            expanded: Set[str] = set()
+            for table in schema_tables:
+                try:
+                    table_columns = list(analyzer.get_table_columns(table)) if analyzer is not None else list(allowed_identifiers.get(table, ()))
+                except Exception:
+                    table_columns = list(allowed_identifiers.get(table, ()))
+                for col in table_columns:
+                    semantic_keys = _semantic_alias_keys(col)
+                    try:
+                        for syn in get_column_synonyms(table, col) or []:
+                            semantic_keys.update(_semantic_alias_keys(syn))
+                    except Exception:
+                        pass
+                    if semantic_keys.intersection(seed_keys):
+                        expanded.update(semantic_keys)
+            return expanded
+
+        include_keys.update(_expand_keys_from_schema(include_keys | alias_keys))
+        exclude_keys.update(_expand_keys_from_schema(exclude_keys))
+
         candidates: List[Tuple[int, int, int, str]] = []
         for table in schema_tables:
             try:
@@ -1722,13 +1757,13 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
     semantic_alias_specs = [
         (
             "listprice",
-            {"msrp", "list price", "retail price", "catalog price"},
-            {"buy price", "purchase price", "cost", "cogs", "unit price", "selling price", "deal price"},
+            set(HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS),
+            set(HELPERS_SEMANTIC_ALIAS_LISTPRICE_EXCLUDE_TERMS),
         ),
         (
             "price",
-            {"unit price", "selling price", "deal price", "sale price", "sales price"},
-            {"buy price", "purchase price", "cost", "cogs", "msrp", "list price", "retail price", "catalog price"},
+            set(HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS),
+            set(HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS),
         ),
     ]
     for alias, include_terms, exclude_terms in semantic_alias_specs:
