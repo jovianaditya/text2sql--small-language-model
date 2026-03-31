@@ -499,6 +499,27 @@ HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS = set(
     )
 )
 
+HELPERS_ORDERING_SEQUENCE_TERMS = set(
+    _env_json_list(
+        "HELPERS_ORDERING_SEQUENCE_TERMS",
+        ["previous", "next", "prior", "following", "lag", "lead"],
+    )
+)
+
+HELPERS_ORDERING_ROW_CONTAINER_TERMS = set(
+    _env_json_list(
+        "HELPERS_ORDERING_ROW_CONTAINER_TERMS",
+        ["row", "rows", "record", "records", "entry", "entries", "result", "results", "item", "items", "tuple", "tuples"],
+    )
+)
+
+HELPERS_ORDERING_ALPHABETIC_TERMS = set(
+    _env_json_list(
+        "HELPERS_ORDERING_ALPHABETIC_TERMS",
+        ["alphabetical", "alphabetically", "a to z", "z to a"],
+    )
+)
+
 HELPERS_METRIC_AGG_INTENT_TERMS = set(
     _env_json_list(
         "HELPERS_METRIC_AGG_INTENT_TERMS",
@@ -515,6 +536,20 @@ HELPERS_METRIC_AGG_INTENT_TERMS = set(
             "rata",
             "rata-rata",
         ],
+    )
+)
+
+HELPERS_HIERARCHICAL_COLLECTION_VERB_STEMS = set(
+    _env_json_list(
+        "HELPERS_HIERARCHICAL_COLLECTION_VERB_STEMS",
+        ["collect", "handle", "manage", "own"],
+    )
+)
+
+HELPERS_HIERARCHICAL_COLLECTION_POSSESSIVES = set(
+    _env_json_list(
+        "HELPERS_HIERARCHICAL_COLLECTION_POSSESSIVES",
+        ["their", "its", "his", "her"],
     )
 )
 

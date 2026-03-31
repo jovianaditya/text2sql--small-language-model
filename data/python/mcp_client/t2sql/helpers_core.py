@@ -31,11 +31,16 @@ from .config import (
     HELPERS_DUAL_FACT_FAMILY_STOPWORDS,
     HELPERS_EXISTENCE_COMPAT_VERBS,
     HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
+    HELPERS_HIERARCHICAL_COLLECTION_POSSESSIVES,
+    HELPERS_HIERARCHICAL_COLLECTION_VERB_STEMS,
     HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS,
     HELPERS_INNER_JOIN_GENERIC_OBJECT_TERMS,
     HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES,
     HELPERS_METRIC_AGG_IDLIKE_TOKENS,
     HELPERS_METRIC_AGG_INTENT_TERMS,
+    HELPERS_ORDERING_ALPHABETIC_TERMS,
+    HELPERS_ORDERING_ROW_CONTAINER_TERMS,
+    HELPERS_ORDERING_SEQUENCE_TERMS,
     HELPERS_ROLLUP_LEGACY_METRIC_TERMS,
 )
 from .rulebook import (
@@ -324,6 +329,43 @@ def _regex_alt_from_terms(terms: Set[str], default: str) -> str:
         pattern = pattern.replace(r"\ ", r"\s+")
         escaped.append(pattern)
     return f"(?:{'|'.join(escaped)})" if escaped else default
+
+
+def _verb_stem_pattern(stem: str) -> str:
+    s = str(stem or "").strip().lower()
+    if not s:
+        return ""
+    if s.endswith("e"):
+        base = re.escape(s[:-1])
+        return rf"{base}(?:e|es|ed|ing)"
+    base = re.escape(s)
+    return rf"{base}(?:s|ed|ing)?"
+
+
+def _hierarchical_collection_pattern(ctx: str = "") -> str:
+    verb_patterns = [
+        _verb_stem_pattern(stem)
+        for stem in sorted(HELPERS_HIERARCHICAL_COLLECTION_VERB_STEMS)
+        if str(stem or "").strip()
+    ]
+    verb_alt = f"(?:{'|'.join(v for v in verb_patterns if v)})" if verb_patterns else r"(?:collected|handled|managed|owned)"
+    possessive_alt = _regex_alt_from_terms(
+        {
+            str(term).strip().lower()
+            for term in HELPERS_HIERARCHICAL_COLLECTION_POSSESSIVES
+            if str(term).strip()
+        },
+        r"(?:their|its|his|her)",
+    )
+    entity_alt = _regex_alt_from_terms(
+        _entity_terms_from_ctx(ctx),
+        r"(?:[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*)",
+    )
+    return (
+        rf"\b(?:{verb_alt})\s+by\b"
+        rf"|"
+        rf"\bby\s+{possessive_alt}(?:\s+{entity_alt})?\b"
+    )
 
 
 def _table_object_terms(table: str) -> Set[str]:
@@ -10083,11 +10125,7 @@ def _question_wants_hierarchical_metric_rollup(question: str, ctx: str = "") -> 
     # Prefer include-zero style, but allow collection phrasing too.
     include_zero = _question_wants_include_zero(question, ctx)
     collection_phrase = bool(
-        re.search(
-            r"\b(?:collected\s+by|handled\s+by|managed\s+by|owned\s+by|by\s+their)\b",
-            q,
-            flags=re.I,
-        )
+        re.search(_hierarchical_collection_pattern(ctx), q, flags=re.I)
     )
     return include_zero or collection_phrase
 
@@ -17068,7 +17106,14 @@ def _question_requests_ordering(question: str) -> bool:
         return re.search(rf"\b{pat}\b", q, flags=re.I) is not None
 
     ordinal_token_pattern = r"(?:second|third|fourth|fifth|\d+(?:st|nd|rd|th))"
-    row_container_pattern = r"(?:row|rows|record|records|entry|entries|result|results|item|items|tuple|tuples)"
+    row_container_pattern = _regex_alt_from_terms(
+        {str(term).strip().lower() for term in HELPERS_ORDERING_ROW_CONTAINER_TERMS if str(term).strip()},
+        r"(?:row|rows|record|records|entry|entries|result|results|item|items|tuple|tuples)",
+    )
+    sequence_term_pattern = _regex_alt_from_terms(
+        {str(term).strip().lower() for term in HELPERS_ORDERING_SEQUENCE_TERMS if str(term).strip()},
+        r"(?:previous|next|prior|following|lag|lead)",
+    )
     
     # --- Pattern 1: Window function context (NOT final ORDER BY) ---
     # If "ascending/descending order" appears with ranking context, skip it
@@ -17089,8 +17134,8 @@ def _question_requests_ordering(question: str) -> bool:
     )
 
     sequence_window_patterns = [
-        r"\b(?:previous|next|prior|following|lag|lead)\b.*\b(?:sorted|ordered)\s+by\b",
-        r"\b(?:sorted|ordered)\s+by\b.*\b(?:previous|next|prior|following|lag|lead)\b",
+        rf"\b{sequence_term_pattern}\b.*\b(?:sorted|ordered)\s+by\b",
+        rf"\b(?:sorted|ordered)\s+by\b.*\b{sequence_term_pattern}\b",
     ]
 
     has_window_context = any(re.search(pat, q) for pat in window_context_patterns) or any(
@@ -17197,7 +17242,12 @@ def _question_requests_ordering(question: str) -> bool:
         ("ordering_intent", "direction_keywords", "desc"),
         ["descending", "desc", "menurun"],
     )
-    sort_direction_keywords = sorted(set(asc_terms + desc_terms + ["alphabetical", "alphabetically"]))
+    alphabetic_terms = [
+        str(term).strip().lower()
+        for term in HELPERS_ORDERING_ALPHABETIC_TERMS
+        if str(term).strip()
+    ]
+    sort_direction_keywords = sorted(set(asc_terms + desc_terms + alphabetic_terms))
     
     if (
         not winner_like_context
