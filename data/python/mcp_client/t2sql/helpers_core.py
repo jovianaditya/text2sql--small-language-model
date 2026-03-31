@@ -9678,8 +9678,16 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
         analyzer = get_schema_analyzer()
     except Exception:
         return sql
-    metric_term_universe = _dual_fact_metric_term_universe(table_universe, analyzer=analyzer)
+    metric_term_universe = _dual_fact_metric_term_universe(
+        table_universe,
+        analyzer=analyzer,
+        question=question,
+    )
     query_tokens = {tok for tok in re.findall(r"[a-z0-9]+", q) if tok}
+    generic_metric_terms = set(HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS)
+    legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+    if not metric_term_universe:
+        metric_term_universe.update(legacy_metric_terms or generic_metric_terms)
     entity_noise_terms: Set[str] = set()
     for table_name in table_universe:
         table_l = str(table_name or "").strip().lower()
@@ -9690,17 +9698,24 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
             entity_noise_terms.update(
                 tok for tok in re.findall(r"[a-z0-9]+", base_term.replace("_", " ").lower()) if tok
             )
+    metric_candidate_seed = set(metric_term_universe)
+    metric_candidate_seed.update(legacy_metric_terms)
+    metric_candidate_seed.update(query_tokens.intersection(generic_metric_terms))
+    if not metric_candidate_seed:
+        metric_candidate_seed.update(generic_metric_terms)
     metric_candidate_terms = {
         term
-        for term in (metric_term_universe | HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+        for term in metric_candidate_seed
         if term and term not in entity_noise_terms and term not in HELPERS_METRIC_AGG_IDLIKE_TOKENS
     }
-    has_metric_intent = bool(query_tokens & (metric_term_universe | HELPERS_METRIC_AGG_INTENT_TERMS))
+    has_metric_intent = bool(
+        query_tokens & (metric_term_universe | legacy_metric_terms | generic_metric_terms | HELPERS_METRIC_AGG_INTENT_TERMS)
+    )
     if not has_metric_intent:
         return sql
 
     metric_query_terms = query_tokens & metric_candidate_terms
-    strong_metric_intent = bool(query_tokens & metric_term_universe)
+    strong_metric_intent = bool(query_tokens & (metric_term_universe | legacy_metric_terms | generic_metric_terms))
 
     role_cache: Dict[Tuple[str, str], str] = {}
     term_cache: Dict[Tuple[str, str], Set[str]] = {}
