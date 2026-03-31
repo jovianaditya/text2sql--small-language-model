@@ -1047,7 +1047,28 @@ def _base_form_from_inflected(term: str) -> str:
     return t
 
 
-def _entity_support_verb_terms(table: str) -> Set[str]:
+def _question_compat_existence_verbs(question: str) -> Set[str]:
+    q = (question or "").lower().strip()
+    if not q:
+        return set()
+
+    q_tokens = set(re.findall(r"[a-z0-9]+", q))
+    matched: Set[str] = set()
+    for verb in HELPERS_EXISTENCE_COMPAT_VERBS:
+        v = str(verb or "").strip().lower()
+        if not v:
+            continue
+        if " " in v:
+            pattern = re.escape(v).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pattern}\b", q, flags=re.I):
+                matched.add(v)
+            continue
+        if v in q_tokens:
+            matched.add(v)
+    return matched
+
+
+def _entity_support_verb_terms(table: str, question: str = "") -> Set[str]:
     verbs: Set[str] = set(HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC)
     inflected_terms = _table_inflected_mention_terms(table)
     verbs.update(inflected_terms)
@@ -1057,7 +1078,8 @@ def _entity_support_verb_terms(table: str) -> Set[str]:
         if base and len(base) >= 3
     )
     # Backward-compatible fallback to preserve existing behavior on legacy phrasing.
-    verbs.update(HELPERS_EXISTENCE_COMPAT_VERBS)
+    compat_verbs = _question_compat_existence_verbs(question)
+    verbs.update(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
     return {verb for verb in verbs if verb}
 
 
@@ -1206,7 +1228,7 @@ def _question_targets_table_existence(question: str, table: str) -> bool:
     )
 
     # Verb-based existence mention.
-    support_verbs = sorted(_entity_support_verb_terms(table), key=len, reverse=True)
+    support_verbs = sorted(_entity_support_verb_terms(table, q_sem), key=len, reverse=True)
     support_verb_alt = "|".join(re.escape(v) for v in support_verbs if v)
     verb_pattern = (
         rf"\b(?:{support_verb_alt})\b"

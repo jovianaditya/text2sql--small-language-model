@@ -449,17 +449,59 @@ def _inner_join_object_tables(ctx: str = "") -> Set[str]:
     return set()
 
 
-def _inner_join_specific_object_terms(ctx: str = "") -> Set[str]:
+def _question_compat_inner_join_terms(question: str, terms: Set[str]) -> Set[str]:
+    q = (question or "").lower().strip()
+    if not q:
+        return set()
+
+    q_tokens = set(re.findall(r"[a-z0-9]+", q))
+    matched: Set[str] = set()
+    for term in terms:
+        t = str(term or "").strip().lower()
+        if not t:
+            continue
+        if " " in t:
+            pat = re.escape(t).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pat}\b", q, flags=re.I):
+                matched.add(t)
+            continue
+        if t in q_tokens:
+            matched.add(t)
+    return matched
+
+
+def _question_compat_metric_terms(question: str, terms: Set[str]) -> Set[str]:
+    q = (question or "").lower().strip()
+    if not q:
+        return set()
+
+    q_tokens = set(re.findall(r"[a-z0-9]+", q))
+    matched: Set[str] = set()
+    for term in terms:
+        t = str(term or "").strip().lower()
+        if not t:
+            continue
+        term_tokens = [tok for tok in re.findall(r"[a-z0-9]+", t) if tok]
+        if not term_tokens:
+            continue
+        if all(tok in q_tokens for tok in term_tokens):
+            matched.add(t)
+    return matched
+
+
+def _inner_join_specific_object_terms(ctx: str = "", question: str = "") -> Set[str]:
     obj_terms: Set[str] = set()
     for table in _inner_join_object_tables(ctx):
         obj_terms.update(_table_object_terms(table))
     if not obj_terms:
-        obj_terms.update(HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS)
+        compat_terms = _question_compat_inner_join_terms(question, HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS)
+        obj_terms.update(compat_terms if question else HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS)
     return {term for term in obj_terms if term}
 
 
-def _inner_join_action_terms(ctx: str = "") -> Set[str]:
-    verbs: Set[str] = set(HELPERS_EXISTENCE_COMPAT_VERBS)
+def _inner_join_action_terms(ctx: str = "", question: str = "") -> Set[str]:
+    compat_verbs = _question_compat_inner_join_terms(question, HELPERS_EXISTENCE_COMPAT_VERBS)
+    verbs: Set[str] = set(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
     for table in _inner_join_object_tables(ctx):
         verbs.update(_table_support_action_terms(table))
     return {verb for verb in verbs if verb and verb not in HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC}
@@ -541,12 +583,14 @@ def _dual_fact_metric_terms_for_table(table_name: str, analyzer: Any = None) -> 
 def _dual_fact_metric_term_universe(
     table_names: Set[str],
     analyzer: Any = None,
+    question: str = "",
 ) -> Set[str]:
     metric_words: Set[str] = set()
     for table_name in sorted(table_names):
         metric_words.update(_dual_fact_metric_terms_for_table(table_name, analyzer=analyzer))
     if not metric_words:
-        metric_words.update(HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS)
+        compat_terms = _question_compat_metric_terms(question, HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS)
+        metric_words.update(compat_terms if question and compat_terms else HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS)
     return metric_words
 
 def _canonicalize_table_names(sql: str, ctx: str) -> str:
@@ -684,17 +728,17 @@ def _question_requires_inner_join(question: str, ctx: str = "") -> bool:
     #
     # Build candidate "existence object" terms from transaction-like tables
     # in schema metadata, narrowed by ALLOWED IDENTIFIERS when available.
-    specific_obj_terms = _inner_join_specific_object_terms(ctx)
+    specific_obj_terms = _inner_join_specific_object_terms(ctx, question)
     obj_terms = set(specific_obj_terms)
     obj_terms.update(HELPERS_INNER_JOIN_GENERIC_OBJECT_TERMS)
     existence_object = _regex_alt_from_terms(obj_terms, r"(?:records?|rows?)")
     specific_existence_object = _regex_alt_from_terms(
         specific_obj_terms,
-        r"(?:orders?|payments?|transactions?|purchases?)",
+        r"(?:records?|rows?)",
     )
     support_action = _regex_alt_from_terms(
-        _inner_join_action_terms(ctx),
-        r"(?:ordered|placed|made|paid|purchased|bought)",
+        _inner_join_action_terms(ctx, question),
+        r"(?:made)",
     )
     has_entity_mention = re.search(rf"\b{entity_kw}\b", q, flags=re.I) is not None
     has_existence_object = re.search(rf"\b{existence_object}\b", q, flags=re.I) is not None
@@ -7493,14 +7537,21 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
                 tok for tok in re.findall(r"[a-z0-9]+", base_term.replace("_", " ").lower()) if tok
             )
 
-    metric_term_universe = _dual_fact_metric_term_universe(table_universe, analyzer=analyzer)
+    metric_term_universe = _dual_fact_metric_term_universe(
+        table_universe,
+        analyzer=analyzer,
+        question=question,
+    )
+    legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+    if not legacy_metric_terms and not metric_term_universe:
+        legacy_metric_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
     metric_candidate_terms = {
         term
-        for term in (metric_term_universe | HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+        for term in (metric_term_universe | legacy_metric_terms)
         if term and term not in entity_noise_terms and term not in HELPERS_METRIC_AGG_IDLIKE_TOKENS
     }
     if not metric_candidate_terms:
-        metric_candidate_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+        metric_candidate_terms = set(legacy_metric_terms or HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
 
     metric_query_alt = _regex_alt_from_terms(
         metric_candidate_terms,
@@ -7914,8 +7965,15 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
         },
         "count": {"count", "counts", "num", "number", "numbers", "frequency", "frequencies"},
     }
-    metric_term_universe = _dual_fact_metric_term_universe(table_universe, analyzer=analyzer)
-    for term in (metric_term_universe | HELPERS_ROLLUP_LEGACY_METRIC_TERMS):
+    metric_term_universe = _dual_fact_metric_term_universe(
+        table_universe,
+        analyzer=analyzer,
+        question=question,
+    )
+    legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+    if not legacy_metric_terms and not metric_term_universe:
+        legacy_metric_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+    for term in (metric_term_universe | legacy_metric_terms):
         tokenized = _text_semantic_terms(term)
         tokenized = {
             tok for tok in tokenized
@@ -9877,7 +9935,11 @@ def _question_wants_dual_fact_rollup(question: str) -> bool:
         metadata is unavailable. This stays generic by extracting lexical
         families from the question instead of relying on specific table names.
         """
-        metric_words = _dual_fact_metric_term_universe(transaction_tables, analyzer=analyzer)
+        metric_words = _dual_fact_metric_term_universe(
+            transaction_tables,
+            analyzer=analyzer,
+            question=question,
+        )
 
         def _collect(pattern: str, text: str = q) -> Set[str]:
             return _dual_fact_collect_families(pattern, text)
