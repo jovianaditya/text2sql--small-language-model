@@ -3395,50 +3395,63 @@ def _contract_identifier_terms(name: str) -> Set[str]:
     return _contract_tokenize(words)
 
 
-def _contract_metric_terms() -> Set[str]:
+def _contract_metric_terms(question_tokens: Optional[Set[str]] = None) -> Set[str]:
     global _CONTRACT_METRIC_TERMS_CACHE
-    if _CONTRACT_METRIC_TERMS_CACHE is not None:
-        return set(_CONTRACT_METRIC_TERMS_CACHE)
-
-    terms: Set[str] = set(AGENT_CONTRACT_BASE_METRIC_TERMS)
-    analyzer = None
-    try:
-        analyzer = get_schema_analyzer()
-    except Exception:
+    base_terms = (
+        set(_CONTRACT_METRIC_TERMS_CACHE)
+        if _CONTRACT_METRIC_TERMS_CACHE is not None
+        else None
+    )
+    if base_terms is None:
+        terms: Set[str] = set(AGENT_CONTRACT_BASE_METRIC_TERMS)
         analyzer = None
-
-    schema_enriched = False
-    for table in get_all_tables() or []:
-        t = str(table or "").strip().lower()
-        if not t:
-            continue
         try:
-            cols = list(analyzer.get_table_columns(t)) if analyzer is not None else []
+            analyzer = get_schema_analyzer()
         except Exception:
-            cols = []
-        for col in cols:
-            c = str(col or "").strip()
-            if not c:
+            analyzer = None
+
+        schema_enriched = False
+        for table in get_all_tables() or []:
+            t = str(table or "").strip().lower()
+            if not t:
                 continue
-            c_low = c.lower()
-            if c_low.endswith(("id", "number", "code", "key")):
-                continue
-            role = ""
             try:
-                if analyzer is not None:
-                    role = str(analyzer._column_roles.get(t, {}).get(c_low, "") or "").lower()
+                cols = list(analyzer.get_table_columns(t)) if analyzer is not None else []
             except Exception:
+                cols = []
+            for col in cols:
+                c = str(col or "").strip()
+                if not c:
+                    continue
+                c_low = c.lower()
+                if c_low.endswith(("id", "number", "code", "key")):
+                    continue
                 role = ""
-            col_terms = _contract_identifier_terms(c)
-            if role in {"metric", "measure", "amount", "quantity"} or col_terms.intersection(terms):
-                schema_enriched = True
-                terms.update(col_terms)
+                try:
+                    if analyzer is not None:
+                        role = str(analyzer._column_roles.get(t, {}).get(c_low, "") or "").lower()
+                except Exception:
+                    role = ""
+                col_terms = _contract_identifier_terms(c)
+                if role in {"metric", "measure", "amount", "quantity"} or col_terms.intersection(terms):
+                    schema_enriched = True
+                    terms.update(col_terms)
 
-    if not schema_enriched:
-        terms.update(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
+        if not schema_enriched:
+            terms.update(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
 
-    _CONTRACT_METRIC_TERMS_CACHE = set(terms)
-    return set(_CONTRACT_METRIC_TERMS_CACHE)
+        _CONTRACT_METRIC_TERMS_CACHE = set(terms)
+        base_terms = set(_CONTRACT_METRIC_TERMS_CACHE)
+
+    terms = set(base_terms)
+    if question_tokens is not None:
+        q_tokens = {str(tok).strip().lower() for tok in question_tokens if str(tok).strip()}
+        legacy_hits = q_tokens.intersection(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
+        if legacy_hits:
+            terms.update(legacy_hits)
+        else:
+            terms.difference_update(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
+    return terms
 
 
 def _contract_entity_terms() -> Set[str]:
@@ -3572,7 +3585,8 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     # - explicit "sum"/"sum of"
     # - "total" only when attached to quantity/value-like metrics.
     has_explicit_sum = bool(re.search(r"\bsum(?:\s+of)?\b", q))
-    metric_terms = _contract_metric_terms()
+    q_tokens = _contract_tokenize(q)
+    metric_terms = _contract_metric_terms(q_tokens)
     entity_terms = _contract_entity_terms()
     total_phrases = [
         str(m.group(1) or "").strip()

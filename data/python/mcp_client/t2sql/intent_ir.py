@@ -23,23 +23,10 @@ from .schema_analyzer import (
     get_table_synonyms,
     get_table_type,
 )
-
-
-_BASE_NUMERIC_HINTS = (
-    "amount",
-    "total",
-    "price",
-    "quantity",
-    "cost",
-    "rate",
-    "count",
-    "number",
-    "value",
-    "percent",
-    "ratio",
-    "limit",
+from .config import (
+    INTENT_IR_BASE_NUMERIC_HINTS,
+    INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS,
 )
-_LEGACY_NUMERIC_FALLBACK_HINTS = {"stock", "msrp", "revenue", "sales"}
 _DATE_HINTS = ("date", "time", "timestamp", "year", "month", "day")
 _NUMBER_TOKEN_PATTERN = r"-?\d[\d,]*(?:\.\d+)?"
 _NUMBER_WORDS = {
@@ -439,57 +426,74 @@ def _column_semantic_tokens(table: str, column: str) -> Set[str]:
     return tokens
 
 
-def _numeric_hint_terms() -> Set[str]:
+def _numeric_hint_terms(question_tokens: Optional[Set[str]] = None) -> Set[str]:
     global _NUMERIC_HINT_TERMS_CACHE
-    if _NUMERIC_HINT_TERMS_CACHE is not None:
-        return set(_NUMERIC_HINT_TERMS_CACHE)
-
-    hints: Set[str] = {str(tok).lower() for tok in _BASE_NUMERIC_HINTS if str(tok).strip()}
-    try:
-        analyzer = get_schema_analyzer()
-    except Exception:
-        analyzer = None
-
-    try:
-        schema_tables = list(get_all_tables() or [])
-    except Exception:
-        schema_tables = []
-
-    numeric_roles = {"metric", "measure", "amount", "quantity"}
-    schema_enriched = False
-    for table in schema_tables:
-        t = str(table or "").strip().lower()
-        if not t:
-            continue
+    base_hints = (
+        set(_NUMERIC_HINT_TERMS_CACHE)
+        if _NUMERIC_HINT_TERMS_CACHE is not None
+        else None
+    )
+    if base_hints is None:
+        hints: Set[str] = {
+            str(tok).lower()
+            for tok in INTENT_IR_BASE_NUMERIC_HINTS
+            if str(tok).strip()
+        }
         try:
-            table_columns = list(analyzer.get_table_columns(t)) if analyzer is not None else []
+            analyzer = get_schema_analyzer()
         except Exception:
-            table_columns = []
-        for col in table_columns:
-            c = str(col or "").strip()
-            if not c:
-                continue
-            c_low = c.lower()
-            if c_low.endswith(("id", "number", "code", "key")):
-                continue
+            analyzer = None
 
-            role = ""
+        try:
+            schema_tables = list(get_all_tables() or [])
+        except Exception:
+            schema_tables = []
+
+        numeric_roles = {"metric", "measure", "amount", "quantity"}
+        schema_enriched = False
+        for table in schema_tables:
+            t = str(table or "").strip().lower()
+            if not t:
+                continue
             try:
-                if analyzer is not None:
-                    role = str(analyzer._column_roles.get(t, {}).get(c_low, "") or "").lower()
+                table_columns = list(analyzer.get_table_columns(t)) if analyzer is not None else []
             except Exception:
+                table_columns = []
+            for col in table_columns:
+                c = str(col or "").strip()
+                if not c:
+                    continue
+                c_low = c.lower()
+                if c_low.endswith(("id", "number", "code", "key")):
+                    continue
+
                 role = ""
+                try:
+                    if analyzer is not None:
+                        role = str(analyzer._column_roles.get(t, {}).get(c_low, "") or "").lower()
+                except Exception:
+                    role = ""
 
-            semantic_terms = _column_semantic_tokens(t, c)
-            if role in numeric_roles or semantic_terms.intersection(hints):
-                schema_enriched = True
-                hints.update(semantic_terms)
+                semantic_terms = _column_semantic_tokens(t, c)
+                if role in numeric_roles or semantic_terms.intersection(hints):
+                    schema_enriched = True
+                    hints.update(semantic_terms)
 
-    if not schema_enriched:
-        hints.update(_LEGACY_NUMERIC_FALLBACK_HINTS)
+        if not schema_enriched:
+            hints.update(INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS)
 
-    _NUMERIC_HINT_TERMS_CACHE = set(hints)
-    return set(_NUMERIC_HINT_TERMS_CACHE)
+        _NUMERIC_HINT_TERMS_CACHE = set(hints)
+        base_hints = set(_NUMERIC_HINT_TERMS_CACHE)
+
+    hints = set(base_hints)
+    if question_tokens is not None:
+        q_tokens = {str(tok).strip().lower() for tok in question_tokens if str(tok).strip()}
+        legacy_hits = q_tokens.intersection(INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS)
+        if legacy_hits:
+            hints.update(legacy_hits)
+        else:
+            hints.difference_update(INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS)
+    return hints
 
 
 def _best_semantic_column_match(
@@ -525,7 +529,7 @@ def _best_semantic_column_match(
 
         score = float(len(overlap))
         score += (len(overlap) / max(len(col_tokens), 1)) * 0.5
-        if any(tok in _numeric_hint_terms() for tok in overlap):
+        if any(tok in _numeric_hint_terms(query_token_set) for tok in overlap):
             score += 0.35
 
         if score > best_score or (score == best_score and best_col is not None and len(col) < len(best_col)):

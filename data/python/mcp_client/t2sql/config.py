@@ -330,6 +330,33 @@ AGENT_CONTRACT_GENERIC_COUNT_NOUNS = set(
     )
 )
 
+INTENT_IR_BASE_NUMERIC_HINTS = tuple(
+    _env_json_list(
+        "INTENT_IR_BASE_NUMERIC_HINTS",
+        [
+            "amount",
+            "total",
+            "price",
+            "quantity",
+            "cost",
+            "rate",
+            "count",
+            "number",
+            "value",
+            "percent",
+            "ratio",
+            "limit",
+        ],
+    )
+)
+
+INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS = set(
+    _env_json_list(
+        "INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS",
+        ["stock", "msrp", "revenue", "sales"],
+    )
+)
+
 HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC = set(
     _env_json_list(
         "HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC",
