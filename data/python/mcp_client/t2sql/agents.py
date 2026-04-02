@@ -342,6 +342,7 @@ from .helpers_core import (
     _question_wants_count_distinct,
     _ensure_reasonable_distinct,
     _ensure_reasonable_count_distinct,
+    _rewrite_missing_joined_agg_threshold_filter,
     _question_requires_regex,
     _question_requires_structural_regex,
     _question_requires_word_boundary_regex,
@@ -5961,6 +5962,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # ------------------------------------------------------------------
     if draft_source == "ir_planner":
         final_sql, warnings = safety_normalize_sql(draft_sql)
+        final_sql = _rewrite_missing_joined_agg_threshold_filter(final_sql, question, ctx)
         corrections = ["Deterministic IR planner output"]
         ir_semantic_repair_used = False
         ir_semantic_fallback_used = False
@@ -6883,17 +6885,36 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             out: Set[str] = set()
             if not text:
                 return out
+            identifier_terms = {
+                "id", "ids", "identifier", "identifiers",
+                "number", "numbers", "code", "codes", "key", "keys",
+            }
+
+            def _expand_term(term: str) -> Set[str]:
+                expanded: Set[str] = set()
+                low = str(term or "").strip().lower()
+                if not low:
+                    return expanded
+                expanded.add(low)
+                if low.endswith("ies") and len(low) > 3:
+                    expanded.add(low[:-3] + "y")
+                elif low.endswith("s") and len(low) > 3:
+                    expanded.add(low[:-1])
+                if low in identifier_terms:
+                    expanded.update(identifier_terms)
+                return expanded
+
             for token in re.findall(r"[A-Za-z0-9_]+", text):
                 low = token.lower()
                 if low:
-                    out.add(low)
+                    out.update(_expand_term(low))
                 for part in low.split("_"):
                     if part:
-                        out.add(part)
+                        out.update(_expand_term(part))
                 camel_spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r"\1 \2", token)
                 for part in re.findall(r"[a-z0-9]+", camel_spaced.lower()):
                     if part:
-                        out.add(part)
+                        out.update(_expand_term(part))
             return out
 
         projected_alias_token_sets: List[Set[str]] = []
@@ -6910,6 +6931,34 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             token_set = _semantic_parts(label)
             if token_set:
                 projected_alias_token_sets.append(token_set)
+
+        identifier_terms = {
+            "id", "ids", "identifier", "identifiers",
+            "number", "numbers", "code", "codes", "key", "keys",
+        }
+
+        def _parts_covered_by_alias(required_parts: Set[str], alias_tokens: Set[str]) -> bool:
+            if not required_parts or not alias_tokens:
+                return False
+
+            def _equiv(a: str, b: str) -> bool:
+                a0 = str(a or "").strip().lower()
+                b0 = str(b or "").strip().lower()
+                if not a0 or not b0:
+                    return False
+                if a0 == b0:
+                    return True
+                if a0 in identifier_terms and b0 in identifier_terms:
+                    return True
+                short, long = (a0, b0) if len(a0) <= len(b0) else (b0, a0)
+                if len(short) >= 3 and len(long) >= 5 and long.startswith(short):
+                    return True
+                return False
+
+            return all(
+                any(_equiv(req, tok) for tok in alias_tokens)
+                for req in required_parts
+            )
         
         # STEP 1b: Ambil tokens dari WHERE/HAVING/subquery (kolom yang dipakai sebagai filter)
         # Kolom yang sudah dipakai di WHERE tidak perlu ada di SELECT (bukan "missing")
@@ -6967,7 +7016,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             if not parts: continue
 
             parts_set = {p for p in parts if p}
-            if parts_set and any(parts_set.issubset(token_set) for token_set in projected_alias_token_sets):
+            if parts_set and any(_parts_covered_by_alias(parts_set, token_set) for token_set in projected_alias_token_sets):
                 continue
 
             last_word = parts[-1]

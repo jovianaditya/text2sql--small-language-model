@@ -79,20 +79,27 @@ from .helpers_core import (
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _preexecute_sql_safety_pass,
-    _rewrite_winner_row_aggregate_misuse, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _rewrite_winner_row_aggregate_misuse, _rewrite_explicit_rank_aggregate_window, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _rewrite_dual_fact_rollup_fanout,
+    _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
+    _rewrite_missing_joined_agg_threshold_filter,
     _rewrite_missing_overall_avg_having,
     _rewrite_employee_latest_payment_customer_identity,
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
+    _rewrite_role_label_count_semantics,
     _drop_unrequested_exists_filters,
     _drop_unrequested_temporal_filters,
+    _rewrite_temporal_year_exclusion_antijoin,
     _prefer_not_exists_for_simple_exclusion,
     _repair_temporal_not_exists_scope,
     _question_wants_latest_year_scope_with_aggregate,
+    _split_top_level_and,
+    _split_top_level_commas,
+    _has_top_level_or,
     # phase 4b - Aggregate in WHERE fix
     _fix_aggregate_in_where,
     _fix_raw_column_where_to_having,
@@ -4256,14 +4263,23 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _fix_winner_row_metric_order_priority(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after winner-row metric priority fix:", s)
 
+        s = _rewrite_explicit_rank_aggregate_window(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after explicit-rank aggregate fix:", s)
+
         s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after metric-agg-column fix:", s)
+
+        s = _rewrite_missing_joined_agg_threshold_filter(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after joined-agg threshold fix:", s)
 
         s = _rewrite_missing_overall_avg_having(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after overall-avg baseline fix:", s)
 
         s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after include-zero winner-row id-source fix:", s)
+
+        s = _rewrite_invalid_metric_bridge_rollup(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after metric-bridge path fix:", s)
 
         s = _rewrite_missing_metric_join_in_rollup(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after hierarchical metric rollup fix:", s)
@@ -4282,6 +4298,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _canonicalize_latest_year_same_year_pattern(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year canonical pattern fix:", s)
+
+        s = _rewrite_latest_year_bridge_tuple_runtime(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year runtime tuple fix:", s)
+
+        s = _rewrite_bridge_latest_year_tuple_filter(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year bridge tuple fix:", s)
 
         s = _rewrite_latest_year_tuple_in_filter(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year tuple-IN fix:", s)
@@ -4309,11 +4331,17 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_row_level_nonnull_to_group_existence(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after nonnull row-filter->group existence fix: {s}")
 
+        s = _rewrite_role_label_count_semantics(s, question)
+        if DEBUG_WR: print(f"[REFINER - PH4] after role-label count fix: {s}")
+
         s = _drop_unrequested_exists_filters(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested EXISTS-drop fix: {s}")
 
         s = _drop_unrequested_temporal_filters(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested temporal-filter drop fix: {s}")
+
+        s = _rewrite_temporal_year_exclusion_antijoin(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after temporal exclusion anti-join fix: {s}")
 
         s = _prefer_not_exists_for_simple_exclusion(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after NOT EXISTS anti-join preference: {s}")
@@ -4345,6 +4373,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             if DEBUG_WR: print(f"[PH4-FORCE] after agg-misuse fix: {s}")
             s = _fix_winner_row_window_order_priority(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after winner-row window order fix: {s}")
+
+            s = _rewrite_missing_joined_agg_threshold_filter(s, question, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after joined-agg threshold fix: {s}")
 
             s = _rewrite_missing_overall_avg_having(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after overall-avg baseline fix: {s}")
@@ -4590,6 +4621,211 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     s = _collapse_spaces_outside_quotes(s)
     return s
+
+
+def _rewrite_latest_year_bridge_tuple_runtime(sql: str, question: str) -> str:
+    """
+    Narrow runtime fallback for bridge-backed latest-year tuple filters.
+    Designed to touch only flat grouped latest-year aggregates.
+    """
+    if not sql or not _question_wants_latest_year_scope_with_aggregate(question):
+        return sql
+
+    s0 = (sql or "").strip().rstrip(";").strip()
+    if " in (select max(year(" not in s0.lower():
+        return sql
+
+    def _find_kw(text: str, keyword: str, start: int = 0) -> int:
+        w = keyword.lower()
+        n = len(w)
+        depth = 0
+        in_sq = in_dq = in_bt = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq and not in_bt:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq and not in_bt:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if ch == "`" and not in_sq and not in_dq:
+                in_bt = not in_bt
+                i += 1
+                continue
+            if in_sq or in_dq or in_bt:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and i >= start and i + n <= len(text):
+                left_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+                right_ok = (i + n) >= len(text) or not (text[i + n].isalnum() or text[i + n] == "_")
+                if left_ok and right_ok and text[i:i + n].lower() == w:
+                    return i
+            i += 1
+        return -1
+
+    sel = _find_kw(s0, "select", 0)
+    frm = _find_kw(s0, "from", sel + 6)
+    grp = _find_kw(s0, "group by", frm + 4)
+    if sel < 0 or frm < 0 or grp < 0:
+        return sql
+    ordp = _find_kw(s0, "order by", grp + 8)
+    limitp = _find_kw(s0, "limit", grp + 8)
+    tail_pos = min([p for p in [ordp, limitp] if p >= 0], default=len(s0))
+
+    select_part = s0[sel + 6:frm].strip()
+    from_part = s0[frm + 4:grp].strip()
+    group_part = s0[grp + 8:tail_pos].strip()
+    tail_part = s0[tail_pos:].strip() if tail_pos < len(s0) else ""
+
+    where_pos = _find_kw(from_part, "where", 0)
+    if where_pos < 0:
+        return sql
+    from_core = from_part[:where_pos].strip()
+    where_body = re.sub(r"^\s*where\s+", "", from_part[where_pos:].strip(), flags=re.I).strip()
+    if not from_core or not where_body or _has_top_level_or(where_body):
+        return sql
+
+    alias_map = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    if not alias_map:
+        return sql
+    conjuncts = _split_top_level_and(where_body)
+    if not conjuncts:
+        return sql
+
+    eq_pairs = list(
+        re.finditer(
+            r"""`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?""",
+            from_core,
+            flags=re.I,
+        )
+    )
+
+    tuple_pat = re.compile(
+        r"""(?is)^\s*\(\s*YEAR\s*\(\s*`?(?P<outer_date_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<outer_date_col>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*,\s*`?(?P<outer_entity_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<outer_entity_col>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s+IN\s*\(\s*SELECT\s+(?:MAX\s*\(\s*YEAR\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<sub_date_col_1>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*\)|YEAR\s*\(\s*MAX\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<sub_date_col_2>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*\))\s*,\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<sub_key_col>[A-Za-z_][A-Za-z0-9_]*)`?\s+FROM\s+`?(?P<sub_date_table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?`?[A-Za-z_][A-Za-z0-9_]*`?)?\s+GROUP\s+BY\s+(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<group_col>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*$""",
+    )
+
+    for idx, cond in enumerate(conjuncts):
+        m = tuple_pat.match((cond or "").strip())
+        if not m:
+            continue
+
+        outer_date_alias = m.group("outer_date_alias")
+        outer_date_col = m.group("outer_date_col")
+        outer_entity_alias = m.group("outer_entity_alias")
+        outer_entity_col = m.group("outer_entity_col")
+
+        bridge_matches: List[Tuple[str, str, str]] = []
+        for m_eq_date in eq_pairs:
+            a1, c1, a2, c2 = m_eq_date.group(1), m_eq_date.group(2), m_eq_date.group(3), m_eq_date.group(4)
+            a1l, a2l = a1.lower(), a2.lower()
+            if a1l == outer_date_alias.lower() and a2l in alias_map and a2l != outer_date_alias.lower():
+                bridge_alias, date_join_col, bridge_fk_col = a2, c1, c2
+            elif a2l == outer_date_alias.lower() and a1l in alias_map and a1l != outer_date_alias.lower():
+                bridge_alias, date_join_col, bridge_fk_col = a1, c2, c1
+            else:
+                continue
+
+            entity_join_ok = False
+            for m_eq_entity in eq_pairs:
+                b1, d1, b2, d2 = m_eq_entity.group(1), m_eq_entity.group(2), m_eq_entity.group(3), m_eq_entity.group(4)
+                b1l, b2l = b1.lower(), b2.lower()
+                if b1l == bridge_alias.lower() and b2l == outer_entity_alias.lower() and d1.lower() == outer_entity_col.lower() and d2.lower() == outer_entity_col.lower():
+                    entity_join_ok = True
+                    break
+                if b2l == bridge_alias.lower() and b1l == outer_entity_alias.lower() and d2.lower() == outer_entity_col.lower() and d1.lower() == outer_entity_col.lower():
+                    entity_join_ok = True
+                    break
+            if entity_join_ok:
+                bridge_matches.append((bridge_alias, date_join_col, bridge_fk_col))
+
+        if len(bridge_matches) != 1:
+            continue
+
+        bridge_alias, date_join_col, bridge_fk_col = bridge_matches[0]
+        bridge_table = alias_map.get(bridge_alias) or alias_map.get(bridge_alias.lower()) or bridge_alias
+        outer_date_table = alias_map.get(outer_date_alias) or alias_map.get(outer_date_alias.lower()) or outer_date_alias
+
+        used_aliases = {a.lower() for a in alias_map.keys() if a}
+        used_aliases.update(str(t or "").replace("`", "").split(".")[-1].strip().lower() for t in alias_map.values())
+
+        def _pick_alias(base: str) -> str:
+            seed = re.sub(r"[^A-Za-z0-9_]+", "_", (base or "")).strip("_") or "t"
+            if not re.match(r"[A-Za-z_]", seed[0]):
+                seed = f"t_{seed}"
+            cand = seed
+            n = 2
+            while cand.lower() in used_aliases:
+                cand = f"{seed}_{n}"
+                n += 1
+            used_aliases.add(cand.lower())
+            return cand
+
+        ly_alias = _pick_alias("latest_years")
+        src_alias = _pick_alias("ly_src")
+        dt_alias = _pick_alias("ly_dt")
+
+        def _replace_year(text: str) -> str:
+            return re.sub(
+                rf"(?is)YEAR\s*\(\s*`?{re.escape(outer_date_alias)}`?\s*\.\s*`?{re.escape(outer_date_col)}`?\s*\)",
+                f"{ly_alias}.latest_year",
+                text,
+            )
+
+        select_rebuilt = _replace_year(select_part)
+        group_items: List[str] = []
+        seen_group: Set[str] = set()
+        for item in _split_top_level_commas(group_part):
+            replaced = _replace_year((item or "").strip()).strip()
+            if not replaced:
+                continue
+            key = replaced.lower()
+            if key in seen_group:
+                continue
+            seen_group.add(key)
+            group_items.append(replaced)
+        if not group_items:
+            continue
+
+        ly_join = (
+            "JOIN (\n"
+            "  SELECT\n"
+            f"    {src_alias}.{outer_entity_col} AS latest_key,\n"
+            f"    MAX(YEAR({dt_alias}.{outer_date_col})) AS latest_year\n"
+            f"  FROM {bridge_table} AS {src_alias}\n"
+            f"  JOIN {outer_date_table} AS {dt_alias}\n"
+            f"    ON {dt_alias}.{date_join_col} = {src_alias}.{bridge_fk_col}\n"
+            f"  GROUP BY {src_alias}.{outer_entity_col}\n"
+            f") AS {ly_alias}\n"
+            f"  ON {ly_alias}.latest_key = {outer_entity_alias}.{outer_entity_col}"
+        )
+
+        remaining = [c.strip() for j, c in enumerate(conjuncts) if j != idx and c.strip()]
+        remaining.append(f"YEAR({outer_date_alias}.{outer_date_col}) = {ly_alias}.latest_year")
+        tail_clause = f"\n{tail_part}" if tail_part else ""
+        return (
+            f"SELECT {select_rebuilt}\n"
+            f"FROM {from_core}\n{ly_join}\n"
+            f"WHERE {' AND '.join(remaining)}\n"
+            f"GROUP BY {', '.join(group_items)}"
+            f"{tail_clause};"
+        )
+
+    return sql
+
 
 def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=None) -> str:
     """
