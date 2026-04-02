@@ -395,6 +395,211 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 
     return None
 
+
+def _extract_loose_json_string_value(text: str, key: str) -> Optional[str]:
+    txt = _strip_code_fences(str(text or ""))
+    if not txt:
+        return None
+
+    m = re.search(rf'(?is)["\']{re.escape(str(key or "").strip())}["\']\s*:\s*', txt)
+    if not m:
+        return None
+
+    i = m.end()
+    n = len(txt)
+    pieces: List[str] = []
+
+    while i < n:
+        while i < n and txt[i].isspace():
+            i += 1
+        if i >= n or txt[i] != '"':
+            break
+        i += 1
+
+        buf: List[str] = []
+        escaped = False
+        closed = False
+        while i < n:
+            ch = txt[i]
+            if escaped:
+                buf.append(ch)
+                escaped = False
+                i += 1
+                continue
+            if ch == "\\":
+                escaped = True
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"':
+                closed = True
+                i += 1
+                break
+            buf.append(ch)
+            i += 1
+
+        if not closed:
+            raw_piece = "".join(buf).strip()
+            if str(key or "").strip().lower() != "sql":
+                return None
+            recovered_piece = (
+                raw_piece
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace('\\"', '"')
+            )
+            recovered_sql = recovered_piece.strip()
+            if not re.match(r"(?is)^(SELECT|WITH)\b", recovered_sql):
+                return None
+            if not (
+                re.search(r"\bFROM\b", recovered_sql, flags=re.I)
+                or re.search(r"\bGROUP\s+BY\b", recovered_sql, flags=re.I)
+                or re.search(r"\bORDER\s+BY\b", recovered_sql, flags=re.I)
+            ):
+                return None
+            pieces.append(recovered_piece)
+            break
+
+        raw_piece = "".join(buf)
+        try:
+            piece = json.loads(f'"{raw_piece}"')
+        except Exception:
+            piece = raw_piece.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+        pieces.append(str(piece))
+
+        while i < n and txt[i].isspace():
+            i += 1
+        if i < n and txt[i] == "+":
+            i += 1
+            continue
+        if i < n and txt[i] == '"':
+            continue
+        break
+
+    joined = "".join(pieces).strip()
+    return joined or None
+
+
+def _extract_jsonish_sql_field(text: str) -> Optional[str]:
+    txt = _strip_code_fences(str(text or ""))
+    if not txt:
+        return None
+
+    m = re.search(r'(?is)["\']sql["\']\s*:\s*', txt)
+    if not m:
+        return None
+
+    tail = txt[m.end():].lstrip()
+    if tail.startswith('"'):
+        tail = tail[1:]
+
+    end_markers = [
+        r'(?is)"\s*,\s*["\']notes["\']\s*:',
+        r'(?is)"\s*,\s*["\'][A-Za-z_][A-Za-z0-9_]*["\']\s*:',
+        r'(?is)"\s*}\s*$',
+        r'(?is)\n\s*["\']notes["\']\s*:',
+    ]
+
+    end_pos = None
+    for pat in end_markers:
+        m_end = re.search(pat, tail)
+        if not m_end:
+            continue
+        cand_end = m_end.start()
+        end_pos = cand_end if end_pos is None else min(end_pos, cand_end)
+
+    raw = tail[:end_pos].strip() if end_pos is not None else tail.strip()
+    raw = raw.rstrip(",").rstrip("}").strip()
+    if not raw:
+        return None
+
+    recovered = (
+        raw
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+    ).strip()
+    if not re.match(r"(?is)^(SELECT|WITH)\b", recovered):
+        return None
+    return recovered
+
+
+def _extract_plain_sql_statement(text: str) -> Optional[str]:
+    txt = _strip_code_fences(str(text or "")).strip()
+    if not txt:
+        return None
+
+    m = re.search(r"(?is)\b(?:SELECT|WITH)\b.+", txt)
+    if not m:
+        return None
+
+    candidate = m.group(0).strip()
+    note_marker = re.search(r'(?is)\s+["\']?notes["\']?\s*:\s*', candidate)
+    if note_marker:
+        candidate = candidate[: note_marker.start()].strip().rstrip(",{")
+
+    if not re.match(r"(?is)^(SELECT|WITH)\b", candidate):
+        return None
+    if " FROM " not in candidate.upper() and not re.match(r"(?is)^WITH\b", candidate):
+        return None
+    return candidate
+
+
+def _looks_complete_sql_statement(sql_text: str) -> bool:
+    s = _strip_code_fences(str(sql_text or "")).strip()
+    if not s:
+        return False
+    if not re.match(r"(?is)^(SELECT|WITH)\b", s):
+        return False
+
+    upper = s.upper()
+    if upper.startswith("SELECT") and " FROM " not in upper:
+        return False
+
+    case_count = len(re.findall(r"\bCASE\b", upper))
+    end_count = len(re.findall(r"\bEND\b", upper))
+    if case_count and end_count < case_count:
+        return False
+
+    if re.search(r"\bWHEN\b", upper) and not case_count:
+        return False
+
+    if re.search(r"(?is)\b(?:SELECT|WITH)\b", s) and s.rstrip().endswith(("THEN", "WHEN", "ELSE", "FROM", "WHERE", "GROUP BY", "ORDER BY")):
+        return False
+
+    return True
+
+
+def _extract_loose_json_object(text: str) -> Optional[Dict[str, Any]]:
+    txt = _strip_code_fences(str(text or ""))
+    if not txt:
+        return None
+
+    sql_value = _extract_loose_json_string_value(txt, "sql")
+    plain_sql = _extract_plain_sql_statement(txt)
+    jsonish_sql = _extract_jsonish_sql_field(txt)
+
+    candidates = []
+    for cand in (sql_value, jsonish_sql, plain_sql):
+        c = str(cand or "").strip()
+        if c:
+            candidates.append(c)
+
+    complete_candidates = [c for c in candidates if _looks_complete_sql_statement(c)]
+    chosen_sql = max(complete_candidates, key=len) if complete_candidates else None
+
+    if chosen_sql:
+        out: Dict[str, Any] = {"sql": chosen_sql}
+        notes_value = _extract_loose_json_string_value(txt, "notes")
+        if notes_value:
+            out["notes"] = notes_value
+        return out
+
+    if plain_sql and _looks_complete_sql_statement(plain_sql):
+        return {"sql": plain_sql}
+
+    return None
+
 def try_llm_json(
     llm: Any,  # ChatOllama atau tipe LLM lain
     prompt: str,
@@ -414,6 +619,7 @@ def try_llm_json(
         print("[LLM Error] LLM Object is None.")
         return None
 
+    last_content = ""
     for attempt in range(max_attempts):
         try:
             # 1. Invoke LLM
@@ -427,14 +633,19 @@ def try_llm_json(
                 return content
 
             content = _coerce_llm_content_text(content if content is not None else resp)
+            last_content = str(content or "")
 
             # 2. Extract JSON (Gunakan regex yang kuat)
             obj = _extract_json_object(content)
-            
             if obj:
                 return obj
-            else:
-                print(f"[LLM Warning] Gagal extract JSON dari response:\n{content[:100]}...")
+
+            salvaged = _extract_loose_json_object(content)
+            if salvaged:
+                print("[LLM Warning] JSON malformed; salvaged SQL payload heuristically.")
+                return salvaged
+
+            print(f"[LLM Warning] Gagal extract JSON dari response:\n{content[:100]}...")
                 
         except Exception as e:
             error_msg = str(e).lower()
@@ -449,6 +660,69 @@ def try_llm_json(
                 # Don't count this as an attempt - let outer loop handle retry
                 continue
 
+    if last_content:
+        final_salvaged = _extract_loose_json_object(last_content)
+        if final_salvaged:
+            print("[LLM Warning] Final raw-response SQL salvage succeeded after JSON failure.")
+            return final_salvaged
+
+    return None
+
+
+def try_llm_sql_text(
+    llm: Any,
+    prompt: str,
+    max_attempts: int = 1,
+    oom_retry_wait: int = 0,
+) -> Optional[str]:
+    """
+    Generic text-mode SQL extraction.
+    Used as a conservative fallback when JSON mode is too fragile for some
+    generic query families.
+    """
+    import time
+
+    if not llm:
+        print("[LLM Error] LLM Object is None.")
+        return None
+
+    last_content = ""
+    for attempt in range(max_attempts):
+        try:
+            resp = llm.invoke(prompt)
+            content = getattr(resp, "content", None)
+            content = _coerce_llm_content_text(content if content is not None else resp)
+            last_content = str(content or "")
+
+            for candidate in (
+                _extract_plain_sql_statement(content),
+                _extract_jsonish_sql_field(content),
+                _extract_loose_json_string_value(content, "sql"),
+            ):
+                cand = str(candidate or "").strip()
+                if cand and _looks_complete_sql_statement(cand):
+                    return cand
+
+            print(f"[LLM Warning] Gagal extract SQL text dari response:\n{last_content[:100]}...")
+        except Exception as e:
+            error_msg = str(e).lower()
+            print(f"[LLM CRITICAL ERROR] SQL text attempt {attempt+1} failed: {e}")
+            if "memory" in error_msg and oom_retry_wait > 0:
+                print(f"[LLM OOM] Detected memory issue. Waiting {oom_retry_wait}s for model to unload...")
+                time.sleep(oom_retry_wait)
+                print("[LLM OOM] Retrying SQL text mode...")
+                continue
+
+    if last_content:
+        for candidate in (
+            _extract_plain_sql_statement(last_content),
+            _extract_jsonish_sql_field(last_content),
+            _extract_loose_json_string_value(last_content, "sql"),
+        ):
+            cand = str(candidate or "").strip()
+            if cand and _looks_complete_sql_statement(cand):
+                print("[LLM Warning] Final SQL-text salvage succeeded after text-mode extraction failure.")
+                return cand
     return None
 
 def build_router_schema(context_input) -> str:

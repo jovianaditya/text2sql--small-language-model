@@ -195,7 +195,7 @@ from .config import (
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
-from .utils import _dbg_print_two, try_llm_json, build_router_schema
+from .utils import _dbg_print_two, try_llm_json, try_llm_sql_text, build_router_schema
 from .generation import regenerate_with_extra_constraint
 from .intent_ir import build_intent_ir, is_ir_plannable
 from .sql_planner import build_sql_from_intent, safety_normalize_sql
@@ -396,13 +396,25 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         context_table_count = 0
     relational_ctx = context_table_count >= 2
     wants_include_zero = relational_ctx and _question_wants_include_zero(question, ctx)
-    wants_anti_existence = relational_ctx and _question_wants_anti_existence(question, ctx) and not wants_include_zero
+    wants_projection_null_fill = _question_requests_projection_null_fill(question)
+    wants_anti_existence = (
+        relational_ctx
+        and _question_wants_anti_existence(question, ctx)
+        and not wants_include_zero
+        and not wants_projection_null_fill
+    )
     wants_final_order = _question_requests_ordering(question)
+    wants_offset_window = _question_has_offset_window_sequence_intent(question)
     wants_boundary_regex = _question_requires_word_boundary_regex(question)
     wants_regex = _question_requires_regex(question)
     wants_structural_regex = _question_requires_structural_regex(question)
     wants_scalar_extrema_date_filter = _question_requires_scalar_extrema_date_filter(question)
-    required_window_partition_col = _resolve_required_window_partition_column(question, ctx)
+    # Same-group/window-partition requirements belong to window-aggregate
+    # families. True winner-row questions should be governed by their
+    # ROW_NUMBER / ORDER BY shape instead of an inferred PARTITION BY contract.
+    required_window_partition_col = ""
+    if not wants_winner_row:
+        required_window_partition_col = _resolve_required_window_partition_column(question, ctx)
     return {
         "requires_projection_distinct": wants_projection_distinct,
         "requires_count_distinct": wants_count_distinct,
@@ -410,6 +422,7 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         "requires_anti_existence": wants_anti_existence,
         "requires_include_zero": wants_include_zero,
         "requires_final_order": wants_final_order,
+        "requires_offset_window": wants_offset_window,
         "requires_boundary_regex": wants_boundary_regex,
         "requires_regex": wants_regex,
         "requires_structural_regex": wants_structural_regex,
@@ -755,7 +768,7 @@ def _rewrite_grouped_aggregate_to_window_partition(sql: str, partition_col: str,
         return sql
     if "OVER" in s.upper() or "GROUP BY" not in s.upper():
         return sql
-    if re.search(r"\b(?:JOIN|HAVING|UNION|INTERSECT|EXCEPT)\b", s, flags=re.I):
+    if re.search(r"\b(?:HAVING|UNION|INTERSECT|EXCEPT)\b", s, flags=re.I):
         return sql
 
     match = re.match(
@@ -765,81 +778,168 @@ def _rewrite_grouped_aggregate_to_window_partition(sql: str, partition_col: str,
         r"\s+GROUP\s+BY\s+(?P<group>.*?)(?:\s+ORDER\s+BY\s+(?P<order>.*?))?\s*$",
         s,
     )
-    if not match:
+    if match:
+        select_clause = (match.group("select") or "").strip()
+        table = (match.group("table") or "").strip()
+        alias = (match.group("alias") or "").strip()
+        where_clause = (match.group("where") or "").strip()
+        order_clause = (match.group("order") or "").strip()
+        if select_clause and table:
+            select_items = _split_top_level_csv(select_clause)
+            if select_items:
+                aggregate_idx = -1
+                aggregate_func = ""
+                aggregate_arg = ""
+                aggregate_alias = ""
+                aggregate_expr = ""
+
+                for idx, item in enumerate(select_items):
+                    agg_match = re.match(
+                        r"(?is)^\s*(?P<func>AVG|COUNT|SUM|MIN|MAX)\s*\(\s*(?P<arg>[^)]*?)\s*\)"
+                        r"(?:\s+AS\s+(?P<alias>`?[A-Za-z_][A-Za-z0-9_]*`?|'[^']+'|\"[^\"]+\"))?\s*$",
+                        item,
+                    )
+                    if agg_match:
+                        if aggregate_idx >= 0:
+                            return sql
+                        aggregate_idx = idx
+                        aggregate_func = (agg_match.group("func") or "").upper()
+                        aggregate_arg = (agg_match.group("arg") or "").strip()
+                        aggregate_alias = (agg_match.group("alias") or "").strip()
+                        aggregate_expr = item.strip()
+
+                if aggregate_idx >= 0 and aggregate_func:
+                    projection_items = [
+                        item.strip()
+                        for idx, item in enumerate(select_items)
+                        if idx != aggregate_idx and item.strip()
+                    ]
+
+                    simple_arg_match = re.match(
+                        r"(?is)^(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)$",
+                        aggregate_arg,
+                    )
+                    arg_col = (simple_arg_match.group(1) if simple_arg_match else "").strip()
+                    if arg_col and _question_mentions_column((question or "").lower(), arg_col):
+                        projection_tokens = " ".join(projection_items).lower()
+                        if arg_col.lower() not in projection_tokens:
+                            projection_items.append(arg_col)
+
+                    window_expr = f"{aggregate_func}({aggregate_arg}) OVER (PARTITION BY {partition_col})"
+                    if aggregate_alias:
+                        window_expr += f" AS {aggregate_alias}"
+                    elif aggregate_expr:
+                        inferred_alias_match = re.search(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b", aggregate_expr, flags=re.I)
+                        if inferred_alias_match:
+                            window_expr += f" AS {inferred_alias_match.group(1)}"
+                    projection_items.append(window_expr)
+
+                    if projection_items:
+                        out = f"SELECT {', '.join(projection_items)} FROM {table}"
+                        if alias:
+                            out += f" AS {alias}"
+                        if where_clause:
+                            out += f" WHERE {where_clause}"
+                        if order_clause:
+                            out += f" ORDER BY {order_clause}"
+                        simple_out = out + ";"
+                        if simple_out != sql:
+                            return simple_out
+
+    # Conservative join-aware fallback:
+    # if a same-group COUNT(*)/COUNT(col) question is answered with a grouped
+    # one-join query, rebuild it as a window COUNT over the detail table only.
+    q_low = (question or "").lower()
+    if not re.search(r"\b(?:how\s+many|count|number\s+of|total)\b", q_low, flags=re.I):
         return sql
 
-    select_clause = (match.group("select") or "").strip()
-    table = (match.group("table") or "").strip()
-    alias = (match.group("alias") or "").strip()
-    where_clause = (match.group("where") or "").strip()
-    order_clause = (match.group("order") or "").strip()
-    if not select_clause or not table:
-        return sql
+    try:
+        import sqlglot
+        from sqlglot import exp
 
-    select_items = _split_top_level_csv(select_clause)
-    if not select_items:
-        return sql
+        parsed = sqlglot.parse_one(s, read="mysql")
+        sel = parsed.find(exp.Select)
+        if sel is None or sel.find(exp.Window):
+            return sql
+        joins = list(sel.args.get("joins") or [])
+        if len(joins) != 1:
+            return sql
 
-    aggregate_idx = -1
-    aggregate_func = ""
-    aggregate_arg = ""
-    aggregate_alias = ""
-    aggregate_expr = ""
+        from_expr = sel.args.get("from") or sel.args.get("from_")
+        base_src = getattr(from_expr, "this", None)
+        if not isinstance(base_src, exp.Table):
+            return sql
 
-    for idx, item in enumerate(select_items):
-        agg_match = re.match(
-            r"(?is)^\s*(?P<func>AVG|COUNT|SUM|MIN|MAX)\s*\(\s*(?P<arg>[^)]*?)\s*\)"
-            r"(?:\s+AS\s+(?P<alias>`?[A-Za-z_][A-Za-z0-9_]*`?|'[^']+'|\"[^\"]+\"))?\s*$",
-            item,
-        )
-        if agg_match:
-            if aggregate_idx >= 0:
+        base_alias = str(base_src.alias_or_name or "").strip()
+        if not base_alias:
+            base_alias = str(base_src.name or "").strip()
+        if not base_alias:
+            return sql
+
+        non_agg_exprs: List[str] = []
+        agg_alias = ""
+        agg_count = 0
+        for item in list(sel.expressions or []):
+            expr_node = item.this if isinstance(item, exp.Alias) else item
+            if expr_node.find(exp.Window):
                 return sql
-            aggregate_idx = idx
-            aggregate_func = (agg_match.group("func") or "").upper()
-            aggregate_arg = (agg_match.group("arg") or "").strip()
-            aggregate_alias = (agg_match.group("alias") or "").strip()
-            aggregate_expr = item.strip()
+            agg_nodes = list(expr_node.find_all(exp.AggFunc))
+            if agg_nodes:
+                if len(agg_nodes) != 1 or agg_count > 0:
+                    return sql
+                agg = agg_nodes[0]
+                if not isinstance(agg, exp.Count):
+                    return sql
+                agg_count += 1
+                if isinstance(item, exp.Alias):
+                    agg_alias = str(item.alias or "").strip()
+                continue
 
-    if aggregate_idx < 0 or not aggregate_func:
+            col_tables = {
+                str(col.table or "").strip()
+                for col in expr_node.find_all(exp.Column)
+                if str(col.table or "").strip()
+            }
+            if col_tables and col_tables != {base_alias}:
+                return sql
+            non_agg_exprs.append(item.sql(dialect="mysql"))
+
+        if agg_count != 1 or not non_agg_exprs:
+            return sql
+
+        where_expr = sel.args.get("where")
+        if where_expr is not None:
+            where_tables = {
+                str(col.table or "").strip()
+                for col in where_expr.find_all(exp.Column)
+                if str(col.table or "").strip()
+            }
+            if where_tables and where_tables != {base_alias}:
+                return sql
+
+        order_expr = sel.args.get("order")
+        if order_expr is not None:
+            order_tables = {
+                str(col.table or "").strip()
+                for col in order_expr.find_all(exp.Column)
+                if str(col.table or "").strip()
+            }
+            if order_tables and order_tables != {base_alias}:
+                return sql
+
+        partition_ref = f"{base_alias}.{partition_col}"
+        window_item = f"COUNT(*) OVER (PARTITION BY {partition_ref})"
+        if agg_alias:
+            window_item += f" AS {agg_alias}"
+
+        rebuilt = f"SELECT {', '.join(non_agg_exprs + [window_item])} FROM {base_src.sql(dialect='mysql')}"
+        if where_expr is not None:
+            rebuilt += f" WHERE {where_expr.sql(dialect='mysql')}"
+        if order_expr is not None:
+            rebuilt += f" {order_expr.sql(dialect='mysql')}"
+        return rebuilt + ";"
+    except Exception:
         return sql
-
-    projection_items = [
-        item.strip()
-        for idx, item in enumerate(select_items)
-        if idx != aggregate_idx and item.strip()
-    ]
-
-    simple_arg_match = re.match(
-        r"(?is)^(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)$",
-        aggregate_arg,
-    )
-    arg_col = (simple_arg_match.group(1) if simple_arg_match else "").strip()
-    if arg_col and _question_mentions_column((question or "").lower(), arg_col):
-        projection_tokens = " ".join(projection_items).lower()
-        if arg_col.lower() not in projection_tokens:
-            projection_items.append(arg_col)
-
-    window_expr = f"{aggregate_func}({aggregate_arg}) OVER (PARTITION BY {partition_col})"
-    if aggregate_alias:
-        window_expr += f" AS {aggregate_alias}"
-    elif aggregate_expr:
-        inferred_alias_match = re.search(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b", aggregate_expr, flags=re.I)
-        if inferred_alias_match:
-            window_expr += f" AS {inferred_alias_match.group(1)}"
-    projection_items.append(window_expr)
-
-    if not projection_items:
-        return sql
-
-    out = f"SELECT {', '.join(projection_items)} FROM {table}"
-    if alias:
-        out += f" AS {alias}"
-    if where_clause:
-        out += f" WHERE {where_clause}"
-    if order_clause:
-        out += f" ORDER BY {order_clause}"
-    return out + ";"
 
 
 def _has_scalar_extrema_date_filter_shape(sql: str) -> bool:
@@ -1039,6 +1139,10 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         if not _has_top_level_order_by(out_sql):
             violations.append("missing_final_order")
 
+    if bool(contract.get("requires_offset_window")):
+        if not _has_required_offset_window(out_sql, question):
+            violations.append("missing_offset_window")
+
     if bool(contract.get("requires_scalar_extrema_date_filter")):
         fixed = _rewrite_scalar_extrema_date_filter(out_sql, question)
         if fixed != out_sql:
@@ -1093,6 +1197,8 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         active_contracts.append("include_zero")
     if contract["requires_final_order"]:
         active_contracts.append("final_order")
+    if bool(contract.get("requires_offset_window")):
+        active_contracts.append("offset_window")
     if bool(contract.get("requires_scalar_extrema_date_filter")):
         active_contracts.append("scalar_extrema_date_filter")
     if required_window_partition_col:
@@ -2816,7 +2922,7 @@ def router_agent(state: RAGState) -> RAGState:
     # These patterns ALWAYS need ROW_NUMBER() with rn = N, much more complex than simple MAX/MIN
     ordinal_words = AGENT_ROUTER_ORDINAL_WORDS
     ordinal_targets = AGENT_ROUTER_ORDINAL_TARGET_TERMS
-    ordinal_pattern = rf"\b({'|'.join(re.escape(w) for w in ordinal_words)})\s+({'|'.join(re.escape(w) for w in ordinal_targets)})\b"
+    ordinal_pattern = rf"\b({'|'.join(re.escape(w) for w in ordinal_words)})(?:\s+|-)+({'|'.join(re.escape(w) for w in ordinal_targets)})\b"
     ordinal_row_pattern = rf"\b({'|'.join(re.escape(w) for w in ordinal_words)})\b(?:\s+\w+){{0,8}}\s+(?:row|record|entry)\b"
     has_explicit_sort_sequence = bool(
         re.search(
@@ -3071,16 +3177,7 @@ def router_agent(state: RAGState) -> RAGState:
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
     # ═══════════════════════════════════════════════════════════════════
     is_multi_table = len(relevant_tables) > 1
-    has_numeric_threshold = bool(
-        re.search(
-            r"\b(?:greater\s+than|more\s+than|over|above|"
-            r"less\s+than|under|below|"
-            r"at\s+least|at\s+most|minimum(?:\s+of)?|maximum(?:\s+of)?)\s+"
-            r"\d[\d,]*(?:\.\d+)?\b",
-            question_lower,
-            flags=re.I,
-        )
-    )
+    has_numeric_threshold = _question_has_numeric_threshold(question_lower)
     has_distinct_term = bool(
         re.search(r"\b(?:distinct|unique|different)\b", question_lower, flags=re.I)
     )
@@ -3124,6 +3221,8 @@ def router_agent(state: RAGState) -> RAGState:
     has_tiebreaker = bool(re.search(AGENT_ROUTER_TIEBREAKER_PATTERN, question_lower))
     if has_tiebreaker:
         is_winner_row = True
+    if not is_winner_row and _question_wants_winner_row(question_lower):
+        is_winner_row = True
     
     # FIXED: Exclusion detection - only trigger for TRUE exclusion patterns
     # These patterns imply NOT EXISTS / NOT IN / LEFT JOIN ... IS NULL (cross-table exclusion)
@@ -3156,7 +3255,11 @@ def router_agent(state: RAGState) -> RAGState:
 
     # Subquery intent cues (e.g., compare against average/overall baseline, EXISTS wording).
     # This is intentionally lightweight and only used for escalation policy.
-    is_subquery_intent = bool(re.search(AGENT_ROUTER_SUBQUERY_INTENT_PATTERN, question_lower))
+    has_global_avg_baseline = _question_has_global_avg_baseline_compare(question_lower)
+    is_subquery_intent = bool(
+        re.search(AGENT_ROUTER_SUBQUERY_INTENT_PATTERN, question_lower)
+        or has_global_avg_baseline
+    )
     has_complex_subquery_cue = bool(
         re.search(AGENT_ROUTER_COMPLEX_SUBQUERY_CUE_PATTERN, question_lower)
     )
@@ -3173,7 +3276,10 @@ def router_agent(state: RAGState) -> RAGState:
         and not is_explicit_rank_function
         and not is_ordinal_ranking
         and not has_exclusion
-        and bool(re.search(AGENT_ROUTER_SIMPLE_SINGLE_TABLE_SUBQUERY_PATTERN, question_lower))
+        and bool(
+            re.search(AGENT_ROUTER_SIMPLE_SINGLE_TABLE_SUBQUERY_PATTERN, question_lower)
+            or has_global_avg_baseline
+        )
         and not has_complex_subquery_cue
     )
 
@@ -4475,6 +4581,7 @@ def _attempt_ir_semantic_repair(
         return result
 
     candidate_sql, _ = safety_normalize_sql(planned_sql)
+    candidate_sql = normalize_sql_pipeline(str(candidate_sql or planned_sql).strip(), question, ctx)
     candidate_gate = _deterministic_sql_acceptance_gate(
         candidate_sql,
         ctx=ctx,
@@ -4871,6 +4978,291 @@ def _ir_regex_family_status(intent_ir: Dict[str, Any], question: str) -> Tuple[b
     return True, True
 
 
+def _question_requests_projection_null_fill(question: str) -> bool:
+    q_raw = str(question or "")
+    q_low = q_raw.lower()
+    if not re.search(r"\b(?:missing|null|empty|blank)\b", q_low, flags=re.I):
+        return False
+    if not re.search(r"\b(?:if|when|whenever)\b", q_low, flags=re.I):
+        return False
+    if not re.search(r"\b(?:display|show|return|use)\b", q_low, flags=re.I):
+        return False
+    if re.search(r"""["'“”][^"'“”]{1,40}["'“”]""", q_raw):
+        return True
+    return bool(re.search(r"\b(?:n/?a|none|unknown|zero)\b", q_low, flags=re.I))
+
+
+def _question_has_numeric_threshold(question: str) -> bool:
+    q = str(question or "").strip().lower()
+    if not q:
+        return False
+    number_pat = (
+        r"(?:\d[\d,]*(?:\.\d+)?|"
+        r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+    )
+    return bool(
+        re.search(
+            rf"\b(?:greater\s+than|more\s+than|over|above|"
+            rf"less\s+than|under|below|"
+            rf"at\s+least|at\s+most|minimum(?:\s+of)?|maximum(?:\s+of)?)\s+{number_pat}\b",
+            q,
+            flags=re.I,
+        )
+    )
+
+
+def _question_has_global_avg_baseline_compare(question: str) -> bool:
+    q = str(question or "").strip().lower()
+    if not q:
+        return False
+    has_avg = bool(re.search(r"\b(?:avg|average|mean)\b", q, flags=re.I))
+    has_baseline = bool(
+        re.search(
+            r"\b(?:overall|global|across\s+all|entire)\b|\bacross\s+the\s+(?:whole|entire)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    has_cmp = bool(
+        re.search(
+            r"\b(?:higher|greater|more|above|over|lower|less|below|under)\s+than\b",
+            q,
+            flags=re.I,
+        )
+        or re.search(
+            r"\b(?:above|over|below|under)\b[^.]{0,32}\b(?:overall|global|average|mean)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    return has_avg and has_baseline and has_cmp
+
+
+def _question_has_offset_window_sequence_intent(question: str) -> bool:
+    q = str(question or "").strip().lower()
+    if not q:
+        return False
+    if not re.search(r"\b(?:previous|prior|next|following)\b", q, flags=re.I):
+        return False
+    return bool(
+        re.search(r"\bordered\s+by\b", q, flags=re.I)
+        or re.search(r"\bbased\s+on\b[^.]{0,80}\border\b", q, flags=re.I)
+        or re.search(r"\b(?:date|time|timestamp)[-\s]+order\b", q, flags=re.I)
+    )
+
+
+def _question_has_case_bucketing_intent(question: str) -> bool:
+    q = str(question or "").strip().lower()
+    if not q:
+        return False
+
+    has_bucket_language = bool(
+        re.search(r"\b(?:bucket|classify|categori[sz]e|group(?:ed|ing)?\s+into|bands?|ranges?|distribution)\b", q, flags=re.I)
+    )
+    if not has_bucket_language:
+        return False
+
+    has_threshold_shape = bool(
+        re.search(r"[<>]=?\s*\d", q)
+        or re.search(r"\bbetween\s+\d+(?:\.\d+)?\s+(?:and|-|to)\s+\d+(?:\.\d+)?\b", q, flags=re.I)
+        or re.search(r"\b(?:low|mid|medium|high)\b", q, flags=re.I)
+    )
+    if not has_threshold_shape:
+        return False
+
+    return bool(
+        re.search(r"\bcount\b", q, flags=re.I)
+        or re.search(r"\bhow\s+many\b", q, flags=re.I)
+        or re.search(r"\bdistribution\b", q, flags=re.I)
+    )
+
+
+def _make_sql_only_draft_prompt(base_prompt: str) -> str:
+    p = str(base_prompt or "").rstrip()
+    return (
+        f"{p}\n\n"
+        "TEMPORARY OUTPUT OVERRIDE:\n"
+        "Ignore any JSON requirement above.\n"
+        "Return ONLY the final MySQL query as plain text on a single line.\n"
+        "Do NOT return JSON. Do NOT return notes. Do NOT use Markdown.\n"
+        "End the SQL with a semicolon."
+    )
+
+
+def _make_case_bucketing_ultra_minimal_prompt(question: str, ctx: str) -> str:
+    prompt_lines = [
+        "Return exactly one valid MySQL SELECT query on a single line.",
+        "Do NOT return JSON. Do NOT return notes. Do NOT use Markdown.",
+        f"Question: {str(question or '').strip()}",
+        "Use CASE WHEN ... THEN ... ELSE ... END for the bucket labels.",
+        "If grouping by the bucket, repeat the full CASE expression inside GROUP BY instead of using the alias.",
+        "If the question asks for counts per bucket, return the bucket label column and a COUNT(...) metric.",
+        "If the question asks for descending count order, sort by COUNT(...) DESC.",
+    ]
+
+    allowed_snapshot = _allowed_identifiers_snapshot(ctx, max_tables=2, max_cols=10)
+    if allowed_snapshot:
+        prompt_lines.append(allowed_snapshot)
+
+    prompt_lines.append("End the SQL with a semicolon.")
+    return "\n".join(prompt_lines)
+
+
+def _make_case_bucketing_micro_prompt(question: str, ctx: str) -> str:
+    q = str(question or "").strip()
+    prompt_lines = [
+        "Write one valid MySQL SELECT query for a single-table numeric bucket aggregation.",
+        "Return plain SQL only on one line.",
+        "Do NOT return JSON. Do NOT return notes. Do NOT use Markdown.",
+        f"Question: {q}",
+        "Use CASE WHEN ... THEN ... ELSE ... END to assign the bucket labels requested by the question.",
+        "Return exactly two outputs: the bucket label and a count metric.",
+        "Repeat the full CASE expression inside GROUP BY instead of using the alias.",
+        "If descending count order is requested, use ORDER BY COUNT(...) DESC.",
+    ]
+
+    allowed_map = _parse_allowed_identifiers(ctx or "")
+    if len(allowed_map) == 1:
+        table_name, cols = next(iter(allowed_map.items()))
+        cols_sorted = sorted(str(c) for c in (cols or set()) if str(c).strip())
+        if table_name:
+            prompt_lines.append(f"Use this table only: {table_name}")
+        if cols_sorted:
+            prompt_lines.append(f"Allowed columns: {', '.join(cols_sorted[:8])}")
+    else:
+        allowed_snapshot = _allowed_identifiers_snapshot(ctx, max_tables=2, max_cols=8)
+        if allowed_snapshot:
+            prompt_lines.append(allowed_snapshot)
+
+    prompt_lines.append("End the SQL with a semicolon.")
+    return "\n".join(prompt_lines)
+
+
+def _recover_missing_outer_winner_row_columns(sql: str, missing_cols: List[str]) -> Optional[str]:
+    s = str(sql or "").strip()
+    if not s or not missing_cols:
+        return None
+    if "ROW_NUMBER" not in s.upper():
+        return None
+
+    pattern = re.compile(
+        r"(?is)^\s*SELECT\s+(?P<outer>.*?)\s+FROM\s*\(\s*SELECT\s+(?P<inner>.*?)\s+FROM\s+(?P<rest>.+?)\)\s*(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s+WHERE\s+(?P=alias)\.rn\s*=\s*\d+\s*;?\s*$"
+    )
+    m = pattern.match(s)
+    if not m:
+        return None
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    buf.append(ch)
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                buf.append(ch)
+                i += 1
+                continue
+            if not in_sq and not in_dq:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif ch == "," and depth == 0:
+                    item = "".join(buf).strip()
+                    if item:
+                        items.append(item)
+                    buf = []
+                    i += 1
+                    continue
+            buf.append(ch)
+            i += 1
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _extract_output_label(select_item: str) -> str:
+        item = str(select_item or "").strip()
+        if not item:
+            return ""
+        alias_match = re.search(
+            r"""(?is)\bAS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item,
+        )
+        if alias_match:
+            return alias_match.group(1).strip("`'\"").lower()
+        simple_match = re.match(
+            r"(?is)^\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            item,
+        )
+        return (simple_match.group(1).lower() if simple_match else "")
+
+    outer_select = m.group("outer").strip()
+    inner_select = m.group("inner").strip()
+    alias = m.group("alias").strip()
+
+    outer_items = _split_top_level_csv(outer_select)
+    inner_items = _split_top_level_csv(inner_select)
+    outer_labels = {lbl for lbl in (_extract_output_label(it) for it in outer_items) if lbl}
+    inner_labels = {lbl for lbl in (_extract_output_label(it) for it in inner_items) if lbl}
+
+    prepend_items: List[str] = []
+    for col_raw in missing_cols:
+        col = str(col_raw or "").strip().strip("`").strip("'").strip('"')
+        if not col:
+            continue
+        col_l = col.lower()
+        if col_l in outer_labels:
+            continue
+        if col_l not in inner_labels:
+            continue
+        prepend_items.append(f"{alias}.{col}")
+        outer_labels.add(col_l)
+
+    if not prepend_items:
+        return None
+
+    rebuilt_outer = ", ".join(prepend_items + outer_items)
+    fixed = re.sub(
+        r"(?is)^\s*SELECT\s+.*?\s+FROM\s*\(",
+        f"SELECT {rebuilt_outer} FROM (",
+        s,
+        count=1,
+    ).strip()
+    if sql.rstrip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _has_required_offset_window(sql: str, question: str) -> bool:
+    s = str(sql or "")
+    q = str(question or "").lower()
+    if not s or not _question_has_offset_window_sequence_intent(question):
+        return True
+
+    wants_previous = bool(re.search(r"\b(?:previous|prior)\b", q, flags=re.I))
+    wants_next = bool(re.search(r"\b(?:next|following)\b", q, flags=re.I))
+    if wants_previous and not re.search(r"\bLAG\s*\(", s, flags=re.I):
+        return False
+    if wants_next and not re.search(r"\bLEAD\s*\(", s, flags=re.I):
+        return False
+    return True
+
+
 def _is_ir_family_preferred(
     intent_ir: Dict[str, Any],
     decision: Dict[str, Any],
@@ -5073,16 +5465,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         q_low = (question or "").lower()
         # HAVING-like aggregate threshold (e.g., "average ... above 50,000").
         # Allow only a conservative, metric-aligned subset.
-        has_numeric_threshold = bool(
-            re.search(
-                r"\b(?:greater\s+than|more\s+than|over|above|"
-                r"less\s+than|under|below|"
-                r"at\s+least|at\s+most|minimum(?:\s+of)?|maximum(?:\s+of)?)\s+"
-                r"\d[\d,]*(?:\.\d+)?\b",
-                q_low,
-                flags=re.I,
-            )
-        )
+        has_numeric_threshold = _question_has_numeric_threshold(q_low)
         has_aggregate_keyword = bool(
             re.search(r"\b(total|sum|avg|average|mean|count|number\s+of)\b", q_low, flags=re.I)
         )
@@ -5139,11 +5522,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         if (
             qtype == AGENT_ROUTER_QTYPE_LOOKUP
             and not ir_metrics
-            and not ir_existence
-            and bool(re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or ""))
-            and bool(re.search(r"\b(?:display|show|return)\b", q_low, flags=re.I))
-            and bool(re.search(r"\b(?:if|when|whenever)\b", q_low, flags=re.I))
-            and bool(re.search(r"\b(?:missing|null|empty|blank)\b", q_low, flags=re.I))
+            and _question_requests_projection_null_fill(question)
         ):
             ir_gate_reasons.append("projection_null_fill_ir_unsupported")
 
@@ -5206,8 +5585,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         if (
             not ir_metrics
             and not ir_existence
-            and bool(re.search(r"\b(?:previous|prior|next|following)\b", q_low, flags=re.I))
-            and bool(re.search(r"\bordered\s+by\b", q_low, flags=re.I))
+            and _question_has_offset_window_sequence_intent(q_low)
         ):
             ir_gate_reasons.append("offset_window_ir_unsupported")
 
@@ -5425,6 +5803,86 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # Store inference time in state for debugging (not logged to reduce noise)
     state["draft_inference_time"] = _inference_time
     print(f"[DEBUG] Draft inference time: {_inference_time:.2f}s")
+
+    if obj is None and target_model == SMALL_MODEL and _question_has_case_bucketing_intent(question):
+        print("[DRAFTER] CASE-bucketing JSON fallback -> retry 3B text mode")
+        text_retry_prompt = _make_sql_only_draft_prompt(prompt)
+        text_llm = build_llm_repair(model=target_model)
+        text_ready = _prewarm_model_with_oom_retry(text_llm, target_model)
+        if text_ready:
+            _t_text = _time.perf_counter()
+            text_sql = try_llm_sql_text(
+                text_llm,
+                text_retry_prompt,
+                max_attempts=1,
+                oom_retry_wait=OOM_WAIT_TIME,
+            )
+            text_inference_time = _time.perf_counter() - _t_text
+            _last_model_warmup[target_model] = _time.time()
+            _inference_time += text_inference_time
+            state["draft_inference_time"] = _inference_time
+            print(f"[DEBUG] Draft text-retry inference time: {text_inference_time:.2f}s")
+            if text_sql:
+                obj = {"sql": text_sql, "notes": "No reasoning provided."}
+                print("[DRAFTER] CASE-bucketing text retry succeeded with 3B")
+            else:
+                print("[DRAFTER] CASE-bucketing text retry failed -> retry 3B ultra-minimal prompt")
+                _t_text_min = _time.perf_counter()
+                text_sql_min = try_llm_sql_text(
+                    text_llm,
+                    _make_case_bucketing_ultra_minimal_prompt(question, ctx),
+                    max_attempts=1,
+                    oom_retry_wait=OOM_WAIT_TIME,
+                )
+                text_min_inference_time = _time.perf_counter() - _t_text_min
+                _last_model_warmup[target_model] = _time.time()
+                _inference_time += text_min_inference_time
+                state["draft_inference_time"] = _inference_time
+                print(f"[DEBUG] Draft ultra-minimal text-retry inference time: {text_min_inference_time:.2f}s")
+                if text_sql_min:
+                    obj = {"sql": text_sql_min, "notes": "No reasoning provided."}
+                    print("[DRAFTER] CASE-bucketing ultra-minimal text retry succeeded with 3B")
+                else:
+                    print("[DRAFTER] CASE-bucketing ultra-minimal retry failed -> retry 3B micro prompt")
+                    _t_text_micro = _time.perf_counter()
+                    text_sql_micro = try_llm_sql_text(
+                        text_llm,
+                        _make_case_bucketing_micro_prompt(question, ctx),
+                        max_attempts=1,
+                        oom_retry_wait=OOM_WAIT_TIME,
+                    )
+                    text_micro_inference_time = _time.perf_counter() - _t_text_micro
+                    _last_model_warmup[target_model] = _time.time()
+                    _inference_time += text_micro_inference_time
+                    state["draft_inference_time"] = _inference_time
+                    print(f"[DEBUG] Draft micro-prompt text-retry inference time: {text_micro_inference_time:.2f}s")
+                    if text_sql_micro:
+                        obj = {"sql": text_sql_micro, "notes": "No reasoning provided."}
+                        print("[DRAFTER] CASE-bucketing micro prompt retry succeeded with 3B")
+
+    if obj is None and target_model != LARGE_MODEL:
+        recovery_model = LARGE_MODEL
+        print(f"[DRAFTER] JSON recovery fallback -> {recovery_model}")
+        recovery_llm = build_llm_json(model=recovery_model)
+        recovery_ready = _prewarm_model_with_oom_retry(recovery_llm, recovery_model)
+        if recovery_ready:
+            _t1 = _time.perf_counter()
+            recovery_obj = try_llm_json(
+                recovery_llm,
+                prompt,
+                max_attempts=1,
+                oom_retry_wait=OOM_WAIT_TIME,
+            )
+            recovery_inference_time = _time.perf_counter() - _t1
+            _last_model_warmup[recovery_model] = _time.time()
+            _inference_time += recovery_inference_time
+            state["draft_inference_time"] = _inference_time
+            print(f"[DEBUG] Draft recovery inference time: {recovery_inference_time:.2f}s")
+            if recovery_obj is not None:
+                obj = recovery_obj
+                target_model = recovery_model
+                state["target_model"] = target_model
+                print(f"[DRAFTER] JSON recovery succeeded with {recovery_model}")
 
     if obj is None:
         return {
@@ -5946,6 +6404,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "STRICT REQUIREMENT: The question asks for a window calculation within the same group, "
                 "so you MUST use a window function with the correct PARTITION BY column. "
                 f"Use `PARTITION BY {required_partition_col}` and do NOT partition by an unrelated display column."
+            )
+        elif "missing_offset_window" in contract_violations:
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question asks for a previous/next value in a sequence. "
+                "You MUST use a window offset function. "
+                "Use `LAG(...)` for previous/prior and `LEAD(...)` for next/following. "
+                "Partition by the entity group when stated and order the window by the sequence column named in the question. "
+                "If the question does not explicitly request descending sequence order, use ascending order inside the window."
             )
         elif "missing_regex_semantics" in contract_violations:
             extra_instruction = (
@@ -6519,8 +6985,40 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 missing_cols.append(col_raw)
 
         if missing_cols:
+            if _question_wants_winner_row(question):
+                recovered_sql = _recover_missing_outer_winner_row_columns(final_sql, missing_cols)
+                if recovered_sql:
+                    final_sql = str(recovered_sql).strip()
+                    if final_sql and not final_sql.endswith(";"):
+                        final_sql += ";"
+                    sql_up = final_sql.upper()
+                    select_match_chk = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, final_sql, re.IGNORECASE | re.DOTALL)
+                    select_text_chk_raw = select_match_chk.group(1) if select_match_chk else ""
+                    select_text_chk = select_text_chk_raw.lower()
+                    select_tokens_chk = set(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, select_text_chk))
+                    select_semantic_tokens = set(select_tokens_chk)
+                    select_tokens_raw_case = set(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, select_text_chk_raw))
+                    for tok_raw in select_tokens_raw_case:
+                        tok_low = tok_raw.lower()
+                        if not tok_low:
+                            continue
+                        select_semantic_tokens.add(tok_low)
+                        for part in tok_low.split("_"):
+                            if part:
+                                select_semantic_tokens.add(part)
+                        camel_spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r"\1 \2", tok_raw)
+                        for part in re.findall(r"[a-z0-9]+", camel_spaced.lower()):
+                            if part:
+                                select_semantic_tokens.add(part)
+
+                    missing_cols = [c for c in missing_cols if str(c or "").lower() not in select_semantic_tokens]
+                    if not missing_cols:
+                        _dbg_agent3_retry("Missing Columns", "Autofixed winner-row projection deterministically.")
+
             # TIERING LOGIC - Smart escalation based on complexity
-            if complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE and qtype == AGENT_ROUTER_QTYPE_LOOKUP:
+            if not missing_cols:
+                pass
+            elif complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE and qtype == AGENT_ROUTER_QTYPE_LOOKUP:
                 # Avoid SQL string surgery. Regenerate so final SQL naturally includes requested columns.
                 _dbg_agent3_retry("Missing Columns", f"Retry (no auto-append): {missing_cols}")
                 extra_instruction = (

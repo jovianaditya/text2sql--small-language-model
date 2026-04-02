@@ -233,6 +233,41 @@ def _camel_to_words(s: str) -> str:
     return re.sub(r"\s+", " ", x).strip().lower()
 
 
+def _semantic_token_variants(token: str) -> List[str]:
+    tok = str(token or "").strip().lower()
+    if not tok:
+        return []
+
+    out: List[str] = []
+
+    def _add(value: str) -> None:
+        cur = str(value or "").strip().lower()
+        if cur and cur not in out:
+            out.append(cur)
+
+    _add(tok)
+
+    if tok.endswith("ies") and len(tok) > 3:
+        _add(tok[:-3] + "y")
+    elif tok.endswith("uses") and len(tok) > 4:
+        _add(tok[:-2])
+    elif tok.endswith("sses") and len(tok) > 4:
+        _add(tok[:-2])
+    elif tok.endswith(("xes", "zes", "ches", "shes")) and len(tok) > 3:
+        _add(tok[:-2])
+    elif tok.endswith("ses") and len(tok) > 3:
+        if tok[:-1].endswith("e"):
+            _add(tok[:-1])
+        else:
+            _add(tok[:-2])
+    elif tok.endswith("es") and len(tok) > 3:
+        _add(tok[:-2])
+    elif tok.endswith("s") and len(tok) > 2 and not tok.endswith(("ss", "us")):
+        _add(tok[:-1])
+
+    return out
+
+
 def _pluralize_last_token(phrase: str) -> str:
     tokens = [t for t in (phrase or "").split() if t]
     if not tokens:
@@ -252,10 +287,9 @@ def _singularize_last_token(phrase: str) -> str:
     if not tokens:
         return phrase
     last = tokens[-1]
-    if last.endswith("ies") and len(last) > 3:
-        tokens[-1] = last[:-3] + "y"
-    elif last.endswith("s") and not last.endswith("ss") and len(last) > 1:
-        tokens[-1] = last[:-1]
+    variants = [v for v in _semantic_token_variants(last) if v != last]
+    if variants:
+        tokens[-1] = variants[0]
     return " ".join(tokens)
 
 
@@ -371,6 +405,20 @@ def _to_int_count_token(token: str) -> Optional[int]:
         except ValueError:
             return None
     return _NUMBER_WORDS.get(s)
+
+
+def _question_requests_null_fill_projection(question: str) -> bool:
+    q_raw = str(question or "")
+    q = q_raw.lower()
+    if not re.search(r"\b(?:missing|null|empty|blank)\b", q, flags=re.I):
+        return False
+    if not re.search(r"\b(?:if|when|whenever)\b", q, flags=re.I):
+        return False
+    if not re.search(r"\b(?:display|show|return|use)\b", q, flags=re.I):
+        return False
+    if re.search(r"""["'“”][^"'“”]{1,40}["'“”]""", q_raw):
+        return True
+    return bool(re.search(r"\b(?:n/?a|none|unknown|zero)\b", q, flags=re.I))
 
 
 def _normalize_match_token(token: str) -> str:
@@ -993,31 +1041,155 @@ def _detect_metrics(
                 best_pos = pos
         return best if best_score > 0 else None
 
+    def _semantic_phrase_tokens(text: str) -> List[str]:
+        out: List[str] = []
+        for tok in re.findall(r"[a-z0-9_'-]+", str(text or "").lower()):
+            for cur in _semantic_token_variants(tok):
+                if cur:
+                    out.append(cur)
+        return out
+
+    def _count_distinct_phrase_candidates(phrase: str) -> List[str]:
+        raw = str(phrase or "").strip()
+        if not raw:
+            return []
+
+        candidates: List[str] = []
+
+        def _add(text: str) -> None:
+            txt = " ".join(str(text or "").strip().split())
+            if txt and txt not in candidates:
+                candidates.append(txt)
+
+        _add(raw)
+
+        lowered = raw.lower()
+        stop_patterns = (
+            r"\b(?:seen|found|present|appearing|appears|occurring|occurs|recorded)\b.*$",
+            r"\b(?:in|within|for|from|during|across|among)\s+"
+            r"(?:that|this|those|these|the|all|each|every|same)\b.*$",
+            r"\b(?:in|within|for|from|during|across|among)\s+"
+            r"(?:[a-z][a-z0-9_'-]*\s+){0,4}(?:orders|records|rows|entries|results|dataset|data)\b.*$",
+        )
+        for pat in stop_patterns:
+            trimmed = re.sub(pat, "", lowered, flags=re.I).strip(" ,.;:-")
+            if trimmed:
+                _add(trimmed)
+
+        tokens = [tok for tok in re.findall(r"[a-z0-9_'-]+", lowered) if tok]
+        generic_container_terms = {
+            "order", "orders", "record", "records", "row", "rows", "entry", "entries",
+            "result", "results", "dataset", "data", "year", "years",
+        }
+        content_tokens = [tok for tok in tokens if tok not in generic_container_terms]
+        if content_tokens:
+            _add(" ".join(content_tokens))
+            singular_content: List[str] = []
+            for tok in content_tokens:
+                variants = [v for v in _semantic_token_variants(tok) if v != tok]
+                singular_content.append(variants[0] if variants else tok)
+            _add(" ".join(singular_content))
+        if len(tokens) >= 2:
+            _add(" ".join(tokens[:2]))
+        if len(tokens) >= 3:
+            _add(" ".join(tokens[:3]))
+
+        return candidates
+
+    def _resolve_count_distinct_column_from_phrase(phrase: str) -> Optional[Tuple[str, str]]:
+        raw_tokens = _semantic_phrase_tokens(phrase)
+        if not raw_tokens:
+            return None
+
+        generic_container_terms = {
+            "order", "orders", "record", "records", "row", "rows", "entry", "entries",
+            "result", "results", "dataset", "data", "year", "years",
+        }
+        raw_token_set = set(raw_tokens)
+        content_tokens = {
+            tok for tok in raw_tokens
+            if tok not in generic_container_terms and tok not in _FUNCTION_WORD_TOKENS
+        }
+        target_tokens = content_tokens or raw_token_set
+        if not target_tokens:
+            return None
+
+        candidates = column_mentions or []
+        if not candidates:
+            for t, cols in allowed.items():
+                for c in cols:
+                    candidates.append((t, c, 10**9))
+
+        best: Optional[Tuple[str, str]] = None
+        best_score = float("-inf")
+        best_pos = 10**9
+        for t, c, pos in candidates:
+            variant_tokens: Set[str] = set()
+            for v in _column_variants(t, c):
+                variant_tokens.update(_semantic_phrase_tokens(v))
+            if not variant_tokens:
+                continue
+
+            content_overlap = len(variant_tokens.intersection(target_tokens))
+            all_overlap = len(variant_tokens.intersection(raw_token_set))
+            if content_overlap <= 0 and all_overlap <= 0:
+                continue
+
+            exact_content = 1 if target_tokens.issubset(variant_tokens) else 0
+            exact_raw = 1 if raw_token_set.issubset(variant_tokens) else 0
+            prefer_subject = 1 if t == subject else 0
+            id_like_penalty = 2 if (
+                content_overlap == 0
+                and str(c or "").lower().endswith(("number", "id", "code"))
+            ) else 0
+
+            score = (
+                (content_overlap * 10)
+                + (all_overlap * 2)
+                + (exact_content * 6)
+                + (exact_raw * 2)
+                + prefer_subject
+                - id_like_penalty
+            )
+            if score > best_score or (
+                score == best_score
+                and prefer_subject == (1 if best and best[0] == subject else 0)
+                and pos < best_pos
+            ):
+                best = (t, c)
+                best_score = score
+                best_pos = pos
+
+        return best if best_score > 0 else None
+
     def _pick_count_distinct_target() -> Optional[Tuple[str, str]]:
         if not wants_count_distinct:
             return None
 
-        for t, c, pos in column_mentions:
-            window_start = max(0, pos - 48)
-            prefix = q[window_start:pos]
-            if re.search(r"\b(distinct|unique|different)\b", prefix, flags=re.I):
-                return (t, c)
-
         m_phrase = re.search(
-            r"\b(?:how\s+many|number\s+of|count|total\s+number(?:\s+of)?)\s+"
+            r"\b(?:how\s+many|number\s+of|count|total\s+number(?:\s+of)?)\s+(?:the\s+)?"
             r"(?:distinct|unique|different)\s+([a-z][a-z0-9_ ]{1,40})\b",
             q,
             flags=re.I,
         )
         if m_phrase:
             phrase = (m_phrase.group(1) or "").strip()
-            resolved_col = _resolve_column_from_phrase(phrase)
-            if resolved_col:
-                return resolved_col
-            resolved_table = _resolve_table_from_phrase(phrase)
-            if resolved_table:
-                id_col = _best_id_column(resolved_table, allowed, question) or "*"
-                return (resolved_table, id_col)
+            for phrase_candidate in _count_distinct_phrase_candidates(phrase):
+                resolved_col = _resolve_count_distinct_column_from_phrase(phrase_candidate)
+                if not resolved_col:
+                    resolved_col = _resolve_column_from_phrase(phrase_candidate)
+                if resolved_col:
+                    return resolved_col
+                resolved_table = _resolve_table_from_phrase(phrase_candidate)
+                if resolved_table:
+                    id_col = _best_id_column(resolved_table, allowed, question) or "*"
+                    return (resolved_table, id_col)
+
+        for t, c, pos in column_mentions:
+            window_start = max(0, pos - 48)
+            prefix = q[window_start:pos]
+            if re.search(r"\b(distinct|unique|different)\b", prefix, flags=re.I):
+                return (t, c)
 
         return None
 
@@ -1177,6 +1349,10 @@ def _detect_dimensions(
         or (re.search(r"\bper\b", q) and not dedupe_row_request)
     )
     date_day_group_requested = bool(re.search(r"\b(for\s+each|per|by)\s+(?:date|day)\b", q))
+    nonnull_percentage_grouping = any(
+        str(getattr(m, "agg", "") or "").lower() == "pct_non_null"
+        for m in (metrics or [])
+    )
     nonnull_cols: Set[str] = set()
     distinct_metric_targets = {
         (str(m.table or "").lower(), str(m.column or "").lower())
@@ -1192,14 +1368,31 @@ def _detect_dimensions(
         dims.append(d)
 
     def _explicit_group_dim_requested(table: str, col: str) -> bool:
+        table_patterns: List[str] = []
+        for tv in sorted(_table_variants(table) or {table}, key=len, reverse=True):
+            cur = str(tv or "").strip().lower()
+            if not cur:
+                continue
+            table_patterns.append(re.escape(cur).replace(r"\ ", r"\s+"))
         for v in _column_variants(table, col):
             pat = re.escape(v).replace(r"\ ", r"\s+")
             if re.search(rf"\b(?:for\s+each|per|by|group\s+by)\s+{pat}\b", q, flags=re.I):
                 return True
+            for table_pat in table_patterns:
+                if re.search(
+                    rf"\b(?:for\s+each|per|by|group\s+by)\s+(?:{table_pat})\s+{pat}\b",
+                    q,
+                    flags=re.I,
+                ):
+                    return True
         return False
 
     # Time bucket dimensions.
-    if re.search(r"\b(for\s+each|per|by)\s+month\b", q):
+    if re.search(
+        r"\b(for\s+each|per|by)\s+month\b|\beach\s+month(?:\s+name)?\b|\bmonth\s+names?\b",
+        q,
+        flags=re.I,
+    ):
         date_col = _find_best_date_column(subject, allowed)
         if date_col:
             add_dim(IRDimension(table=subject, column=date_col, alias="month_name", transform="month_name", visible=True))
@@ -1262,6 +1455,8 @@ def _detect_dimensions(
             if aggregate_like:
                 # In aggregate-like intents, keep grouping columns only.
                 if col.lower() in nonnull_cols:
+                    continue
+                if nonnull_percentage_grouping and not _explicit_group_dim_requested(table, col):
                     continue
                 if (
                     (table.lower(), col.lower()) in distinct_metric_targets
@@ -1492,9 +1687,14 @@ def _detect_filters(
         rf"\bbetween\s+({_NUMBER_TOKEN_PATTERN})\s+and\s+({_NUMBER_TOKEN_PATTERN})\b",
         q,
     )
-    if m_between and numeric_col:
-        v1 = _to_float_token(m_between.group(1))
-        v2 = _to_float_token(m_between.group(2))
+    m_range = re.search(
+        rf"\bfrom\s+({_NUMBER_TOKEN_PATTERN})\s+(?:through|thru|to)\s+({_NUMBER_TOKEN_PATTERN})(?:\s+inclusive)?\b",
+        q,
+    )
+    range_match = m_between or m_range
+    if range_match and numeric_col:
+        v1 = _to_float_token(range_match.group(1))
+        v2 = _to_float_token(range_match.group(2))
         t, c = numeric_col
         if v1 is not None and v2 is not None:
             add_filter(IRFilter(table=t, column=c, op="between", value=v1, value2=v2))
@@ -1677,9 +1877,10 @@ def _detect_filters(
                 add_filter(IRFilter(table=status_table, column=status_col, op="eq", value=quoted_values[0].strip()))
 
     # Missing/empty (skip when intent is explicit non-null/not-null).
-    if re.search(r"\b(missing|null|empty|blank)\b", q) and not re.search(
-        r"\b(?:non[-\s]?null|not\s+null)\b",
-        q,
+    if (
+        re.search(r"\b(missing|null|empty|blank)\b", q)
+        and not re.search(r"\b(?:non[-\s]?null|not\s+null)\b", q)
+        and not _question_requests_null_fill_projection(question)
     ):
         target = None
         for t, c, _ in column_mentions:
@@ -1722,6 +1923,21 @@ def _detect_filters(
                 regex = f"^[A-Z]{{{n_letters}}}[0-9]{{{n_digits}}}$"
             target = _pick_text_target_column(anchor_pos=m_upper_start.start())
             if target:
+                add_filter(IRFilter(table=target[0], column=target[1], op="regexp", value=regex))
+                strict_regex_applied = True
+
+    if not strict_regex_applied:
+        m_literal_prefix_digits = re.search(
+            r"""\bmatch(?:es|ing)?\s+(?:the\s+letter\s+)?["'“”]?([A-Za-z0-9]+)["'“”]?\s+followed\s+by\s+exactly\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+digits?\b""",
+            q,
+            flags=re.I,
+        )
+        if m_literal_prefix_digits:
+            token = str(m_literal_prefix_digits.group(1) or "").strip()
+            n_digits = _to_int_count_token(m_literal_prefix_digits.group(2))
+            target = _pick_text_target_column(anchor_pos=m_literal_prefix_digits.start())
+            if target and token and n_digits is not None and n_digits >= 0:
+                regex = f"^{re.escape(token)}[0-9]{{{n_digits}}}$"
                 add_filter(IRFilter(table=target[0], column=target[1], op="regexp", value=regex))
                 strict_regex_applied = True
 

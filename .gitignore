@@ -15,8 +15,15 @@ __pycache__/
 *.ipynb_checkpoints
 
 data/python/mcp_client/results.xlsx
+data/python/mcp_client/results_paraphrase.xlsx
 **/run_easy.log
+**/run_easy_ori.log
+**/run_paraphrase_easy.log
 **/run_medium.log
+**/run_medium_ori.log
+**/run_paraphrase_medium.log
 **/run_hard.log
+**/run_hard_ori.log
+**/run_paraphrase_hard.log
 **/run_full.log
 **/.codex

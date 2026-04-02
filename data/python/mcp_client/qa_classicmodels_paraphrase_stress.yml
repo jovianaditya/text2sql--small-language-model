@@ -1,0 +1,721 @@
+cases:
+- id: PE1
+  source_id: E1
+  difficulty: easy
+  question: Return the customer name and city for customers based in Japan, ordered by city A-Z.
+  groundtruth_sql: "SELECT customerName, city \nFROM customers \nWHERE country = 'Japan' \nORDER BY city;\n"
+- id: PE2
+  source_id: E2
+  difficulty: easy
+  question: List the top 10 products by quantity in stock, showing product code, product name, and quantity in stock.
+  groundtruth_sql: "SELECT productCode, productName, quantityInStock \nFROM products \nORDER BY quantityInStock \nDESC LIMIT 10;\n"
+- id: PE3
+  source_id: E3
+  difficulty: easy
+  question: Show all orders from 2004 with order number and order date, starting with the most recent order.
+  groundtruth_sql: "SELECT orderNumber, orderDate \nFROM orders \nWHERE YEAR(orderDate) = 2004 \nORDER BY orderDate DESC;\n"
+- id: PE4
+  source_id: E4
+  difficulty: easy
+  question: Return every payment over 10,000 with customer number, check number, and amount, sorted by amount descending.
+  groundtruth_sql: "SELECT customerNumber, checkNumber, amount \nFROM payments \nWHERE amount > 10000 \nORDER BY amount DESC;\n"
+- id: PE5
+  source_id: E5
+  difficulty: easy
+  question: List offices where state is missing or blank. Show office code, city, country, and state.
+  groundtruth_sql: "SELECT officeCode, city, country, state \nFROM offices \nWHERE (state IS NULL OR state = '');\n"
+- id: PE6
+  source_id: E6
+  difficulty: easy
+  question: Find products whose product name begins with '196'. Return product code and product name.
+  groundtruth_sql: "SELECT productCode, productName \nFROM products \nWHERE productName LIKE '196%';\n"
+- id: PE7
+  source_id: E7
+  difficulty: easy
+  question: Return employees assigned to office codes 1, 2, or 3, with employee number, first name, last name, and office code.
+  groundtruth_sql: "SELECT employeeNumber, firstName, lastName, officeCode \nFROM employees \nWHERE officeCode IN ('1', '2', '3');\n"
+- id: PE8
+  source_id: E8
+  difficulty: easy
+  question: Show employees whose extension matches x followed by exactly three digits. Return employee number, first name, last name, and extension.
+  groundtruth_sql: "SELECT employeeNumber, firstName, lastName, extension \nFROM employees \nWHERE extension REGEXP '^x[0-9]{3}$';\n"
+- id: PE9
+  source_id: E9
+  difficulty: easy
+  question: List orders whose status is either 'Cancelled' or 'On Hold', including order number, order date, and status.
+  groundtruth_sql: "SELECT orderNumber, orderDate, status \nFROM orders \nWHERE status IN('Cancelled','On Hold');\n"
+- id: PE10
+  source_id: E10
+  difficulty: easy
+  question: Return products with quantity in stock from 500 through 1000 inclusive, showing product code, product name, and quantity in stock.
+  groundtruth_sql: "SELECT productCode, productName, quantityInStock \nFROM products \nWHERE quantityInStock BETWEEN 500 AND 1000;\n"
+- id: PE11
+  source_id: E11
+  difficulty: easy
+  question: Show the distinct customer countries, one row per country, sorted alphabetically.
+  groundtruth_sql: |
+    SELECT DISTINCT
+      country
+    FROM customers
+    ORDER BY
+      country ASC;
+- id: PE12
+  source_id: E12
+  difficulty: easy
+  question: Return every office with office code, city, country, and state, but display 'N/A' whenever state is missing. Order by office code ascending.
+  groundtruth_sql: |
+    SELECT
+      officeCode,
+      city,
+      country,
+      COALESCE(state, 'N/A') AS state_display
+    FROM offices
+    ORDER BY
+      officeCode ASC;
+- id: PE13
+  source_id: E13
+  difficulty: easy
+  question: List orders shipped later than their required date. Show order number, required date, and shipped date, ordered by shipped date descending then order number ascending.
+  groundtruth_sql: |
+    SELECT
+      orderNumber,
+      requiredDate,
+      shippedDate
+    FROM orders
+    WHERE shippedDate > requiredDate
+    ORDER BY
+      shippedDate DESC,
+      orderNumber ASC;
+- id: PM1
+  source_id: M1
+  difficulty: medium
+  question: For orders in 2004, show each month name with its order count, ordering months from latest to earliest.
+  groundtruth_sql: "SELECT \n  DATE_FORMAT(orderDate, '%M') AS month_name,\n  COUNT(orderNumber) AS order_count\nFROM orders\nWHERE YEAR(orderDate) = 2004\nGROUP BY MONTH(orderDate), DATE_FORMAT(orderDate, '%M')\nORDER BY MONTH(orderDate) DESC\n"
+- id: PM2
+  source_id: M2
+  difficulty: medium
+  question: Bucket products into MSRP bands Low (<50), Mid (50-150), and High (>150), then count products in each bucket and sort by count descending.
+  groundtruth_sql: |
+    SELECT
+      CASE
+        WHEN MSRP < 50 THEN 'Low'
+        WHEN MSRP BETWEEN 50 AND 150 THEN 'Mid'
+        ELSE 'High'
+      END AS price_band,
+      COUNT(*) AS product_count
+    FROM products
+    GROUP BY
+      CASE
+        WHEN MSRP < 50 THEN 'Low'
+        WHEN MSRP BETWEEN 50 AND 150 THEN 'Mid'
+        ELSE 'High'
+      END
+    ORDER BY product_count DESC;
+- id: PM3
+  source_id: M3
+  difficulty: medium
+  question: For every customer, keep only the payment with the largest amount; if multiple payments tie, keep the latest payment date. Return customer ID, amount, and payment date.
+  groundtruth_sql: "SELECT\n  pmt.customerNumber,\n  pmt.amount,\n  pmt.paymentDate\nFROM (\nSELECT \n  customerNumber, \n  amount, \n  paymentDate,\n  ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC, paymentDate DESC) AS rn\nFROM payments) AS pmt\nWHERE pmt.rn = 1;\n"
+- id: PM4
+  source_id: M4
+  difficulty: medium
+  question: Group orders by status and return the order count plus the earliest order date for each status.
+  groundtruth_sql: |
+    SELECT
+      status,
+      COUNT(orderNumber) AS total_orders,
+      MIN(orderDate) AS earliest_order_date
+    FROM orders
+    GROUP BY status;
+- id: PM5
+  source_id: M5
+  difficulty: medium
+  question: Compute average payment amount for each customer, but keep only customers whose average payment exceeds 50,000. Return customer ID and average payment.
+  groundtruth_sql: |
+    SELECT
+      customerNumber,
+      AVG(amount) AS average_payment
+    FROM payments
+    GROUP BY customerNumber
+    HAVING AVG(amount) > 50000;
+- id: PM6
+  source_id: M6
+  difficulty: medium
+  question: Return customer name and customer number for customers whose credit limit is above the global average credit limit.
+  groundtruth_sql: |
+    SELECT
+      customerName,
+      customerNumber
+    FROM customers
+    WHERE creditLimit > (SELECT AVG(creditLimit) FROM customers);
+- id: PM7
+  source_id: M7
+  difficulty: medium
+  question: By order status, report the percentage of rows whose shippedDate is not null, sorted from highest percentage to lowest.
+  groundtruth_sql: |
+    SELECT
+      status,
+      (SUM(CASE WHEN shippedDate IS NOT NULL THEN 1 ELSE 0 END) * 100 / COUNT(*)) AS shipped_percentage
+    FROM orders
+    GROUP BY status
+    ORDER BY shipped_percentage DESC;
+- id: PM8
+  source_id: M8
+  difficulty: medium
+  question: Count products per product line and keep only product lines with more than five products.
+  groundtruth_sql: |
+    SELECT
+      productLine,
+      COUNT(*) AS total_products
+    FROM products
+    GROUP BY productLine
+    HAVING COUNT(*) > 5;
+- id: PM9
+  source_id: M9
+  difficulty: medium
+  question: For each territory, show how many offices belong to it, ordered by office count descending.
+  groundtruth_sql: |
+    SELECT
+      territory,
+      COUNT(*) AS office_count
+    FROM offices
+    GROUP BY territory
+    ORDER BY office_count DESC;
+- id: PM10
+  source_id: M10
+  difficulty: medium
+  question: Within each job title, rank employees by employee number descending. Return employee number, job title, and rank.
+  groundtruth_sql: |
+    SELECT
+      employeeNumber,
+      jobTitle,
+      RANK() OVER (
+        PARTITION BY jobTitle
+        ORDER BY employeeNumber DESC
+      ) AS employee_rank
+    FROM employees;
+- id: PM11
+  source_id: M11
+  difficulty: medium
+  question: For each customer who has at least two payments, return the amount from that customer's second-highest payment when ordering payments by amount descending, along with the customer ID.
+  groundtruth_sql: "SELECT\n  pmt.customerNumber,\n  pmt.amount\nFROM (\n  SELECT \n    customerNumber\n    ,amount\n    ,ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC) AS rn \n  FROM payments) pmt\nWHERE rn = 2;\n"
+- id: PM12
+  source_id: M12
+  difficulty: medium
+  question: For each payment row, show customer number, payment date, amount, and the running total of that customer's payments in payment-date order.
+  groundtruth_sql: |
+    SELECT
+      customerNumber,
+      paymentDate,
+      amount,
+      SUM(amount) OVER (
+        PARTITION BY customerNumber
+        ORDER BY paymentDate
+      ) AS cumulative_payment
+    FROM payments;
+- id: PM13
+  source_id: M13
+  difficulty: medium
+  question: Return each employee's employee number, job title, and the count of employees working in the same office.
+  groundtruth_sql: |
+    SELECT
+      employeeNumber,
+      jobTitle,
+      COUNT(*) OVER (
+        PARTITION BY officeCode
+      ) AS employees_in_same_office
+    FROM employees;
+- id: PM14
+  source_id: M14
+  difficulty: medium
+  question: For every product, show product code, buy price, and the average buy price of all products in that same product line.
+  groundtruth_sql: |
+    SELECT
+      productCode,
+      buyPrice,
+      AVG(buyPrice) OVER (
+        PARTITION BY productLine
+      ) AS average_buy_price_per_line
+    FROM products;
+- id: PM15
+  source_id: M15
+  difficulty: medium
+  question: For each product, show its quantity in stock and the percentage that quantity contributes to total stock across the whole products table.
+  groundtruth_sql: |
+    SELECT
+      productCode,
+      quantityInStock,
+      (quantityInStock * 100.0 / SUM(quantityInStock) OVER ()) AS stock_percentage
+    FROM products;
+- id: PM16
+  source_id: M16
+  difficulty: medium
+  question: Combine 2003 and 2004 orders into one deduplicated result with order number and a year label ('2003' or '2004'), ordered by year label ascending then order number ascending.
+  groundtruth_sql: |
+    SELECT
+      orderNumber,
+      '2003' AS year_label
+    FROM orders
+    WHERE YEAR(orderDate) = 2003
+    UNION
+    SELECT
+      orderNumber,
+      '2004' AS year_label
+    FROM orders
+    WHERE YEAR(orderDate) = 2004
+    ORDER BY
+      year_label ASC,
+      orderNumber ASC;
+- id: PM17
+  source_id: M17
+  difficulty: medium
+  question: For each order year, count the distinct order statuses seen in that year's orders, ordered by year ascending.
+  groundtruth_sql: |
+    SELECT
+      YEAR(orderDate) AS order_year,
+      COUNT(DISTINCT status) AS distinct_status_count
+    FROM orders
+    GROUP BY
+      YEAR(orderDate)
+    ORDER BY
+      order_year ASC;
+- id: PM18
+  source_id: M18
+  difficulty: medium
+  question: For each payment, return the previous payment amount for the same customer based on payment-date order, and sort the final output by customer number ascending then payment date descending.
+  groundtruth_sql: |
+    SELECT
+      customerNumber,
+      paymentDate,
+      amount,
+      LAG(amount) OVER (
+        PARTITION BY customerNumber
+        ORDER BY paymentDate
+      ) AS previous_payment_amount
+    FROM payments
+    ORDER BY
+      customerNumber ASC,
+      paymentDate DESC;
+- id: PM19
+  source_id: M19
+  difficulty: medium
+  question: Return all orders that occurred on the latest order date in the dataset, showing order number, order date, and status, sorted by order number ascending.
+  groundtruth_sql: |
+    SELECT
+      orderNumber,
+      orderDate,
+      status
+    FROM orders
+    WHERE orderDate = (
+      SELECT MAX(orderDate)
+      FROM orders
+    )
+    ORDER BY
+      orderNumber ASC;
+- id: PM20
+  source_id: M20
+  difficulty: medium
+  question: For each country, count distinct customer cities and keep only countries with more than three distinct cities. Order by distinct city count descending, then country ascending.
+  groundtruth_sql: |
+    SELECT
+      country,
+      COUNT(DISTINCT city) AS distinct_city_count
+    FROM customers
+    GROUP BY
+      country
+    HAVING
+      COUNT(DISTINCT city) > 3
+    ORDER BY
+      distinct_city_count DESC,
+      country ASC;
+- id: PH1
+  source_id: H1
+  difficulty: hard
+  question: For each customer, calculate total payments made in 2004 and return only customers whose 2004 total exceeds 50,000. Show customer name, customer ID, and total payment amount.
+  groundtruth_sql: |
+    SELECT
+      cust.customerNumber,
+      cust.customerName,
+      SUM(pmt.amount) AS total_payment_amount
+    FROM customers AS cust
+    LEFT JOIN payments AS pmt ON cust.customerNumber = pmt.customerNumber AND YEAR(pmt.paymentDate) = 2004
+    GROUP BY cust.customerNumber, cust.customerName
+    HAVING SUM(pmt.amount) > 50000;
+- id: PH2
+  source_id: H2
+  difficulty: hard
+  question: Return only customers who have at least one order, along with customer number, customer name, and how many orders they placed.
+  groundtruth_sql: |
+    SELECT
+      cust.customerNumber,
+      cust.customerName,
+      COUNT(ord.orderNumber) AS total_orders
+    FROM customers AS cust
+    JOIN orders AS ord ON cust.customerNumber = ord.customerNumber
+    GROUP BY cust.customerNumber, cust.customerName;
+- id: PH3
+  source_id: H3
+  difficulty: hard
+  question: Show only products that appear in at least one order line, and for each product return product code, product name, and summed quantity ordered.
+  groundtruth_sql: |
+    SELECT
+      p.productCode,
+      p.productName,
+      SUM(od.quantityOrdered) AS total_quantity_ordered
+    FROM products AS p
+    JOIN orderdetails AS od
+      ON p.productCode = od.productCode
+    GROUP BY p.productCode, p.productName;
+- id: PH4
+  source_id: H4
+  difficulty: hard
+  question: For customers with at least one order, return customer number, customer name, and total order value, where order value is sum(quantityOrdered * priceEach).
+  groundtruth_sql: |
+    SELECT
+      cust.customerNumber,
+      cust.customerName,
+      SUM(od.quantityOrdered * od.priceEach) AS total_order_amount
+    FROM customers AS cust
+    JOIN orders AS ord
+      ON cust.customerNumber = ord.customerNumber
+    JOIN orderdetails AS od
+      ON ord.orderNumber = od.orderNumber
+    GROUP BY cust.customerNumber, cust.customerName;
+- id: PH5
+  source_id: H5
+  difficulty: hard
+  question: For every employee, even if they manage no customers, and even if those customers never paid, return employee number, employee name, and total payments collected from their customers.
+  groundtruth_sql: |
+    SELECT
+      emp.employeeNumber,
+      CONCAT(emp.firstName, ' ', emp.lastName) AS employee_name,
+      SUM(pmt.amount) AS total_payment_amount
+    FROM employees AS emp
+    LEFT JOIN customers AS cust
+      ON emp.employeeNumber = cust.salesRepEmployeeNumber
+    LEFT JOIN payments AS pmt
+      ON cust.customerNumber = pmt.customerNumber
+    GROUP BY
+      emp.employeeNumber,
+      emp.firstName,
+      emp.lastName;
+- id: PH6
+  source_id: H6
+  difficulty: hard
+  question: Consider only products that have been sold at least once. Return product code, product name, and rank them by total sales value using order-line priceEach * quantityOrdered, highest first.
+  groundtruth_sql: |
+    SELECT
+      p.productCode,
+      p.productName,
+      RANK() OVER (
+        ORDER BY SUM(od.quantityOrdered * od.priceEach) DESC
+      ) AS sales_rank
+    FROM products AS p
+    JOIN orderdetails AS od
+      ON p.productCode = od.productCode
+    GROUP BY p.productCode, p.productName;
+- id: PH7
+  source_id: H7
+  difficulty: hard
+  question: For customers who have payments, return customer ID, customer name, the latest payment date within their most recent payment year, and the total amount paid during that year. Order by that latest payment date descending.
+  groundtruth_sql: |
+    SELECT
+      c.customerNumber,
+      c.customerName,
+      MAX(p.paymentDate) AS latest_payment_date_in_latest_year,
+      SUM(p.amount) AS total_payment_in_latest_year
+    FROM customers AS c
+    JOIN (
+      SELECT
+        customerNumber,
+        MAX(YEAR(paymentDate)) AS latest_year
+      FROM payments
+      GROUP BY customerNumber
+    ) AS ly
+      ON ly.customerNumber = c.customerNumber
+    JOIN payments AS p
+      ON p.customerNumber = c.customerNumber
+     AND YEAR(p.paymentDate) = ly.latest_year
+    GROUP BY c.customerNumber, c.customerName
+    ORDER BY MAX(p.paymentDate) DESC;
+- id: PH8
+  source_id: H8
+  difficulty: hard
+  question: For each product ordered at least once, find its latest order year, then compute total quantity ordered in that same year. Return product code, product name, latest year, and that quantity, sorted by quantity descending then product code ascending.
+  groundtruth_sql: |
+    SELECT
+      p.productCode,
+      p.productName,
+      ly.latest_year AS latest_order_year,
+      SUM(od.quantityOrdered) AS total_quantity_in_latest_year
+    FROM products AS p
+    JOIN (
+      SELECT
+        od2.productCode,
+        MAX(YEAR(o2.orderDate)) AS latest_year
+      FROM orderdetails AS od2
+      JOIN orders AS o2
+        ON o2.orderNumber = od2.orderNumber
+      GROUP BY od2.productCode
+    ) AS ly
+      ON ly.productCode = p.productCode
+    JOIN orderdetails AS od
+      ON od.productCode = p.productCode
+    JOIN orders AS o
+      ON o.orderNumber = od.orderNumber
+    AND YEAR(o.orderDate) = ly.latest_year
+    GROUP BY
+      p.productCode,
+      p.productName,
+      ly.latest_year
+    ORDER BY
+      total_quantity_in_latest_year DESC,
+      p.productCode ASC;
+- id: PH9
+  source_id: H9
+  difficulty: hard
+  question: Find product lines where at least one product has MSRP above the overall average MSRP. For each such line, return the product line and the count of products in that line meeting the condition, ordered by count descending then product line A-Z.
+  groundtruth_sql: |
+    SELECT
+      pl.productLine,
+      COUNT(*) AS product_count
+    FROM productlines AS pl
+    JOIN products AS p
+      ON p.productLine = pl.productLine
+    WHERE p.MSRP > (
+      SELECT AVG(p2.MSRP)
+      FROM products AS p2
+    )
+    GROUP BY
+      pl.productLine
+    ORDER BY
+      product_count DESC,
+      pl.productLine ASC;
+- id: PH10
+  source_id: H10
+  difficulty: hard
+  question: For each office, return office code, city, total employees, and number of Sales Reps. Keep only offices that have at least one Sales Rep and at least one employee with a non-null reportsTo. Sort by Sales Rep count descending then office code.
+  groundtruth_sql: |
+    SELECT
+      o.officeCode,
+      o.city,
+      COUNT(e.employeeNumber) AS total_employees,
+      SUM(CASE WHEN e.jobTitle = 'Sales Rep' THEN 1 ELSE 0 END) AS sales_rep_count
+    FROM offices AS o
+    JOIN employees AS e
+      ON e.officeCode = o.officeCode
+    GROUP BY
+      o.officeCode,
+      o.city
+    HAVING
+      SUM(CASE WHEN e.jobTitle = 'Sales Rep' THEN 1 ELSE 0 END) > 0
+      AND EXISTS (
+        SELECT 1
+        FROM employees AS e2
+        WHERE e2.officeCode = o.officeCode
+          AND e2.reportsTo IS NOT NULL
+      )
+    ORDER BY
+      sales_rep_count DESC,
+      o.officeCode ASC;
+- id: PH11
+  source_id: H11
+  difficulty: hard
+  question: Return customers who have made payments but never placed orders. Show customer ID, customer name, and total payment amount, ordered by total payment amount descending then customer ID ascending.
+  groundtruth_sql: |
+    SELECT
+      c.customerNumber,
+      c.customerName,
+      SUM(p.amount) AS total_payment_amount
+    FROM customers AS c
+    JOIN payments AS p
+      ON p.customerNumber = c.customerNumber
+    LEFT JOIN orders AS o
+      ON o.customerNumber = c.customerNumber
+    GROUP BY
+      c.customerNumber,
+      c.customerName
+    HAVING
+      COUNT(o.orderNumber) = 0
+    ORDER BY
+      total_payment_amount DESC,
+      c.customerNumber ASC;
+- id: PH12
+  source_id: H12
+  difficulty: hard
+  question: Find offices whose customers' average credit limit is above the overall non-null customer credit limit average. Return office code, city, and average credit limit, sorted by average credit limit descending then office code ascending.
+  groundtruth_sql: |
+    SELECT
+      o.officeCode,
+      o.city,
+      AVG(c.creditLimit) AS avg_credit_limit
+    FROM offices AS o
+    JOIN employees AS e
+      ON e.officeCode = o.officeCode
+    JOIN customers AS c
+      ON c.salesRepEmployeeNumber = e.employeeNumber
+    GROUP BY
+      o.officeCode,
+      o.city
+    HAVING
+      AVG(c.creditLimit) > (
+        SELECT AVG(c2.creditLimit)
+        FROM customers AS c2
+        WHERE c2.creditLimit IS NOT NULL
+      )
+    ORDER BY
+      avg_credit_limit DESC,
+      o.officeCode ASC;
+- id: PH13
+  source_id: H13
+  difficulty: hard
+  question: For every employee, including those without customers and customers without payments, return the most recent payment made by any of that employee's customers. Show employee ID, employee name, customer ID, payment date, and amount. If several payments share that most recent date, keep the largest amount. Sort by payment date descending then employee number ascending.
+  groundtruth_sql: |
+    SELECT
+      t.employeeNumber,
+      t.employee_name,
+      t.customerNumber,
+      t.paymentDate,
+      t.amount
+    FROM (
+      SELECT
+        e.employeeNumber,
+        CONCAT(e.firstName, ' ', e.lastName) AS employee_name,
+        c.customerNumber,
+        p.paymentDate,
+        p.amount,
+        ROW_NUMBER() OVER (
+          PARTITION BY e.employeeNumber
+          ORDER BY p.paymentDate DESC, p.amount DESC, c.customerNumber ASC
+        ) AS rn
+      FROM employees AS e
+      LEFT JOIN customers AS c
+        ON c.salesRepEmployeeNumber = e.employeeNumber
+      LEFT JOIN payments AS p
+        ON p.customerNumber = c.customerNumber
+    ) AS t
+    WHERE t.rn = 1
+    ORDER BY
+      t.paymentDate DESC,
+      t.employeeNumber ASC;
+- id: PH14
+  source_id: H14
+  difficulty: hard
+  question: For customers with at least one order, return customer ID, customer name, total orders, total payment amount, and a payment_status of Paid when total payments > 0 otherwise Unpaid. Sort by total orders descending then customer ID.
+  groundtruth_sql: |
+    SELECT
+      c.customerNumber,
+      c.customerName,
+      o.total_orders,
+      COALESCE(p.total_payments, 0) AS total_payments,
+      CASE
+        WHEN COALESCE(p.total_payments, 0) > 0 THEN 'Paid'
+        ELSE 'Unpaid'
+      END AS payment_status
+    FROM customers AS c
+    JOIN (
+      SELECT
+        customerNumber,
+        COUNT(*) AS total_orders
+      FROM orders
+      GROUP BY customerNumber
+    ) AS o
+      ON o.customerNumber = c.customerNumber
+    LEFT JOIN (
+      SELECT
+        customerNumber,
+        SUM(amount) AS total_payments
+      FROM payments
+      GROUP BY customerNumber
+    ) AS p
+      ON p.customerNumber = c.customerNumber
+    ORDER BY
+      o.total_orders DESC,
+      c.customerNumber ASC;
+- id: PH15
+  source_id: H15
+  difficulty: hard
+  question: Find products ordered in 2004 but not ordered in 2005. Return product code, product name, and total quantity ordered in 2004, sorted by total quantity descending then product code ascending.
+  groundtruth_sql: |
+    SELECT
+      p.productCode,
+      p.productName,
+      SUM(od.quantityOrdered) AS total_quantity_2004
+    FROM products AS p
+    JOIN orderdetails AS od
+      ON od.productCode = p.productCode
+    JOIN orders AS o
+      ON o.orderNumber = od.orderNumber
+    WHERE YEAR(o.orderDate) = 2004
+      AND NOT EXISTS (
+        SELECT 1
+        FROM orderdetails AS od2
+        JOIN orders AS o2
+          ON o2.orderNumber = od2.orderNumber
+        WHERE od2.productCode = p.productCode
+          AND YEAR(o2.orderDate) = 2005
+      )
+    GROUP BY
+      p.productCode,
+      p.productName
+    ORDER BY
+      total_quantity_2004 DESC,
+      p.productCode ASC;
+- id: PH16
+  source_id: H16
+  difficulty: hard
+  question: Return customers who have purchased more than 20 distinct products, with customer ID, customer name, and distinct product count, sorted by count descending then customer ID ascending.
+  groundtruth_sql: |
+    SELECT
+      c.customerNumber,
+      c.customerName,
+      COUNT(DISTINCT od.productCode) AS distinct_product_count
+    FROM customers AS c
+    JOIN orders AS o
+      ON o.customerNumber = c.customerNumber
+    JOIN orderdetails AS od
+      ON od.orderNumber = o.orderNumber
+    GROUP BY
+      c.customerNumber,
+      c.customerName
+    HAVING
+      COUNT(DISTINCT od.productCode) > 20
+    ORDER BY
+      distinct_product_count DESC,
+      c.customerNumber ASC;
+- id: PH17
+  source_id: H17
+  difficulty: hard
+  question: Within each product line, pick the product with the greatest total quantity ordered. Break quantity ties using higher total sales value based on actual line price, then smaller product code. Return product line, product code, product name, total quantity ordered, and total sales value, ordered by product line ascending.
+  groundtruth_sql: |
+    SELECT
+      ranked.productLine,
+      ranked.productCode,
+      ranked.productName,
+      ranked.total_quantity_ordered,
+      ranked.total_sales_value
+    FROM (
+      SELECT
+        p.productLine,
+        p.productCode,
+        p.productName,
+        SUM(od.quantityOrdered) AS total_quantity_ordered,
+        SUM(od.quantityOrdered * od.priceEach) AS total_sales_value,
+        ROW_NUMBER() OVER (
+          PARTITION BY p.productLine
+          ORDER BY
+            SUM(od.quantityOrdered) DESC,
+            SUM(od.quantityOrdered * od.priceEach) DESC,
+            p.productCode ASC
+        ) AS rn
+      FROM products AS p
+      JOIN orderdetails AS od
+        ON od.productCode = p.productCode
+      GROUP BY
+        p.productLine,
+        p.productCode,
+        p.productName
+    ) AS ranked
+    WHERE ranked.rn = 1
+    ORDER BY
+      ranked.productLine ASC;

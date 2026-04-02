@@ -45,9 +45,18 @@ done
 
 # running EVALUATION
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx" 2>&1 | tee run_full.log
+
 # hard
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --hard" 2>&1 | tee run_hard.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset_ori.yml --output results.xlsx --hard" 2>&1 | tee run_hard_ori.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_paraphrase_stress.yml --output results.xlsx --hard" 2>&1 | tee run_paraphrase_hard.log
+
 # medium
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --medium" 2>&1 | tee run_medium.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset_ori.yml --output results.xlsx --medium" 2>&1 | tee run_medium_ori.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_paraphrase_stress.yml --output results.xlsx --medium" 2>&1 | tee run_paraphrase_medium.log
+
 # easy
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy" 2>&1 | tee run_easy.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset_ori.yml --output results.xlsx --easy" 2>&1 | tee run_easy_ori.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_paraphrase_stress.yml --output results.xlsx --easy" 2>&1 | tee run_paraphrase_easy.log

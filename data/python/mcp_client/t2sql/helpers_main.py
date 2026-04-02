@@ -103,7 +103,7 @@ from .helpers_core import (
     _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _parse_from_join_aliases,
     _ast_guardrails,
     # phase 7
-    _simplify_default_window_frame, _enforce_window_sequence_direction, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
+    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -326,6 +326,23 @@ def validate_identifiers(sql: str, ctx: str) -> List[str]:
     ):
         derived_aliases.add(m.group(1))
 
+    derived_output_aliases: Set[str] = set()
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        ast = sqlglot.parse_one(sql, read="mysql")
+        for subq in ast.find_all(exp.Subquery):
+            inner_sel = subq.this if isinstance(getattr(subq, "this", None), exp.Select) else None
+            if not isinstance(inner_sel, exp.Select):
+                continue
+            for expr in inner_sel.expressions or []:
+                alias_name = str(getattr(expr, "alias_or_name", "") or "").strip("`")
+                if alias_name:
+                    derived_output_aliases.add(alias_name.lower())
+    except Exception:
+        derived_output_aliases = set()
+
     # --------------------------------------------------
     # Remap used qualifiers (alias -> real table)
     # --------------------------------------------------
@@ -394,6 +411,8 @@ def validate_identifiers(sql: str, ctx: str) -> List[str]:
     if single_table:
         allowed_cols = _allowed_cols_for_table(single_table)
         for col in used.get(None, set()):
+            if col.lower() in derived_output_aliases:
+                continue
             if col.lower() not in allowed_cols:
                 errs.append(
                     f"{single_table} -> invalid column (unqualified): {col}"
@@ -447,7 +466,7 @@ def classify_query(question: str) -> str:
     # --- 0. DETEKSI ORDINAL RANKING (always "rank") ---
     # "second highest", "third largest", etc. ALWAYS need ROW_NUMBER subquery
     # ---------------------------------------------------------------------------
-    ordinal_pattern = r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th|kedua|ketiga|keempat|kelima)\s+(highest|lowest|largest|smallest|biggest|top|bottom|best|worst|most|least|terbesar|terkecil|tertinggi|terendah)\b"
+    ordinal_pattern = r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th|kedua|ketiga|keempat|kelima)(?:\s+|-)+(highest|lowest|largest|smallest|biggest|top|bottom|best|worst|most|least|terbesar|terkecil|tertinggi|terendah)\b"
     ordinal_row_pattern = r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th|kedua|ketiga|keempat|kelima)\b(?:\s+\w+){0,8}\s+(row|record|entry)\b"
     if re.search(ordinal_pattern, q) or (
         re.search(ordinal_row_pattern, q) and re.search(r"\b(sorted|ordered)\s+by\b", q)
@@ -3154,7 +3173,11 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
 
     has_offset_window_intent = bool(
         re.search(r"\b(?:previous|prior|next|following)\b", question.lower())
-        and re.search(r"\bordered\s+by\b", question.lower())
+        and (
+            re.search(r"\bordered\s+by\b", question.lower())
+            or re.search(r"\bbased\s+on\b[^.]{0,80}\border\b", question.lower())
+            or re.search(r"\b(?:date|time|timestamp)[-\s]+order\b", question.lower())
+        )
     )
     if has_offset_window_intent:
         constraints.append(
@@ -4459,7 +4482,10 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Cosmetic and execution-safety adjustments only
     # ---------------------------------------------------------------------------
     s = _simplify_default_window_frame(s, question)
+    s = _rewrite_single_table_case_band_derived_subquery(s, question)
+    s = _rewrite_correlated_offset_subquery_to_window(s, question)
     s = _enforce_window_sequence_direction(s, question)
+    s = _repair_offset_window_projection_shape(s, question)
     s = _enforce_requested_order_direction(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
     s = _maybe_add_limit(question, s)    

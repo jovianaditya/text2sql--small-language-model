@@ -610,7 +610,6 @@ def save_to_excel(
     
     # Save
     wb.save(output_path)
-    print(f"\nResults saved to Excel: {output_path}")
 
 async def execute_sql(
     mcp: Client,
