@@ -43,6 +43,8 @@ class SchemaAnalyzer:
         self._fk_relationships: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {fk_col: target_table}}
         self._column_roles: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: role}}
         self._column_datatypes: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: datatype}}
+        self._column_primary_key_hints: Dict[str, bool] = {}
+        self._column_foreign_key_hints: Dict[str, bool] = {}
         # Store original case for column names (lowercase -> original)
         self._column_original_case: Dict[str, str] = {}
 
@@ -96,6 +98,16 @@ class SchemaAnalyzer:
         if fk_match:
             target_table = fk_match.group(1).lower()
             self._fk_relationships[table.lower()][column.lower()] = target_table
+
+        combined_key_text = f"{description} {text}".lower()
+        col_key = f"{table.lower()}.{column.lower()}"
+        self._column_primary_key_hints[col_key] = bool(
+            re.search(r"\bprimary\s+key\b", combined_key_text)
+            or re.search(r"\b(?:part\s+of\s+)?composite\s+pk\b", combined_key_text)
+        )
+        self._column_foreign_key_hints[col_key] = bool(
+            fk_match or re.search(r"\bforeign\s+key\b", combined_key_text)
+        )
 
         # Extract column role
         role = self._next_field_after(text, "Role:")
@@ -417,6 +429,96 @@ def _get_original_case(table_lower: str, col_lower: str) -> str:
     return analyzer._column_original_case.get(col_key, col_lower)
 
 
+def _identifier_phrase_hints(table_lower: str, col_lower: str) -> Set[str]:
+    analyzer = get_schema_analyzer()
+    out: Set[str] = set()
+    for syn in analyzer._column_synonyms.get(f"{table_lower}.{col_lower}", []):
+        syn_l = str(syn or "").strip().lower()
+        if not syn_l:
+            continue
+        out.add(syn_l)
+        out.add(syn_l.replace(" ", ""))
+    return out
+
+
+def _column_has_identifier_hint(table_lower: str, col_lower: str) -> bool:
+    hints = _identifier_phrase_hints(table_lower, col_lower)
+    for hint in hints:
+        if any(tok in hint for tok in ("primarykey", "primary key", "identifier", "uniqueid", "unique id")):
+            return True
+        if re.search(r"\b(?:id|key)\b", hint):
+            return True
+    return False
+
+
+def _column_matches_entity_key_shape(table_lower: str, col_lower: str) -> bool:
+    singular = (get_singular_form(table_lower) or "").replace("_", "").lower()
+    col_compact = str(col_lower or "").replace("_", "").lower()
+    if not singular or not col_compact:
+        return col_compact == "id"
+
+    if col_compact == "id":
+        return True
+
+    direct_forms = {
+        singular,
+        f"{singular}id",
+        f"{singular}key",
+        f"{singular}code",
+        f"{singular}number",
+    }
+    if col_compact in direct_forms:
+        return True
+
+    return col_compact.startswith(singular) and any(
+        col_compact.endswith(suffix) for suffix in ("id", "key", "code", "number")
+    )
+
+
+def _column_identifier_score(table_lower: str, col_lower: str) -> int:
+    analyzer = get_schema_analyzer()
+    key = f"{table_lower}.{col_lower}"
+    is_pk = bool(analyzer._column_primary_key_hints.get(key))
+    is_fk = bool(
+        analyzer._column_foreign_key_hints.get(key)
+        or col_lower in analyzer._fk_relationships.get(table_lower, {})
+    )
+    score = 0
+
+    base_identifier_evidence = False
+
+    if is_pk:
+        score += 100
+        base_identifier_evidence = True
+    if _column_has_identifier_hint(table_lower, col_lower):
+        score += 30
+        base_identifier_evidence = True
+    if _column_matches_entity_key_shape(table_lower, col_lower):
+        score += 30
+        base_identifier_evidence = True
+
+    if is_fk:
+        base_identifier_evidence = True
+
+    # Suffix patterns are useful, but only after we already have some other
+    # evidence that the column behaves like an entity key. This avoids false
+    # positives such as postalCode or faxNumber.
+    if base_identifier_evidence:
+        if col_lower.endswith("id"):
+            score += 18
+        elif col_lower.endswith("number"):
+            score += 16
+        elif col_lower.endswith("code"):
+            score += 14
+        elif col_lower.endswith("key"):
+            score += 10
+
+    if is_fk and not is_pk:
+        score -= 15
+
+    return score
+
+
 def get_id_column(table: str) -> Optional[str]:
     """
     Get the primary key/ID column for a table from schema metadata.
@@ -436,29 +538,17 @@ def get_id_column(table: str) -> Optional[str]:
     table_lower = table.lower()
     columns = analyzer._table_columns.get(table_lower, [])
 
-    # 1. Check synonyms for 'id', 'code', or 'primary key'
+    scored_cols: List[Tuple[int, str]] = []
     for col in columns:
-        synonyms = analyzer._column_synonyms.get(f"{table_lower}.{col}", [])
-        for syn in synonyms:
-            syn_lower = syn.lower()
-            if 'id' in syn_lower or 'code' in syn_lower or 'primary key' in syn_lower:
-                return _get_original_case(table_lower, col)
+        score = _column_identifier_score(table_lower, col)
+        if score > 0:
+            scored_cols.append((score, col))
 
-    # 2. Pattern matching (order matters - matches classicmodels pattern)
-    # Priority: *number > *code > *id
-    for col in columns:
-        if col.endswith("number") and col != "ordernumber":
-            return _get_original_case(table_lower, col)
+    if scored_cols:
+        scored_cols.sort(key=lambda item: (-item[0], item[1]))
+        return _get_original_case(table_lower, scored_cols[0][1])
 
-    for col in columns:
-        if col.endswith("code") and col not in ("zipcode", "postcode"):
-            return _get_original_case(table_lower, col)
-
-    for col in columns:
-        if col.endswith("id") and "employeenumber" not in col:
-            return _get_original_case(table_lower, col)
-
-    # 3. Fallback: column name matches table singular (e.g., productlines.productLine)
+    # Fallback: column name matches table singular (e.g., productlines.productLine)
     singular = get_singular_form(table_lower)
     for col in columns:
         if col.lower() == singular or col.lower() == singular + "line":
@@ -804,16 +894,10 @@ def is_id_column(table: str, column: str) -> bool:
     t = (table or "").lower()
     c = (column or "").lower()
     
-    # Exclusions - these are not ID columns
-    exclude_patterns = ('zipcode', 'postalcode', 'phonenumber', 'faxnumber')
-    if any(c == ep or c.endswith(ep) for ep in exclude_patterns):
-        return False
-    
-    # 1. Check name patterns
-    id_patterns = ('id', 'number', 'code', 'key')
-    if any(c.endswith(p) for p in id_patterns):
+    # 1. Prefer metadata-aware identifier score over raw suffix matching.
+    if _column_identifier_score(t, c) > 0:
         return True
-    
+
     # 2. Check if it's an FK column
     analyzer = get_schema_analyzer()
     fk_map = analyzer._fk_relationships.get(t, {})

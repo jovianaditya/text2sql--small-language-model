@@ -70,7 +70,7 @@ from .helpers_core import (
     # phase 2
     _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns, _repair_simple_single_table_column_names,
     # phase 3
-    _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
+    _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _ensure_explicit_simple_projection_columns, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
     _normalize_alias_lengths,
@@ -79,7 +79,7 @@ from .helpers_core import (
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _preexecute_sql_safety_pass,
-    _rewrite_winner_row_aggregate_misuse, _rewrite_explicit_rank_aggregate_window, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _rewrite_winner_row_aggregate_misuse, _rewrite_single_table_tuple_in_winner_row, _rewrite_explicit_rank_aggregate_window, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _rewrite_dual_fact_rollup_fanout,
@@ -4007,6 +4007,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     s = _prefer_friendly_names(s, question)
     s = _ensure_entity_id_and_name_if_requested(s, question)
+    s = _ensure_explicit_simple_projection_columns(s, question)
     s = _prune_non_primary_dimensions_for_primary_aggregate(s, question, ctx)
     s = _drop_redundant_raw_name_columns_when_concat_present(s, question)
     s = _expand_group_by_aliases_regex(s)
@@ -4257,6 +4258,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_winner_row_aggregate_misuse(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after agg-misuse:", s)
 
+        s = _rewrite_single_table_tuple_in_winner_row(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after tuple-IN winner-row fix:", s)
+
         s = _fix_winner_row_window_order_priority(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after winner-row window order fix:", s)
 
@@ -4371,6 +4375,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             # This avoids model-specific aggregate leakage before Agent3 checks.
             s = _rewrite_winner_row_aggregate_misuse(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after agg-misuse fix: {s}")
+            s = _rewrite_single_table_tuple_in_winner_row(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after tuple-IN winner-row fix: {s}")
             s = _fix_winner_row_window_order_priority(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after winner-row window order fix: {s}")
 
