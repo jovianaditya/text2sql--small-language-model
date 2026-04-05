@@ -6300,8 +6300,30 @@ def _fix_inconsistent_subquery_alias(sql: str) -> Optional[str]:
     # Find all aliases used in the outer SELECT
     alias_refs = set(re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.\w+', outer_cols))
 
-    # Check if any alias is different from the correct one
-    inconsistent_aliases = alias_refs - {correct_alias.lower(), correct_alias}
+    # Build the set of valid top-level aliases after the derived-table alias.
+    # Only aliases that are truly undefined at the outer scope should be
+    # rewritten. This avoids corrupting queries that legitimately join the
+    # ranked subquery with other top-level tables.
+    valid_outer_aliases: Set[str] = {correct_alias.lower()}
+    tail_after_alias = alias_tail[alias_match.end():]
+    for m_tbl in re.finditer(
+        r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?""",
+        f"FROM ({sql[lparen_idx:close_idx+1]}) {correct_alias} {tail_after_alias}",
+    ):
+        table_expr = (m_tbl.group(1) or "").strip()
+        if not table_expr:
+            continue
+        table_name = table_expr.replace("`", "").split(".")[-1].strip()
+        alias_name = (m_tbl.group(2) or "").strip() or table_name
+        if alias_name:
+            valid_outer_aliases.add(alias_name.lower())
+
+    # Check if any alias is different from the correct one *and* not valid in
+    # the outer scope.
+    inconsistent_aliases = {
+        a for a in alias_refs
+        if a.lower() not in valid_outer_aliases
+    }
 
     if not inconsistent_aliases:
         return None  # All aliases are consistent
@@ -6323,6 +6345,200 @@ def _fix_inconsistent_subquery_alias(sql: str) -> Optional[str]:
     # print(f"[ALIAS FIX] Fixed inconsistent alias: {inconsistent_aliases} -> {correct_alias}")
 
     return fixed
+
+
+def _drop_tuple_in_filter_from_include_zero_ranked_winner(sql: str, question: str, ctx: str = "") -> str:
+    """
+    For include-zero winner-row queries that already rank at the preserved
+    parent grain, drop an inner tuple-IN filter that narrows the nullable LEFT
+    JOIN side before ROW_NUMBER() is applied.
+
+    Why this is safe:
+    - only runs for clear include-zero winner-row asks
+    - only when the outer query already filters `rn = 1`
+    - only when the inner query is built from a preserved base table with
+      LEFT JOIN chain
+    - only removes tuple-IN predicates from the inner WHERE; all other
+      predicates stay intact
+    """
+    if not sql or not question:
+        return sql
+    if "ROW_NUMBER" not in (sql or "").upper():
+        return sql
+    if not _question_wants_winner_row(question):
+        return sql
+    include_zero_like = _question_wants_include_zero(question, ctx) or bool(
+        re.search(r"(?is)\bincluding\b.{0,120}\bwithout\b", question or "")
+    )
+    if not include_zero_like:
+        return sql
+    if not re.search(r"\bWHERE\b[^;]*\brn\s*=\s*1\b", sql, flags=re.I | re.S):
+        return sql
+
+    s = sql.strip()
+    if not re.match(r"(?is)^\s*SELECT\b", s):
+        return sql
+    if not re.search(r"(?is)\bLEFT\s+JOIN\b", s):
+        return sql
+
+    def _find_top_level_from_idx(raw: str) -> int:
+        low = raw.lower()
+        depth = 0
+        i = 0
+        in_sq = False
+        in_dq = False
+        in_bt = False
+        while i < len(raw):
+            ch = raw[i]
+            if ch == "'" and not in_dq and not in_bt:
+                if in_sq and i + 1 < len(raw) and raw[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq and not in_bt:
+                if in_dq and i + 1 < len(raw) and raw[i + 1] == '"':
+                    i += 2
+                    continue
+                in_dq = not in_dq
+                i += 1
+                continue
+            if ch == "`" and not in_sq and not in_dq:
+                in_bt = not in_bt
+                i += 1
+                continue
+            if in_sq or in_dq or in_bt:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and low.startswith("from", i):
+                prev_ok = (i == 0) or (not low[i - 1].isalnum() and low[i - 1] != "_")
+                j = i + 4
+                next_ok = (j >= len(low)) or (not low[j].isalnum() and low[j] != "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
+
+    from_idx = _find_top_level_from_idx(s)
+    if from_idx < 0:
+        return sql
+    after_from = s[from_idx + 4:].lstrip()
+    if not after_from.startswith("("):
+        return sql
+    lparen_idx = from_idx + 4 + (len(s[from_idx + 4:]) - len(after_from))
+
+    depth = 0
+    close_idx = -1
+    for i in range(lparen_idx, len(s)):
+        ch = s[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_idx = i
+                break
+    if close_idx < 0:
+        return sql
+
+    inner_sql = s[lparen_idx + 1:close_idx].strip()
+    if "ROW_NUMBER" not in inner_sql.upper():
+        return sql
+    if not re.search(r"(?is)\bLEFT\s+JOIN\b", inner_sql):
+        return sql
+
+    where_m = re.search(r"\bWHERE\b", inner_sql, flags=re.I)
+    if not where_m:
+        return sql
+
+    inner_before_where = inner_sql[:where_m.start()].rstrip()
+    inner_after_where = inner_sql[where_m.end():].lstrip()
+    boundary_m = re.search(r"(?is)\bORDER\s+BY\b|\bGROUP\s+BY\b|\bHAVING\b|\bLIMIT\b$", "")
+    # Find the next top-level clause after WHERE manually.
+    depth = 0
+    end_where_idx = len(inner_after_where)
+    in_sq = in_dq = in_bt = False
+    low_after = inner_after_where.lower()
+    i = 0
+    while i < len(inner_after_where):
+        ch = inner_after_where[i]
+        if ch == "'" and not in_dq and not in_bt:
+            if in_sq and i + 1 < len(inner_after_where) and inner_after_where[i + 1] == "'":
+                i += 2
+                continue
+            in_sq = not in_sq
+            i += 1
+            continue
+        if ch == '"' and not in_sq and not in_bt:
+            if in_dq and i + 1 < len(inner_after_where) and inner_after_where[i + 1] == '"':
+                i += 2
+                continue
+            in_dq = not in_dq
+            i += 1
+            continue
+        if ch == "`" and not in_sq and not in_dq:
+            in_bt = not in_bt
+            i += 1
+            continue
+        if in_sq or in_dq or in_bt:
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0:
+            for kw in (" order by", " group by", " having", " limit"):
+                if low_after.startswith(kw, i):
+                    end_where_idx = i
+                    i = len(inner_after_where)
+                    break
+        i += 1
+
+    where_body = inner_after_where[:end_where_idx].strip()
+    inner_tail = inner_after_where[end_where_idx:].strip()
+    if not where_body or _has_top_level_or(where_body):
+        return sql
+
+    conjuncts = _split_top_level_and(where_body)
+    remaining = []
+    removed = False
+    for cond in conjuncts:
+        c = cond.strip()
+        if re.match(r"(?is)^\(\s*[^()]+,\s*[^()]+\s*\)\s+IN\s*\(\s*SELECT\b", c):
+            removed = True
+            continue
+        remaining.append(c)
+    if not removed and re.match(r"(?is)^\(\s*[^()]+,\s*[^()]+\s*\)\s+IN\s*\(\s*SELECT\b.*\)\s*$", where_body):
+        removed = True
+        remaining = []
+    if not removed:
+        return sql
+
+    rebuilt_inner = inner_before_where
+    if remaining:
+        rebuilt_inner += " WHERE " + " AND ".join(remaining)
+    if inner_tail:
+        rebuilt_inner += " " + inner_tail
+
+    out = s[:lparen_idx + 1] + rebuilt_inner + s[close_idx:]
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    if out and not out.endswith(";"):
+        out += ";"
+    return out or sql
 
 
 def _fix_inner_rn_filter_scope(sql: str) -> Optional[str]:
@@ -12314,7 +12530,37 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
     if not _question_wants_dual_fact_rollup(question):
         return sql
 
-    parsed = _parse_select_from_groupby(sql)
+    def _safe_sql_alias(name: Optional[str], fallback: str) -> str:
+        raw = str(name or "").strip().strip("`'\"")
+        if not raw:
+            raw = fallback
+        raw = re.sub(r"[^A-Za-z0-9_]+", "_", raw).strip("_")
+        if not raw:
+            raw = fallback
+        if not re.match(r"[A-Za-z_]", raw):
+            raw = f"a_{raw}"
+        return raw
+
+    def _outer_alias_sql(name: Optional[str], fallback: str) -> str:
+        raw = str(name or "").strip().strip("`'\"")
+        if not raw:
+            raw = fallback
+        return _smart_backtick(raw)
+
+    def _sanitize_dual_fact_parse_input(sql_text: str) -> str:
+        out = _fix_bad_backticks(sql_text or "")
+        out = re.sub(r"`\s*\.\s*`", ".", out)
+        out = re.sub(
+            r"(?is)\b([A-Za-z_][A-Za-z0-9_]*)`\s*\.\s*`([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"\1.\2",
+            out,
+        )
+        out = re.sub(r"(?is)\bAS(?=`?[A-Za-z_])", "AS ", out)
+        out = re.sub(r"\s{2,}", " ", out).strip()
+        return out
+
+    sql_work = _sanitize_dual_fact_parse_input(sql)
+    parsed = _parse_select_from_groupby(sql_work)
     if not parsed:
         return sql
 
@@ -12674,6 +12920,11 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
     if not sum_alias_out:
         sum_alias_out = f"total_{sum_table}"
 
+    count_metric_alias = _safe_sql_alias(count_alias_out, f"total_{count_table}")
+    sum_metric_alias = _safe_sql_alias(sum_alias_out, f"total_{sum_table}")
+    count_outer_alias = _outer_alias_sql(count_alias_out, count_metric_alias)
+    sum_outer_alias = _outer_alias_sql(sum_alias_out, sum_metric_alias)
+
     # Deduplicate base projection conservatively.
     dedup_base: List[str] = []
     seen_base_expr: Set[str] = set()
@@ -12889,18 +13140,18 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
 
     projected_items: List[str] = []
     projected_items.extend(base_select_items)
-    count_projection = f"{count_agg_alias}.{count_alias_out} AS {count_alias_out}"
+    count_projection = f"{count_agg_alias}.{count_metric_alias} AS {count_outer_alias}"
     if count_join_keyword == "LEFT JOIN":
-        count_projection = f"COALESCE({count_agg_alias}.{count_alias_out}, 0) AS {count_alias_out}"
+        count_projection = f"COALESCE({count_agg_alias}.{count_metric_alias}, 0) AS {count_outer_alias}"
     projected_items.append(count_projection)
-    projected_items.append(f"COALESCE({sum_agg_alias}.{sum_alias_out}, 0) AS {sum_alias_out}")
+    projected_items.append(f"COALESCE({sum_agg_alias}.{sum_metric_alias}, 0) AS {sum_outer_alias}")
 
     case_sum_pat = re.compile(
         rf"(?is)SUM\s*\(\s*(?:DISTINCT\s+)?`?{re.escape(sum_fact_alias)}`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*\)"
     )
     for case_expr, case_alias in case_items:
         rewritten_case = case_sum_pat.sub(
-            f"COALESCE({sum_agg_alias}.{sum_alias_out}, 0)",
+            f"COALESCE({sum_agg_alias}.{sum_metric_alias}, 0)",
             case_expr,
         )
         if case_alias:
@@ -12909,6 +13160,57 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
             projected_items.append(rewritten_case)
 
     tail_clause = (parsed.get("tail") or "").strip()
+    if tail_clause:
+        count_inner_col = count_inner_clean.split(".")[-1] if count_inner_clean != "*" else "*"
+        count_table_name = alias_to_table.get(count_fact_alias or "", count_fact_alias or "")
+        sum_table_name = alias_to_table.get(sum_fact_alias or "", sum_fact_alias or "")
+
+        def _literal_sql_pattern(text: str) -> str:
+            return re.escape(text).replace(r"\ ", r"\s*").replace(r"\`", r"`?")
+
+        count_patterns = []
+        if count_fact_alias and count_inner_col != "*":
+            count_patterns.append(
+                rf"COUNT\s*\(\s*(?:DISTINCT\s+)?`?{re.escape(count_fact_alias)}`?\s*\.\s*`?{re.escape(count_inner_col)}`?\s*\)"
+            )
+        if count_table_name and count_inner_col != "*":
+            count_patterns.append(
+                rf"COUNT\s*\(\s*(?:DISTINCT\s+)?`?{re.escape(count_table_name)}`?\s*\.\s*`?{re.escape(count_inner_col)}`?\s*\)"
+            )
+        if count_alias_out:
+            count_patterns.append(rf"\b{_literal_sql_pattern(count_alias_out)}\b")
+        sum_inner_col = sum_inner_clean.split(".")[-1]
+        sum_patterns = []
+        if sum_fact_alias:
+            sum_patterns.append(
+                rf"SUM\s*\(\s*`?{re.escape(sum_fact_alias)}`?\s*\.\s*`?{re.escape(sum_inner_col)}`?\s*\)"
+            )
+        if sum_table_name:
+            sum_patterns.append(
+                rf"SUM\s*\(\s*`?{re.escape(sum_table_name)}`?\s*\.\s*`?{re.escape(sum_inner_col)}`?\s*\)"
+            )
+        if sum_alias_out:
+            sum_patterns.append(rf"\b{_literal_sql_pattern(sum_alias_out)}\b")
+        normalized_tail = tail_clause
+        for pattern in count_patterns:
+            normalized_tail = re.sub(pattern, count_metric_alias, normalized_tail, flags=re.I)
+        for pattern in sum_patterns:
+            normalized_tail = re.sub(pattern, sum_metric_alias, normalized_tail, flags=re.I)
+
+        def _replace_nonbase_tail_ref(m: re.Match) -> str:
+            qualifier = (m.group(1) or "").strip()
+            col_name = (m.group(2) or "").strip()
+            mapped = _map_simple_ref_to_base(qualifier, col_name)
+            if mapped:
+                return f"{base_alias}.{mapped}"
+            return m.group(0)
+
+        normalized_tail = re.sub(
+            r"(?is)\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            _replace_nonbase_tail_ref,
+            normalized_tail,
+        )
+        tail_clause = normalized_tail
     entity_id_alias = f"{entity_slug}_id" if entity_slug else "entity_id"
     if tail_clause and id_col and re.search(rf"\b{re.escape(entity_id_alias)}\b", tail_clause, flags=re.I):
         has_entity_id_alias = any(
@@ -12931,13 +13233,13 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
         f"  {select_block}\n"
         f"FROM {base_table_expr} {base_alias}\n"
         f"{count_join_keyword} (\n"
-        f"  SELECT {count_key}, {count_expr} AS {count_alias_out}\n"
+        f"  SELECT {count_key}, {count_expr} AS {count_metric_alias}\n"
         f"  FROM {count_table}\n"
         f"  GROUP BY {count_key}\n"
         f") AS {count_agg_alias}\n"
         f"  ON {count_agg_alias}.{count_key} = {base_alias}.{base_count_key}\n"
         f"{metric_join_keyword} (\n"
-        f"  SELECT {sum_key}, SUM({sum_inner_clean}) AS {sum_alias_out}\n"
+        f"  SELECT {sum_key}, SUM({sum_inner_clean}) AS {sum_metric_alias}\n"
         f"  FROM {sum_table}\n"
         f"  GROUP BY {sum_key}\n"
         f") AS {sum_agg_alias}\n"
@@ -17552,7 +17854,7 @@ def _rewrite_temporal_year_exclusion_antijoin(sql: str, question: str, ctx: str 
     explicit_aliases: Dict[str, str] = {}
     for m in re.finditer(
         r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?""",
-        from_core,
+        f"FROM {from_core}",
     ):
         table_expr = (m.group(1) or "").strip()
         if not table_expr or table_expr.startswith("("):
@@ -17804,6 +18106,445 @@ def _rewrite_temporal_year_exclusion_antijoin(sql: str, question: str, ctx: str 
         f"SELECT {parsed['select'].strip()}\n"
         f"FROM {from_core}{join_to_add}\n"
         f"WHERE {' AND '.join(remaining_conds)}\n"
+        f"GROUP BY {parsed['groupby'].strip()}"
+        f"{tail_clause};"
+    )
+    return fixed
+
+
+def _rewrite_missing_temporal_bridge_exclusion(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Repair exclusion-by-year aggregate queries when the SQL applies YEAR(...)
+    filters to non-temporal aliases and omits the temporal bridge entirely.
+
+    Canonical near-miss:
+      SELECT entity_id, ..., SUM(bridge.metric)
+      FROM entity e
+      JOIN bridge b ON ...
+      WHERE YEAR(e.orderDate) = 2004 AND YEAR(b.orderDate) = 2004
+      GROUP BY ...
+
+    Rewritten to:
+      ... JOIN temporal_table t ON ...
+      WHERE YEAR(t.date_col) = 2004
+        AND NOT EXISTS (... YEAR(t2.date_col) = 2005 ...)
+
+    Safety:
+    - only for grouped flat queries
+    - only when question explicitly contains exclusion wording and two years
+    - only when malformed YEAR(alias.col)=year points to aliases whose tables do
+      not own that temporal column
+    - only when there is a unique bridge->temporal FK path and a direct bridge
+      correlation back to the grouped entity
+    """
+    if not sql or not question:
+        return sql
+
+    q = (question or "").lower()
+    if not re.search(r"\b(?:not|without|exclude|excluding|never)\b", q):
+        return sql
+
+    year_tokens = [m.group(0) for m in re.finditer(r"\b(?:19|20)\d{2}\b", question or "")]
+    ordered_years: List[str] = []
+    seen_years: Set[str] = set()
+    for y in year_tokens:
+        if y not in seen_years:
+            seen_years.add(y)
+            ordered_years.append(y)
+    if len(ordered_years) < 2:
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed or not parsed.get("where"):
+        return sql
+
+    from_core = (parsed.get("from_core") or "").strip()
+    if not from_core or re.search(r"\bNOT\s+EXISTS\b|\bNOT\s+IN\s*\(", from_core, flags=re.I):
+        return sql
+
+    explicit_aliases: Dict[str, str] = {}
+    ordered_aliases: List[Tuple[str, str]] = []
+    for m in re.finditer(
+        r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?""",
+        f"FROM {from_core}",
+    ):
+        table_expr = (m.group(1) or "").strip()
+        if not table_expr or table_expr.startswith("("):
+            continue
+        table_plain = table_expr.replace("`", "").split(".")[-1].strip()
+        alias_name = (m.group(2) or "").strip() or table_plain
+        if not alias_name:
+            continue
+        explicit_aliases[alias_name.lower()] = table_plain
+        ordered_aliases.append((alias_name, table_plain))
+    if not ordered_aliases:
+        return sql
+
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    allowed_cols: Dict[str, Set[str]] = {}
+    if not analyzer and ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            allowed_cols = {
+                str(t or "").lower(): {str(c or "").lower() for c in (cols or set())}
+                for t, cols in (allowed or {}).items()
+                if str(t or "").strip()
+            }
+        except Exception:
+            allowed_cols = {}
+
+    fk_map_raw = {}
+    try:
+        fk_map_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_map_raw = {}
+    fk_map: Dict[str, Dict[str, str]] = {}
+    for src, rels in fk_map_raw.items():
+        src_l = str(src or "").lower().strip()
+        if not src_l:
+            continue
+        fk_map.setdefault(src_l, {})
+        for fk_col, tgt in (rels or {}).items():
+            fk_l = str(fk_col or "").lower().strip()
+            tgt_l = str(tgt or "").lower().strip()
+            if fk_l and tgt_l:
+                fk_map[src_l][fk_l] = tgt_l
+
+    def _plain_table_name(table_expr: str) -> str:
+        return (table_expr or "").replace("`", "").split(".")[-1].strip()
+
+    def _table_cols(table_name: str) -> Set[str]:
+        tbl_l = _plain_table_name(table_name).lower()
+        cols = set(allowed_cols.get(tbl_l, set()))
+        if analyzer is not None:
+            try:
+                cols.update(str(c or "").lower() for c in analyzer.get_table_columns(tbl_l))
+            except Exception:
+                pass
+        return cols
+
+    def _temporal_cols_for_table(table_name: str) -> List[str]:
+        return [
+            c for c in sorted(_table_cols(table_name))
+            if any(k in c for k in ("date", "time", "timestamp"))
+        ]
+
+    def _pick_alias(base: str, used: Set[str]) -> str:
+        seed = re.sub(r"[^A-Za-z0-9_]+", "_", (base or "")).strip("_") or "t"
+        if not re.match(r"[A-Za-z_]", seed[0]):
+            seed = f"t_{seed}"
+        cand = seed
+        idx = 2
+        while cand.lower() in used:
+            cand = f"{seed}_{idx}"
+            idx += 1
+        used.add(cand.lower())
+        return cand
+
+    where_raw = re.sub(r"^\s*WHERE\s+", "", (parsed.get("where") or "").strip(), flags=re.I).strip()
+    if not where_raw or _has_top_level_or(where_raw):
+        return sql
+    conjuncts = _split_top_level_and(where_raw)
+    if not conjuncts:
+        return sql
+
+    invalid_year_conds: List[Tuple[int, str, str, str, str]] = []
+    for idx, cond in enumerate(conjuncts):
+        m_year = re.match(
+            r"""(?is)^\s*YEAR\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*=\s*((?:19|20)\d{2})\s*$""",
+            cond.strip(),
+        )
+        if not m_year:
+            continue
+        alias_name, col_name, yr = m_year.group(1), m_year.group(2), m_year.group(3)
+        table_name = explicit_aliases.get(alias_name.lower(), "")
+        if not table_name:
+            continue
+        if col_name.lower() in _table_cols(table_name):
+            continue
+        invalid_year_conds.append((idx, alias_name, table_name, col_name, yr))
+
+    if not invalid_year_conds:
+        return sql
+
+    include_year = invalid_year_conds[0][4]
+    exclude_year = next((y for y in ordered_years if y != include_year), "")
+    if not exclude_year:
+        return sql
+
+    groupby_part = (parsed.get("groupby") or "").strip()
+
+    # Fast path: two-table entity + bridge aggregate with malformed temporal
+    # YEAR filters but no temporal table joined yet.
+    if len(ordered_aliases) == 2:
+        outer_alias, outer_table = ordered_aliases[0]
+        bridge_alias, bridge_table = ordered_aliases[1]
+        outer_cols = _table_cols(outer_table)
+        outer_id_col = ""
+        try:
+            outer_id_col = (get_id_column(outer_table) or "").strip()
+        except Exception:
+            outer_id_col = ""
+        if not outer_id_col or outer_id_col.lower() not in outer_cols:
+            for item in _split_top_level_commas(groupby_part):
+                m_outer = re.match(
+                    rf"""(?is)^\s*`?{re.escape(outer_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$""",
+                    (item or "").strip(),
+                )
+                if not m_outer:
+                    continue
+                cand = (m_outer.group(1) or "").strip()
+                cand_l = cand.lower()
+                if cand_l in outer_cols and (
+                    cand_l.endswith("id")
+                    or cand_l.endswith("number")
+                    or cand_l.endswith("code")
+                    or cand_l.endswith("key")
+                ):
+                    outer_id_col = cand
+                    break
+
+        eq_pairs = list(
+            re.finditer(
+                r"""`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?""",
+                from_core,
+                flags=re.I,
+            )
+        )
+
+        bridge_outer_col = ""
+        for m_eq in eq_pairs:
+            a1, c1, a2, c2 = m_eq.group(1), m_eq.group(2), m_eq.group(3), m_eq.group(4)
+            if a1.lower() == outer_alias.lower() and a2.lower() == bridge_alias.lower() and c1.lower() == outer_id_col.lower():
+                bridge_outer_col = c2
+                break
+            if a2.lower() == outer_alias.lower() and a1.lower() == bridge_alias.lower() and c2.lower() == outer_id_col.lower():
+                bridge_outer_col = c1
+                break
+
+        rels = fk_map.get(_plain_table_name(bridge_table).lower(), {})
+        temporal_bridge_candidate = None
+        for fk_col, tgt_table in rels.items():
+            temporal_cols = _temporal_cols_for_table(tgt_table)
+            if not temporal_cols:
+                continue
+            preferred_temporal_col = ""
+            for _idx, _bad_alias, _bad_table, bad_col, _yr in invalid_year_conds:
+                if bad_col.lower() in temporal_cols:
+                    preferred_temporal_col = bad_col.lower()
+                    break
+            if not preferred_temporal_col:
+                if len(temporal_cols) == 1:
+                    preferred_temporal_col = temporal_cols[0]
+                elif "orderdate" in temporal_cols:
+                    preferred_temporal_col = "orderdate"
+                elif "paymentdate" in temporal_cols:
+                    preferred_temporal_col = "paymentdate"
+            if not preferred_temporal_col:
+                continue
+            try:
+                target_pk = (get_id_column(tgt_table) or "").strip()
+            except Exception:
+                target_pk = ""
+            target_cols = _table_cols(tgt_table)
+            if not target_pk or target_pk.lower() not in target_cols:
+                if fk_col.lower() in target_cols:
+                    target_pk = fk_col
+                else:
+                    continue
+            temporal_bridge_candidate = (fk_col, tgt_table, preferred_temporal_col, target_pk)
+            break
+
+        if outer_id_col and bridge_outer_col and temporal_bridge_candidate is not None:
+            bridge_fk_col, temporal_table, temporal_col, temporal_pk = temporal_bridge_candidate
+            used_aliases = {a.lower() for a in explicit_aliases.keys()}
+            temporal_alias = _pick_alias(f"{_plain_table_name(temporal_table)}_outer", used_aliases)
+            anti_bridge_alias = _pick_alias("anti_src", used_aliases)
+            anti_temporal_alias = _pick_alias("anti_dt", used_aliases)
+            anti_not_exists = (
+                "NOT EXISTS (\n"
+                "  SELECT 1\n"
+                f"  FROM {bridge_table} AS {anti_bridge_alias}\n"
+                f"  JOIN {temporal_table} AS {anti_temporal_alias}\n"
+                f"    ON {anti_temporal_alias}.{temporal_pk} = {anti_bridge_alias}.{bridge_fk_col}\n"
+                f"  WHERE {anti_bridge_alias}.{bridge_outer_col} = {outer_alias}.{outer_id_col}\n"
+                f"    AND YEAR({anti_temporal_alias}.{temporal_col}) = {exclude_year}\n"
+                ")"
+            )
+            remaining = [
+                c.strip()
+                for idx, c in enumerate(conjuncts)
+                if idx not in {item[0] for item in invalid_year_conds} and c.strip()
+            ]
+            remaining.insert(0, f"YEAR({temporal_alias}.{temporal_col}) = {include_year}")
+            remaining.append(anti_not_exists)
+            tail_clause = f"\n{parsed['tail'].strip()}" if parsed["tail"].strip() else ""
+            fixed = (
+                f"SELECT {parsed['select'].strip()}\n"
+                f"FROM {from_core}\n"
+                f"JOIN {temporal_table} AS {temporal_alias} "
+                f"ON {temporal_alias}.{temporal_pk} = {bridge_alias}.{bridge_fk_col}\n"
+                f"WHERE {' AND '.join(remaining)}\n"
+                f"GROUP BY {groupby_part}"
+                f"{tail_clause};"
+            )
+            return fixed
+
+    outer_alias, outer_table = ordered_aliases[0]
+    outer_id_col = ""
+    try:
+        outer_id_col = (get_id_column(outer_table) or "").strip()
+    except Exception:
+        outer_id_col = ""
+    outer_cols = _table_cols(outer_table)
+    if not outer_id_col or outer_id_col.lower() not in outer_cols:
+        for item in _split_top_level_commas(groupby_part):
+            m_outer = re.match(
+                rf"""(?is)^\s*`?{re.escape(outer_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$""",
+                (item or "").strip(),
+            )
+            if not m_outer:
+                continue
+            cand = (m_outer.group(1) or "").strip()
+            cand_l = cand.lower()
+            if cand_l in outer_cols and (
+                cand_l.endswith("id")
+                or cand_l.endswith("number")
+                or cand_l.endswith("code")
+                or cand_l.endswith("key")
+            ):
+                outer_id_col = cand
+                break
+    if not outer_id_col or outer_id_col.lower() not in outer_cols:
+        return sql
+    if not re.search(
+        rf"""(?is)\b`?{re.escape(outer_alias)}`?\s*\.\s*`?{re.escape(outer_id_col)}`?\b""",
+        groupby_part,
+    ):
+        return sql
+
+    eq_pairs = list(
+        re.finditer(
+            r"""`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?""",
+            from_core,
+            flags=re.I,
+        )
+    )
+
+    bridge_candidates: List[Tuple[str, str, str, str, str, str]] = []
+    for alias_name, table_name in ordered_aliases[1:]:
+        table_l = _plain_table_name(table_name).lower()
+        rels = fk_map.get(table_l, {})
+        if not rels:
+            continue
+
+        outer_bridge_col = ""
+        for m_eq in eq_pairs:
+            a1, c1, a2, c2 = m_eq.group(1), m_eq.group(2), m_eq.group(3), m_eq.group(4)
+            if a1.lower() == alias_name.lower() and a2.lower() == outer_alias.lower() and c2.lower() == outer_id_col.lower():
+                outer_bridge_col = c1
+                break
+            if a2.lower() == alias_name.lower() and a1.lower() == outer_alias.lower() and c1.lower() == outer_id_col.lower():
+                outer_bridge_col = c2
+                break
+        if not outer_bridge_col:
+            continue
+
+        for fk_col, tgt_table in rels.items():
+            temporal_cols = _temporal_cols_for_table(tgt_table)
+            if not temporal_cols:
+                continue
+            preferred_temporal_col = ""
+            for _idx, bad_alias, _bad_table, bad_col, _yr in invalid_year_conds:
+                if bad_col.lower() in temporal_cols:
+                    preferred_temporal_col = bad_col.lower()
+                    break
+            if not preferred_temporal_col:
+                if len(temporal_cols) == 1:
+                    preferred_temporal_col = temporal_cols[0]
+                elif "orderdate" in temporal_cols:
+                    preferred_temporal_col = "orderdate"
+                elif "paymentdate" in temporal_cols:
+                    preferred_temporal_col = "paymentdate"
+            if not preferred_temporal_col:
+                continue
+
+            try:
+                target_pk = (get_id_column(tgt_table) or "").strip()
+            except Exception:
+                target_pk = ""
+            target_cols = _table_cols(tgt_table)
+            if not target_pk or target_pk.lower() not in target_cols:
+                if fk_col.lower() in target_cols:
+                    target_pk = fk_col
+                else:
+                    continue
+
+            bridge_candidates.append(
+                (
+                    alias_name,
+                    table_name,
+                    outer_bridge_col,
+                    fk_col,
+                    tgt_table,
+                    preferred_temporal_col,
+                    target_pk,
+                )
+            )
+
+    if len(bridge_candidates) != 1:
+        return sql
+
+    bridge_alias, bridge_table, outer_bridge_col, bridge_fk_col, temporal_table, temporal_col, temporal_pk = bridge_candidates[0]
+
+    used_aliases = {a.lower() for a in explicit_aliases.keys()}
+    outer_temporal_alias = next(
+        (
+            alias_name
+            for alias_name, table_name in ordered_aliases
+            if _plain_table_name(table_name).lower() == _plain_table_name(temporal_table).lower()
+        ),
+        "",
+    )
+    join_to_add = ""
+    if not outer_temporal_alias:
+        outer_temporal_alias = _pick_alias(f"{_plain_table_name(temporal_table)}_outer", used_aliases)
+        join_to_add = (
+            f"\nJOIN {temporal_table} AS {outer_temporal_alias} "
+            f"ON {outer_temporal_alias}.{temporal_pk} = {bridge_alias}.{bridge_fk_col}"
+        )
+
+    anti_bridge_alias = _pick_alias("anti_src", used_aliases)
+    anti_temporal_alias = _pick_alias("anti_dt", used_aliases)
+    anti_not_exists = (
+        "NOT EXISTS (\n"
+        "  SELECT 1\n"
+        f"  FROM {bridge_table} AS {anti_bridge_alias}\n"
+        f"  JOIN {temporal_table} AS {anti_temporal_alias}\n"
+        f"    ON {anti_temporal_alias}.{temporal_pk} = {anti_bridge_alias}.{bridge_fk_col}\n"
+        f"  WHERE {anti_bridge_alias}.{outer_bridge_col} = {outer_alias}.{outer_id_col}\n"
+        f"    AND YEAR({anti_temporal_alias}.{temporal_col}) = {exclude_year}\n"
+        ")"
+    )
+
+    remaining = [
+        c.strip()
+        for idx, c in enumerate(conjuncts)
+        if idx not in {item[0] for item in invalid_year_conds} and c.strip()
+    ]
+    remaining.insert(0, f"YEAR({outer_temporal_alias}.{temporal_col}) = {include_year}")
+    remaining.append(anti_not_exists)
+
+    tail_clause = f"\n{parsed['tail'].strip()}" if parsed["tail"].strip() else ""
+    fixed = (
+        f"SELECT {parsed['select'].strip()}\n"
+        f"FROM {from_core}{join_to_add}\n"
+        f"WHERE {' AND '.join(remaining)}\n"
         f"GROUP BY {parsed['groupby'].strip()}"
         f"{tail_clause};"
     )
@@ -21515,24 +22256,23 @@ def _enforce_window_sequence_direction(sql: str, question: str) -> str:
         q,
         flags=re.I,
     )
-    if not sequence_cue:
-        return sql
-
-    ordered_idx = sequence_cue.start()
-    ordered_tail = q[ordered_idx:] if ordered_idx >= 0 else q
-    stop_positions: List[int] = []
-    for pat in (
-        r"[.;!?]",
-        r",",
-        r"\band\s+(?:sort|order|arrange)\b",
-        r"\bthen\s+(?:sort|order|arrange)\b",
-        r"\b(?:sort|order|arrange)\s+the\s+(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
-    ):
-        m = re.search(pat, ordered_tail, flags=re.I)
-        if m:
-            stop_positions.append(m.start())
-    if stop_positions:
-        ordered_tail = ordered_tail[:min(stop_positions)]
+    ordered_tail = ""
+    if sequence_cue:
+        ordered_idx = sequence_cue.start()
+        ordered_tail = q[ordered_idx:] if ordered_idx >= 0 else q
+        stop_positions: List[int] = []
+        for pat in (
+            r"[.;!?]",
+            r",",
+            r"\band\s+(?:sort|order|arrange)\b",
+            r"\bthen\s+(?:sort|order|arrange)\b",
+            r"\b(?:sort|order|arrange)\s+the\s+(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
+        ):
+            m = re.search(pat, ordered_tail, flags=re.I)
+            if m:
+                stop_positions.append(m.start())
+        if stop_positions:
+            ordered_tail = ordered_tail[:min(stop_positions)]
 
     if re.search(r"\b(?:descending|desc|reverse)\b", ordered_tail, flags=re.I):
         desired_dir = "DESC"

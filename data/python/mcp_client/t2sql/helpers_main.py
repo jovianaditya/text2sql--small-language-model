@@ -88,11 +88,13 @@ from .helpers_core import (
     _rewrite_missing_joined_agg_threshold_filter,
     _rewrite_missing_overall_avg_having,
     _rewrite_employee_latest_payment_customer_identity,
+    _drop_tuple_in_filter_from_include_zero_ranked_winner,
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
     _rewrite_role_label_count_semantics,
     _drop_unrequested_exists_filters,
     _drop_unrequested_temporal_filters,
+    _rewrite_missing_temporal_bridge_exclusion,
     _rewrite_temporal_year_exclusion_antijoin,
     _prefer_not_exists_for_simple_exclusion,
     _repair_temporal_not_exists_scope,
@@ -3107,19 +3109,19 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "SET OPERATION RULE (CRITICAL): If the question asks for an identifier plus a label, "
             "return them as TWO SEPARATE columns. "
             "Do NOT pack them into one CONCAT(...) column. "
-            "Example pattern: `SELECT orderNumber, '2003' AS year_label ... UNION SELECT orderNumber, '2004' AS year_label ...`"
+            "Example pattern: `SELECT entity_id, 'label_a' AS label_name ... UNION SELECT entity_id, 'label_b' AS label_name ...`"
         )
         constraints.append(
             "SET OPERATION RULE (CRITICAL): Do NOT emulate UNION by using multiple CASE WHEN columns in one SELECT. "
-            "Wrong: `SELECT CASE WHEN ... THEN id END AS label1, CASE WHEN ... THEN id END AS label2 FROM ...`. "
+            "Wrong: `SELECT CASE WHEN ... THEN entity_id END AS label_a, CASE WHEN ... THEN entity_id END AS label_b FROM ...`. "
             "Correct: one SELECT branch per label, then combine branches with UNION or UNION ALL."
         )
         constraints.append(
             "SET OPERATION RULE (CRITICAL): If each UNION branch represents one specific label or year, "
             "assign that branch label as a constant literal in the SELECT list. "
             "Do NOT reuse the same CASE WHEN label expression in every branch. "
-            "Wrong: both branches use `CASE WHEN YEAR(orderDate)=2003 THEN '2003' ELSE '2004' END`. "
-            "Correct: first branch selects `'2003' AS year_label`, second branch selects `'2004' AS year_label`."
+            "Wrong: both branches use the same CASE-based label expression. "
+            "Correct: first branch selects `'label_a' AS label_name`, second branch selects `'label_b' AS label_name`."
         )
         if is_simple_set_operation:
             constraints.append(
@@ -3135,7 +3137,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "Do NOT add subqueries to filter grouping columns. "
             "TABLE SELECTION RULE: When counting 'number of Y' per each X, use FROM the Y table (the entity being counted), "
             "NOT the dimension table for X. "
-            "Example: 'for each product line, count products' -> FROM products GROUP BY productLine (NOT FROM productlines). "
+            "Example: 'for each grouping label, count entities' -> FROM entity_table GROUP BY grouping_label (NOT FROM grouping_dimension_table). "
             "The COUNT(*) counts rows in the FROM table, so use the table containing the entities to count. "
             "CORRECT: SELECT groupingCol, COUNT(*) FROM entity_table GROUP BY groupingCol "
             "WRONG: SELECT groupingCol, COUNT(*) FROM dimension_table GROUP BY groupingCol (this counts dimension rows, not entities)"
@@ -3223,8 +3225,8 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "SIMPLE SCALAR SUBQUERY RULE (CRITICAL): This question compares rows to a single-table scalar baseline such as "
             "the overall average, MAX(date), or MIN(date). "
             "You MUST keep the base table as the main FROM table and use a scalar subquery in WHERE. "
-            "Example: `WHERE orderDate = (SELECT MAX(orderDate) FROM orders)` or "
-            "`WHERE creditLimit > (SELECT AVG(creditLimit) FROM customers)`."
+            "Example: `WHERE date_col = (SELECT MAX(date_col) FROM base_table)` or "
+            "`WHERE metric_col > (SELECT AVG(metric_col) FROM base_table)`."
         )
         constraints.append(
             "SIMPLE SCALAR SUBQUERY RULE (CRITICAL): Do NOT replace the scalar subquery with only ORDER BY/LIMIT on the outer query. "
@@ -3554,8 +3556,8 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             # Strongest constraint for "Include X, Y, Z" pattern
             constraints.append(
                 f"CRITICAL COLUMN REQUIREMENT: The question explicitly says 'Include {cols_list}'. "
-                f"Select ONLY these columns (plus the 'For each' entity identifier). "
-                f"Do NOT add any other columns like checkNumber, orderNumber, etc."
+                f"Select ONLY these columns (plus the 'For each' entity identifier or display label when required). "
+                f"Do NOT add any other unrequested identifiers, labels, or auxiliary columns."
             )
         else:
             constraints.append(
@@ -3570,12 +3572,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     else:
         constraints.append(
             "STRICT COLUMN SELECTION: Select EXACTLY the columns requested by the user. "
-            "Do NOT add extra columns like IDs, codes, or check numbers unless explicitly mentioned."
+            "Do NOT add extra identifiers, codes, labels, or auxiliary columns unless explicitly mentioned."
         )
     constraints.append(
         "IMPLICIT SELECTION RULE: If the user says 'For each [Entity]' or 'List [Entity]', "
-        "you MUST include that Entity's Identifier/Name in the SELECT list, even if not explicitly listed in 'Include ...'. "
-        "Example: 'For each Customer, show total amount' -> You MUST Select `customerName` AND `totalAmount`."
+        "you MUST include that entity's identifier or display label in the SELECT list, even if not explicitly listed in 'Include ...'. "
+        "Example: 'For each entity, show total metric' -> You MUST select the entity identifier or display label AND the aggregated metric."
     )
     constraints.append(
         "NO EXTRA COLUMNS: Apart from the 'For each' entity, do NOT add other IDs/Codes unless asked."
@@ -4282,6 +4284,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after include-zero winner-row id-source fix:", s)
 
+        s = _drop_tuple_in_filter_from_include_zero_ranked_winner(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after include-zero tuple-IN drop fix:", s)
+
         s = _rewrite_invalid_metric_bridge_rollup(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after metric-bridge path fix:", s)
 
@@ -4343,6 +4348,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _drop_unrequested_temporal_filters(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested temporal-filter drop fix: {s}")
+
+        s = _rewrite_missing_temporal_bridge_exclusion(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after temporal missing-bridge exclusion fix: {s}")
 
         s = _rewrite_temporal_year_exclusion_antijoin(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after temporal exclusion anti-join fix: {s}")
