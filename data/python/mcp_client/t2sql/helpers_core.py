@@ -3732,6 +3732,20 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
         return c_l
 
     def _extract_requested_output_segment(text: str) -> str:
+        # Highest-priority: capture explicit output list before filter clauses like
+        # "Return <cols> for entities with ..."
+        head_patterns = [
+            r"\b(?:return|show|display|get)\s+(?:the\s+)?(?P<seg>.+?)\s+\bfor\b",
+            r"\b(?:return|show|display|get)\s+(?:the\s+)?(?P<seg>.+?)\s+\bwhere\b",
+        ]
+        for pat in head_patterns:
+            m = re.search(pat, text, flags=re.I)
+            if not m:
+                continue
+            seg = str(m.group("seg") or "").strip(" .;")
+            if seg:
+                return seg
+
         patterns = [
             r"\bwith\b\s+(?P<seg>.+)$",
             r"\bincluding\b\s+(?P<seg>.+)$",
@@ -3751,6 +3765,15 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
             stop_m = stop_pat.search(seg)
             if stop_m:
                 seg = seg[:stop_m.start()].strip(" ,.;")
+            # Reject filter-like "with ..." tails such as
+            # "with a metric greater than the average ..." because they do not
+            # describe requested output columns.
+            if re.search(
+                r"\b(?:greater|less|higher|lower|more|fewer|above|below|than|between|before|after|equal|equals|at\s+least|at\s+most)\b",
+                seg,
+                flags=re.I,
+            ):
+                continue
             return seg
         return ""
 
@@ -8403,16 +8426,169 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
     if re.search(r"\bROW_NUMBER\s*\(", sql, flags=re.I):
         return sql
 
+    def _fallback_simple_wrapper(sql_text: str) -> str:
+        parsed = _parse_select_from_groupby(sql_text)
+        if not parsed:
+            return sql_text
+        if (parsed.get("where") or "").strip():
+            return sql_text
+        if (parsed.get("having") or "").strip():
+            return sql_text
+
+        groupby = (parsed.get("groupby") or "").strip()
+        tail = (parsed.get("tail") or "").strip()
+        if not groupby or not tail:
+            return sql_text
+
+        m_order = re.match(r"(?is)^ORDER\s+BY\s+(.+)$", tail)
+        if not m_order:
+            return sql_text
+        order_items = _split_top_level_commas(m_order.group(1) or "")
+        if len(order_items) < 2:
+            return sql_text
+
+        def _split_expr_alias(item: str) -> tuple[str, Optional[str]]:
+            m = re.match(
+                r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+                (item or "").strip(),
+            )
+            if not m:
+                return (item or "").strip(), None
+            return (m.group(1) or "").strip(), (m.group(2) or "").strip()
+
+        def _parse_simple_col(expr: str) -> Optional[tuple[str, str]]:
+            m = re.match(
+                r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$""",
+                (expr or "").strip(),
+            )
+            if not m:
+                return None
+            return str(m.group(1) or "").strip(), str(m.group(2) or "").strip()
+
+        def _norm_expr(expr: str) -> str:
+            return re.sub(r"[\s`]+", "", str(expr or "").lower())
+
+        def _strip_order_dir(item: str) -> tuple[str, bool]:
+            text = (item or "").strip()
+            m = re.match(r"(?is)^(.*?)(?:\s+(ASC|DESC))?$", text)
+            core = (m.group(1) or "").strip() if m else text
+            desc = bool(m and (m.group(2) or "").strip().upper() == "DESC")
+            return core, desc
+
+        select_items = _split_top_level_commas(parsed.get("select", ""))
+        if not select_items:
+            return sql_text
+
+        projected_items: List[str] = []
+        projected_nonagg_exprs: List[str] = []
+        alias_names: List[str] = []
+        alias_to_expr: Dict[str, str] = {}
+        alias_is_agg: Dict[str, bool] = {}
+        group_aliases: Set[str] = set()
+        seen_aliases: Set[str] = set()
+
+        for raw_item in select_items:
+            expr, out_alias = _split_expr_alias(raw_item)
+            expr_clean = (expr or "").strip()
+            parsed_col = _parse_simple_col(expr_clean)
+            is_agg = bool(re.search(r"(?is)\b(?:SUM|COUNT|AVG|MIN|MAX)\s*\(", expr_clean))
+            if out_alias:
+                alias_name = out_alias.strip("`'\"")
+            elif parsed_col:
+                alias_name = parsed_col[1]
+            else:
+                return sql_text
+
+            if not alias_name:
+                return sql_text
+            alias_key = alias_name.lower()
+            if alias_key in seen_aliases:
+                return sql_text
+            seen_aliases.add(alias_key)
+            projected_items.append((raw_item or "").strip())
+            alias_names.append(alias_name)
+            alias_to_expr[alias_key] = expr_clean
+            alias_is_agg[alias_key] = is_agg
+            if not is_agg:
+                projected_nonagg_exprs.append(expr_clean)
+            if parsed_col and not is_agg:
+                group_aliases.add(alias_key)
+
+        order_aliases: List[str] = []
+        order_dirs: List[bool] = []
+        for raw_item in order_items:
+            core, desc = _strip_order_dir(raw_item)
+            core_l = core.strip("`'\"").lower()
+            chosen: Optional[str] = None
+            if core_l in alias_to_expr:
+                chosen = next((a for a in alias_names if a.lower() == core_l), None)
+            else:
+                parsed_col = _parse_simple_col(core)
+                if parsed_col:
+                    col_name = parsed_col[1].lower()
+                    chosen = next((a for a in alias_names if a.lower() == col_name), None)
+                if not chosen:
+                    norm_core = _norm_expr(core)
+                    for alias_name in alias_names:
+                        if _norm_expr(alias_to_expr.get(alias_name.lower(), "")) == norm_core:
+                            chosen = alias_name
+                            break
+            if not chosen or chosen in order_aliases:
+                continue
+            order_aliases.append(chosen)
+            order_dirs.append(desc)
+
+        if len(order_aliases) < 2:
+            return sql_text
+
+        partition_alias = order_aliases[0]
+        if alias_is_agg.get(partition_alias.lower(), False):
+            return sql_text
+        if partition_alias.lower() not in group_aliases:
+            return sql_text
+
+        rank_aliases = order_aliases[1:]
+        rank_dirs = order_dirs[1:]
+        if not rank_aliases:
+            return sql_text
+
+        candidate_groupby = ", ".join(dict.fromkeys(projected_nonagg_exprs))
+        if not candidate_groupby:
+            return sql_text
+        candidate_select = ", ".join(projected_items)
+        candidate_sql = (
+            f"SELECT {candidate_select} FROM {parsed['from_core'].strip()} "
+            f"GROUP BY {candidate_groupby}"
+        )
+        candidate_sub = f"({candidate_sql}) AS c"
+        ranked_order = ", ".join(
+            f"c.{alias} {'DESC' if desc else 'ASC'}"
+            for alias, desc in zip(rank_aliases, rank_dirs)
+        )
+        ranked_sql = (
+            "SELECT "
+            + ", ".join(f"c.{alias}" for alias in alias_names)
+            + f", ROW_NUMBER() OVER (PARTITION BY c.{partition_alias} ORDER BY {ranked_order}) AS rn "
+            + f"FROM {candidate_sub}"
+        )
+        outer_sql = (
+            "SELECT "
+            + ", ".join(f"t.{alias}" for alias in alias_names)
+            + f" FROM ({ranked_sql}) AS t WHERE t.rn = 1 "
+            + f"ORDER BY t.{partition_alias} {'DESC' if order_dirs[0] else 'ASC'}"
+        )
+        return outer_sql + ";"
+
     try:
         import sqlglot
         from sqlglot import exp
     except Exception:
-        return sql
+        return _fallback_simple_wrapper(sql)
 
     try:
         ast = sqlglot.parse_one(sql, read="mysql")
     except Exception:
-        return sql
+        return _fallback_simple_wrapper(sql)
 
     sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
     if not isinstance(sel, exp.Select):
@@ -8461,6 +8637,25 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
     if not dedup_projection_items:
         return sql
     candidate_sel.set("expressions", dedup_projection_items)
+
+    # Rebuild the grouped candidate layer from the visible non-aggregate
+    # projection only. This avoids carrying malformed or stale GROUP BY terms
+    # (for example aliases from an earlier draft shape) into the ranked wrapper.
+    rebuilt_group_exprs: List[exp.Expression] = []
+    rebuilt_group_norms: Set[str] = set()
+    for item in candidate_sel.expressions:
+        base = item.this if isinstance(item, exp.Alias) else item
+        contains_aggregate = isinstance(base, exp.AggFunc) or any(True for _ in base.find_all(exp.AggFunc))
+        if contains_aggregate:
+            continue
+        base_norm = _norm_expr(base)
+        if not base_norm or base_norm in rebuilt_group_norms:
+            continue
+        rebuilt_group_exprs.append(base.copy())
+        rebuilt_group_norms.add(base_norm)
+    if not rebuilt_group_exprs:
+        return sql
+    candidate_sel.set("group", exp.Group(expressions=rebuilt_group_exprs))
 
     group_expr_norms = {
         _norm_expr(g)
@@ -8836,7 +9031,367 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
             )
             out_sql = pat.sub(f"{rel_alias}.{alias} ASC", out_sql)
 
+    if out_sql == sql:
+        return _fallback_simple_wrapper(sql)
     return out_sql
+
+
+def _rewrite_dual_fact_rollup_exists_shape(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Repair base-entity grouped dual-fact rollups that degraded into:
+      base_table
+      WHERE EXISTS (count_fact ...)
+      COUNT(unqualified_count_col), SUM(unqualified_metric_col)
+
+    Example family:
+      "customers with at least one order ... total number of orders, total payment amount"
+
+    Conservative guardrails:
+    - clear dual-fact rollup intent
+    - FROM has only the base entity table
+    - WHERE is a single EXISTS subquery
+    - grouped SELECT contains one COUNT and one SUM
+    """
+    if not sql or not question:
+        return sql
+    if not _question_wants_dual_fact_rollup(question):
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+    if (parsed.get("having") or "").strip():
+        return sql
+
+    from_core = (parsed.get("from_core") or "").strip()
+    where_clause = (parsed.get("where") or "").strip()
+    groupby = (parsed.get("groupby") or "").strip()
+    if not from_core or not where_clause or not groupby:
+        return sql
+    if " join " in f" {from_core.lower()} ":
+        return sql
+
+    reserved_alias_tokens = {
+        "left", "right", "inner", "outer", "full", "cross", "join",
+        "on", "where", "group", "order", "having", "limit",
+    }
+    m_base = re.match(
+        r"""(?is)^\s*(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?\s*$""",
+        from_core,
+    )
+    if not m_base:
+        return sql
+    base_table_expr = (m_base.group(1) or "").strip()
+    base_table = base_table_expr.replace("`", "").split(".")[-1].strip()
+    if not base_table:
+        return sql
+    base_alias_raw = (m_base.group(2) or "").strip()
+    if base_alias_raw.lower() in reserved_alias_tokens:
+        base_alias_raw = ""
+    base_alias = (base_alias_raw or base_table).strip()
+    base_alias_l = base_alias.lower()
+
+    m_exists = re.match(
+        r"""(?is)^\s*WHERE\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?\s+WHERE\s+(.+?)\s*\)\s*$""",
+        where_clause,
+    )
+    if not m_exists:
+        return sql
+    count_table_expr = (m_exists.group(1) or "").strip()
+    count_table = count_table_expr.replace("`", "").split(".")[-1].strip()
+    if not count_table:
+        return sql
+    count_alias_raw = (m_exists.group(2) or "").strip()
+    if count_alias_raw.lower() in reserved_alias_tokens:
+        count_alias_raw = ""
+    count_alias = (count_alias_raw or count_table).strip()
+    count_alias_l = count_alias.lower()
+    exists_pred = (m_exists.group(3) or "").strip()
+
+    eq_match = re.search(
+        rf"""(?is)\b(?:`?{re.escape(base_alias)}`?\s*\.\s*`?(?P<base_col_a>[A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?{re.escape(count_alias)}`?\s*\.\s*`?(?P<count_col_a>[A-Za-z_][A-Za-z0-9_]*)`?|`?{re.escape(count_alias)}`?\s*\.\s*`?(?P<count_col_b>[A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?{re.escape(base_alias)}`?\s*\.\s*`?(?P<base_col_b>[A-Za-z_][A-Za-z0-9_]*)`?)\b""",
+        exists_pred,
+    )
+    if not eq_match:
+        return sql
+    base_count_key = (eq_match.group("base_col_a") or eq_match.group("base_col_b") or "").strip()
+    count_key = (eq_match.group("count_col_a") or eq_match.group("count_col_b") or "").strip()
+    if not base_count_key or not count_key:
+        return sql
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+    allowed_identifiers = _parse_allowed_identifiers(ctx)
+
+    def _table_cols_lower(table: str) -> Set[str]:
+        table_l = str(table or "").strip().lower()
+        if not table_l:
+            return set()
+        if analyzer is not None:
+            try:
+                return {
+                    str(c).strip("`").lower()
+                    for c in analyzer.get_table_columns(table_l)
+                }
+            except Exception:
+                pass
+        for tbl, cols in (allowed_identifiers or {}).items():
+            if str(tbl or "").strip().lower() != table_l:
+                continue
+            return {
+                str(c).strip("`").lower()
+                for c in (cols or set())
+                if str(c or "").strip()
+            }
+        return set()
+
+    def _split_expr_alias(item: str) -> tuple[str, Optional[str]]:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            (item or "").strip(),
+        )
+        if not m:
+            return (item or "").strip(), None
+        return (m.group(1) or "").strip(), (m.group(2) or "").strip()
+
+    def _parse_simple_col(expr: str) -> Optional[Tuple[str, str]]:
+        m = re.match(
+            r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$""",
+            (expr or "").strip(),
+        )
+        if not m:
+            return None
+        return str(m.group(1) or "").strip(), str(m.group(2) or "").strip()
+
+    select_items = _split_top_level_commas(parsed.get("select", ""))
+    if not select_items:
+        return sql
+
+    base_select_items: List[str] = []
+    count_alias_out: Optional[str] = None
+    count_inner_clean: Optional[str] = None
+    sum_alias_out: Optional[str] = None
+    sum_inner_clean: Optional[str] = None
+    case_items: List[tuple[str, Optional[str]]] = []
+
+    count_table_cols = _table_cols_lower(count_table)
+
+    for raw_item in select_items:
+        expr, out_alias = _split_expr_alias(raw_item)
+        expr_clean = (expr or "").strip()
+
+        m_count = re.match(r"(?is)^COUNT\s*\(\s*(DISTINCT\s+)?(.+?)\s*\)$", expr_clean)
+        if m_count:
+            inner = (m_count.group(2) or "").strip()
+            if inner == "*":
+                count_inner_clean = "*"
+            else:
+                parsed_col = _parse_simple_col(inner)
+                if parsed_col:
+                    qualifier, col_name = parsed_col
+                    if qualifier and qualifier.lower() not in {count_alias_l, count_table.lower()}:
+                        return sql
+                    if col_name.lower() not in count_table_cols:
+                        return sql
+                    count_inner_clean = col_name
+                else:
+                    if inner.lower() not in count_table_cols:
+                        return sql
+                    count_inner_clean = inner
+            count_alias_out = (out_alias or "").strip("`'\"") or None
+            continue
+
+        m_sum = re.match(r"(?is)^SUM\s*\(\s*(.+?)\s*\)$", expr_clean)
+        if m_sum:
+            inner = (m_sum.group(1) or "").strip()
+            parsed_col = _parse_simple_col(inner)
+            if parsed_col:
+                qualifier, col_name = parsed_col
+                if qualifier and qualifier.lower() == base_alias_l:
+                    return sql
+                sum_inner_clean = col_name
+            else:
+                sum_inner_clean = inner
+            sum_alias_out = (out_alias or "").strip("`'\"") or None
+            continue
+
+        if expr_clean.lower().startswith("case") and re.search(r"\bSUM\s*\(", expr_clean, flags=re.I):
+            case_items.append((expr_clean, out_alias))
+            continue
+
+        parsed_col = _parse_simple_col(expr_clean)
+        if not parsed_col:
+            return sql
+        qualifier, col_name = parsed_col
+        if qualifier and qualifier.lower() not in {base_alias_l, base_table.lower()}:
+            return sql
+        rewritten = f"{base_alias}.{col_name}"
+        if out_alias:
+            rewritten += f" AS {out_alias.strip()}"
+        base_select_items.append(rewritten)
+
+    if not base_select_items or not count_inner_clean or not sum_inner_clean:
+        return sql
+
+    try:
+        fk_map_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_map_raw = {}
+    fk_map: Dict[str, Dict[str, str]] = {}
+    for src, mapping in fk_map_raw.items():
+        src_l = str(src or "").strip().lower()
+        if not src_l:
+            continue
+        fk_map[src_l] = {}
+        for fk_col, tgt in (mapping or {}).items():
+            fk_s = str(fk_col or "").strip()
+            tgt_l = str(tgt or "").strip().lower()
+            if fk_s and tgt_l:
+                fk_map[src_l][fk_s] = tgt_l
+
+    def _safe_id_col(table_name: str) -> str:
+        try:
+            return str(get_id_column(table_name) or "").strip()
+        except Exception:
+            return ""
+
+    def _direct_pairs_to_base(child_table: str) -> List[tuple[str, str]]:
+        out: List[tuple[str, str]] = []
+        child_l = str(child_table or "").strip().lower()
+        base_l = base_table.lower()
+        for fk_col, tgt in (fk_map.get(child_l, {}) or {}).items():
+            if str(tgt).lower() == base_l:
+                out.append((_safe_id_col(base_table) or base_count_key, str(fk_col).strip()))
+        for fk_col, tgt in (fk_map.get(base_l, {}) or {}).items():
+            if str(tgt).lower() == child_l:
+                out.append((str(fk_col).strip(), _safe_id_col(child_table) or str(fk_col).strip()))
+        if not out:
+            base_cols = _table_cols_lower(base_table)
+            child_cols = _table_cols_lower(child_table)
+            shared_keys = [
+                c for c in sorted(base_cols & child_cols)
+                if c.endswith(("id", "number", "code", "key"))
+            ]
+            for key_col in shared_keys:
+                out.append((key_col, key_col))
+        return out
+
+    sum_candidates: List[tuple[int, str, tuple[str, str]]] = []
+    try:
+        all_tables = sorted(str(t).strip().lower() for t in get_all_tables() if str(t).strip())
+    except Exception:
+        all_tables = sorted(str(t).strip().lower() for t in (allowed_identifiers or {}).keys() if str(t).strip())
+    try:
+        txn_tables = {str(t).strip().lower() for t in get_transaction_tables() if str(t).strip()}
+    except Exception:
+        txn_tables = set()
+
+    q_low = (question or "").lower()
+    for table_name in all_tables:
+        if table_name == base_table.lower():
+            continue
+        cols_l = _table_cols_lower(table_name)
+        if sum_inner_clean.lower() not in cols_l:
+            continue
+        pairs = _direct_pairs_to_base(table_name)
+        if not pairs:
+            continue
+        base_sum_key, sum_key = pairs[0]
+        score = 0
+        if table_name != count_table.lower():
+            score += 4
+        if table_name in txn_tables:
+            score += 2
+        for word in _entity_words_for_table(table_name):
+            ww = (word or "").strip().lower()
+            if not ww:
+                continue
+            w_pat = re.escape(ww).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{w_pat}\b", q_low, flags=re.I):
+                score += 3
+                break
+        if sum_inner_clean.lower() in {"amount", "payment", "payments"} and "pay" in table_name:
+            score += 2
+        sum_candidates.append((score, table_name, (base_sum_key, sum_key)))
+
+    if not sum_candidates:
+        return sql
+    sum_candidates.sort(key=lambda item: (-item[0], item[1]))
+    _sum_score, sum_table, sum_pair = sum_candidates[0]
+    base_sum_key, sum_key = sum_pair
+    if not sum_table or sum_table == base_table.lower():
+        return sql
+
+    count_alias_out = count_alias_out or "total_count"
+    sum_alias_out = sum_alias_out or "total_amount"
+
+    used_aliases = {base_alias_l, count_alias_l}
+    reserved_alias_tokens = {
+        "left", "right", "inner", "outer", "full", "cross", "join",
+        "on", "where", "group", "order", "having", "limit", "or", "and",
+    }
+
+    def _safe_alias(base_name: str) -> str:
+        raw = re.sub(r"[^A-Za-z0-9_]+", "_", str(base_name or "").strip()).strip("_").lower()
+        if not raw:
+            raw = "agg"
+        if not re.match(r"[a-z_]", raw):
+            raw = f"a_{raw}"
+        if raw in reserved_alias_tokens:
+            raw = f"{raw}_alias"
+        candidate = raw
+        idx = 2
+        while candidate.lower() in used_aliases or candidate.lower() in reserved_alias_tokens:
+            candidate = f"{raw}_{idx}"
+            idx += 1
+        used_aliases.add(candidate.lower())
+        return candidate
+
+    count_agg_alias = _safe_alias(f"{count_table}_agg")
+    sum_agg_alias = _safe_alias(f"{sum_table}_agg")
+    count_metric_alias = re.sub(r"[^A-Za-z0-9_]+", "_", count_alias_out).strip("_") or "count_metric"
+    sum_metric_alias = re.sub(r"[^A-Za-z0-9_]+", "_", sum_alias_out).strip("_") or "sum_metric"
+
+    projected_items = list(base_select_items)
+    projected_items.append(f"{count_agg_alias}.{count_metric_alias} AS {_smart_backtick(count_alias_out)}")
+    projected_items.append(f"COALESCE({sum_agg_alias}.{sum_metric_alias}, 0) AS {_smart_backtick(sum_alias_out)}")
+
+    sum_case_pat = re.compile(r"(?is)SUM\s*\(\s*(.+?)\s*\)")
+    for case_expr, case_alias in case_items:
+        rewritten_case = sum_case_pat.sub(
+            f"COALESCE({sum_agg_alias}.{sum_metric_alias}, 0)",
+            case_expr,
+        )
+        if case_alias:
+            projected_items.append(f"{rewritten_case} AS {case_alias}")
+        else:
+            projected_items.append(rewritten_case)
+
+    tail_clause = (parsed.get("tail") or "").strip()
+    tail_block = f"\n{tail_clause}" if tail_clause else ""
+    select_block = ",\n  ".join(projected_items)
+    count_expr = "COUNT(*)" if count_inner_clean == "*" else f"COUNT({count_inner_clean})"
+    fixed = (
+        "SELECT\n"
+        f"  {select_block}\n"
+        f"FROM {base_table_expr} {base_alias}\n"
+        "JOIN (\n"
+        f"  SELECT {count_key}, {count_expr} AS {count_metric_alias}\n"
+        f"  FROM {count_table}\n"
+        f"  GROUP BY {count_key}\n"
+        f") AS {count_agg_alias}\n"
+        f"  ON {count_agg_alias}.{count_key} = {base_alias}.{base_count_key}\n"
+        "LEFT JOIN (\n"
+        f"  SELECT {sum_key}, SUM({sum_inner_clean}) AS {sum_metric_alias}\n"
+        f"  FROM {sum_table}\n"
+        f"  GROUP BY {sum_key}\n"
+        f") AS {sum_agg_alias}\n"
+        f"  ON {sum_agg_alias}.{sum_key} = {base_alias}.{base_sum_key}"
+        f"{tail_block};"
+    )
+    return fixed
 
 
 def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
@@ -9098,6 +9653,16 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
                 if not c0:
                     continue
                 if _norm_expr(c0) in seen_norm:
+                    continue
+                qual_aliases = {
+                    str(a).strip().lower()
+                    for a in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", c0)
+                    if str(a).strip()
+                }
+                # When rewriting a specific ROW_NUMBER window, do not pull in a
+                # fallback reference from an outer/inner alias that is not valid
+                # in the current window scope.
+                if qual_aliases and not qual_aliases.issubset(preferred_aliases):
                     continue
                 return c0
         return None
@@ -9579,6 +10144,62 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
             for alias in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", window_sql, flags=re.I)
             if alias
         }
+        qualified_ref_norms = {_norm_expr(ref) for ref in qualified_refs}
+
+        def _coerce_identifier_scope(ref: Optional[str]) -> Optional[str]:
+            if not ref:
+                return None
+            if not current_aliases:
+                return ref
+            m_ref = re.match(
+                r"(?is)^\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+                str(ref or "").strip(),
+            )
+            if not m_ref:
+                return ref
+            alias_name = str(m_ref.group(1) or "").strip().lower()
+            col_name = str(m_ref.group(2) or "").strip()
+            if not col_name:
+                return ref
+            if alias_name in current_aliases:
+                return ref
+            for alias in sorted(current_aliases):
+                candidate = f"{alias}.{col_name}"
+                if _norm_expr(candidate) in qualified_ref_norms:
+                    return candidate
+            return None
+
+        def _raw_identifier_terms(ref: str) -> Set[str]:
+            m_col = re.match(
+                r"(?is)^\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+                str(ref or "").strip(),
+            )
+            if not m_col:
+                return set()
+            col_name = str(m_col.group(1) or "").strip()
+            if not col_name:
+                return set()
+            base_terms = set(_text_semantic_terms(col_name))
+            col_l = col_name.lower()
+            if col_l.endswith("code") or "code" in col_l:
+                base_terms.add("code")
+            if col_l.endswith("id") or "id" in col_l:
+                base_terms.add("id")
+            if col_l.endswith("key") or "key" in col_l:
+                base_terms.add("key")
+            return base_terms
+
+        scope_identifier_fallbacks = [
+            ref for ref in qualified_refs
+            if (
+                (m := re.match(r"(?is)^\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.", str(ref or "").strip()))
+                and str(m.group(1) or "").strip().lower() in current_aliases
+                and (
+                    (_expr_terms(ref) & identifier_terms)
+                    or (_raw_identifier_terms(ref) & identifier_terms)
+                )
+            )
+        ]
 
         primary_items: List[str] = []
         secondary_items: List[str] = []
@@ -9622,7 +10243,10 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
                 seen_norm.add(_norm_expr(fb_secondary))
 
         if wants_smaller_identifier and not id_items:
-            fb_id = _pick_fallback(identifier_fallbacks, seen_norm, current_aliases)
+            fb_id = _pick_fallback(scope_identifier_fallbacks, seen_norm, current_aliases)
+            if not fb_id:
+                fb_id = _pick_fallback(identifier_fallbacks, seen_norm, current_aliases)
+                fb_id = _coerce_identifier_scope(fb_id)
             if fb_id:
                 id_items.append(_force_dir(fb_id, desc=False))
 
@@ -10667,6 +11291,46 @@ def _rewrite_joined_ranked_subquery_to_outer_winner(sql: str, question: str, ctx
         return out_sql or sql
 
     return sql
+
+
+def _sanitize_order_by_alias_assignment(sql: str) -> str:
+    """
+    Remove malformed alias-assignment fragments that sometimes leak into
+    ORDER BY, e.g.:
+      ORDER BY total_orders DESC, customer_id AS C
+    -> ORDER BY total_orders DESC, customer_id ASC
+
+    Conservative:
+    - only touches ORDER BY tail
+    - only repairs identifier + AS + single token direction-like garbage
+    """
+    if not sql or "order by" not in (sql or "").lower():
+        return sql
+
+    def _fix_item(item: str) -> str:
+        text = (item or "").strip()
+        m = re.match(
+            r"""(?is)^
+            (`?[A-Za-z_][A-Za-z0-9_]*`?(?:\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+            \s+AS\s+([A-Za-z_][A-Za-z0-9_]*)\s*$
+            """,
+            text,
+            flags=re.X,
+        )
+        if not m:
+            return text
+        return f"{m.group(1).strip()} ASC"
+
+    m_order = re.search(r"(?is)\bORDER\s+BY\s+(.+?)(;?\s*)$", sql)
+    if not m_order:
+        return sql
+    order_body = (m_order.group(1) or "").strip()
+    items = _split_top_level_commas(order_body)
+    if not items:
+        return sql
+    fixed_items = [_fix_item(item) for item in items]
+    fixed_order = ", ".join(fixed_items)
+    return sql[:m_order.start(1)] + fixed_order + sql[m_order.end(1):]
 
 
 def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
@@ -12336,6 +13000,11 @@ def _rewrite_invalid_metric_bridge_rollup(sql: str, question: str, ctx: str = ""
     metric_alias_l = metric_alias.lower()
     base_alias_l = base_alias.lower()
 
+    # Self-joins are valid for cumulative/running and intra-table comparative
+    # shapes; they do not imply a missing bridge table.
+    if base_table == metric_table:
+        return sql
+
     def _split_expr_alias(item: str) -> tuple[str, Optional[str]]:
         m = re.match(
             r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
@@ -12529,6 +13198,9 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
         return sql
     if not _question_wants_dual_fact_rollup(question):
         return sql
+    exists_shape_fixed = _rewrite_dual_fact_rollup_exists_shape(sql, question, ctx)
+    if exists_shape_fixed != sql:
+        return exists_shape_fixed
 
     def _safe_sql_alias(name: Optional[str], fallback: str) -> str:
         raw = str(name or "").strip().strip("`'\"")
@@ -22466,6 +23138,643 @@ def _repair_offset_window_projection_shape(sql: str, question: str) -> str:
     sel.set("expressions", new_exprs)
     try:
         return ast.sql(dialect="mysql")
+    except Exception:
+        return sql
+
+
+def _preserve_requested_base_columns_in_running_self_join(sql: str, question: str) -> str:
+    """
+    Preserve explicitly requested base-row columns for cumulative/running
+    self-join aggregates.
+
+    Typical near-miss:
+      SELECT p.customerNumber, p.paymentDate, SUM(pp.amount) AS running_total
+      FROM payments p JOIN payments pp ...
+      GROUP BY p.customerNumber, p.paymentDate
+
+    If the question explicitly asked for a base metric column such as
+    `amount`, keep it in the projection and extend GROUP BY conservatively.
+
+    Guardrails:
+    - only for running/cumulative intent
+    - only when the top-level query has GROUP BY + aggregate
+    - only when the same base table is joined to itself
+    - only add base-table simple columns explicitly requested before the
+      running/cumulative phrase in the question
+    """
+    s = (sql or "").strip()
+    q = (question or "").strip()
+    if not s or not q:
+        return sql
+
+    q_low = q.lower()
+    m_running = re.search(r"\b(?:running|cumulative|kumulatif|akumulatif)\b", q_low, flags=re.I)
+    if not m_running:
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(s, read="mysql")
+    except Exception:
+        return sql
+
+    sel = ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return sql
+
+    grp = sel.args.get("group")
+    if not grp or not getattr(grp, "expressions", None):
+        return sql
+
+    if not any(
+        isinstance(item.this if isinstance(item, exp.Alias) else item, exp.AggFunc)
+        or any(True for _ in (item.this if isinstance(item, exp.Alias) else item).find_all(exp.AggFunc))
+        for item in sel.expressions or []
+    ):
+        return sql
+
+    from_expr = sel.args.get("from") or sel.args.get("from_")
+    base_src = getattr(from_expr, "this", None) if from_expr is not None else None
+    if not isinstance(base_src, exp.Table):
+        return sql
+
+    base_table = str(base_src.name or "").strip()
+    base_alias = str(base_src.alias_or_name or base_table).strip()
+    if not base_table or not base_alias:
+        return sql
+
+    same_table_join_aliases: Set[str] = set()
+    for join in sel.args.get("joins") or []:
+        join_tbl = getattr(join, "this", None)
+        if isinstance(join_tbl, exp.Table) and str(join_tbl.name or "").strip().lower() == base_table.lower():
+            same_table_join_aliases.add(str(join_tbl.alias_or_name or join_tbl.name or "").strip())
+    if not same_table_join_aliases:
+        return sql
+
+    def _identifier_parts(text: str) -> List[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        raw = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)
+        raw = raw.replace("_", " ").replace("-", " ")
+        return [tok for tok in re.findall(r"[a-z0-9]+", raw.lower()) if tok]
+
+    def _identifier_variants(parts: List[str]) -> Set[str]:
+        if not parts:
+            return set()
+        variants: Set[str] = {" ".join(parts)}
+        suffix_terms = {str(x or "").strip().lower() for x in identifier_id_like_terms() if str(x or "").strip()}
+        if len(parts) >= 2 and parts[-1] in suffix_terms:
+            prefix = parts[:-1]
+            for suffix in sorted(suffix_terms):
+                variants.add(" ".join(prefix + [suffix]))
+        return {v.strip() for v in variants if v.strip()}
+
+    try:
+        analyzer = get_schema_analyzer()
+        table_cols = [
+            str(c).strip("`")
+            for c in analyzer.get_table_columns(base_table)
+            if str(c).strip()
+        ]
+    except Exception:
+        table_cols = []
+    if not table_cols:
+        return sql
+
+    question_prefix = q_low[:m_running.start()]
+    requested_hits: List[Tuple[int, str]] = []
+    for col in table_cols:
+        col_l = str(col or "").strip().lower()
+        if not col_l:
+            continue
+        best_pos: Optional[int] = None
+        for phrase in _identifier_variants(_identifier_parts(col)):
+            phrase_regex = re.escape(phrase).replace(r"\ ", r"\s+")
+            m_phrase = re.search(rf"\b{phrase_regex}\b", question_prefix, flags=re.I)
+            if m_phrase:
+                pos = m_phrase.start()
+                if best_pos is None or pos < best_pos:
+                    best_pos = pos
+        if best_pos is not None:
+            requested_hits.append((best_pos, col_l))
+    if not requested_hits:
+        return sql
+
+    selected_base_cols: Set[str] = set()
+    agg_index = len(sel.expressions or [])
+    for idx, item in enumerate(sel.expressions or []):
+        base = item.this if isinstance(item, exp.Alias) else item
+        if isinstance(base, exp.Column):
+            tbl = str(base.table or "").strip().lower()
+            col = str(base.name or "").strip().lower()
+            if tbl == base_alias.lower() and col:
+                selected_base_cols.add(col)
+        contains_agg = isinstance(base, exp.AggFunc) or any(True for _ in base.find_all(exp.AggFunc))
+        if contains_agg:
+            agg_index = min(agg_index, idx)
+
+    missing_cols: List[str] = []
+    for _, col_l in sorted(requested_hits, key=lambda x: (x[0], x[1])):
+        if col_l not in selected_base_cols and col_l not in missing_cols:
+            missing_cols.append(col_l)
+    if not missing_cols:
+        return sql
+
+    new_exprs = list(sel.expressions or [])
+    group_exprs = list(grp.expressions or [])
+    existing_group_norms: Set[str] = set()
+
+    def _norm_expr(e: "exp.Expression") -> str:
+        try:
+            return re.sub(r"[\s`]+", "", e.sql(dialect="mysql").lower())
+        except Exception:
+            return ""
+
+    for g in group_exprs:
+        existing_group_norms.add(_norm_expr(g))
+
+    insert_at = agg_index
+    added_any = False
+    for col_l in missing_cols:
+        col_expr = exp.column(col_l, table=base_alias)
+        col_norm = _norm_expr(col_expr)
+        if col_norm and col_norm in {_norm_expr(e.this if isinstance(e, exp.Alias) else e) for e in new_exprs}:
+            continue
+        new_exprs.insert(insert_at, col_expr)
+        insert_at += 1
+        if col_norm and col_norm not in existing_group_norms:
+            group_exprs.append(col_expr.copy())
+            existing_group_norms.add(col_norm)
+        added_any = True
+
+    if not added_any:
+        return sql
+
+    sel.set("expressions", new_exprs)
+    sel.set("group", exp.Group(expressions=group_exprs))
+    try:
+        return ast.sql(dialect="mysql")
+    except Exception:
+        return sql
+
+
+def _rewrite_same_table_group_count_self_join_to_window(sql: str, question: str) -> str:
+    """
+    Rewrite same-table grouped self-join COUNT rollups into a window count.
+
+    Typical near-miss:
+      SELECT e.id, e.role, COUNT(e2.id) AS office_count
+      FROM employees e
+      JOIN employees e2 ON e.officeCode = e2.officeCode
+      WHERE e.id IS NOT NULL
+      GROUP BY e.id, e.role
+
+    ->
+      SELECT e.id, e.role,
+             COUNT(*) OVER (PARTITION BY e.officeCode) AS office_count
+      FROM employees e
+      WHERE e.id IS NOT NULL
+
+    Guardrails:
+    - exactly one self-join on the same base table
+    - exactly one COUNT aggregate and no other aggregate/window expression
+    - join predicate consists only of left/right equality predicates
+    - all non-aggregate projected/grouped columns come from the left alias only
+    - WHERE clause must not reference the right alias
+    """
+    s = (sql or "").strip()
+    if not s or re.search(r"\bOVER\s*\(", s, flags=re.I):
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(s, read="mysql")
+    except Exception:
+        return sql
+
+    sel = ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return sql
+    if sel.args.get("having") is not None or sel.args.get("distinct") is not None:
+        return sql
+
+    joins = sel.args.get("joins") or []
+    if len(joins) != 1:
+        return sql
+    join_obj = joins[0]
+    join_kind = str(join_obj.args.get("kind") or "").strip().upper()
+    if join_kind in {"RIGHT", "FULL", "CROSS"}:
+        return sql
+
+    from_expr = sel.args.get("from") or sel.args.get("from_")
+    left_tbl = getattr(from_expr, "this", None) if from_expr is not None else None
+    right_tbl = getattr(join_obj, "this", None)
+    if not isinstance(left_tbl, exp.Table) or not isinstance(right_tbl, exp.Table):
+        return sql
+    if str(left_tbl.name or "").strip().lower() != str(right_tbl.name or "").strip().lower():
+        return sql
+
+    left_alias = str(left_tbl.alias_or_name or left_tbl.name or "").strip()
+    right_alias = str(right_tbl.alias_or_name or right_tbl.name or "").strip()
+    if not left_alias or not right_alias or left_alias.lower() == right_alias.lower():
+        return sql
+
+    def _flatten_and(expr: "exp.Expression") -> List["exp.Expression"]:
+        if isinstance(expr, exp.And):
+            return _flatten_and(expr.left) + _flatten_and(expr.right)
+        return [expr]
+
+    def _col_side(expr: "exp.Expression") -> Optional[Tuple[str, str]]:
+        if not isinstance(expr, exp.Column):
+            return None
+        alias = str(expr.table or "").strip()
+        col = str(expr.name or "").strip()
+        if not alias or not col:
+            return None
+        return alias, col
+
+    on_expr = join_obj.args.get("on")
+    if not isinstance(on_expr, exp.Expression):
+        return sql
+
+    partition_exprs: List["exp.Expression"] = []
+    seen_partition_norms: Set[str] = set()
+
+    def _expr_norm(e: "exp.Expression") -> str:
+        try:
+            return re.sub(r"[\s`]+", "", e.sql(dialect="mysql").lower())
+        except Exception:
+            return ""
+
+    for cond in _flatten_and(on_expr):
+        if not isinstance(cond, exp.EQ):
+            return sql
+        lhs = _col_side(cond.left)
+        rhs = _col_side(cond.right)
+        if not lhs or not rhs:
+            return sql
+        if lhs[0].lower() == left_alias.lower() and rhs[0].lower() == right_alias.lower():
+            left_col, right_col = lhs[1], rhs[1]
+        elif rhs[0].lower() == left_alias.lower() and lhs[0].lower() == right_alias.lower():
+            left_col, right_col = rhs[1], lhs[1]
+        else:
+            return sql
+        if left_col.lower() != right_col.lower():
+            return sql
+        part_expr = exp.column(left_col, table=left_alias)
+        norm = _expr_norm(part_expr)
+        if norm and norm not in seen_partition_norms:
+            partition_exprs.append(part_expr)
+            seen_partition_norms.add(norm)
+    if not partition_exprs:
+        return sql
+
+    where_expr = sel.args.get("where")
+    if isinstance(where_expr, exp.Expression):
+        for col in where_expr.find_all(exp.Column):
+            alias = str(col.table or "").strip().lower()
+            if alias == right_alias.lower():
+                return sql
+
+    def _unwrap_count(expr: "exp.Expression") -> Optional["exp.Count"]:
+        if isinstance(expr, exp.Count):
+            return expr
+        if isinstance(expr, exp.Coalesce):
+            counts = list(expr.find_all(exp.Count))
+            if len(counts) == 1:
+                return counts[0]
+        return None
+
+    nonagg_items: List["exp.Expression"] = []
+    count_alias = "group_count"
+    count_metric_expr: Optional["exp.Expression"] = None
+    seen_count = False
+
+    for item in sel.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        if any(True for _ in base.find_all(exp.Window)):
+            return sql
+        count_node = _unwrap_count(base)
+        if count_node is not None:
+            if seen_count:
+                return sql
+            seen_count = True
+            if isinstance(item, exp.Alias) and item.alias:
+                count_alias = str(item.alias).strip()
+            count_arg = getattr(count_node, "this", None)
+            if count_arg is None:
+                count_metric_expr = exp.Star()
+            elif isinstance(count_arg, exp.Star):
+                count_metric_expr = exp.Star()
+            elif isinstance(count_arg, exp.Column):
+                if str(count_arg.table or "").strip().lower() != right_alias.lower():
+                    return sql
+                count_metric_expr = exp.column(str(count_arg.name or "").strip(), table=left_alias)
+            else:
+                return sql
+            continue
+
+        if isinstance(base, exp.AggFunc) or any(True for _ in base.find_all(exp.AggFunc)):
+            return sql
+        if not isinstance(base, exp.Column):
+            return sql
+        if str(base.table or "").strip().lower() != left_alias.lower():
+            return sql
+        nonagg_items.append(item.copy())
+
+    if not seen_count or count_metric_expr is None or not nonagg_items:
+        return sql
+
+    grp = sel.args.get("group")
+    if not grp or not getattr(grp, "expressions", None):
+        return sql
+    group_norms: Set[str] = set()
+    for g in grp.expressions or []:
+        if not isinstance(g, exp.Column):
+            return sql
+        if str(g.table or "").strip().lower() != left_alias.lower():
+            return sql
+        group_norms.add(_expr_norm(g))
+    for item in nonagg_items:
+        base = item.this if isinstance(item, exp.Alias) else item
+        if _expr_norm(base) not in group_norms:
+            return sql
+
+    if isinstance(count_metric_expr, exp.Star):
+        window_count_this: "exp.Expression" = exp.Star()
+    else:
+        window_count_this = count_metric_expr.copy()
+
+    window_expr = exp.alias_(
+        exp.Window(
+            this=exp.Count(this=window_count_this),
+            partition_by=exp.Partition(expressions=[e.copy() for e in partition_exprs]),
+        ),
+        count_alias,
+        quoted=False,
+    )
+
+    new_select = exp.Select(
+        expressions=[item.copy() for item in nonagg_items] + [window_expr]
+    ).from_(
+        exp.Table(
+            this=exp.to_identifier(str(left_tbl.name or "").strip()),
+            alias=exp.TableAlias(this=exp.to_identifier(left_alias)),
+        )
+    )
+    if isinstance(where_expr, exp.Expression):
+        new_select.set("where", where_expr.copy())
+    order_expr = sel.args.get("order")
+    if isinstance(order_expr, exp.Order):
+        new_select.set("order", order_expr.copy())
+    limit_expr = sel.args.get("limit")
+    if isinstance(limit_expr, exp.Limit):
+        new_select.set("limit", limit_expr.copy())
+
+    try:
+        return new_select.sql(dialect="mysql") + ";"
+    except Exception:
+        return sql
+
+
+def _rewrite_running_self_join_aggregate_to_window(sql: str, question: str) -> str:
+    """
+    Rewrite cumulative/running self-join aggregates into a single-table window.
+
+    Typical near-miss:
+      SELECT p.k, p.d, p.amount, SUM(pp.amount) AS running_total
+      FROM payments p
+      JOIN payments pp
+        ON p.k = pp.k AND p.d >= pp.d
+      GROUP BY p.k, p.d, p.amount
+
+    ->
+      SELECT p.k, p.d, p.amount,
+             SUM(p.amount) OVER (PARTITION BY p.k ORDER BY p.d) AS running_total
+      FROM payments p
+
+    Conservative guardrails:
+    - running/cumulative intent only
+    - top-level grouped aggregate, no existing window
+    - exactly one self-join on the same table
+    - non-aggregate projection must come from the left/base alias only
+    - join predicate must contain at least one equality partition key and one
+      monotonic inequality on left-vs-right columns
+    """
+    s = (sql or "").strip()
+    q = (question or "").lower()
+    if not s or not q:
+        return sql
+    if not any(t in q for t in ["running", "cumulative", "kumulatif", "akumulatif"]):
+        return sql
+    if re.search(r"\bOVER\s*\(", s, flags=re.I):
+        return sql
+
+    # Preserve explicitly requested base-row columns (for example `amount`)
+    # before collapsing the self-join aggregate into a window query.
+    s = _preserve_requested_base_columns_in_running_self_join(s, question)
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(s, read="mysql")
+    except Exception:
+        return sql
+
+    sel = ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return sql
+    if sel.args.get("where") is not None or sel.args.get("having") is not None:
+        return sql
+
+    grp = sel.args.get("group")
+    if not grp or not getattr(grp, "expressions", None):
+        return sql
+
+    joins = sel.args.get("joins") or []
+    if len(joins) != 1:
+        return sql
+
+    from_expr = sel.args.get("from") or sel.args.get("from_")
+    left_tbl = getattr(from_expr, "this", None) if from_expr is not None else None
+    join_tbl = getattr(joins[0], "this", None)
+    if not isinstance(left_tbl, exp.Table) or not isinstance(join_tbl, exp.Table):
+        return sql
+    if str(left_tbl.name or "").strip().lower() != str(join_tbl.name or "").strip().lower():
+        return sql
+
+    left_alias = str(left_tbl.alias_or_name or left_tbl.name or "").strip()
+    right_alias = str(join_tbl.alias_or_name or join_tbl.name or "").strip()
+    if not left_alias or not right_alias or left_alias.lower() == right_alias.lower():
+        return sql
+
+    base_table_name = str(left_tbl.name or "").strip()
+    exact_col_map: Dict[str, str] = {}
+    compact_col_map: Dict[str, List[str]] = {}
+    try:
+        analyzer = get_schema_analyzer()
+        for col in analyzer.get_table_columns(base_table_name):
+            col_text = str(col).strip("`").strip()
+            if not col_text:
+                continue
+            exact_col_map[col_text.lower()] = col_text
+            compact = re.sub(r"[^a-z0-9]+", "", col_text.lower())
+            if compact:
+                compact_col_map.setdefault(compact, []).append(col_text)
+    except Exception:
+        pass
+
+    def _canonical_col_name(raw_col: str) -> str:
+        raw = str(raw_col or "").strip().strip("`")
+        if not raw:
+            return raw
+        lower = raw.lower()
+        if lower in exact_col_map:
+            return exact_col_map[lower]
+        compact = re.sub(r"[^a-z0-9]+", "", lower)
+        matches = compact_col_map.get(compact, [])
+        if len(matches) == 1:
+            return matches[0]
+        return raw
+
+    def _flatten_and(expr: "exp.Expression") -> List["exp.Expression"]:
+        if isinstance(expr, exp.And):
+            return _flatten_and(expr.left) + _flatten_and(expr.right)
+        return [expr]
+
+    def _col_side(expr: "exp.Expression") -> Optional[Tuple[str, str]]:
+        if not isinstance(expr, exp.Column):
+            return None
+        alias = str(expr.table or "").strip()
+        col = str(expr.name or "").strip()
+        if not alias or not col:
+            return None
+        return alias, col
+
+    on_expr = joins[0].args.get("on")
+    if not isinstance(on_expr, exp.Expression):
+        return sql
+
+    partition_exprs: List["exp.Expression"] = []
+    seen_partitions: Set[str] = set()
+    order_expr: Optional["exp.Expression"] = None
+    order_desc = False
+
+    def _norm_expr(e: "exp.Expression") -> str:
+        try:
+            return re.sub(r"[\s`]+", "", e.sql(dialect="mysql").lower())
+        except Exception:
+            return ""
+
+    for cond in _flatten_and(on_expr):
+        if isinstance(cond, exp.EQ):
+            lhs = _col_side(cond.left)
+            rhs = _col_side(cond.right)
+            if not lhs or not rhs:
+                continue
+            if lhs[0].lower() == left_alias.lower() and rhs[0].lower() == right_alias.lower() and lhs[1].lower() == rhs[1].lower():
+                part_expr = exp.column(_canonical_col_name(lhs[1]), table=left_alias)
+            elif rhs[0].lower() == left_alias.lower() and lhs[0].lower() == right_alias.lower() and lhs[1].lower() == rhs[1].lower():
+                part_expr = exp.column(_canonical_col_name(rhs[1]), table=left_alias)
+            else:
+                continue
+            part_norm = _norm_expr(part_expr)
+            if part_norm and part_norm not in seen_partitions:
+                partition_exprs.append(part_expr)
+                seen_partitions.add(part_norm)
+            continue
+
+        if isinstance(cond, (exp.GTE, exp.GT, exp.LTE, exp.LT)):
+            lhs = _col_side(cond.left)
+            rhs = _col_side(cond.right)
+            if not lhs or not rhs:
+                continue
+            if lhs[1].lower() != rhs[1].lower():
+                continue
+            if lhs[0].lower() == left_alias.lower() and rhs[0].lower() == right_alias.lower():
+                order_expr = exp.column(_canonical_col_name(lhs[1]), table=left_alias)
+                order_desc = isinstance(cond, (exp.LTE, exp.LT))
+            elif rhs[0].lower() == left_alias.lower() and lhs[0].lower() == right_alias.lower():
+                order_expr = exp.column(_canonical_col_name(rhs[1]), table=left_alias)
+                order_desc = isinstance(cond, (exp.GTE, exp.GT))
+
+    if not partition_exprs or not isinstance(order_expr, exp.Expression):
+        return sql
+
+    nonagg_items: List["exp.Expression"] = []
+    agg_item: Optional["exp.Expression"] = None
+    agg_alias = "running_total"
+    metric_base_expr: Optional["exp.Expression"] = None
+
+    for item in sel.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        contains_agg = isinstance(base, exp.AggFunc) or any(True for _ in base.find_all(exp.AggFunc))
+        if contains_agg:
+            if agg_item is not None:
+                return sql
+            agg_item = item
+            if isinstance(item, exp.Alias) and item.alias:
+                agg_alias = str(item.alias).strip()
+            agg_func = base
+            if isinstance(base, exp.Coalesce):
+                agg_candidates = list(base.find_all(exp.AggFunc))
+                if len(agg_candidates) != 1:
+                    return sql
+                agg_func = agg_candidates[0]
+            if not isinstance(agg_func, exp.Sum):
+                return sql
+            metric_expr = getattr(agg_func, "this", None)
+            if not isinstance(metric_expr, exp.Column):
+                return sql
+            if str(metric_expr.table or "").strip().lower() != right_alias.lower():
+                return sql
+            metric_base_expr = exp.column(_canonical_col_name(str(metric_expr.name or "").strip()), table=left_alias)
+        else:
+            if not isinstance(base, exp.Column):
+                return sql
+            if str(base.table or "").strip().lower() != left_alias.lower():
+                return sql
+            nonagg_items.append(item.copy())
+
+    if agg_item is None or metric_base_expr is None or not nonagg_items:
+        return sql
+
+    group_norms = {_norm_expr(g) for g in grp.expressions or [] if isinstance(g, exp.Expression)}
+    for item in nonagg_items:
+        base = item.this if isinstance(item, exp.Alias) else item
+        if _norm_expr(base) not in group_norms:
+            return sql
+
+    window_expr = exp.alias_(
+        exp.Window(
+            this=exp.Sum(this=metric_base_expr.copy()),
+            partition_by=exp.Partition(expressions=[e.copy() for e in partition_exprs]),
+            order=exp.Order(expressions=[exp.Ordered(this=order_expr.copy(), desc=order_desc)]),
+        ),
+        agg_alias,
+        quoted=False,
+    )
+
+    new_select = exp.Select(expressions=[item.copy() for item in nonagg_items] + [window_expr]).from_(
+        exp.Table(this=exp.to_identifier(str(left_tbl.name or "").strip()), alias=exp.TableAlias(this=exp.to_identifier(left_alias)))
+    )
+    try:
+        return new_select.sql(dialect="mysql") + ";"
     except Exception:
         return sql
 

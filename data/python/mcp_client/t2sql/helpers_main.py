@@ -83,6 +83,8 @@ from .helpers_core import (
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _rewrite_dual_fact_rollup_fanout,
+    _rewrite_grouped_winner_row_ranked_aggregate,
+    _sanitize_order_by_alias_assignment,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_joined_agg_threshold_filter,
@@ -112,7 +114,7 @@ from .helpers_core import (
     _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _parse_from_join_aliases,
     _ast_guardrails,
     # phase 7
-    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
+    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -2248,14 +2250,14 @@ def _infer_target_column(
     """
     Infer the target column name for a FK relationship.
 
-    Example: If fk_col is "customerNumber" and target_table is "customers",
-    the target column is likely "customerNumber".
+    Example: If fk_col is an identifier-like reference for the target entity,
+    the target column is often the same identifier on the referenced table.
     """
     # Check if we have this column in ranked_cols
     for tbl, col in ranked_cols:
         if tbl.lower() == target_table.lower():
             col_lower = col.lower()
-            # Common pattern: fk_col = target_col (e.g., customerNumber -> customerNumber)
+            # Common pattern: fk_col and target column share the same identifier name.
             if fk_col.lower() == col_lower:
                 return col
 
@@ -3577,10 +3579,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     constraints.append(
         "IMPLICIT SELECTION RULE: If the user says 'For each [Entity]' or 'List [Entity]', "
         "you MUST include that entity's identifier or display label in the SELECT list, even if not explicitly listed in 'Include ...'. "
-        "Example: 'For each entity, show total metric' -> You MUST select the entity identifier or display label AND the aggregated metric."
+        "Example: 'For each grouping entity, show the aggregated metric' -> "
+        "You MUST select the grouping entity identifier or display label AND the aggregated metric."
     )
     constraints.append(
-        "NO EXTRA COLUMNS: Apart from the 'For each' entity, do NOT add other IDs/Codes unless asked."
+        "NO EXTRA COLUMNS: Apart from the required grouping entity identifier or display label, "
+        "do NOT add extra identifiers, codes, or labels unless asked."
     )
     constraints.append(
         "ALIAS CONSISTENCY: If you use a table alias (e.g. `t`, `p`, `cust`), "
@@ -4295,6 +4299,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _rewrite_dual_fact_rollup_fanout(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after dual-fact fanout fix:", s)
+        s = _sanitize_order_by_alias_assignment(s)
+        if DEBUG_WR: print("[REFINER - PH4] after ORDER BY alias sanitize:", s)
 
         s = _rewrite_latest_year_same_year_aggregate(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year-sum fix:", s)
@@ -4360,6 +4366,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _repair_temporal_not_exists_scope(s, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after temporal NOT EXISTS scope repair: {s}")
 
+        s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after grouped winner-row fallback:", s)
+        s = _fix_winner_row_window_order_priority(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after post-fallback window order fix:", s)
+        s = _fix_winner_row_metric_order_priority(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after post-fallback metric priority fix:", s)
         s = _rewrite_having_alias_to_expr(s)
         s = _winner_row_final_sanity(s, question)
 
@@ -4397,6 +4409,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after include-zero winner-row id-source fix: {s}")
 
+            s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after grouped winner-row fallback: {s}")
+            s = _fix_winner_row_window_order_priority(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after post-fallback window order fix: {s}")
+            s = _fix_winner_row_metric_order_priority(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after post-fallback metric priority fix: {s}")
             s = _rewrite_having_alias_to_expr(s)
             s = _winner_row_final_sanity(s, question)
             s = _force_restore_groupby_if_aggregate_without_groupby(before_phase4, s)
@@ -4529,8 +4547,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _simplify_default_window_frame(s, question)
     s = _rewrite_single_table_case_band_derived_subquery(s, question)
     s = _rewrite_correlated_offset_subquery_to_window(s, question)
+    s = _rewrite_same_table_group_count_self_join_to_window(s, question)
+    s = _rewrite_running_self_join_aggregate_to_window(s, question)
     s = _enforce_window_sequence_direction(s, question)
     s = _repair_offset_window_projection_shape(s, question)
+    s = _preserve_requested_base_columns_in_running_self_join(s, question)
     s = _enforce_requested_order_direction(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
     s = _maybe_add_limit(question, s)    
