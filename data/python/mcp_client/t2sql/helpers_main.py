@@ -1149,9 +1149,27 @@ def _entity_support_verb_terms(table: str, question: str = "") -> Set[str]:
         for base in (_base_form_from_inflected(term) for term in inflected_terms)
         if base and len(base) >= 3
     )
-    # Backward-compatible fallback to preserve existing behavior on legacy phrasing.
-    compat_verbs = _question_compat_existence_verbs(question)
-    verbs.update(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
+    # Backward-compatible fallback only when table-derived support verbs are not
+    # already grounded by the question wording.
+    q = (question or "").lower().strip()
+    has_table_grounded_match = False
+    if q:
+        q_tokens = set(re.findall(r"[a-z0-9]+", q))
+        for verb in verbs:
+            vv = str(verb or "").strip().lower()
+            if not vv:
+                continue
+            if " " in vv:
+                pattern = re.escape(vv).replace(r"\ ", r"\s+")
+                if re.search(rf"\b{pattern}\b", q, flags=re.I):
+                    has_table_grounded_match = True
+                    break
+            elif vv in q_tokens:
+                has_table_grounded_match = True
+                break
+    if not has_table_grounded_match:
+        compat_verbs = _question_compat_existence_verbs(question)
+        verbs.update(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
     return {verb for verb in verbs if verb}
 
 

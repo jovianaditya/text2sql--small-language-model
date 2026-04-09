@@ -514,10 +514,12 @@ def _inner_join_specific_object_terms(ctx: str = "", question: str = "") -> Set[
 
 
 def _inner_join_action_terms(ctx: str = "", question: str = "") -> Set[str]:
-    compat_verbs = _question_compat_inner_join_terms(question, HELPERS_EXISTENCE_COMPAT_VERBS)
-    verbs: Set[str] = set(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
+    verbs: Set[str] = set()
     for table in _inner_join_object_tables(ctx):
         verbs.update(_table_support_action_terms(table))
+    if not verbs:
+        compat_verbs = _question_compat_inner_join_terms(question, HELPERS_EXISTENCE_COMPAT_VERBS)
+        verbs.update(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
     return {verb for verb in verbs if verb and verb not in HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC}
 
 
@@ -9452,9 +9454,10 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
     legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
     if not legacy_metric_terms and not metric_term_universe:
         legacy_metric_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+    active_metric_terms = set(metric_term_universe) if metric_term_universe else set(legacy_metric_terms)
     metric_candidate_terms = {
         term
-        for term in (metric_term_universe | legacy_metric_terms)
+        for term in active_metric_terms
         if term and term not in entity_noise_terms and term not in HELPERS_METRIC_AGG_IDLIKE_TOKENS
     }
     if not metric_candidate_terms:
@@ -9909,7 +9912,8 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
     legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
     if not legacy_metric_terms and not metric_term_universe:
         legacy_metric_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
-    for term in (metric_term_universe | legacy_metric_terms):
+    active_metric_terms = set(metric_term_universe) if metric_term_universe else set(legacy_metric_terms)
+    for term in active_metric_terms:
         tokenized = _text_semantic_terms(term)
         tokenized = {
             tok for tok in tokenized
@@ -12118,7 +12122,8 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
                 tok for tok in re.findall(r"[a-z0-9]+", base_term.replace("_", " ").lower()) if tok
             )
     metric_candidate_seed = set(metric_term_universe)
-    metric_candidate_seed.update(legacy_metric_terms)
+    if not metric_term_universe:
+        metric_candidate_seed.update(legacy_metric_terms)
     metric_candidate_seed.update(query_tokens.intersection(generic_metric_terms))
     if not metric_candidate_seed:
         metric_candidate_seed.update(generic_metric_terms)

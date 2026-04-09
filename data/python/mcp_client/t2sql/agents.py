@@ -3552,8 +3552,11 @@ def _contract_metric_terms(question_tokens: Optional[Set[str]] = None) -> Set[st
         q_tokens = {str(tok).strip().lower() for tok in question_tokens if str(tok).strip()}
         # Domain lexical priors are only a compatibility fallback here.
         # The schema-enriched term set above remains the primary signal.
+        schema_or_generic_hits = q_tokens.intersection(
+            terms.difference(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
+        )
         legacy_hits = q_tokens.intersection(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
-        if legacy_hits:
+        if legacy_hits and not schema_or_generic_hits:
             terms.update(legacy_hits)
         else:
             terms.difference_update(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)

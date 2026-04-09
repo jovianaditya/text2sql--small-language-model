@@ -534,7 +534,10 @@ def _numeric_hint_terms(question_tokens: Optional[Set[str]] = None) -> Set[str]:
     if question_tokens is not None:
         q_tokens = {str(tok).strip().lower() for tok in question_tokens if str(tok).strip()}
         legacy_hits = q_tokens.intersection(INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS)
-        if legacy_hits:
+        schema_or_generic_hits = q_tokens.intersection(
+            hints.difference(INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS)
+        )
+        if legacy_hits and not schema_or_generic_hits:
             # Domain-oriented numeric hints remain optional fallbacks; generic
             # numeric cues and schema metadata still drive the main inference path.
             hints.update(legacy_hits)
