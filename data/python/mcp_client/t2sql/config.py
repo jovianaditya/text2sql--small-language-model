@@ -305,10 +305,20 @@ AGENT_CONTRACT_BASE_METRIC_TERMS = set(
     )
 )
 
+# Domain-oriented lexical priors live separately from generic metric cues so the
+# core pipeline can remain schema-driven while still keeping a lightweight
+# compatibility layer for business-style phrasing.
+AGENT_CONTRACT_DOMAIN_METRIC_FALLBACK_TERMS = set(
+    _env_json_list(
+        "AGENT_CONTRACT_DOMAIN_METRIC_FALLBACK_TERMS",
+        ["payment", "sales", "revenue", "stock", "credit"],
+    )
+)
+# Backward-compatible alias used by the existing pipeline.
 AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS = set(
     _env_json_list(
         "AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS",
-        ["payment", "sales", "revenue", "stock", "credit"],
+        sorted(AGENT_CONTRACT_DOMAIN_METRIC_FALLBACK_TERMS),
     )
 )
 
@@ -350,10 +360,16 @@ INTENT_IR_BASE_NUMERIC_HINTS = tuple(
     )
 )
 
+INTENT_IR_DOMAIN_NUMERIC_FALLBACK_HINTS = set(
+    _env_json_list(
+        "INTENT_IR_DOMAIN_NUMERIC_FALLBACK_HINTS",
+        ["stock", "msrp", "revenue", "sales"],
+    )
+)
 INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS = set(
     _env_json_list(
         "INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS",
-        ["stock", "msrp", "revenue", "sales"],
+        sorted(INTENT_IR_DOMAIN_NUMERIC_FALLBACK_HINTS),
     )
 )
 
@@ -364,10 +380,16 @@ HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC = set(
     )
 )
 
+HELPERS_EXISTENCE_SUPPORT_VERBS_DOMAIN = set(
+    _env_json_list(
+        "HELPERS_EXISTENCE_SUPPORT_VERBS_DOMAIN",
+        ["placed", "paid", "ordered", "purchased", "bought"],
+    )
+)
 HELPERS_EXISTENCE_COMPAT_VERBS = set(
     _env_json_list(
         "HELPERS_EXISTENCE_COMPAT_VERBS",
-        ["placed", "paid", "ordered", "purchased", "bought"],
+        sorted(HELPERS_EXISTENCE_SUPPORT_VERBS_DOMAIN),
     )
 )
 
@@ -392,9 +414,9 @@ HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES = tuple(
     )
 )
 
-HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS = set(
+HELPERS_INNER_JOIN_DOMAIN_OBJECT_TERMS = set(
     _env_json_list(
-        "HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS",
+        "HELPERS_INNER_JOIN_DOMAIN_OBJECT_TERMS",
         [
             "order",
             "orders",
@@ -407,6 +429,12 @@ HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS = set(
         ],
     )
 )
+HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS = set(
+    _env_json_list(
+        "HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS",
+        sorted(HELPERS_INNER_JOIN_DOMAIN_OBJECT_TERMS),
+    )
+)
 
 HELPERS_INNER_JOIN_GENERIC_OBJECT_TERMS = set(
     _env_json_list(
@@ -415,21 +443,24 @@ HELPERS_INNER_JOIN_GENERIC_OBJECT_TERMS = set(
     )
 )
 
+HELPERS_ROLLUP_GENERIC_METRIC_TERMS = set(
+    _env_json_list(
+        "HELPERS_ROLLUP_GENERIC_METRIC_TERMS",
+        ["amount", "value", "price", "quantity", "cost", "spend"],
+    )
+)
+
+HELPERS_ROLLUP_DOMAIN_METRIC_TERMS = set(
+    _env_json_list(
+        "HELPERS_ROLLUP_DOMAIN_METRIC_TERMS",
+        ["revenue", "sales", "paid", "payment"],
+    )
+)
+
 HELPERS_ROLLUP_LEGACY_METRIC_TERMS = set(
     _env_json_list(
         "HELPERS_ROLLUP_LEGACY_METRIC_TERMS",
-        [
-            "amount",
-            "value",
-            "revenue",
-            "sales",
-            "price",
-            "quantity",
-            "cost",
-            "spend",
-            "paid",
-            "payment",
-        ],
+        sorted(HELPERS_ROLLUP_GENERIC_METRIC_TERMS | HELPERS_ROLLUP_DOMAIN_METRIC_TERMS),
     )
 )
 

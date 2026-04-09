@@ -9447,6 +9447,8 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
         analyzer=analyzer,
         question=question,
     )
+    # Keep legacy/domain metric terms as a compatibility fallback for business-style
+    # phrasing when schema-derived evidence is sparse.
     legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
     if not legacy_metric_terms and not metric_term_universe:
         legacy_metric_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
