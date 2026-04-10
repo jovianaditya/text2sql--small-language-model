@@ -393,6 +393,27 @@ HELPERS_EXISTENCE_COMPAT_VERBS = set(
     )
 )
 
+HELPERS_GROUPING_INTENT_PATTERNS = tuple(
+    _env_json_list(
+        "HELPERS_GROUPING_INTENT_PATTERNS",
+        [
+            r"\bfor\s+(?:each|every)\b",
+            r"\bper\b",
+            r"\beach\b",
+            r"\bevery\b",
+            r"\bin\s+each\b",
+            r"\bgrouped\s+by\b",
+        ],
+    )
+)
+
+HELPERS_COUNT_INTENT_TERMS = tuple(
+    _env_json_list(
+        "HELPERS_COUNT_INTENT_TERMS",
+        ["total number", "number of", "count of", "how many", "count"],
+    )
+)
+
 HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES = tuple(
     _env_json_list(
         "HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES",
@@ -1173,9 +1194,9 @@ AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT = os.getenv(
 AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS = _env_json_list(
     "AGENT_ROUTER_FOR_EACH_ENTITY_PATTERNS",
     [
-        r"\bfor\s+each\s+(?:\w+\s+)?__ENTITY__\b",
-        r"\bper\s+(?:\w+\s+)?__ENTITY__\b",
-        r"\beach\s+(?:\w+\s+)?__ENTITY__\b",
+        r"\bfor\s+(?:each|every)\s+(?:(?:such|individual|respective)\s+)?(?:\w+\s+){0,2}__ENTITY__\b",
+        r"\bper\s+(?:(?:such|individual|respective)\s+)?(?:\w+\s+){0,2}__ENTITY__\b",
+        r"\b(?:each|every)\s+(?:(?:such|individual|respective)\s+)?(?:\w+\s+){0,2}__ENTITY__\b",
     ],
 )
 
@@ -1295,7 +1316,7 @@ AGENT_ROUTER_WINNER_ROW_RECORD_PATTERN = os.getenv(
 
 AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN = os.getenv(
     "AGENT_ROUTER_WINNER_ROW_FOR_EACH_PATTERN",
-    r"\b(largest|highest|lowest|smallest|biggest)\s+\w+\s+(for\s+each|per)\b",
+    r"\b(largest|highest|lowest|smallest|biggest)\s+\w+\s+(for\s+(?:each|every)|per)\b",
 ).strip()
 
 AGENT_ROUTER_TIEBREAKER_PATTERN = os.getenv(

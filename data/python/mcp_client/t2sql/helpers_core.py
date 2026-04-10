@@ -29,12 +29,14 @@ from .schema_analyzer import (
 )
 from .config import (
     ALIAS_MAX_LEN,
+    HELPERS_COUNT_INTENT_TERMS,
     HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS,
     HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS,
     HELPERS_DUAL_FACT_FAMILY_STOPWORDS,
     HELPERS_ENTITY_GENERIC_FALLBACK_TERMS,
     HELPERS_EXISTENCE_COMPAT_VERBS,
     HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
+    HELPERS_GROUPING_INTENT_PATTERNS,
     HELPERS_HIERARCHICAL_COLLECTION_POSSESSIVES,
     HELPERS_HIERARCHICAL_COLLECTION_VERB_STEMS,
     HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS,
@@ -79,6 +81,36 @@ def cached_search(pattern: str, string: str, flags: int = 0) -> Optional[re.Matc
 def cached_match(pattern: str, string: str, flags: int = 0) -> Optional[re.Match[str]]:
     """Regex match with cached pattern compilation."""
     return compile_pattern(pattern, flags).match(string)
+
+
+def _question_has_grouping_intent(question: str) -> bool:
+    """
+    Shared lexical grouping cue detector used by lightweight guardrails.
+
+    Keep this generic and paraphrase-friendly so helpers can reason about
+    grouped/iterative intent without hardcoding one wording family such as
+    only "for each".
+    """
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    return any(re.search(pat, q, flags=re.I) for pat in HELPERS_GROUPING_INTENT_PATTERNS)
+
+
+def _question_has_count_intent(question: str) -> bool:
+    """
+    Shared count-intent detector for helper-level guardrails.
+
+    Count requests are intentionally narrower than generic metric cues like
+    "total", because COUNT(*) rewrites should only trigger for explicit
+    counting language.
+    """
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    if any(term in q for term in HELPERS_COUNT_INTENT_TERMS):
+        return True
+    return bool(re.search(r"\bcount(?:ing)?\b", q, flags=re.I))
 
 
 def cached_sub(pattern: str, repl: str, string: str, count: int = 0, flags: int = 0) -> str:
@@ -24748,25 +24780,13 @@ def _add_missing_count_for_group_by(sql: str, question: str = "") -> str:
         # Likely needs window function, HAVING, or subquery - skip
         return sql
 
-    # GUARDRAIL 3: Has GROUP BY intent indicators (looser patterns)
-    group_by_indicators = [
-        r"for each",
-        r"per ",
-        r"every ",
-        r"by\s+\w+",           # "by status", "by city"
-        r"in each",            # "in each city"
-        r"for\s+\w+",          # "for customers"
-        r"each\s+\w+",         # "each status"
-    ]
-    has_group_intent = any(re.search(p, question, re.IGNORECASE) for p in group_by_indicators)
-    if not has_group_intent:
+    # GUARDRAIL 3: Shared grouped/iterative intent cues.
+    if not _question_has_grouping_intent(question):
         return sql
 
-    # GUARDRAIL 4: Question asks for count/total number (specific phrases only)
-    # NOTE: "total" alone removed - too generic, can mean SUM(amount) not COUNT(*)
-    count_keywords = ["total number", "number of", "count of", "how many", "count"]
-    has_count_intent = any(kw in question_lower for kw in count_keywords)
-    if not has_count_intent:
+    # GUARDRAIL 4: Count requests only; generic metric words like "total"
+    # should not trigger COUNT(*) rewrites on their own.
+    if not _question_has_count_intent(question_lower):
         return sql
 
     # GUARDRAIL 5: COUNT not already in SELECT
