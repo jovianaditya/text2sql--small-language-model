@@ -27,6 +27,7 @@ from .config import (
     AGENT_AST_SEMANTIC_FIRST,
     AGENT_NORMALIZE_REWRITE_BUDGET,
     AGENT_NORMALIZE_EARLY_STOP,
+    DOMAIN_HEURISTICS_ENABLED,
     HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
     HELPERS_EXISTENCE_COMPAT_VERBS,
     HELPERS_PROBE_GENERIC_METRIC_TERMS,
@@ -1120,6 +1121,8 @@ def _base_form_from_inflected(term: str) -> str:
 
 
 def _question_compat_existence_verbs(question: str) -> Set[str]:
+    if not DOMAIN_HEURISTICS_ENABLED:
+        return set()
     q = (question or "").lower().strip()
     if not q:
         return set()
@@ -1169,7 +1172,8 @@ def _entity_support_verb_terms(table: str, question: str = "") -> Set[str]:
                 break
     if not has_table_grounded_match:
         compat_verbs = _question_compat_existence_verbs(question)
-        verbs.update(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
+        if DOMAIN_HEURISTICS_ENABLED:
+            verbs.update(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
     return {verb for verb in verbs if verb}
 
 

@@ -24,6 +24,7 @@ from .schema_analyzer import (
     get_table_type,
 )
 from .config import (
+    DOMAIN_HEURISTICS_ENABLED,
     INTENT_IR_BASE_NUMERIC_HINTS,
     INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS,
 )
@@ -533,6 +534,9 @@ def _numeric_hint_terms(question_tokens: Optional[Set[str]] = None) -> Set[str]:
     hints = set(base_hints)
     if question_tokens is not None:
         q_tokens = {str(tok).strip().lower() for tok in question_tokens if str(tok).strip()}
+        if not DOMAIN_HEURISTICS_ENABLED:
+            hints.difference_update(INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS)
+            return hints
         legacy_hits = q_tokens.intersection(INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS)
         schema_or_generic_hits = q_tokens.intersection(
             hints.difference(INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS)

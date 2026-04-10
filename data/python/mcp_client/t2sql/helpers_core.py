@@ -29,6 +29,7 @@ from .schema_analyzer import (
 )
 from .config import (
     ALIAS_MAX_LEN,
+    DOMAIN_HEURISTICS_ENABLED,
     HELPERS_COUNT_INTENT_TERMS,
     HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS,
     HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS,
@@ -539,7 +540,7 @@ def _inner_join_specific_object_terms(ctx: str = "", question: str = "") -> Set[
     obj_terms: Set[str] = set()
     for table in _inner_join_object_tables(ctx):
         obj_terms.update(_table_object_terms(table))
-    if not obj_terms:
+    if not obj_terms and DOMAIN_HEURISTICS_ENABLED:
         compat_terms = _question_compat_inner_join_terms(question, HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS)
         obj_terms.update(compat_terms if question else HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS)
     return {term for term in obj_terms if term}
@@ -549,7 +550,7 @@ def _inner_join_action_terms(ctx: str = "", question: str = "") -> Set[str]:
     verbs: Set[str] = set()
     for table in _inner_join_object_tables(ctx):
         verbs.update(_table_support_action_terms(table))
-    if not verbs:
+    if not verbs and DOMAIN_HEURISTICS_ENABLED:
         compat_verbs = _question_compat_inner_join_terms(question, HELPERS_EXISTENCE_COMPAT_VERBS)
         verbs.update(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
     return {verb for verb in verbs if verb and verb not in HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC}
@@ -9483,16 +9484,18 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
     )
     # Keep legacy/domain metric terms as a compatibility fallback for business-style
     # phrasing when schema-derived evidence is sparse.
-    legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
-    if not legacy_metric_terms and not metric_term_universe:
-        legacy_metric_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+    legacy_metric_terms: Set[str] = set()
+    if DOMAIN_HEURISTICS_ENABLED:
+        legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+        if not legacy_metric_terms and not metric_term_universe:
+            legacy_metric_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
     active_metric_terms = set(metric_term_universe) if metric_term_universe else set(legacy_metric_terms)
     metric_candidate_terms = {
         term
         for term in active_metric_terms
         if term and term not in entity_noise_terms and term not in HELPERS_METRIC_AGG_IDLIKE_TOKENS
     }
-    if not metric_candidate_terms:
+    if not metric_candidate_terms and DOMAIN_HEURISTICS_ENABLED:
         metric_candidate_terms = set(legacy_metric_terms or HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
 
     metric_query_alt = _regex_alt_from_terms(
@@ -9941,9 +9944,11 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
         analyzer=analyzer,
         question=question,
     )
-    legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
-    if not legacy_metric_terms and not metric_term_universe:
-        legacy_metric_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+    legacy_metric_terms: Set[str] = set()
+    if DOMAIN_HEURISTICS_ENABLED:
+        legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+        if not legacy_metric_terms and not metric_term_universe:
+            legacy_metric_terms = set(HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
     active_metric_terms = set(metric_term_universe) if metric_term_universe else set(legacy_metric_terms)
     for term in active_metric_terms:
         tokenized = _text_semantic_terms(term)
@@ -12140,7 +12145,9 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
     )
     query_tokens = {tok for tok in re.findall(r"[a-z0-9]+", q) if tok}
     generic_metric_terms = set(HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS)
-    legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
+    legacy_metric_terms: Set[str] = set()
+    if DOMAIN_HEURISTICS_ENABLED:
+        legacy_metric_terms = _question_compat_metric_terms(question, HELPERS_ROLLUP_LEGACY_METRIC_TERMS)
     if not metric_term_universe:
         metric_term_universe.update(legacy_metric_terms or generic_metric_terms)
     entity_noise_terms: Set[str] = set()

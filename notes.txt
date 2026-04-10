@@ -60,3 +60,18 @@ docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluatio
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy" 2>&1 | tee run_easy.log
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_devset_ori.yml --output results.xlsx --easy" 2>&1 | tee run_easy_ori.log
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_paraphrase_stress.yml --output results.xlsx --easy" 2>&1 | tee run_paraphrase_easy.log
+
+# ablation hard domain off
+docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --hard" 2>&1 | tee run_hard_domain_off.log
+docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_devset_ori.yml --output results.xlsx --hard" 2>&1 | tee run_hard_ori_domain_off.log
+docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_paraphrase_stress.yml --output results.xlsx --hard" 2>&1 | tee run_paraphrase_hard_domain_off.log
+
+# ablation medium domain off
+docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --medium" 2>&1 | tee run_medium_domain_off.log
+docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_devset_ori.yml --output results.xlsx --medium" 2>&1 | tee run_medium_ori_domain_off.log
+docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_paraphrase_stress.yml --output results.xlsx --medium" 2>&1 | tee run_paraphrase_medium_domain_off.log
+
+# ablation easy domain off
+docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy" 2>&1 | tee run_easy_domain_off.log
+docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_devset_ori.yml --output results.xlsx --easy" 2>&1 | tee run_easy_ori_domain_off.log
+docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_paraphrase_stress.yml --output results.xlsx --easy" 2>&1 | tee run_paraphrase_easy_domain_off.log

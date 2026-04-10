@@ -93,6 +93,7 @@ from .config import (
     AGENT_CONTRACT_BASE_METRIC_TERMS,
     AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS,
     AGENT_CONTRACT_GENERIC_COUNT_NOUNS,
+    DOMAIN_HEURISTICS_ENABLED,
     AGENT_ROUTER_FK_SUFFIX_TERMS,
     AGENT_ROUTER_IGNORE_PATTERNS,
     AGENT_ROUTER_WEAK_EVIDENCE_TAGS,
@@ -3550,6 +3551,9 @@ def _contract_metric_terms(question_tokens: Optional[Set[str]] = None) -> Set[st
     terms = set(base_terms)
     if question_tokens is not None:
         q_tokens = {str(tok).strip().lower() for tok in question_tokens if str(tok).strip()}
+        if not DOMAIN_HEURISTICS_ENABLED:
+            terms.difference_update(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
+            return terms
         # Domain lexical priors are only a compatibility fallback here.
         # The schema-enriched term set above remains the primary signal.
         schema_or_generic_hits = q_tokens.intersection(

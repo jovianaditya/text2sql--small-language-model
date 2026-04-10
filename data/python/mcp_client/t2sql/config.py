@@ -414,6 +414,10 @@ HELPERS_COUNT_INTENT_TERMS = tuple(
     )
 )
 
+# Batch-4 ablation switch: keeps the schema-driven core intact while allowing
+# domain-compatibility lexical priors to be disabled for controlled evaluation.
+DOMAIN_HEURISTICS_ENABLED = bool(int(os.getenv("DOMAIN_HEURISTICS_ENABLED", "1")))
+
 HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES = tuple(
     _env_json_list(
         "HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES",
