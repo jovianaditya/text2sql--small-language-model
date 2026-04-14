@@ -1308,8 +1308,7 @@ async def run_batch_eval(
     else:
         print("Test Suite (TS): N/A")
     print(
-        f"Route Split: IR={ir_used_count}/{total} ({100*ir_used_count/total:.1f}%), "
-        f"LLM fallback={llm_fallback_count}/{total} ({100*llm_fallback_count/total:.1f}%), "
+        f"Route Split: LLM fallback={llm_fallback_count}/{total} ({100*llm_fallback_count/total:.1f}%), "
         f"IR hint passed={ir_hint_passed_count}/{llm_fallback_count}"
     )
 
