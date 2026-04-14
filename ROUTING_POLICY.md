@@ -365,17 +365,17 @@ Notes:
 
 | ID  | Current Lane |                                               Note                                             |
 |-----|--------------|------------------------------------------------------------------------------------------------|
-| E1  | IR           | Single-table equality filter + simple sort                                                     |
-| E2  | IR           | Top-N lookup uses IR when schema-grounded numeric ordering + `LIMIT` resolve deterministically |
-| E3  | IR           | Single-table year filter + descending date sort                                                |
-| E4  | IR           | Single-table numeric threshold + explicit sort                                                 |
-| E5  | IR           | Single-table null / empty filter                                                               |
-| E6  | IR           | Single-table prefix pattern (`LIKE 'prefix%'`)                                                 |
-| E7  | IR           | Single-table `IN (...)` filter on FK-like code column                                          |
-| E8  | IR           | Single-table deterministic regex pattern                                                       |
-| E9  | IR           | Single-table categorical `IN (...)` filter                                                     |
-| E10 | IR           | Single-table `BETWEEN` numeric filter                                                          |
-| E11 | IR           | Single-table lookup with top-level `SELECT DISTINCT`                                           |
+| E1  | 3B           | Single-table equality filter + simple sort                                                     |
+| E2  | 3B           | Top-N lookup uses IR when schema-grounded numeric ordering + `LIMIT` resolve deterministically |
+| E3  | 3B           | Single-table year filter + descending date sort                                                |
+| E4  | 3B           | Single-table numeric threshold + explicit sort                                                 |
+| E5  | 3B           | Single-table null / empty filter                                                               |
+| E6  | 3B           | Single-table prefix pattern (`LIKE 'prefix%'`)                                                 |
+| E7  | 3B           | Single-table `IN (...)` filter on FK-like code column                                          |
+| E8  | 3B           | Single-table deterministic regex pattern                                                       |
+| E9  | 3B           | Single-table categorical `IN (...)` filter                                                     |
+| E10 | 3B           | Single-table `BETWEEN` numeric filter                                                          |
+| E11 | 3B           | Single-table lookup with top-level `SELECT DISTINCT`                                           |
 | E12 | 3B           | Projection null-fill lookup is outside current IR shape                                        |
 | E13 | 3B           | Current benchmark phrasing still falls back to LLM (`column_to_column_compare_ir_unsupported`) |
 
@@ -383,15 +383,15 @@ Notes:
 
 | ID  | Current Lane |                          Note                            |
 |-----|--------------|----------------------------------------------------------|
-| M1  | IR           | Single-table aggregate + month grouping                  |
+| M1  | 3B           | Single-table aggregate + month grouping                  |
 | M2  | 3B           | CASE-band aggregation                                    |
 | M3  | 3B           | Winner-row single-table (payments)                       |
-| M4  | IR           | Single-table group + min/count                           |
+| M4  | 3B           | Single-table group + min/count                           |
 | M5  | 3B           | Group + HAVING aggregate filter                          |
 | M6  | 3B           | Simple scalar subquery single-table                      |
-| M7  | IR           | Supported percentage metric pattern                      |
-| M8  | IR           | Group + HAVING count                                     |
-| M9  | IR           | Single-table group + order-by aggregate                  |
+| M7  | 3B           | Supported percentage metric pattern                      |
+| M8  | 3B           | Group + HAVING count                                     |
+| M9  | 3B           | Single-table group + order-by aggregate                  |
 | M10 | 3B           | Window rank single-table                                 |
 | M11 | 3B           | Second-highest single-table winner-row                   |
 | M12 | 3B           | Window cumulative single-table                           |
@@ -399,18 +399,18 @@ Notes:
 | M14 | 3B           | Window avg partition single-table                        |
 | M15 | 3B           | Window percentage-over-total single-table                |
 | M16 | 3B           | Simple single-table set operation stays in LLM lane      |
-| M17 | IR           | Single-table `COUNT(DISTINCT ...)` grouped by order year |
+| M17 | 3B           | Single-table `COUNT(DISTINCT ...)` grouped by order year |
 | M18 | 3B           | Offset window (`LAG`) single-table                       |
 | M19 | 3B           | Scalar extrema-date subquery single-table                |
-| M20 | IR           | Single-table `COUNT(DISTINCT ...)` + HAVING              |
+| M20 | 3B           | Single-table `COUNT(DISTINCT ...)` + HAVING              |
 
 ### 10.3 Hard (H1-H17)
 
 | ID  | Current Lane |                                 Note                                       |
 |-----|--------------|----------------------------------------------------------------------------|
-| H1  | IR           | Multi-table aggregate, planner-safe family                                 |
-| H2  | IR           | Simple 2-table existence + grouped count                                   |
-| H3  | IR           | Simple 2-table join + grouped sum                                          |
+| H1  | 3B           | Multi-table aggregate, planner-safe family                                 |
+| H2  | 3B           | Simple 2-table existence + grouped count                                   |
+| H3  | 3B           | Simple 2-table join + grouped sum                                          |
 | H4  | 3B           | Simple multi-join + grouped sum                                            |
 | H5  | 3B           | Null-preserving multi-table rollup stays in LLM lane but does not escalate |
 | H6  | 7B           | Explicit ranking in multi-table context                                    |

@@ -199,7 +199,6 @@ from .state import RAGState
 from .utils import _dbg_print_two, try_llm_json, try_llm_sql_text, build_router_schema
 from .generation import regenerate_with_extra_constraint
 from .intent_ir import build_intent_ir, is_ir_plannable
-from .sql_planner import build_sql_from_intent, safety_normalize_sql
 from .confidence import compute_sql_confidence
 
 # Confidence threshold - below this, log warning
@@ -1077,6 +1076,351 @@ def _has_include_zero_shape(sql: str) -> bool:
     return True
 
 
+def _find_top_level_kw(sql: str, keyword: str, start: int = 0) -> int:
+    if not sql:
+        return -1
+    s = str(sql)
+    low = s.lower()
+    kw = keyword.lower()
+    depth = 0
+    in_sq = False
+    in_dq = False
+    i = max(0, start)
+    while i <= len(low) - len(kw):
+        ch = low[i]
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            i += 1
+            continue
+        if not in_sq and not in_dq:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if depth == 0 and low.startswith(kw, i):
+                before_ok = i == 0 or not low[i - 1].isalnum()
+                after_ok = i + len(kw) >= len(low) or not low[i + len(kw)].isalnum()
+                if before_ok and after_ok:
+                    return i
+        i += 1
+    return -1
+
+
+def _ensure_group_by_for_non_agg(sql: str) -> str:
+    s = (sql or "").strip()
+    if not s:
+        return s
+    trailing_semicolon = ";" if s.endswith(";") else ""
+    if trailing_semicolon:
+        s = s[:-1].rstrip()
+    if _find_top_level_kw(s, "group by") >= 0:
+        return s + trailing_semicolon
+
+    select_match = re.search(r"^\s*select\s+(.*?)\s+from\s", s, flags=re.I | re.S)
+    if not select_match:
+        return s + trailing_semicolon
+    select_items = _split_top_level_csv(select_match.group(1))
+    if not select_items:
+        return s + trailing_semicolon
+
+    def _is_top_level_window_expr(expr: str) -> bool:
+        return bool(re.search(r"\bOVER\s*\(", str(expr or ""), flags=re.I))
+
+    def _has_top_level_plain_agg(expr: str) -> bool:
+        expr_l = str(expr or "").lower()
+        if not expr_l:
+            return False
+        if "select" in expr_l:
+            return False
+        if _is_top_level_window_expr(expr):
+            return False
+        return bool(re.search(r"\b(count|sum|avg|min|max)\s*\(", expr_l))
+
+    if not any(_has_top_level_plain_agg(item) for item in select_items):
+        return s + trailing_semicolon
+    if any(_is_top_level_window_expr(item) for item in select_items):
+        return s + trailing_semicolon
+
+    def _strip_alias(expr: str) -> str:
+        raw = re.sub(r"\s+AS\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s*$", "", expr, flags=re.I)
+        raw = re.sub(r"\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s*$", "", raw)
+        return raw.strip()
+
+    group_items: List[str] = []
+    for item in select_items:
+        if not item:
+            continue
+        if _has_top_level_plain_agg(item) or _is_top_level_window_expr(item):
+            continue
+        if re.search(r"^\s*['\"].*['\"]\s*$", item.strip()):
+            continue
+        if re.search(r"^\s*\d+(\.\d+)?\s*$", item.strip()):
+            continue
+        if re.search(r"\*\s*$", item.strip()):
+            continue
+        expr = _strip_alias(item)
+        if expr:
+            group_items.append(expr)
+
+    if not group_items:
+        return s + trailing_semicolon
+
+    order_pos = _find_top_level_kw(s, "order by")
+    having_pos = _find_top_level_kw(s, "having")
+    limit_pos = _find_top_level_kw(s, "limit")
+    tail_candidates = [p for p in [having_pos, order_pos, limit_pos] if p >= 0]
+    insert_pos = min(tail_candidates) if tail_candidates else len(s)
+    group_by_clause = " GROUP BY " + ", ".join(group_items) + " "
+    out = s[:insert_pos].rstrip() + group_by_clause + s[insert_pos:].lstrip()
+    return out.rstrip() + trailing_semicolon
+
+
+def _repair_chronological_month_order(sql: str, question: str) -> str:
+    s = (sql or "").strip()
+    q = str(question or "").lower()
+    if not s or "month" not in q:
+        return s
+    trailing_semicolon = ";" if s.endswith(";") else ""
+    if trailing_semicolon:
+        s = s[:-1].rstrip()
+
+    group_pos = _find_top_level_kw(s, "group by")
+    if group_pos < 0:
+        return s + trailing_semicolon
+
+    order_pos = _find_top_level_kw(s, "order by", group_pos + len("group by"))
+    having_pos = _find_top_level_kw(s, "having", group_pos + len("group by"))
+    limit_pos = _find_top_level_kw(s, "limit", group_pos + len("group by"))
+    group_end_candidates = [p for p in [having_pos, order_pos, limit_pos] if p >= 0]
+    group_end = min(group_end_candidates) if group_end_candidates else len(s)
+    group_clause = s[group_pos + len("group by"):group_end].strip().rstrip(";")
+    group_items = _split_top_level_csv(group_clause)
+    if not group_items:
+        return s + trailing_semicolon
+
+    def _normalize_expr(expr: str) -> str:
+        return re.sub(r"\s+", "", str(expr or "").strip()).lower()
+
+    def _extract_month_label_source(expr: str) -> str:
+        item_s = str(expr or "").strip()
+        date_format_match = re.match(
+            r"""(?is)^DATE_FORMAT\s*\(\s*(?P<date>.+?)\s*,\s*(?P<quote>['"])(?P<fmt>%[A-Za-z])(?P=quote)\s*\)$""",
+            item_s,
+        )
+        if date_format_match and str(date_format_match.group("fmt") or "") == "%M":
+            return str(date_format_match.group("date") or "").strip()
+        monthname_match = re.match(r"""(?is)^MONTHNAME\s*\(\s*(?P<date>.+?)\s*\)$""", item_s)
+        if monthname_match:
+            return str(monthname_match.group("date") or "").strip()
+        return ""
+
+    def _extract_month_numeric_source(expr: str) -> str:
+        item_s = str(expr or "").strip()
+        month_match = re.match(r"""(?is)^MONTH\s*\(\s*(?P<date>.+?)\s*\)$""", item_s)
+        if month_match:
+            return str(month_match.group("date") or "").strip()
+        date_format_match = re.match(
+            r"""(?is)^DATE_FORMAT\s*\(\s*(?P<date>.+?)\s*,\s*(?P<quote>['"])(?P<fmt>%[A-Za-z])(?P=quote)\s*\)$""",
+            item_s,
+        )
+        if date_format_match and str(date_format_match.group("fmt") or "") == "%m":
+            return str(date_format_match.group("date") or "").strip()
+        return ""
+
+    def _is_month_label_expr(expr: str) -> bool:
+        item_s = str(expr or "").strip()
+        if re.search(r"\bMONTHNAME\s*\(", item_s, flags=re.I):
+            return True
+        date_format_match = re.match(
+            r"""(?is)^DATE_FORMAT\s*\(\s*(?P<date>.+?)\s*,\s*(?P<quote>['"])(?P<fmt>%[A-Za-z])(?P=quote)\s*\)$""",
+            item_s,
+        )
+        return bool(date_format_match and str(date_format_match.group("fmt") or "") == "%M")
+
+    month_sort_expr = ""
+    month_source_expr = ""
+    for item in group_items:
+        item_s = str(item or "").strip()
+        numeric_source = _extract_month_numeric_source(item_s)
+        if numeric_source:
+            month_sort_expr = item_s
+            month_source_expr = numeric_source
+            break
+        label_source = _extract_month_label_source(item_s)
+        if label_source and not month_source_expr:
+            month_source_expr = label_source
+
+    added_month_sort_to_group = False
+    if not month_sort_expr and month_source_expr:
+        month_sort_expr = f"MONTH({month_source_expr})"
+        if all(_normalize_expr(item) != _normalize_expr(month_sort_expr) for item in group_items):
+            group_items.append(month_sort_expr)
+            rebuilt_group = ", ".join(item.strip() for item in group_items if item.strip())
+            suffix = s[group_end:]
+            if suffix and not suffix[:1].isspace():
+                suffix = " " + suffix
+            s = (
+                s[:group_pos + len("group by")]
+                + " "
+                + rebuilt_group
+                + suffix
+            )
+            added_month_sort_to_group = True
+
+    if not month_sort_expr:
+        return s + trailing_semicolon
+
+    if added_month_sort_to_group:
+        group_pos = _find_top_level_kw(s, "group by")
+        order_pos = _find_top_level_kw(s, "order by", group_pos + len("group by"))
+        having_pos = _find_top_level_kw(s, "having", group_pos + len("group by"))
+        limit_pos = _find_top_level_kw(s, "limit", group_pos + len("group by"))
+
+    direction = ""
+    if re.search(r"\b(?:latest|newest|most\s+recent|descending|desc)\b", q, flags=re.I):
+        direction = "DESC"
+    elif re.search(r"\b(?:earliest|oldest|ascending|asc|chronological)\b", q, flags=re.I):
+        direction = "ASC"
+    if not direction:
+        return s + trailing_semicolon
+
+    select_match = re.search(r"^\s*select\s+(.*?)\s+from\s", s, flags=re.I | re.S)
+    month_label_aliases: Set[str] = set()
+    if select_match:
+        for item in _split_top_level_csv(select_match.group(1)):
+            if not re.search(r"DATE_FORMAT\s*\([^)]*%M", item, flags=re.I):
+                continue
+            alias_match = re.search(r"\bAS\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$", item, flags=re.I)
+            if alias_match:
+                month_label_aliases.add(alias_match.group(1).strip().lower())
+
+    if order_pos < 0:
+        if not _question_requests_ordering(question):
+            return s + trailing_semicolon
+        insert_pos = limit_pos if limit_pos >= 0 else len(s)
+        order_clause = f" ORDER BY {month_sort_expr} {direction} "
+        out = s[:insert_pos].rstrip() + order_clause + s[insert_pos:].lstrip()
+        return out.rstrip() + trailing_semicolon
+
+    limit_after_order = _find_top_level_kw(s, "limit", order_pos + len("order by"))
+    order_end_candidates = [p for p in [limit_after_order] if p >= 0]
+    order_end = min(order_end_candidates) if order_end_candidates else len(s)
+    order_clause = s[order_pos + len("order by"):order_end].strip().rstrip(";")
+    order_items = _split_top_level_csv(order_clause)
+    if not order_items:
+        return s + trailing_semicolon
+
+    first_item = order_items[0].strip()
+    first_base = re.sub(r"\s+\b(?:ASC|DESC)\b\s*$", "", first_item, flags=re.I).strip()
+    first_base_l = first_base.lower()
+    first_numeric_source = _extract_month_numeric_source(first_base)
+    first_is_month_label = (
+        first_base_l in month_label_aliases
+        or _is_month_label_expr(first_base)
+        or _normalize_expr(first_base) == _normalize_expr(month_sort_expr)
+        or (
+            bool(first_numeric_source)
+            and bool(month_source_expr)
+            and _normalize_expr(first_numeric_source) == _normalize_expr(month_source_expr)
+        )
+    )
+    if not first_is_month_label:
+        return s + trailing_semicolon
+
+    order_items[0] = f"{month_sort_expr} {direction}"
+    rebuilt_order = ", ".join(item.strip() for item in order_items if item.strip())
+    out = (
+        s[:order_pos + len("order by")]
+        + " "
+        + rebuilt_order
+        + s[order_end:]
+    )
+    return out.rstrip().rstrip(";") + trailing_semicolon
+
+
+def _add_missing_final_order(sql: str, question: str) -> str:
+    s = (sql or "").strip()
+    if not s or _has_top_level_order_by(s):
+        return s
+    if not _question_requests_ordering(question):
+        return s
+    trailing_semicolon = ";" if s.endswith(";") else ""
+    if trailing_semicolon:
+        s = s[:-1].rstrip()
+
+    select_match = re.search(r"^\s*select\s+(.*?)\s+from\s", s, flags=re.I | re.S)
+    if not select_match:
+        return s + trailing_semicolon
+    select_items = _split_top_level_csv(select_match.group(1))
+    if not select_items:
+        return s + trailing_semicolon
+
+    q = (question or "").lower()
+    direction = "DESC" if re.search(
+        r"\b(descending|desc|highest|lowest|most|least|largest|smallest|newest|oldest)\b",
+        q,
+        flags=re.I,
+    ) else "ASC"
+    temporal_order_intent = bool(
+        re.search(
+            r"\b(?:most\s+recent|least\s+recent|latest|earliest|newest|oldest|chronological)\b",
+            q,
+            flags=re.I,
+        )
+    )
+
+    def _extract_alias(expr: str) -> str:
+        m = re.search(r"\bAS\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$", expr, flags=re.I)
+        if m:
+            return m.group(1)
+        m = re.search(r"\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$", expr.strip())
+        return m.group(1) if m else ""
+
+    def _looks_temporal(expr: str, alias: str = "") -> bool:
+        text = " ".join(x for x in [expr, alias] if x)
+        normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text.replace("_", " "))
+        if re.search(r"\b(?:date|time|timestamp|year|month|day)\b", normalized, flags=re.I):
+            return True
+        return bool(re.search(r"\b(?:date|time|timestamp|year|month|day|extract|date_format)\s*\(", expr, flags=re.I))
+
+    order_expr = ""
+    fallback_candidates: List[str] = []
+    temporal_candidates: List[str] = []
+    for item in select_items:
+        item_l = item.lower()
+        if re.search(r"\b(count|sum|avg|min|max)\s*\(", item_l):
+            continue
+        alias = _extract_alias(item)
+        candidate = alias or item.strip()
+        if not candidate:
+            continue
+        fallback_candidates.append(candidate)
+        if temporal_order_intent and _looks_temporal(item, alias):
+            temporal_candidates.append(candidate)
+
+    if temporal_candidates:
+        order_expr = temporal_candidates[0]
+    elif fallback_candidates:
+        order_expr = fallback_candidates[0]
+
+    if not order_expr:
+        first = select_items[0].strip()
+        order_expr = _extract_alias(first) or first
+
+    if not order_expr:
+        return s + trailing_semicolon
+
+    limit_pos = _find_top_level_kw(s, "limit")
+    insert_pos = limit_pos if limit_pos >= 0 else len(s)
+    order_clause = f" ORDER BY {order_expr} {direction} "
+    out = s[:insert_pos].rstrip() + order_clause + s[insert_pos:].lstrip()
+    return out.rstrip() + trailing_semicolon
+
+
 def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[str, List[str], List[str]]:
     """
     Apply low-risk semantic repairs and report any remaining unmet contracts.
@@ -1088,6 +1432,11 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
     out_sql = sql
     corrections: List[str] = []
     violations: List[str] = []
+
+    fixed = _ensure_group_by_for_non_agg(out_sql)
+    if fixed != out_sql:
+        out_sql = fixed
+        corrections.append("Semantic contract: added missing GROUP BY for non-aggregate select")
 
     if contract["requires_projection_distinct"]:
         fixed = _ensure_reasonable_distinct(out_sql, question)
@@ -1134,10 +1483,18 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
             violations.append("missing_include_zero")
 
     if contract["requires_final_order"]:
+        fixed = _add_missing_final_order(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: added missing final ORDER BY")
         fixed = _enforce_requested_order_direction(out_sql, question)
         if fixed != out_sql:
             out_sql = fixed
             corrections.append("Semantic contract: enforced final ORDER BY direction")
+        fixed = _repair_chronological_month_order(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: normalized chronological month ordering")
         if not _has_top_level_order_by(out_sql):
             violations.append("missing_final_order")
 
@@ -4328,6 +4685,119 @@ def _is_critical_gate_failure(gate: Dict[str, Any]) -> bool:
     return bool(gate.get("parse_error"))
 
 
+def _has_balanced_sql_delimiters(sql: str) -> bool:
+    depth = 0
+    in_sq = False
+    in_dq = False
+    i = 0
+    s = str(sql or "")
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_dq:
+            if in_sq and i + 1 < len(s) and s[i + 1] == "'":
+                i += 2
+                continue
+            in_sq = not in_sq
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            i += 1
+            continue
+        if in_sq or in_dq:
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        i += 1
+    return depth == 0 and not in_sq and not in_dq
+
+
+def _can_bypass_parse_only_gate(
+    *,
+    sql: str,
+    ctx: str,
+    decision: Dict[str, Any],
+) -> bool:
+    def _is_safe_single_table_grouped_aggregate(candidate_sql: str) -> bool:
+        stmt = str(candidate_sql or "").strip().rstrip(";").strip()
+        if not stmt:
+            return False
+        if has_join(stmt):
+            return False
+        if re.search(r"\(\s*SELECT\b", stmt, flags=re.I):
+            return False
+        if re.search(r"\bUNION(?:\s+ALL)?\b", stmt, flags=re.I):
+            return False
+        if re.search(r"\bOVER\s*\(", stmt, flags=re.I):
+            return False
+
+        from_pos = _find_top_level_kw(stmt, "from")
+        if from_pos < 0:
+            return False
+        group_pos = _find_top_level_kw(stmt, "group by", from_pos + len("from"))
+        if group_pos < 0:
+            return False
+
+        select_part = stmt[len("select"):from_pos].strip()
+        if not re.search(r"\b(?:count|sum|avg|min|max)\s*\(", select_part, flags=re.I):
+            return False
+
+        where_pos = _find_top_level_kw(stmt, "where", from_pos + len("from"))
+        from_end_candidates = [p for p in [where_pos, group_pos] if p >= 0]
+        from_end = min(from_end_candidates) if from_end_candidates else len(stmt)
+        from_core = stmt[from_pos + len("from"):from_end].strip()
+        if not from_core:
+            return False
+        if re.search(r"\bJOIN\b", from_core, flags=re.I):
+            return False
+        if len([part for part in _split_top_level_csv(from_core) if part.strip()]) != 1:
+            return False
+
+        order_pos = _find_top_level_kw(stmt, "order by", group_pos + len("group by"))
+        having_pos = _find_top_level_kw(stmt, "having", group_pos + len("group by"))
+        limit_pos = _find_top_level_kw(stmt, "limit", group_pos + len("group by"))
+        group_end_candidates = [p for p in [having_pos, order_pos, limit_pos] if p >= 0]
+        group_end = min(group_end_candidates) if group_end_candidates else len(stmt)
+        group_clause = stmt[group_pos + len("group by"):group_end].strip()
+        if not group_clause:
+            return False
+        if order_pos < 0 and re.search(r"\b(?:asc|desc)\b\s*$", group_clause, flags=re.I):
+            return False
+
+        group_items = [item.strip() for item in _split_top_level_csv(group_clause) if item.strip()]
+        return bool(group_items)
+
+    s = str(sql or "").strip()
+    if not s or not re.match(r"^\s*SELECT\b", s, flags=re.I):
+        return False
+    if not _has_balanced_sql_delimiters(s):
+        return False
+    if re.search(AGENT_REFINE_BROKEN_ALIAS_PATTERN, s.lower()):
+        return False
+
+    identifier_errors = validate_identifiers(s, ctx)
+    if identifier_errors or _collect_hard_identifier_errors(identifier_errors):
+        return False
+
+    has_window = bool(re.search(r"\bOVER\s*\(", s, flags=re.I))
+    has_subquery = bool(re.search(r"\(\s*SELECT\b", s, flags=re.I))
+    has_set_op = bool(re.search(r"\bUNION(?:\s+ALL)?\b", s, flags=re.I))
+    has_top_level_join = has_join(s)
+
+    if has_window and not has_top_level_join and bool(decision.get("is_window_aggregate", False)):
+        return True
+    if has_subquery and not has_top_level_join and bool(decision.get("is_simple_scalar_subquery_single_table", False)):
+        return True
+    if has_set_op and not has_top_level_join and bool(decision.get("is_set_operation_intent", False)):
+        return True
+    if _is_safe_single_table_grouped_aggregate(s):
+        return True
+    return False
+
+
 def _allowed_identifiers_snapshot(ctx: str, max_tables: int = 4, max_cols: int = 12) -> str:
     allowed_map = _parse_allowed_identifiers(ctx)
     if not allowed_map:
@@ -4410,109 +4880,6 @@ def _attempt_last_chance_rescue_7b(
     return result
 
 
-_IR_SEMANTIC_FALLBACK_FAILURE_PREFIXES = ("limit_mismatch:",)
-_IR_SEMANTIC_FALLBACK_FAILURES = {
-    "missing_order_by",
-    "missing_limit",
-    "missing_agg_count",
-    "missing_agg_sum",
-    "missing_agg_avg",
-}
-
-
-def _is_supported_pct_non_null_semantic_false_positive(
-    *,
-    sql: str,
-    question: str,
-    gate: Dict[str, Any],
-    intent_ir: Optional[Dict[str, Any]] = None,
-) -> bool:
-    """
-    Detect false-positive semantic gate failures for deterministic percentage-
-    of-non-null aggregate queries.
-
-    This keeps a planner-safe IR family in the deterministic lane when the SQL
-    already has the expected grouped percentage shape, but the semantic gate
-    still reports missing aggregate/order requirements.
-    """
-    if not sql or not gate or bool(gate.get("accepted", False)):
-        return False
-
-    reasons = {str(r) for r in (gate.get("reasons") or []) if str(r).strip()}
-    if not reasons or not reasons.issubset({"semantic_contract_mismatch"}):
-        return False
-
-    ir_payload = dict(intent_ir or {})
-    metrics = [m for m in (ir_payload.get("metrics") or []) if isinstance(m, dict)]
-    if not metrics:
-        return False
-    if not all(str(m.get("agg") or "").strip().lower() == "pct_non_null" for m in metrics):
-        return False
-    if ir_payload.get("existence"):
-        return False
-
-    subject = str(ir_payload.get("subject_entity") or "").strip().lower()
-    if not subject:
-        return False
-    if any(str(m.get("table") or subject).strip().lower() != subject for m in metrics):
-        return False
-
-    dims = [d for d in (ir_payload.get("dimensions") or []) if isinstance(d, dict)]
-    if not dims:
-        return False
-    if any(str(d.get("table") or subject).strip().lower() != subject for d in dims):
-        return False
-
-    low_sql = str(sql or "").lower()
-    if "group by" not in low_sql:
-        return False
-    if "case when" not in low_sql:
-        return False
-    if (
-        "is not null" not in low_sql
-        and "not " not in low_sql
-        and " is null" not in low_sql
-    ):
-        return False
-    if "sum(" not in low_sql or "count(" not in low_sql:
-        return False
-    if "/" not in low_sql:
-        return False
-
-    semantic_contract = gate.get("semantic_contract") or {}
-    if semantic_contract.get("requires_order_by") and not _has_top_level_order_by(sql):
-        return False
-
-    failures = {str(f) for f in (gate.get("semantic_failures") or []) if str(f).strip()}
-    if failures and not failures.issubset({"missing_order_by", "missing_agg_count", "missing_agg_sum"}):
-        return False
-
-    return True
-
-
-def _is_ir_semantic_fallback_gate(gate: Dict[str, Any]) -> bool:
-    if not gate or bool(gate.get("accepted", False)):
-        return False
-    if _is_critical_gate_failure(gate):
-        return False
-
-    reasons = {str(r) for r in (gate.get("reasons") or []) if str(r).strip()}
-    if not reasons or not reasons.issubset({"semantic_contract_mismatch"}):
-        return False
-
-    failures = [str(f) for f in (gate.get("semantic_failures") or []) if str(f).strip()]
-    if not failures:
-        return False
-
-    for failure in failures:
-        if failure in _IR_SEMANTIC_FALLBACK_FAILURES:
-            continue
-        if any(failure.startswith(prefix) for prefix in _IR_SEMANTIC_FALLBACK_FAILURE_PREFIXES):
-            continue
-        return False
-    return True
-
-
 _LLM_SEMANTIC_RETRY_FAILURE_PREFIXES = ("limit_mismatch:",)
 _LLM_SEMANTIC_RETRY_FAILURES = {
     "missing_order_by",
@@ -4545,173 +4912,6 @@ def _is_llm_semantic_retry_gate(gate: Dict[str, Any]) -> bool:
             continue
         return False
     return True
-
-
-def _attempt_ir_semantic_repair(
-    *,
-    question: str,
-    ctx: str,
-    state: RAGState,
-    current_sql: str,
-    gate: Dict[str, Any],
-) -> Dict[str, Any]:
-    result: Dict[str, Any] = {
-        "used": False,
-        "accepted": False,
-        "sql": (current_sql or "").strip(),
-        "gate": gate,
-        "error": "",
-    }
-
-    if not _is_ir_semantic_fallback_gate(gate):
-        return result
-
-    _dbg_print_two("[IR] Semantic repair", "Rebuilding deterministic SQL from intent_ir")
-    result["used"] = True
-
-    rebuilt_intent = build_intent_ir(
-        question=question,
-        ctx=ctx,
-        router_decision=state.get("router_decision", {}),
-        primary_table=state.get("primary_table", ""),
-    )
-    candidate_intent = dict(rebuilt_intent or state.get("intent_ir") or {})
-    if not candidate_intent:
-        result["error"] = "semantic_repair_missing_intent_ir"
-        return result
-
-    semantic_contract = gate.get("semantic_contract") or {}
-    required_limit = semantic_contract.get("required_limit")
-    if isinstance(required_limit, int) and required_limit > 0:
-        candidate_intent["limit"] = int(required_limit)
-
-    planned_sql, plan_meta = build_sql_from_intent(candidate_intent, ctx)
-    if not planned_sql:
-        result["error"] = ",".join(str(e) for e in (plan_meta.get("errors") or [])) or "semantic_repair_empty_sql"
-        return result
-
-    candidate_sql, _ = safety_normalize_sql(planned_sql)
-    candidate_sql = normalize_sql_pipeline(str(candidate_sql or planned_sql).strip(), question, ctx)
-    candidate_gate = _deterministic_sql_acceptance_gate(
-        candidate_sql,
-        ctx=ctx,
-        question=question,
-        strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
-    )
-    candidate_sql = str(candidate_gate.get("sql") or candidate_sql).strip()
-    if candidate_sql and not candidate_sql.endswith(";"):
-        candidate_sql += ";"
-
-    result["sql"] = candidate_sql
-    result["gate"] = candidate_gate
-    result["accepted"] = bool(candidate_gate.get("accepted", False))
-    if not result["accepted"]:
-        result["error"] = "semantic_repair_gate_failed"
-    return result
-
-
-def _attempt_ir_semantic_fallback_llm(
-    *,
-    question: str,
-    ctx: str,
-    current_sql: str,
-    gate: Dict[str, Any],
-    model_name: str,
-    intent_ir: Optional[Dict[str, Any]] = None,
-    strict_join_key: bool = False,
-) -> Dict[str, Any]:
-    result: Dict[str, Any] = {
-        "used": False,
-        "accepted": False,
-        "sql": (current_sql or "").strip(),
-        "gate": gate,
-        "model": str(model_name or "").strip(),
-        "error": "",
-    }
-
-    if not _is_ir_semantic_fallback_gate(gate):
-        return result
-    if model_name not in {SMALL_MODEL, LARGE_MODEL}:
-        result["error"] = "semantic_fallback_invalid_model"
-        return result
-
-    result["used"] = True
-    model_label = "7B" if model_name == LARGE_MODEL else "3B"
-    _dbg_print_two("[IR] Semantic fallback", f"Regenerating with {model_label}")
-
-    semantic_failures = [str(f) for f in (gate.get("semantic_failures") or []) if str(f).strip()]
-    semantic_contract = gate.get("semantic_contract") or {}
-
-    contract_parts: List[str] = []
-    if semantic_contract.get("requires_order_by"):
-        contract_parts.append("ORDER BY required")
-    if semantic_contract.get("required_limit") is not None:
-        contract_parts.append(f"LIMIT {semantic_contract.get('required_limit')}")
-    required_aggs = [str(a).upper() for a in (semantic_contract.get("required_aggs") or []) if str(a).strip()]
-    if required_aggs:
-        contract_parts.append(f"aggregates={required_aggs}")
-
-    ir_summary_parts: List[str] = []
-    ir_payload = intent_ir or {}
-    ir_qtype = str(ir_payload.get("qtype") or "").strip()
-    ir_subject = str(ir_payload.get("subject_entity") or "").strip()
-    if ir_qtype:
-        ir_summary_parts.append(f"qtype={ir_qtype}")
-    if ir_subject:
-        ir_summary_parts.append(f"subject={ir_subject}")
-    ir_limit = ir_payload.get("limit")
-    if isinstance(ir_limit, int) and ir_limit > 0:
-        ir_summary_parts.append(f"limit={ir_limit}")
-
-    instruction_lines = [
-        "SEMANTIC FALLBACK: Rewrite the SQL so it satisfies the semantic contract. Return one valid MySQL SELECT only.",
-        f"- Current IR SQL: {str(current_sql or '').strip()}",
-        f"- Semantic failures: {semantic_failures}",
-    ]
-    if contract_parts:
-        instruction_lines.append(f"- Semantic requirements: {'; '.join(contract_parts)}")
-    if ir_summary_parts:
-        instruction_lines.append(f"- Intent IR summary: {'; '.join(ir_summary_parts)}")
-    instruction_lines.extend(
-        [
-            "- Preserve the intended tables and columns when they are valid.",
-            "- Do NOT invent identifiers outside ALLOWED IDENTIFIERS.",
-        ]
-    )
-
-    allowed_snapshot = _allowed_identifiers_snapshot(ctx)
-    if allowed_snapshot:
-        instruction_lines.append(allowed_snapshot)
-
-    llm_fallback = build_llm_repair(model=model_name)
-    regenerated_sql, _ = regenerate_with_extra_constraint(
-        llm_fallback,
-        make_generation_prompt,
-        ctx,
-        question,
-        "\n".join(instruction_lines),
-    )
-    if not regenerated_sql:
-        result["error"] = "semantic_fallback_empty_sql"
-        return result
-
-    candidate_sql = normalize_sql_pipeline(str(regenerated_sql).strip(), question, ctx)
-    candidate_gate = _deterministic_sql_acceptance_gate(
-        candidate_sql,
-        ctx=ctx,
-        question=question,
-        strict_join_key=strict_join_key,
-    )
-    candidate_sql = str(candidate_gate.get("sql") or candidate_sql).strip()
-    if candidate_sql and not candidate_sql.endswith(";"):
-        candidate_sql += ";"
-
-    result["sql"] = candidate_sql
-    result["gate"] = candidate_gate
-    result["accepted"] = bool(candidate_gate.get("accepted", False))
-    if not result["accepted"]:
-        result["error"] = "semantic_fallback_gate_failed"
-    return result
 
 
 def _prewarm_model_with_oom_retry(llm, target_model: str, max_retries: int = OOM_MAX_RETRIES) -> bool:
@@ -5349,8 +5549,6 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # IR-FIRST deterministic planning (schema-agnostic)
     # ------------------------------------------------------------------
     if AGENT_IR_ENABLED:
-        # Start timing for IR lane from draft construction to final SQL output.
-        ir_processing_start = _time.perf_counter()
         intent_ir = build_intent_ir(
             question=question,
             ctx=ctx,
@@ -5692,61 +5890,8 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             )
 
         if ir_plannable:
-            planned_sql, plan_meta = build_sql_from_intent(intent_ir, ctx)
-            if planned_sql:
-                normalized_sql, normalize_warnings = safety_normalize_sql(planned_sql)
-                if AGENT_IR_DEBUG:
-                    print(f"[IR] SQL planned successfully. warnings={normalize_warnings}")
-                if not normalized_sql.endswith(";"):
-                    normalized_sql += ";"
-                ir_note_parts = [
-                    "Deterministic IR planner used",
-                    f"qtype={qtype or 'unknown'}",
-                    f"conf={ir_confidence:.2f}",
-                    f"tables={table_count}",
-                ]
-                subject_entity = str(intent_ir.get("subject_entity") or "").strip()
-                if subject_entity:
-                    ir_note_parts.append(f"subject={subject_entity}")
-                if has_column_compare_filter:
-                    ir_note_parts.append("filter=column_compare")
-                if has_resolved_ordering and ir_ordering:
-                    first_order = next(
-                        (o for o in ir_ordering if isinstance(o, dict)),
-                        None,
-                    )
-                    if first_order:
-                        order_kind = str(first_order.get("kind") or "").strip().lower()
-                        order_target = str(first_order.get("by") or "").strip()
-                        order_dir = str(first_order.get("direction") or "ASC").strip().upper()
-                        if order_kind == "expression":
-                            ir_note_parts.append(f"order=expr:{order_dir}")
-                        elif order_target:
-                            ir_note_parts.append(f"order={order_kind}:{order_target}:{order_dir}")
-                if isinstance(intent_ir.get("limit"), int) and int(intent_ir.get("limit") or 0) > 0:
-                    ir_note_parts.append(f"limit={int(intent_ir.get('limit') or 0)}")
-                ir_internal_notes = [
-                    str(n).strip()
-                    for n in (intent_ir.get("notes") or [])
-                    if str(n).strip()
-                ]
-                if ir_internal_notes:
-                    ir_note_parts.append(f"ir_notes={','.join(ir_internal_notes[:2])}")
-                if normalize_warnings:
-                    ir_note_parts.append(f"warnings={','.join(str(w) for w in normalize_warnings[:2])}")
-                return {
-                    **state,
-                    "processing_start_time": ir_processing_start,
-                    "draft_inference_time": 0.0,
-                    "draft_source": "ir_planner",
-                    "ir_used": True,
-                    "join_plan": plan_meta.get("join_plan", {}),
-                    "draft_sql": normalized_sql,
-                    "agent_notes": " | ".join(ir_note_parts),
-                }
-            else:
-                if AGENT_IR_DEBUG:
-                    print(f"[IR] planner fallback -> LLM. errors={plan_meta.get('errors')}")
+            if AGENT_IR_DEBUG:
+                print("[IR] planner disabled -> LLM. intent IR used as hint only")
         elif AGENT_IR_DEBUG and not ir_plannable:
             print(
                 f"[IR] gated off -> LLM. reasons={ir_log_reasons or ['unknown_ir_gate_reason']}"
@@ -5964,235 +6109,6 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     ctx = state.get("context", "")
     draft_sql = (state.get("draft_sql") or "").strip()
     draft_source = (state.get("draft_source") or "").strip().lower()
-
-    # ------------------------------------------------------------------
-    # IR planner path: safety-only normalization + identifier validation.
-    # Skip heavy regex rewrite/regeneration to keep deterministic behavior.
-    # ------------------------------------------------------------------
-    if draft_source == "ir_planner":
-        final_sql, warnings = safety_normalize_sql(draft_sql)
-        final_sql = _rewrite_missing_joined_agg_threshold_filter(final_sql, question, ctx)
-        corrections = ["Deterministic IR planner output"]
-        ir_semantic_repair_used = False
-        ir_semantic_fallback_used = False
-        ir_semantic_fallback_model = ""
-        gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
-        current_gate = gate
-        final_sql = str(gate.get("sql") or final_sql)
-        validation_errors = list(gate.get("identifier_errors") or [])
-        if warnings:
-            corrections.append(f"Safety warnings: {warnings}")
-        if gate.get("ast_fixes"):
-            corrections.append(f"AST gate fixes: {gate.get('ast_fixes')}")
-        if not gate.get("accepted", False):
-            corrections.append(f"Acceptance gate blocked SQL: {gate.get('reasons')}")
-        if validation_errors or gate.get("parse_error"):
-            if validation_errors:
-                corrections.append(f"Identifier validation errors: {validation_errors}")
-            # Last-resort fallback to legacy normalizer for recovery.
-            final_sql = normalize_sql_pipeline(final_sql, question, ctx)
-            gate_after_fallback = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
-            current_gate = gate_after_fallback
-            final_sql = str(gate_after_fallback.get("sql") or final_sql)
-            validation_errors = list(gate_after_fallback.get("identifier_errors") or validation_errors)
-            if not gate_after_fallback.get("accepted", False):
-                corrections.append(
-                    f"Post-fallback acceptance warnings: {gate_after_fallback.get('reasons')}"
-                )
-
-        semantic_seed_sql = final_sql
-        semantic_fallback_eligible = _is_ir_semantic_fallback_gate(current_gate)
-        if current_gate.get("accepted", False):
-            print("[IR] Semantic fallback: not needed")
-        elif semantic_fallback_eligible:
-            print("[IR] Semantic fallback: eligible")
-        elif _is_critical_gate_failure(current_gate):
-            print("[IR] Semantic fallback: skipped (critical gate path)")
-        else:
-            print("[IR] Semantic fallback: skipped (non-whitelisted)")
-
-        if not current_gate.get("accepted", False) and semantic_fallback_eligible:
-            semantic_repair = _attempt_ir_semantic_repair(
-                question=question,
-                ctx=ctx,
-                state=state,
-                current_sql=final_sql,
-                gate=current_gate,
-            )
-            if semantic_repair.get("used", False):
-                semantic_seed_sql = str(semantic_repair.get("sql") or semantic_seed_sql).strip() or semantic_seed_sql
-            if semantic_repair.get("accepted", False):
-                final_sql = str(semantic_repair.get("sql") or final_sql).strip()
-                current_gate = semantic_repair.get("gate") or current_gate
-                ir_semantic_repair_used = True
-                corrections.append("Deterministic IR semantic repair succeeded")
-                print("[IR] Semantic fallback: not needed after deterministic repair")
-            elif semantic_repair.get("used", False):
-                corrections.append(
-                    f"Deterministic IR semantic repair did not clear gate: {semantic_repair.get('error') or (semantic_repair.get('gate') or {}).get('reasons')}"
-                )
-
-        if (
-            not current_gate.get("accepted", False)
-            and _is_supported_pct_non_null_semantic_false_positive(
-                sql=semantic_seed_sql,
-                question=question,
-                gate=current_gate,
-                intent_ir=state.get("intent_ir") or {},
-            )
-        ):
-            final_sql = str(semantic_seed_sql or final_sql).strip() or final_sql
-            current_gate = {
-                **dict(current_gate or {}),
-                "accepted": True,
-                "reasons": [],
-                "semantic_failures": [],
-            }
-            corrections.append("Accepted deterministic pct_non_null IR shape")
-            print("[IR] Semantic fallback: not needed for supported pct_non_null family")
-
-        semantic_fallback_eligible = _is_ir_semantic_fallback_gate(current_gate)
-        if not current_gate.get("accepted", False) and semantic_fallback_eligible:
-            fallback_model = str(
-                state.get("router_model_candidate")
-                or (LARGE_MODEL if (decision.get("escalation_reasons") or []) else SMALL_MODEL)
-                or SMALL_MODEL
-            ).strip()
-
-            semantic_fallback = _attempt_ir_semantic_fallback_llm(
-                question=question,
-                ctx=ctx,
-                current_sql=semantic_seed_sql,
-                gate=current_gate,
-                model_name=fallback_model,
-                intent_ir=state.get("intent_ir") or {},
-                strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
-            )
-            if semantic_fallback.get("accepted", False):
-                final_sql = str(semantic_fallback.get("sql") or final_sql).strip()
-                current_gate = semantic_fallback.get("gate") or current_gate
-                ir_semantic_fallback_used = True
-                ir_semantic_fallback_model = str(semantic_fallback.get("model") or fallback_model)
-                corrections.append(
-                    "IR semantic fallback succeeded "
-                    f"({'7B' if ir_semantic_fallback_model == LARGE_MODEL else '3B'})"
-                )
-            elif semantic_fallback.get("used", False):
-                corrections.append(
-                    f"IR semantic fallback ({'7B' if fallback_model == LARGE_MODEL else '3B'}) did not clear gate"
-                )
-
-            if (
-                not current_gate.get("accepted", False)
-                and _is_ir_semantic_fallback_gate(current_gate)
-                and fallback_model != LARGE_MODEL
-            ):
-                semantic_fallback_7b = _attempt_ir_semantic_fallback_llm(
-                    question=question,
-                    ctx=ctx,
-                    current_sql=semantic_seed_sql,
-                    gate=current_gate,
-                    model_name=LARGE_MODEL,
-                    intent_ir=state.get("intent_ir") or {},
-                    strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
-                )
-                if semantic_fallback_7b.get("accepted", False):
-                    final_sql = str(semantic_fallback_7b.get("sql") or final_sql).strip()
-                    current_gate = semantic_fallback_7b.get("gate") or current_gate
-                    ir_semantic_fallback_used = True
-                    ir_semantic_fallback_model = LARGE_MODEL
-                    corrections.append("IR semantic fallback escalated and succeeded (7B)")
-                elif semantic_fallback_7b.get("used", False):
-                    corrections.append("IR semantic fallback escalation (7B) did not clear gate")
-
-        rescue_7b_used = False
-        ir_final_model = "ir_planner"
-        if ir_semantic_fallback_used and ir_semantic_fallback_model:
-            ir_final_model = ir_semantic_fallback_model
-        if not current_gate.get("accepted", False) and _is_critical_gate_failure(current_gate):
-            _dbg_safety_block("IR", f"{current_gate.get('reasons')}")
-            rescue = _attempt_last_chance_rescue_7b(
-                question=question,
-                ctx=ctx,
-                current_sql=final_sql,
-                gate=current_gate,
-                strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
-            )
-            rescue_7b_used = bool(rescue.get("used", False))
-            if rescue_7b_used:
-                final_sql = str(rescue.get("sql") or final_sql)
-                current_gate = rescue.get("gate") or current_gate
-                if rescue.get("accepted", False):
-                    ir_final_model = LARGE_MODEL
-                    corrections.append("Last-chance rescue succeeded (7B)")
-                else:
-                    corrections.append(
-                        f"Last-chance rescue failed: {rescue.get('error')} | reasons={current_gate.get('reasons')}"
-                    )
-
-        if not current_gate.get("accepted", False) and _is_critical_gate_failure(current_gate):
-            final_sql = "SELECT 'FINAL_GATE_BLOCKED' AS error_message;"
-            ir_final_model = "gate_blocked"
-            corrections.append(f"Fail-closed: blocked unsafe SQL ({current_gate.get('reasons')})")
-
-        validation_errors = list(current_gate.get("identifier_errors") or validation_errors)
-        if not final_sql.endswith(";"):
-            final_sql += ";"
-
-        processing_start = state.get("processing_start_time")
-        if processing_start:
-            processing_time = _time.perf_counter() - processing_start
-            state["processing_time"] = processing_time
-            print(f"[DEBUG] Processing time: {processing_time:.2f}s")
-            draft_inf = float(state.get("draft_inference_time", 0.0) or 0.0)
-            postproc_time = max(0.0, processing_time - draft_inf)
-            print(
-                f"[DEBUG] Time breakdown: draft={draft_inf:.2f}s, "
-                f"postprocess={postproc_time:.2f}s"
-            )
-
-        # Compute confidence score (schema-agnostic)
-        confidence_result = compute_sql_confidence(final_sql, question, ctx)
-        _log_confidence_result(confidence_result)
-        
-        # Confidence-based retry (1x max) if below threshold
-        confidence_retry_used = False
-        if confidence_result["confidence"] < CONFIDENCE_THRESHOLD:
-            retry_result = _attempt_confidence_retry(
-                question=question,
-                ctx=ctx,
-                current_sql=final_sql,
-                confidence_result=confidence_result,
-                make_prompt_fn=make_generation_prompt,
-            )
-            confidence_retry_used = retry_result.get("used", False)
-            if retry_result.get("accepted", False):
-                final_sql = retry_result["sql"]
-                confidence_result = retry_result["confidence"]
-                corrections.append("Confidence retry succeeded (7B)")
-                ir_final_model = LARGE_MODEL
-            else:
-                corrections.append("Confidence retry attempted (no improvement)")
-
-        return {
-            **state,
-            "validation_errors": validation_errors,
-            "final_sql": final_sql,
-            "answer": final_sql,
-            "critic_feedback": " | ".join(corrections),
-            "final_model": ir_final_model,
-            "final_gate_pass": bool(current_gate.get("accepted", False)),
-            "final_gate_reasons": list(current_gate.get("reasons") or []),
-            "rescue_7b_used": bool(rescue_7b_used),
-            "ir_semantic_repair_used": bool(ir_semantic_repair_used),
-            "ir_semantic_fallback_used": bool(ir_semantic_fallback_used),
-            "ir_semantic_fallback_model": ir_semantic_fallback_model,
-            "sql_confidence": confidence_result["confidence"],
-            "confidence_signals": confidence_result["signals"],
-            "confidence_warnings": confidence_result["warnings"],
-            "confidence_low": confidence_result["confidence"] < CONFIDENCE_THRESHOLD,
-            "confidence_retry_used": confidence_retry_used,
-        }
 
     # DYNAMIC MODEL SELECTION berdasarkan draft quality
     draft_model = state.get("target_model") or SMALL_MODEL  # Track model asal
@@ -7154,6 +7070,20 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         )
 
         if has_month_name_group and not has_safe_sort:
+            repaired_month_sort = _repair_chronological_month_order(final_sql, question)
+            if repaired_month_sort != final_sql:
+                final_sql = repaired_month_sort
+                corrections.append("Deterministic repair: enforced chronological month ordering")
+                sql_up = final_sql.upper()
+                has_safe_sort = re.search(
+                    AGENT_REFINE_SAFE_MONTH_SORT_FUNC_PATTERN,
+                    sql_up, re.DOTALL | re.IGNORECASE
+                ) or re.search(
+                    AGENT_REFINE_SAFE_MONTH_SORT_DATE_PATTERN,
+                    sql_up, re.IGNORECASE
+                )
+
+        if has_month_name_group and not has_safe_sort:
             _dbg_agent3_retry("Unsafe Month Sorting", "Sorting by Month Name (Alphabetical) detected.")
             extra_instruction = (
                 "STRICT REQUIREMENT: You are grouping by Month Name, which sorts Alphabetically (Apr, Aug...). "
@@ -7206,6 +7136,20 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if gated_sql and gated_sql != final_sql:
         final_sql = gated_sql
         corrections.append("Deterministic acceptance gate rewrites applied")
+
+    parse_only_reasons = {str(r) for r in (pre_gate.get("reasons") or []) if str(r).strip()}
+    if (
+        not pre_gate.get("accepted", False)
+        and parse_only_reasons == {"parse_error"}
+        and _can_bypass_parse_only_gate(sql=final_sql, ctx=ctx, decision=decision)
+    ):
+        pre_gate = {
+            **dict(pre_gate or {}),
+            "accepted": True,
+            "reasons": [],
+            "parse_error": "",
+        }
+        corrections.append("Deterministic acceptance gate: bypassed parse-only false positive for safe family")
 
     pre_reason_labels = {str(r) for r in (pre_gate.get("reasons") or []) if str(r).strip()}
     llm_semantic_retry_eligible = _is_llm_semantic_retry_gate(pre_gate)
@@ -7515,6 +7459,20 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     final_gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
     final_sql = str(final_gate.get("sql") or final_sql).strip()
+
+    final_parse_only_reasons = {str(r) for r in (final_gate.get("reasons") or []) if str(r).strip()}
+    if (
+        not final_gate.get("accepted", False)
+        and final_parse_only_reasons == {"parse_error"}
+        and _can_bypass_parse_only_gate(sql=final_sql, ctx=ctx, decision=decision)
+    ):
+        final_gate = {
+            **dict(final_gate or {}),
+            "accepted": True,
+            "reasons": [],
+            "parse_error": "",
+        }
+        corrections.append("Final acceptance gate: bypassed parse-only false positive for safe family")
 
     rescue_7b_used = False
     if not final_gate.get("accepted", False) and _is_critical_gate_failure(final_gate):

@@ -3620,7 +3620,7 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
     return fixed
 
 
-def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
+def _ensure_explicit_simple_projection_columns(sql: str, question: str, ctx: str = "") -> str:
     """
     For flat single-table lookup/list queries, preserve explicitly requested
     output columns from question phrasing like:
@@ -3644,7 +3644,10 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
         return sql
     if re.search(r"\b(?:row_number|rank|dense_rank)\s*\(", s, flags=re.I):
         return sql
-    if re.search(r"\b(?:from|where|exists|in)\s*\(", s, flags=re.I):
+    if (
+        re.search(r"\b(?:from|where|exists)\s*\(", s, flags=re.I)
+        or re.search(r"\bin\s*\(\s*select\b", s, flags=re.I)
+    ):
         return sql
 
     m_sel = re.match(
@@ -3696,6 +3699,15 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
         base_table,
     )
 
+    allowed_identifiers = _parse_allowed_identifiers(ctx)
+    allowed_table_cols = [
+        str(c).strip("`")
+        for c in allowed_identifiers.get(base_table, set())
+        if str(c).strip()
+    ]
+
+    analyzer = None
+    table_cols: List[str] = []
     try:
         analyzer = get_schema_analyzer()
         table_cols = [
@@ -3714,6 +3726,19 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
         except Exception:
             analyzer = None
             table_cols = []
+
+    merged_cols: List[str] = []
+    seen_cols: Set[str] = set()
+    for col in table_cols + allowed_table_cols:
+        raw = str(col).strip("`")
+        if not raw:
+            continue
+        low = raw.lower()
+        if low in seen_cols:
+            continue
+        seen_cols.add(low)
+        merged_cols.append(raw)
+    table_cols = merged_cols
     if not table_cols:
         return sql
 
@@ -3821,10 +3846,11 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
         return sql
 
     selected_cols: Set[str] = set()
-    selected_alias_tokens: List[Set[str]] = []
+    select_item_analysis: List[Tuple[str, Optional[str], Set[str]]] = []
     prefer_qualified = False
     for item in select_items:
         expr, out_alias = _split_expr_alias(item)
+        item_simple_col: Optional[str] = None
         parsed_col = _parse_simple_col(expr)
         if parsed_col:
             qual, col = parsed_col
@@ -3832,13 +3858,14 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
             col_l = str(col or "").strip().lower()
             if not qual_l or qual_l == base_alias.lower() or qual_l == base_table:
                 selected_cols.add(col_l)
+                item_simple_col = col_l
                 prefer_qualified = prefer_qualified or bool(qual_l)
         alias_label = str(out_alias or "").strip("`'\"")
-        if alias_label:
-            selected_alias_tokens.append(set(_identifier_parts(alias_label)))
+        alias_tokens = set(_identifier_parts(alias_label)) if alias_label else set()
+        select_item_analysis.append((item.strip(), item_simple_col, alias_tokens))
 
-    def _alias_covers(parts: List[str]) -> bool:
-        if not parts:
+    def _alias_tokens_cover(alias_tokens: Set[str], parts: List[str]) -> bool:
+        if not parts or not alias_tokens:
             return False
         part_set = set(parts)
         identifier_terms = {str(x or "").strip().lower() for x in identifier_id_like_terms() if str(x or "").strip()}
@@ -3855,10 +3882,12 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
             short, long = (a0, b0) if len(a0) <= len(b0) else (b0, a0)
             return len(short) >= 3 and len(long) >= 5 and long.startswith(short)
 
-        return any(
-            all(any(_equiv(req, tok) for tok in alias_tokens) for req in part_set)
-            for alias_tokens in selected_alias_tokens
-        )
+        return all(any(_equiv(req, tok) for tok in alias_tokens) for req in part_set)
+
+    def _alias_covers(parts: List[str]) -> bool:
+        if not parts:
+            return False
+        return any(_alias_tokens_cover(alias_tokens, parts) for _, _, alias_tokens in select_item_analysis)
 
     requested_cols: List[Tuple[int, str]] = []
     for col in table_cols:
@@ -3884,10 +3913,12 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
         return sql
 
     requested_cols.sort(key=lambda x: (x[0], x[1]))
+    requested_parts_by_col: Dict[str, List[str]] = {}
     missing_cols: List[str] = []
     seen_missing: Set[str] = set()
     for _, col_l in requested_cols:
         parts = _identifier_parts(_column_original_case(col_l))
+        requested_parts_by_col[col_l] = parts
         if col_l in selected_cols or _alias_covers(parts):
             continue
         if col_l in seen_missing:
@@ -3898,12 +3929,30 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str) -> str:
     if not missing_cols:
         return sql
 
-    missing_items: List[str] = []
-    for col_l in missing_cols:
+    used_item_indexes: Set[int] = set()
+    ordered_select_items: List[str] = []
+    for _, col_l in requested_cols:
+        parts = requested_parts_by_col.get(col_l) or _identifier_parts(_column_original_case(col_l))
+        matched_index: Optional[int] = None
+        for idx, (item_text, item_simple_col, alias_tokens) in enumerate(select_item_analysis):
+            if idx in used_item_indexes:
+                continue
+            if item_simple_col == col_l or _alias_tokens_cover(alias_tokens, parts):
+                matched_index = idx
+                break
+        if matched_index is not None:
+            used_item_indexes.add(matched_index)
+            ordered_select_items.append(select_item_analysis[matched_index][0])
+            continue
         col_out = _column_original_case(col_l)
-        missing_items.append(f"{base_alias}.{col_out}" if prefer_qualified else col_out)
+        ordered_select_items.append(f"{base_alias}.{col_out}" if prefer_qualified else col_out)
 
-    new_select_items = missing_items + [it.strip() for it in select_items if it.strip()]
+    for idx, (item_text, _, _) in enumerate(select_item_analysis):
+        if idx in used_item_indexes:
+            continue
+        ordered_select_items.append(item_text)
+
+    new_select_items = ordered_select_items
     dedup_select: List[str] = []
     seen_keys: Set[str] = set()
     for item in new_select_items:
@@ -19885,6 +19934,142 @@ def _drop_unrequested_exists_filters(sql: str, question: str, ctx: str = "") -> 
     return fixed
 
 
+def _drop_unrequested_group_key_filters(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Drop hallucinated literal filters on the same column used as a GROUP BY key.
+
+    Conservative scope:
+    - flat grouped queries only (via `_parse_select_from_groupby`)
+    - top-level AND-only WHERE clause
+    - only removes simple `col = literal` / `col IN (literal, ...)` predicates
+      when `col` is also a simple GROUP BY column
+    - keeps predicates whose literal values are explicitly mentioned in the question
+    """
+    if not sql:
+        return sql
+
+    q = (question or "").strip().lower()
+    if not q:
+        return sql
+
+    parsed = _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+
+    where_clause = (parsed.get("where") or "").strip()
+    if not where_clause or not where_clause.lower().startswith("where "):
+        return sql
+
+    where_body = where_clause[6:].strip()
+    if not where_body or _has_top_level_or(where_body):
+        return sql
+
+    group_items = _split_top_level_commas(parsed.get("groupby") or "")
+    if not group_items:
+        return sql
+
+    simple_col_pat = re.compile(
+        r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$"""
+    )
+
+    grouped_cols: Set[str] = set()
+    for item in group_items:
+        m_group = simple_col_pat.match(str(item or "").strip())
+        if not m_group:
+            continue
+        grouped_cols.add((m_group.group(2) or "").strip().lower())
+    if not grouped_cols:
+        return sql
+
+    literal_pat = r"""(?:'[^']*'|"[^"]*"|-?\d+(?:\.\d+)?)"""
+    eq_pat = re.compile(
+        rf"""(?is)^\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*=\s*(?P<lit>{literal_pat})\s*$"""
+    )
+    eq_rev_pat = re.compile(
+        rf"""(?is)^\s*(?P<lit>{literal_pat})\s*=\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$"""
+    )
+    in_pat = re.compile(
+        rf"""(?is)^\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s+IN\s*\(\s*(?P<items>{literal_pat}(?:\s*,\s*{literal_pat})*)\s*\)\s*$"""
+    )
+
+    def _col_name(expr: str) -> str:
+        m = simple_col_pat.match(str(expr or "").strip())
+        if not m:
+            return ""
+        return (m.group(2) or "").strip().lower()
+
+    def _literal_text(token: str) -> str:
+        raw = str(token or "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1]
+        return raw.strip().lower()
+
+    def _question_mentions_literal(token: str) -> bool:
+        lit = _literal_text(token)
+        if not lit:
+            return False
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", lit):
+            return re.search(rf"\b{re.escape(lit)}\b", q, flags=re.I) is not None
+        phrase = re.escape(lit).replace(r"\ ", r"\s+")
+        return re.search(rf"\b{phrase}\b", q, flags=re.I) is not None
+
+    conds = _split_top_level_and(where_body)
+    if not conds:
+        return sql
+
+    keep_conds: List[str] = []
+    removed_any = False
+    for cond in conds:
+        c0 = str(cond or "").strip()
+        if not c0:
+            continue
+
+        match = eq_pat.match(c0) or eq_rev_pat.match(c0)
+        if match:
+            col_l = _col_name(match.group("col") or "")
+            lit = match.group("lit") or ""
+            if col_l in grouped_cols and not _question_mentions_literal(lit):
+                removed_any = True
+                continue
+            keep_conds.append(c0)
+            continue
+
+        in_match = in_pat.match(c0)
+        if in_match:
+            col_l = _col_name(in_match.group("col") or "")
+            items = str(in_match.group("items") or "")
+            lit_tokens = [x.strip() for x in items.split(",") if x.strip()]
+            if (
+                col_l in grouped_cols
+                and lit_tokens
+                and not any(_question_mentions_literal(tok) for tok in lit_tokens)
+            ):
+                removed_any = True
+                continue
+            keep_conds.append(c0)
+            continue
+
+        keep_conds.append(c0)
+
+    if not removed_any:
+        return sql
+
+    out_lines = [
+        f"SELECT {parsed['select'].strip()}",
+        f"FROM {parsed['from_core'].strip()}",
+    ]
+    if keep_conds:
+        out_lines.append(f"WHERE {' AND '.join(keep_conds)}")
+    out_lines.append(f"GROUP BY {parsed['groupby'].strip()}")
+    if parsed.get("tail"):
+        out_lines.append(parsed["tail"].strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _drop_unrequested_temporal_filters(sql: str, question: str, ctx: str = "") -> str:
     """
     Remove hallucinated temporal WHERE predicates when question has no temporal intent.
@@ -20931,7 +21116,48 @@ def _ensure_reasonable_distinct(sql: str, question: str) -> str:
         return sql
     
     # Guard 4: GROUP BY already provides deduplication semantics
+    # Exception: if SELECT projects only the GROUP BY columns (no aggregates),
+    # adding DISTINCT is safe and satisfies explicit dedup intent.
     if "GROUP BY" in s_up:
+        if _question_wants_count_distinct(question):
+            return _remove_distinct(sql)
+
+        def _split_top_level(expr: str) -> list[str]:
+            parts: list[str] = []
+            buf: list[str] = []
+            depth = 0
+            for ch in expr:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                if ch == "," and depth == 0:
+                    part = "".join(buf).strip()
+                    if part:
+                        parts.append(part)
+                    buf = []
+                    continue
+                buf.append(ch)
+            tail = "".join(buf).strip()
+            if tail:
+                parts.append(tail)
+            return parts
+
+        def _strip_alias(col: str) -> str:
+            raw = re.sub(r"\s+AS\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s*$", "", col, flags=re.I)
+            raw = re.sub(r"\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s*$", "", raw)
+            return raw.strip()
+
+        select_match = re.search(r"^\s*select\s+(.*?)\s+from\s", sql, flags=re.I | re.S)
+        group_match = re.search(r"\bgroup\s+by\s+(.+?)(?:\border\s+by\b|\blimit\b|;|$)", sql, flags=re.I | re.S)
+        if select_match and group_match:
+            select_cols = _split_top_level(select_match.group(1))
+            group_cols = _split_top_level(group_match.group(1))
+            if select_cols and group_cols:
+                norm_select = {re.sub(r"[`\s]+", "", _strip_alias(c)).lower() for c in select_cols}
+                norm_group = {re.sub(r"[`\s]+", "", _strip_alias(c)).lower() for c in group_cols}
+                if "*" not in norm_select and norm_select == norm_group:
+                    return _add_distinct(sql)
         return sql
     
     if _question_wants_count_distinct(question):
@@ -22937,14 +23163,22 @@ def _question_requests_ordering(question: str) -> bool:
     
     # --- Pattern 5: Phrase-based ordering intent ---
     # "from highest to lowest", "from latest", "from A to Z"
-    ordering_phrases = rule_list(
-        ("ordering_intent", "ordering_phrase_regex"),
-        [
-            r"\bfrom\s+(the\s+)?(highest|lowest|latest|earliest|newest|oldest)",
-            r"\bfrom\s+(a\s+to\s+z|z\s+to\s+a)",
-            r"\b(sorted|ordered)\s+from\b",
-        ],
-    )
+    supplemental_ordering_phrases = [
+        r"\bfrom\s+(the\s+)?(highest|lowest|latest|earliest|newest|oldest)",
+        r"\b(?:start|starting|begin|beginning)\s+(?:with|from)\s+(?:the\s+)?(?:highest|lowest|latest|earliest|newest|oldest|most\s+recent|least\s+recent)",
+        r"\b(?:most\s+recent|least\s+recent|latest|earliest|newest|oldest)\s+first\b",
+        r"\bfrom\s+(a\s+to\s+z|z\s+to\s+a)",
+        r"\b(sorted|ordered)\s+from\b",
+    ]
+    configured_ordering_phrases = [
+        str(p).strip()
+        for p in rule_list(
+            ("ordering_intent", "ordering_phrase_regex"),
+            [],
+        )
+        if str(p).strip()
+    ]
+    ordering_phrases = list(dict.fromkeys(configured_ordering_phrases + supplemental_ordering_phrases))
     
     if not has_window_context and not winner_like_context and any(re.search(pat, q) for pat in ordering_phrases):
         return True
@@ -24798,6 +25032,8 @@ def _add_missing_count_for_group_by(sql: str, question: str = "") -> str:
 
     # GUARDRAIL 5: COUNT not already in SELECT
     select_clause = s[select_pos + len("select"):from_pos].upper()
+    if re.search(r"\bOVER\s*\(", select_clause, flags=re.IGNORECASE):
+        return sql
     if "COUNT" in select_clause:
         return sql  # COUNT already present
 

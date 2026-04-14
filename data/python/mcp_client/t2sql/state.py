@@ -29,7 +29,7 @@ class RAGState(TypedDict, total=False):
     # generation outputs
     answer: str
     draft_sql: str
-    draft_source: str  # llm|ir_planner
+    draft_source: str  # llm (ir_planner deprecated)
     draft_inference_time: float
     ranked_cols: List[tuple[str, str]]
     final_sql: str

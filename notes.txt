@@ -75,3 +75,6 @@ docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 pytho
 docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy" 2>&1 | tee run_easy_domain_off.log
 docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_devset_ori.yml --output results.xlsx --easy" 2>&1 | tee run_easy_ori_domain_off.log
 docker exec -it mcp_client bash -c "cd /app && DOMAIN_HEURISTICS_ENABLED=0 python -m t2sql.testing_evaluation --testset qa_classicmodels_paraphrase_stress.yml --output results.xlsx --easy" 2>&1 | tee run_paraphrase_easy_domain_off.log
+
+# EVALUATION
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset test_classicmodels_easy.yml --output results.xlsx --easy" 2>&1 | tee evaluation_easy.log

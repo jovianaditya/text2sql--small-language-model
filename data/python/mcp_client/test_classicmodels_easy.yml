@@ -1,0 +1,140 @@
+cases:
+    - id: E1
+      difficulty: easy
+      question: "Give me all customer names in A-Z order."
+      groundtruth_sql: |
+        SELECT customerName FROM customers ORDER BY customerName;
+    - id: E2
+      difficulty: easy
+      question: "Show customer names and credit limits where the limit is at least 100000. Sort by credit limit descending, then by name."
+      groundtruth_sql: |
+        SELECT customerName, creditLimit 
+        FROM customers 
+        WHERE creditLimit >= 100000 
+        ORDER BY creditLimit DESC, customerName ASC;
+    - id: E3
+      difficulty: easy
+      question: "List order numbers placed between 2003-01-16 and 2003-03-07."
+      groundtruth_sql: |
+        SELECT orderNumber
+        FROM orders
+        WHERE orderDate BETWEEN '2003-01-16' AND '2003-03-07';
+    - id: E4
+      difficulty: easy
+      question: "Top 5 most expensive products: show product code, name, and list price."
+      groundtruth_sql: |
+        SELECT productCode, productName, MSRP 
+        FROM products 
+        ORDER BY MSRP DESC LIMIT 5;
+    - id: E5
+      difficulty: easy
+      question: "Show products with stock below 100 units."
+      groundtruth_sql: |
+        SELECT productName, quantityInStock 
+        FROM products 
+        WHERE quantityInStock < 100;
+    - id: E6
+      difficulty: easy
+      question: "Show product lines and their text descriptions where HTML description is missing."
+      groundtruth_sql: |
+        SELECT productLine, textDescription 
+        FROM productlines 
+        WHERE htmlDescription IS NULL;
+    - id: E7
+      difficulty: easy
+      question: "Find products whose names contain Ford. Return product codes and names."
+      groundtruth_sql: |
+        SELECT productCode, productName 
+        FROM products 
+        WHERE productName LIKE '%Ford%';
+    - id: E8
+      difficulty: easy
+      question: "List customers and their countries in France, Germany, or Spain."
+      groundtruth_sql: |
+        SELECT customerName, country 
+        FROM customers 
+        WHERE country IN ('France', 'Germany', 'Spain');
+    - id: E9
+      difficulty: easy
+      question: "Show orders with status Shipped. Return order number, order date, and status."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate, status 
+        FROM orders 
+        WHERE status = 'Shipped';
+    - id: E10
+      difficulty: easy
+      question: "Orders not shipped yet: return order number, order date, and status."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate, status 
+        FROM orders 
+        WHERE shippedDate IS NULL;
+    - id: E11
+      difficulty: easy
+      question: "List offices in territories EMEA or APAC."
+      groundtruth_sql: |
+        SELECT officeCode, city, territory 
+        FROM offices 
+        WHERE territory IN ('EMEA', 'APAC');
+    - id: E12
+      difficulty: easy
+      question: "Show order details where product code starts with S."
+      groundtruth_sql: |
+        SELECT orderNumber, productCode, quantityOrdered, priceEach 
+        FROM orderdetails 
+        WHERE productCode LIKE 'S%';
+    - id: E13
+      difficulty: easy
+      question: "Find employees reporting to employee number 1143."
+      groundtruth_sql: |
+        SELECT employeeNumber, firstName, lastName, reportsTo 
+        FROM employees 
+        WHERE reportsTo = 1143;
+    - id: E14
+      difficulty: easy
+      question: "Payments with check numbers matching two letters + 5 digits + 1 digit. Show check number and amount."
+      groundtruth_sql: |
+        SELECT checkNumber, amount
+        FROM payments
+        WHERE checkNumber REGEXP '^[A-Z]{2}[0-9]{5}[0-9]$';
+    - id: E15
+      difficulty: easy
+      question: "Payments in Q1 2004 (Jan-Mar): show customer number, payment date, and amount."
+      groundtruth_sql: |
+        SELECT customerNumber, paymentDate, amount 
+        FROM payments 
+        WHERE YEAR(paymentDate) = 2004 AND MONTH(paymentDate) BETWEEN 1 AND 3;
+    - id: E16
+      difficulty: easy
+      question: "Order details with quantity between 20 and 40 and product code starting with S. Return order number, product code, and quantity ordered."
+      groundtruth_sql: |
+        SELECT orderNumber, productCode, quantityOrdered 
+        FROM orderdetails 
+        WHERE quantityOrdered BETWEEN 20 AND 40 AND productCode LIKE 'S%';
+    - id: E17
+      difficulty: easy
+      question: "Find offices where the city name has exactly two words."
+      groundtruth_sql: |
+        SELECT officeCode, city 
+        FROM offices 
+        WHERE city REGEXP '^[A-Za-z]+[[:space:]][A-Za-z]+$';
+    - id: E18
+      difficulty: easy
+      question: "Find employees with last names containing e but not ending with e."
+      groundtruth_sql: |
+        SELECT employeeNumber, firstName, lastName 
+        FROM employees 
+        WHERE lastName LIKE '%e%' AND lastName NOT LIKE '%e';
+    - id: E19
+      difficulty: easy
+      question: "Find offices not in USA, France, or Australia."
+      groundtruth_sql: |
+        SELECT officeCode, city, country 
+        FROM offices 
+        WHERE country NOT IN ('USA', 'France', 'Australia');
+    - id: E20
+      difficulty: easy
+      question: "Find orders placed on Friday."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate 
+        FROM orders 
+        WHERE DAYOFWEEK(orderDate) = 6;

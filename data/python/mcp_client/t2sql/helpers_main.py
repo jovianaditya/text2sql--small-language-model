@@ -96,6 +96,7 @@ from .helpers_core import (
     _rewrite_row_level_nonnull_to_group_existence,
     _rewrite_role_label_count_semantics,
     _drop_unrequested_exists_filters,
+    _drop_unrequested_group_key_filters,
     _drop_unrequested_temporal_filters,
     _rewrite_missing_temporal_bridge_exclusion,
     _rewrite_temporal_year_exclusion_antijoin,
@@ -1734,6 +1735,56 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
     except Exception:
         schema_tables = list(allowed_identifiers.keys())
 
+    allowed_tables_case = {
+        str(table).strip("`").lower(): str(table).strip("`")
+        for table in allowed_identifiers.keys()
+        if str(table).strip("`")
+    }
+
+    def _fallback_scope_tables(sql_text: str) -> List[str]:
+        """
+        Scope schema-driven alias fallback to tables already active in the
+        current SQL when possible, then fall back to request-scoped ALLOWED
+        tables. This keeps generic aliases like bare `name` table-aware.
+        """
+        scoped: List[str] = []
+        seen: Set[str] = set()
+
+        def _push(table_name: str) -> None:
+            raw = str(table_name or "").strip().strip("`")
+            if not raw:
+                return
+            canon = allowed_tables_case.get(raw.lower(), raw)
+            low = canon.lower()
+            if low in seen:
+                return
+            seen.add(low)
+            scoped.append(canon)
+
+        code_parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")", sql_text or "")
+        code_only = "".join(part if idx % 2 == 0 else " " for idx, part in enumerate(code_parts))
+        table_pat = re.compile(
+            r"\b(?:FROM|JOIN)\s+((?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)",
+            flags=re.I,
+        )
+        for match in table_pat.finditer(code_only):
+            raw_ref = str(match.group(1) or "").strip()
+            if not raw_ref:
+                continue
+            parts = [p.strip().strip("`") for p in raw_ref.split(".") if p.strip()]
+            if not parts:
+                continue
+            _push(parts[-1])
+
+        if scoped:
+            return scoped
+
+        for table_name in allowed_identifiers.keys():
+            _push(table_name)
+        return scoped or list(schema_tables)
+
+    fallback_tables = _fallback_scope_tables(sql)
+
     def _semantic_alias_keys(text: str) -> Set[str]:
         raw = str(text or "").strip().lower()
         if not raw:
@@ -1767,7 +1818,7 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
             if not seed_keys:
                 return set()
             expanded: Set[str] = set()
-            for table in schema_tables:
+            for table in fallback_tables:
                 try:
                     table_columns = list(analyzer.get_table_columns(table)) if analyzer is not None else list(allowed_identifiers.get(table, ()))
                 except Exception:
@@ -1787,7 +1838,7 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
         exclude_keys.update(_expand_keys_from_schema(exclude_keys))
 
         candidates: List[Tuple[int, int, int, str]] = []
-        for table in schema_tables:
+        for table in fallback_tables:
             try:
                 table_columns = list(analyzer.get_table_columns(table)) if analyzer is not None else list(allowed_identifiers.get(table, ()))
             except Exception:
@@ -1828,7 +1879,7 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
             return
         _put_fallback(alias, best_canon)
 
-    for table in schema_tables:
+    for table in fallback_tables:
         # Add name column mapping
         name_col = get_name_column(table)
         if name_col:
@@ -4035,7 +4086,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     s = _prefer_friendly_names(s, question)
     s = _ensure_entity_id_and_name_if_requested(s, question)
-    s = _ensure_explicit_simple_projection_columns(s, question)
+    s = _ensure_explicit_simple_projection_columns(s, question, ctx)
     s = _prune_non_primary_dimensions_for_primary_aggregate(s, question, ctx)
     s = _drop_redundant_raw_name_columns_when_concat_present(s, question)
     s = _expand_group_by_aliases_regex(s)
@@ -4464,6 +4515,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _rewrite_union_case_label_to_literal_branches(s, question)
     s = _rewrite_concat_label_union(s, question)
     s = _strip_unneeded_count_distinct(s, question)
+    s = _drop_unrequested_group_key_filters(s, question, ctx)
+    if DEBUG_WR: print(f"[REFINER - PH6] after unrequested group-key filter drop fix: {s}")
     # ---------------------------------------------------------------------------
     # Phase 6.5 — Strip Hallucinated WHERE on GROUP BY Column for "For Each" Queries
     # ---------------------------------------------------------------------------
