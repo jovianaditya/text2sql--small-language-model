@@ -98,6 +98,8 @@ from .helpers_core import (
     _drop_unrequested_exists_filters,
     _drop_unrequested_group_key_filters,
     _drop_unrequested_temporal_filters,
+    _repair_unbalanced_not_exists_order_by,
+    _rewrite_two_table_grouped_temporal_exclusion,
     _rewrite_missing_temporal_bridge_exclusion,
     _rewrite_temporal_year_exclusion_antijoin,
     _prefer_not_exists_for_simple_exclusion,
@@ -4334,6 +4336,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_winner_row_guardrail(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after guardrail:", s)
 
+        s = _repair_unbalanced_not_exists_order_by(s)
+        if DEBUG_WR: print("[REFINER - PH4] after unbalanced NOT EXISTS fix:", s)
+
         s = _rewrite_winner_row_aggregate_misuse(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after agg-misuse:", s)
 
@@ -4428,6 +4433,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _drop_unrequested_temporal_filters(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested temporal-filter drop fix: {s}")
 
+        s = _rewrite_two_table_grouped_temporal_exclusion(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after two-table temporal exclusion fix: {s}")
+
         s = _rewrite_missing_temporal_bridge_exclusion(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after temporal missing-bridge exclusion fix: {s}")
 
@@ -4461,6 +4469,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
                 if DEBUG_WR: print(f"[PH4-FORCE] after raw-where-to-having fix: {s}")
             elif DEBUG_WR:
                 print("[PH4-FORCE] AST semantic-first enabled: skip regex agg/having surgery")
+            s = _repair_unbalanced_not_exists_order_by(s)
+            if DEBUG_WR: print(f"[PH4-FORCE] after unbalanced NOT EXISTS fix: {s}")
             s = _add_missing_count_for_group_by(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after add-count fix: {s}")
 
