@@ -9396,8 +9396,6 @@ def _rewrite_dual_fact_rollup_exists_shape(sql: str, question: str, ctx: str = "
             if re.search(rf"\b{w_pat}\b", q_low, flags=re.I):
                 score += 3
                 break
-        if sum_inner_clean.lower() in {"amount", "payment", "payments"} and "pay" in table_name:
-            score += 2
         sum_candidates.append((score, table_name, (base_sum_key, sum_key)))
 
     if not sum_candidates:

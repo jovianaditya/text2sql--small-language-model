@@ -1077,29 +1077,93 @@ async def warmup_models(app, paths: list[str]):
     This guarantees model loading regardless of pipeline success.
     Eliminates cold start bias in latency measurements.
     """
+    await warmup_models_selected(app, paths, resolve_warmup_targets("all"))
+
+
+def resolve_warmup_targets(warmup_models_spec: str | None) -> list[tuple[str, str]]:
+    """
+    Resolve CLI warmup target spec into ordered `(model_name, description)` tuples.
+
+    Supported tokens:
+      - all
+      - router
+      - small / 3b / simple
+      - large / 7b / complex
+
+    Unknown tokens raise ValueError so the caller gets a clear CLI failure.
+    """
+    available_targets = {
+        "router": (ROUTING_MODEL, "Router (1.5b)"),
+        "small": (SMALL_MODEL, "Simple SQL (3b)"),
+        "3b": (SMALL_MODEL, "Simple SQL (3b)"),
+        "simple": (SMALL_MODEL, "Simple SQL (3b)"),
+        "large": (LARGE_MODEL, "Complex SQL (7b)"),
+        "7b": (LARGE_MODEL, "Complex SQL (7b)"),
+        "complex": (LARGE_MODEL, "Complex SQL (7b)"),
+    }
+    default_order = ["router", "small", "large"]
+
+    spec = str(warmup_models_spec or "all").strip().lower()
+    if not spec or spec == "all":
+        return [available_targets[key] for key in default_order]
+
+    requested_tokens = [tok.strip().lower() for tok in spec.split(",") if tok.strip()]
+    if not requested_tokens:
+        return [available_targets[key] for key in default_order]
+
+    resolved: list[tuple[str, str]] = []
+    seen_models: set[str] = set()
+    for token in requested_tokens:
+        if token == "all":
+            for key in default_order:
+                model_name, desc = available_targets[key]
+                if model_name not in seen_models:
+                    resolved.append((model_name, desc))
+                    seen_models.add(model_name)
+            continue
+        if token not in available_targets:
+            valid_tokens = "all, router, small, 3b, simple, large, 7b, complex"
+            raise ValueError(
+                f"Unknown warmup target '{token}'. Valid values: {valid_tokens}"
+            )
+        model_name, desc = available_targets[token]
+        if model_name in seen_models:
+            continue
+        resolved.append((model_name, desc))
+        seen_models.add(model_name)
+
+    return resolved
+
+
+async def warmup_models_selected(
+    app,
+    paths: list[str],
+    warmup_targets: list[tuple[str, str]],
+):
+    """
+    Warmup selected models by calling Ollama API directly.
+    """
+    if not warmup_targets:
+        print("[STATUS] Warmup skipped - no warmup targets selected.")
+        return
+
     print("\n" + "=" * 60)
     print("WARMUP PHASE - Loading models into memory...")
     print("=" * 60)
-    
-    # Models to warm up (directly call Ollama, bypass pipeline)
-    models_to_warmup = [
-        (ROUTING_MODEL, "Router (1.5b)"),
-        (SMALL_MODEL, "Simple SQL (3b)"),
-        (LARGE_MODEL, "Complex SQL (7b)"),
-    ]
-    
-    # Simple prompt that any model can answer
+    print(
+        "[STATUS] Warmup targets: "
+        + ", ".join(f"{desc}: {model}" for model, desc in warmup_targets)
+    )
+
     warmup_prompt = "Say 'ready' in one word."
-    
-    import sys
-    # Set agents._last_model_warmup after warmup
+
     try:
         from . import agents
     except ImportError:
         agents = None
     async with httpx.AsyncClient(timeout=120.0) as client:
         now = time.time()
-        for model, desc in models_to_warmup:
+        for model, desc in warmup_targets:
             print(f"[STATUS] Loading {desc}: {model}")
             try:
                 response = await client.post(
@@ -1114,16 +1178,15 @@ async def warmup_models(app, paths: list[str]):
                 )
                 if response.status_code == 200:
                     print(f"  ✓ {desc} loaded successfully")
-                    # Update agents._last_model_warmup so agent logic can skip warmup
                     if agents is not None:
                         agents._last_model_warmup[model] = now
                 else:
                     print(f"  ⚠ {desc} returned status {response.status_code}")
             except Exception as e:
                 print(f"  ⚠ Failed to load {desc}: {e}")
-    
+
     print("=" * 60)
-    print("Warmup complete - all models are now in memory")
+    print("Warmup complete - selected models are now in memory")
     print("=" * 60 + "\n")
 
 
@@ -1133,6 +1196,7 @@ async def run_batch_eval(
     paths: list[str] | None = None,
     execute_groundtruth: bool = True,
     skip_warmup: bool = False,
+    warmup_models_spec: str | None = None,
     difficulty_filters: dict[str, set[int] | None] | None = None,
     null_zero_mode: str = "auto",
     ts_databases: list[str] | None = None,
@@ -1147,6 +1211,7 @@ async def run_batch_eval(
         paths: JSONL paths for context
         execute_groundtruth: Whether to execute groundtruth SQL for comparison
         skip_warmup: Skip warmup phase (not recommended)
+        warmup_models_spec: Comma-separated warmup targets. Default warms all.
         difficulty_filters: Dict mapping difficulty to ID filter (e.g., {'easy': {4, 5, 6, 7}})
                           None value means all IDs for that difficulty.
                           Example: {'easy': {4, 5, 6, 7}, 'hard': None}
@@ -1238,7 +1303,8 @@ async def run_batch_eval(
     
     # Warmup phase to eliminate cold start bias
     if not skip_warmup:
-        await warmup_models(app, paths)
+        warmup_targets = resolve_warmup_targets(warmup_models_spec)
+        await warmup_models_selected(app, paths, warmup_targets)
     
     # Setup MCP connection
     transport = StreamableHttpTransport(MCP_BASE)
@@ -1449,6 +1515,15 @@ Examples:
         help="Skip warmup phase (not recommended - will cause cold start bias)"
     )
     parser.add_argument(
+        "--warmup-models",
+        default="all",
+        help=(
+            "Comma-separated warmup targets. "
+            "Supported: all, router, small, 3b, simple, large, 7b, complex. "
+            "Examples: --warmup-models small or --warmup-models router,small"
+        ),
+    )
+    parser.add_argument(
         "--null-zero-equivalent",
         action="store_true",
         help="Backward-compatible alias for --null-zero-mode on"
@@ -1546,6 +1621,7 @@ Examples:
             output_path=args.output,
             execute_groundtruth=not args.no_groundtruth_exec,
             skip_warmup=args.skip_warmup,
+            warmup_models_spec=args.warmup_models,
             difficulty_filters=difficulty_filters if difficulty_filters else None,
             null_zero_mode=null_zero_mode,
             ts_databases=ts_databases,
