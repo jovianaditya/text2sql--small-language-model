@@ -131,7 +131,7 @@ class SchemaAnalyzer:
         Infer table types from column patterns and metadata.
 
         Table Types:
-        - transaction: Tables with amount/quantity columns (payments, orderdetails)
+        - transaction: Tables with metric-like numeric signals plus relational activity
         - dimension: Master tables (customers, products, employees)
         - bridge: Junction tables with composite FKs (orderdetails)
         - reference: Lookup tables (productlines, offices)
@@ -139,19 +139,55 @@ class SchemaAnalyzer:
         for table in self._tables:
             columns = self._table_columns[table]
 
-            # Check for transaction indicators
-            has_amount = any('amount' in col for col in columns)
-            has_quantity = any('quantity' in col for col in columns)
-            has_price = any('price' in col for col in columns)
-
             # Check for bridge table (multiple FKs)
             fk_count = len(self._fk_relationships.get(table, {}))
+
+            roles = self._column_roles.get(table, {})
+            datatypes = self._column_datatypes.get(table, {})
+
+            metric_role_cols = {
+                col for col in columns
+                if str(roles.get(col, "")).strip().lower() in {"metric", "measure", "amount", "quantity"}
+            }
+
+            numeric_dtype_cols = {
+                col for col in columns
+                if any(
+                    nt in str(datatypes.get(col, "")).upper()
+                    for nt in {
+                        "INT", "INTEGER", "DECIMAL", "FLOAT", "DOUBLE", "NUMERIC",
+                        "SMALLINT", "BIGINT", "TINYINT", "MEDIUMINT", "REAL",
+                    }
+                )
+            }
+            non_key_numeric_cols = {
+                col for col in numeric_dtype_cols
+                if not self._column_primary_key_hints.get(f"{table}.{col}", False)
+                and not self._column_foreign_key_hints.get(f"{table}.{col}", False)
+                and not (
+                    col.endswith("id")
+                    or col.endswith("number")
+                    or col.endswith("code")
+                    or "postal" in col
+                    or "zip" in col
+                )
+            }
+
+            has_temporal_signal = any(
+                any(k in col for k in ("date", "time", "timestamp"))
+                or "DATE" in str(datatypes.get(col, "")).upper()
+                or "TIME" in str(datatypes.get(col, "")).upper()
+                for col in columns
+            )
+
+            has_metric_signal = bool(metric_role_cols) or bool(non_key_numeric_cols)
+            has_activity_signal = has_metric_signal and (has_temporal_signal or fk_count >= 2)
 
             # Check for dimension indicators
             has_name = any('name' in col for col in columns)
             is_master = table.endswith('s') and fk_count == 0 and has_name
 
-            if has_amount or has_quantity:
+            if has_activity_signal and fk_count >= 1:
                 self._table_types[table] = "transaction"
             elif fk_count >= 2:
                 self._table_types[table] = "bridge"
@@ -804,9 +840,9 @@ def is_numeric_column(table: str, column: str) -> bool:
     Check if column is numeric (for ORDER BY, aggregation, comparison).
     
     Detection methods:
-    1. Datatype from metadata (INT, DECIMAL, FLOAT, DOUBLE, NUMERIC)
-    2. Column name patterns (amount, price, quantity, total, count, number)
-    3. Role from metadata (metric)
+    1. Role from metadata (metric/measure)
+    2. Datatype from metadata (INT, DECIMAL, FLOAT, DOUBLE, NUMERIC)
+    3. Generic cross-domain metric naming cues
     
     Args:
         table: Table name
@@ -817,26 +853,28 @@ def is_numeric_column(table: str, column: str) -> bool:
     """
     t = (table or "").lower()
     c = (column or "").lower()
+
+    # 1. Check role from metadata first
+    role = get_column_role(t, c)
+    if role in ('metric', 'measure', 'quantity', 'amount'):
+        return True
     
-    # 1. Check datatype from metadata
+    # 2. Check datatype from metadata
     dtype = get_column_datatype(t, c).upper()
     numeric_types = {'INT', 'INTEGER', 'DECIMAL', 'FLOAT', 'DOUBLE', 'NUMERIC', 
                      'SMALLINT', 'BIGINT', 'TINYINT', 'MEDIUMINT', 'REAL'}
     if any(nt in dtype for nt in numeric_types):
         return True
     
-    # 2. Check column name patterns
-    numeric_patterns = ('amount', 'price', 'quantity', 'total', 'count', 
-                       'sum', 'cost', 'value', 'rate', 'percent', 'ratio',
-                       'limit', 'balance', 'fee', 'tax', 'discount', 'msrp',
-                       'buyprice', 'creditlimit', 'quantityinstock')
+    # 3. Check generic cross-domain name patterns.
+    # Keep this intentionally narrow and avoid domain-specific tokens such as
+    # MSRP / buyPrice / creditLimit / quantityInStock.
+    numeric_patterns = (
+        'amount', 'price', 'quantity', 'total', 'count',
+        'sum', 'cost', 'value', 'rate', 'percent', 'ratio',
+    )
     # Use suffix/whole-word matching to avoid 'country' matching 'count'
     if c in numeric_patterns or any(c.endswith(p) for p in numeric_patterns):
-        return True
-    
-    # 3. Check role from metadata
-    role = get_column_role(t, c)
-    if role in ('metric', 'measure', 'quantity', 'amount'):
         return True
     
     return False
@@ -1122,7 +1160,7 @@ def infer_best_order_column(table: str, question: str) -> Optional[str]:
     
     Strategy:
     1. If question mentions 'date', 'time', 'recent', 'latest' → date column
-    2. If question mentions 'amount', 'price', 'revenue', 'sales' → numeric column
+    2. If question semantically overlaps with a numeric column → numeric column
     3. If question asks for 'highest', 'lowest', 'top' → first numeric column
     4. Fallback: first orderable column
     
@@ -1164,10 +1202,8 @@ def infer_best_aggregate_column(table: str, question: str) -> Optional[str]:
     Infer the best column for aggregation based on question context.
     
     Strategy:
-    1. If question mentions 'total', 'sum', 'revenue' → amount/sales column
-    2. If question mentions 'average', 'avg' → price/amount column
-    3. If question mentions 'count', 'how many' → ID column (for COUNT)
-    4. Fallback: first numeric column
+    1. If question semantically overlaps with a numeric column → that column
+    2. Fallback: first numeric column
     
     Args:
         table: Table name
@@ -1196,7 +1232,7 @@ def get_column_semantic_type(table: str, column: str) -> str:
     
     Returns one of:
     - 'id': Primary key or foreign key
-    - 'metric': Numeric measure (amount, quantity, price)
+    - 'metric': Numeric measure
     - 'date': Date/datetime/timestamp
     - 'name': Name/descriptive text field
     - 'code': Classification code (not PK/FK)

@@ -1068,15 +1068,26 @@ def _table_inflected_mention_terms(table: str) -> Set[str]:
 
     # Include compact single-token candidates/synonyms as optional stems.
     for cand in _table_mention_candidates(t, include_synonyms=True):
-        token = str(cand or "").strip().lower().replace(" ", "")
-        if not token or not token.isalpha():
-            continue
-        if len(token) >= 3:
-            stems.add(token)
-        if token.endswith("s") and len(token) >= 4:
-            stems.add(token[:-1])
-        if token.endswith("ment") and len(token) >= 6:
-            stems.add(token[:-4])
+        cand_text = str(cand or "").strip().lower()
+        token = cand_text.replace(" ", "")
+        if token and token.isalpha():
+            if len(token) >= 3:
+                stems.add(token)
+            if token.endswith("s") and len(token) >= 4:
+                stems.add(token[:-1])
+            if token.endswith("ment") and len(token) >= 6:
+                stems.add(token[:-4])
+
+        # Compound names such as "order details" should contribute stems from
+        # component words too, so activity phrasing like "ordered" can ground
+        # bridge/supporting tables without table-specific rules.
+        for piece in re.findall(r"[a-z]+", cand_text):
+            if len(piece) < 3:
+                continue
+            stems.add(piece)
+            singular_piece = get_singular_form(piece)
+            if singular_piece and len(singular_piece) >= 3:
+                stems.add(singular_piece.lower())
 
     terms: Set[str] = set()
     for stem in list(stems):

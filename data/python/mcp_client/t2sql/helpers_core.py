@@ -14049,6 +14049,11 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
       FROM entity JOIN metric_table ...
       GROUP BY key_cols
 
+    Also handles the paraphrased shape:
+      SELECT key_cols, YEAR(orderDate) AS latest_year, SUM(metric)
+      FROM ...
+      GROUP BY key_cols, YEAR(orderDate)
+
     This sums across all years. Correct strategy:
       1) derive latest_year per entity from the metric table
       2) join/filter metric rows to that latest_year
@@ -14173,6 +14178,19 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
 
     date_expr_raw: Optional[str] = None
     sum_expr_raw: Optional[str] = None
+    allow_explicit_year_projection = not bool((parsed.get("where") or "").strip())
+
+    def _clean_alias_token(alias_value: Optional[str]) -> str:
+        if not alias_value:
+            return ""
+        a = alias_value.strip()
+        if (
+            (a.startswith("`") and a.endswith("`"))
+            or (a.startswith("'") and a.endswith("'"))
+            or (a.startswith('"') and a.endswith('"'))
+        ):
+            a = a[1:-1]
+        return a.strip().lower()
 
     for it in select_items:
         expr, _alias = _split_expr_alias(it)
@@ -14190,6 +14208,23 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
                 _, col_name = parsed_col
                 if ("date" in col_name.lower()) or ("time" in col_name.lower()):
                     date_expr_raw = max_inner_col
+                    continue
+
+        m_year = re.match(r"(?is)^YEAR\s*\(\s*(.+?)\s*\)$", expr)
+        if allow_explicit_year_projection and m_year and date_expr_raw is None:
+            year_inner = m_year.group(1).strip()
+            parsed_col = _parse_qualified_col(year_inner)
+            if parsed_col:
+                _, col_name = parsed_col
+                alias_l = _clean_alias_token(_alias)
+                # Keep this narrow: only treat explicit YEAR(date) projection as
+                # the target latest-year output when the alias is year-like.
+                if (
+                    (("date" in col_name.lower()) or ("time" in col_name.lower()))
+                    and alias_l
+                    and (("year" in alias_l) or ("tahun" in alias_l))
+                ):
+                    date_expr_raw = year_inner
                     continue
 
         m_sum = re.match(r"(?is)^SUM\s*\(\s*(.+?)\s*\)$", expr)
@@ -17307,6 +17342,7 @@ def _rewrite_latest_year_tuple_in_filter(sql: str, question: str, ctx: str = "")
             outer_tuple_items = _split_top_level_commas(malformed_tuple_match.group("outer_tuple") or "")
             if outer_tuple_items:
                 first_outer = (outer_tuple_items[0] or "").strip()
+                second_outer_ref = _parse_simple_col(outer_tuple_items[1]) if len(outer_tuple_items) >= 2 else None
                 outer_year = re.match(
                     r"""(?is)^YEAR\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*$""",
                     first_outer,
@@ -17351,6 +17387,52 @@ def _rewrite_latest_year_tuple_in_filter(sql: str, question: str, ctx: str = "")
                                     ),
                                     None,
                                 )
+                                if not target_outer_ref and second_outer_ref:
+                                    current_outer_alias, current_outer_col = second_outer_ref
+                                    outer_date_table = alias_map.get(outer_date_alias) or alias_map.get(outer_date_alias.lower())
+                                    if outer_date_table:
+                                        bridge_candidates_for_inference: List[tuple[int, tuple[str, str, str, str]]] = []
+                                        for m_eq in eq_pairs:
+                                            a1, c1, a2, c2 = m_eq.group(1), m_eq.group(2), m_eq.group(3), m_eq.group(4)
+                                            a1l, a2l = a1.lower(), a2.lower()
+
+                                            if a1l == outer_date_alias.lower() and a2l in alias_map and a2l != outer_date_alias.lower():
+                                                bridge_alias, date_join_col, bridge_link_col = a2, c1, c2
+                                            elif a2l == outer_date_alias.lower() and a1l in alias_map and a1l != outer_date_alias.lower():
+                                                bridge_alias, date_join_col, bridge_link_col = a1, c2, c1
+                                            else:
+                                                continue
+
+                                            if bridge_alias.lower() != str(current_outer_alias or "").lower():
+                                                continue
+                                            if bridge_link_col.lower() != str(current_outer_col or "").lower():
+                                                continue
+
+                                            bridge_table = alias_map.get(bridge_alias) or alias_map.get(bridge_alias.lower())
+                                            bridge_cols = _table_cols(bridge_table)
+                                            if bridge_cols and bridge_link_col.lower() not in bridge_cols:
+                                                continue
+                                            date_cols = _table_cols(outer_date_table)
+                                            if date_cols and date_join_col.lower() not in date_cols:
+                                                continue
+
+                                            bridge_candidates_for_inference.append(
+                                                (2, (bridge_alias, bridge_table, date_join_col, bridge_link_col))
+                                            )
+
+                                        if bridge_candidates_for_inference:
+                                            bridge_candidates_for_inference.sort(key=lambda item: item[0], reverse=True)
+                                            bridge_alias, bridge_table, _date_join_col, bridge_link_col = bridge_candidates_for_inference[0][1]
+                                            inferred_target = _infer_grouped_entity_target(
+                                                bridge_alias,
+                                                bridge_table,
+                                                outer_date_alias,
+                                                current_outer_alias,
+                                                current_outer_col,
+                                                bridge_link_col,
+                                            )
+                                            if inferred_target:
+                                                target_outer_ref = (inferred_target[0], inferred_target[1])
                                 if target_outer_ref:
                                     outer_entity_alias, outer_entity_col = target_outer_ref
                                     outer_date_table = alias_map.get(outer_date_alias) or alias_map.get(outer_date_alias.lower())

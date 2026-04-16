@@ -5458,6 +5458,304 @@ def _recover_missing_outer_winner_row_columns(sql: str, missing_cols: List[str])
     return fixed
 
 
+def _repair_single_table_winner_row_projection(sql: str, question: str, ctx: str = "") -> Optional[str]:
+    """
+    Repair narrow winner-row near-misses for single-table ranked queries.
+
+    Typical malformed shape:
+      SELECT t.customer
+      FROM (
+        SELECT customer, amount,
+               ROW_NUMBER() OVER (PARTITION BY customer ORDER BY amount DESC) AS rn
+        FROM payments AS t1
+      ) AS t
+      WHERE t.rn = 2;
+
+    Correct generic shape:
+      SELECT t.customerNumber, t.amount
+      FROM (
+        SELECT customerNumber, amount,
+               ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC) AS rn
+        FROM payments AS t1
+      ) AS t
+      WHERE t.rn = 2;
+
+    Guardrails:
+    - only for winner-row questions
+    - only for single-table ROW_NUMBER derived-table patterns
+    - only when a generic entity token can be mapped uniquely to a key-like
+      schema column (e.g. customer -> customerNumber)
+    - only auto-adds projected columns that are explicitly requested and
+      already available from the ranked inner rows
+    """
+    s = str(sql or "").strip()
+    if not s or "ROW_NUMBER" not in s.upper():
+        return None
+    if not _question_wants_winner_row(question):
+        return None
+
+    pattern = re.compile(
+        r"(?is)^\s*SELECT\s+(?P<outer>.*?)\s+FROM\s*\(\s*SELECT\s+(?P<inner>.*?)\s+FROM\s+(?P<rest>.+?)\)\s*(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s+WHERE\s+(?P=alias)\.rn\s*=\s*(?P<rank>\d+)\s*(?P<tail>.*?);?\s*$"
+    )
+    m = pattern.match(s)
+    if not m:
+        return None
+
+    inner_rest = str(m.group("rest") or "").strip()
+    if not inner_rest or re.search(r"(?is)\bJOIN\b", inner_rest):
+        return None
+    if re.search(r"(?is)\bSELECT\b", inner_rest):
+        return None
+
+    base_match = re.match(
+        r"""(?is)^\s*(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?(?P<tail>.*)$""",
+        inner_rest,
+    )
+    if not base_match:
+        return None
+
+    inner_table_expr = str(base_match.group(1) or "").strip()
+    inner_tail = str(base_match.group("tail") or "").strip()
+    if "," in inner_table_expr or "," in inner_tail:
+        return None
+
+    table_name = inner_table_expr.replace("`", "").split(".")[-1].strip().lower()
+    if not table_name:
+        return None
+
+    allowed_map = _parse_allowed_identifiers(ctx or "")
+    valid_cols_by_lower: Dict[str, str] = {
+        str(c).strip("`").lower(): str(c).strip("`")
+        for t, cols in (allowed_map or {}).items()
+        if str(t).strip("`").lower() == table_name
+        for c in (cols or set())
+        if str(c).strip("`")
+    }
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+    if analyzer is not None:
+        try:
+            for col_name in analyzer.get_table_columns(table_name):
+                raw_col = str(col_name).strip("`")
+                if raw_col:
+                    valid_cols_by_lower.setdefault(raw_col.lower(), raw_col)
+        except Exception:
+            pass
+    valid_cols = set(valid_cols_by_lower.keys())
+    if not valid_cols:
+        return None
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    buf.append(ch)
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                buf.append(ch)
+                i += 1
+                continue
+            if not in_sq and not in_dq:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif ch == "," and depth == 0:
+                    item = "".join(buf).strip()
+                    if item:
+                        items.append(item)
+                    buf = []
+                    i += 1
+                    continue
+            buf.append(ch)
+            i += 1
+        tail_item = "".join(buf).strip()
+        if tail_item:
+            items.append(tail_item)
+        return items
+
+    def _extract_output_label(select_item: str) -> str:
+        item = str(select_item or "").strip()
+        if not item:
+            return ""
+        alias_match = re.search(
+            r"""(?is)\bAS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item,
+        )
+        if alias_match:
+            return alias_match.group(1).strip("`'\"").lower()
+        simple_match = re.match(
+            r"(?is)^\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            item,
+        )
+        return (simple_match.group(1).lower() if simple_match else "")
+
+    def _simple_ref(item: str) -> Optional[Tuple[Optional[str], str]]:
+        item_s = str(item or "").strip()
+        m_ref = re.match(
+            r"(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            item_s,
+        )
+        if not m_ref:
+            return None
+        qualifier = m_ref.group(1)
+        col = m_ref.group(2)
+        return (qualifier.lower() if qualifier else None, col.lower())
+
+    def _name_tokens(name: str) -> List[str]:
+        spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r"\1 \2", str(name or ""))
+        spaced = spaced.replace("_", " ")
+        tokens = [tok for tok in re.findall(r"[a-z0-9]+", spaced.lower()) if tok]
+        if len(tokens) == 1:
+            raw = tokens[0]
+            for suffix in ("number", "date", "amount", "code", "name", "time", "limit", "id", "key"):
+                if raw.endswith(suffix) and len(raw) > len(suffix):
+                    prefix = raw[: -len(suffix)].strip("_")
+                    if prefix:
+                        return [prefix, suffix]
+        return tokens
+
+    key_suffixes = {"id", "number", "code", "key"}
+
+    def _question_mentions_col(col_name: str) -> bool:
+        q = str(question or "").lower()
+        if not q:
+            return False
+        if re.search(rf"\b{re.escape(col_name.lower())}\b", q):
+            return True
+        tokens = _name_tokens(col_name)
+        if not tokens:
+            return False
+        spaced = " ".join(tokens)
+        if spaced and re.search(rf"\b{re.escape(spaced)}\b", q):
+            return True
+        entity_tokens = [tok for tok in tokens if tok not in key_suffixes]
+        if entity_tokens and key_suffixes.intersection(tokens):
+            entity_phrase = " ".join(entity_tokens)
+            if entity_phrase and re.search(
+                rf"\b{re.escape(entity_phrase)}\s+(?:id|number|code|key)\b",
+                q,
+                flags=re.I,
+            ):
+                return True
+        return False
+
+    def _pick_key_like_match(entity_token: str) -> Optional[str]:
+        entity = str(entity_token or "").strip().lower()
+        if not entity:
+            return None
+        ranked: List[Tuple[int, str]] = []
+        for col_lower, col_name in valid_cols_by_lower.items():
+            tokens = _name_tokens(col_name)
+            if entity not in tokens:
+                continue
+            if not key_suffixes.intersection(tokens):
+                continue
+            score = 0
+            if tokens and tokens[0] == entity:
+                score += 4
+            if tokens and tokens[-1] in key_suffixes:
+                score += 2
+            if col_lower.startswith(entity):
+                score += 1
+            ranked.append((score, col_name))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+        if len(ranked) > 1 and ranked[0][0] == ranked[1][0] and ranked[0][1] != ranked[1][1]:
+            return None
+        return ranked[0][1]
+
+    outer_select = str(m.group("outer") or "").strip()
+    inner_select = str(m.group("inner") or "").strip()
+    alias = str(m.group("alias") or "").strip()
+    tail = str(m.group("tail") or "").strip()
+
+    outer_items = _split_top_level_csv(outer_select)
+    inner_items = _split_top_level_csv(inner_select)
+
+    generic_map: Dict[str, str] = {}
+    for item in inner_items + outer_items:
+        ref = _simple_ref(item)
+        if not ref:
+            continue
+        _, col = ref
+        if col in valid_cols or col == "rn":
+            continue
+        mapped = _pick_key_like_match(col)
+        if mapped and mapped != col:
+            generic_map[col] = mapped
+
+    if not generic_map:
+        return None
+
+    def _replace_identifier_token(text: str, old: str, new: str) -> str:
+        out = str(text or "")
+        out = re.sub(
+            rf"(?i)(\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)`?{re.escape(old)}`?(?![A-Za-z0-9_])",
+            lambda m_ref: f"{m_ref.group(1)}{new}",
+            out,
+        )
+        out = re.sub(
+            rf"(?i)(?<![A-Za-z0-9_`])`?{re.escape(old)}`?(?![A-Za-z0-9_])",
+            new,
+            out,
+        )
+        return out
+
+    rebuilt_inner = inner_select
+    rebuilt_outer = outer_select
+    for old_col, new_col in generic_map.items():
+        rebuilt_inner = _replace_identifier_token(rebuilt_inner, old_col, new_col)
+        rebuilt_outer = _replace_identifier_token(rebuilt_outer, old_col, new_col)
+
+    outer_items_after = _split_top_level_csv(rebuilt_outer)
+    inner_items_after = _split_top_level_csv(rebuilt_inner)
+    outer_labels = {lbl for lbl in (_extract_output_label(it) for it in outer_items_after) if lbl}
+    inner_labels = {lbl for lbl in (_extract_output_label(it) for it in inner_items_after) if lbl}
+
+    append_items: List[str] = []
+    for inner_label in inner_labels:
+        if inner_label in {"rn"} or inner_label in outer_labels:
+            continue
+        if _question_mentions_col(inner_label):
+            append_items.append(f"{alias}.{inner_label}")
+            outer_labels.add(inner_label)
+
+    if append_items:
+        rebuilt_outer = ", ".join(_split_top_level_csv(rebuilt_outer) + append_items)
+
+    if rebuilt_outer.strip() == outer_select.strip() and rebuilt_inner.strip() == inner_select.strip():
+        return None
+
+    fixed = (
+        f"SELECT {rebuilt_outer} FROM (SELECT {rebuilt_inner} FROM {inner_rest}) {alias} "
+        f"WHERE {alias}.rn = {m.group('rank')}"
+    ).strip()
+    if tail:
+        fixed += " " + tail
+    fixed = re.sub(r"\s{2,}", " ", fixed).strip()
+    if s.endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _has_required_offset_window(sql: str, question: str) -> bool:
     s = str(sql or "")
     q = str(question or "").lower()
@@ -6144,6 +6442,11 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     final_sql, contract_corrections, contract_violations = _apply_semantic_contract(final_sql, question, ctx)
     if contract_corrections:
         corrections.extend(contract_corrections)
+
+    repaired_winner_projection = _repair_single_table_winner_row_projection(final_sql, question, ctx)
+    if repaired_winner_projection and repaired_winner_projection != final_sql:
+        final_sql = str(repaired_winner_projection).strip()
+        corrections.append("Applied single-table winner-row projection repair")
 
     sql_up = final_sql.upper()
 
