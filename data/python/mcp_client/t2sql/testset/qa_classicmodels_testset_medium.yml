@@ -1,0 +1,455 @@
+cases:
+    - id: M1
+      difficulty: medium
+      question: "Give me a 2004 order summary by quarter. Return the quarter number, total orders, and how many orders were shipped later than the required date. Sort from Q1 to Q4."
+      groundtruth_sql: |
+        SELECT
+          QUARTER(orderDate) AS quarter_number,
+          COUNT(*) AS total_orders,
+          SUM(CASE WHEN shippedDate > requiredDate THEN 1 ELSE 0 END) AS late_shipped_orders
+        FROM orders
+        WHERE YEAR(orderDate) = 2004
+        GROUP BY QUARTER(orderDate)
+        ORDER BY quarter_number ASC;
+
+    - id: M2
+      difficulty: medium
+      question: "For payments made in 2004, group them by calendar quarter. Return the quarter number, payment count, total amount, and average amount. Sort from quarter 1 to quarter 4."
+      groundtruth_sql: |
+        SELECT
+          QUARTER(paymentDate) AS quarter_number,
+          COUNT(*) AS payment_count,
+          SUM(amount) AS total_amount,
+          AVG(amount) AS average_amount
+        FROM payments
+        WHERE YEAR(paymentDate) = 2004
+        GROUP BY QUARTER(paymentDate)
+        ORDER BY quarter_number ASC;
+
+    - id: M3
+      difficulty: medium
+      question: "Find countries with at least 3 customers, then show the customer count and average credit limit. Keep only countries whose average credit limit is above the overall average credit limit. Order by customer count descending, then country A-Z."
+      groundtruth_sql: |
+        SELECT
+          country,
+          COUNT(*) AS customer_count,
+          AVG(creditLimit) AS average_credit_limit
+        FROM customers
+        WHERE creditLimit IS NOT NULL
+        GROUP BY country
+        HAVING COUNT(*) >= 3
+           AND AVG(creditLimit) > (
+             SELECT AVG(creditLimit)
+             FROM customers
+             WHERE creditLimit IS NOT NULL
+           )
+        ORDER BY customer_count DESC, country ASC;
+
+    - id: M4
+      difficulty: medium
+      question: "For each employee, return the employee number, office code, and that employee's rank inside the office when employee numbers are sorted from highest to lowest. Final output should be ordered by office code, then rank, then employee number."
+      groundtruth_sql: |
+        SELECT
+          employeeNumber,
+          officeCode,
+          ROW_NUMBER() OVER (
+            PARTITION BY officeCode
+            ORDER BY employeeNumber DESC
+          ) AS office_row_number
+        FROM employees
+        ORDER BY officeCode ASC, office_row_number ASC, employeeNumber DESC;
+
+    - id: M5
+      difficulty: medium
+      question: "Show products whose MSRP is higher than the average MSRP within the same product line. Return product code, product name, product line, and MSRP. Sort by highest MSRP first, then product code."
+      groundtruth_sql: |
+        SELECT
+          p.productCode,
+          p.productName,
+          p.productLine,
+          p.MSRP
+        FROM products AS p
+        WHERE p.MSRP > (
+          SELECT AVG(p2.MSRP)
+          FROM products AS p2
+          WHERE p2.productLine = p.productLine
+        )
+        ORDER BY p.MSRP DESC, p.productCode ASC;
+
+    - id: M6
+      difficulty: medium
+      question: "For each vendor, show how many products they have, the highest MSRP, and the lowest buy price. Keep only vendors with at least 3 products. Sort by highest MSRP descending, then vendor."
+      groundtruth_sql: |
+        SELECT
+          productVendor,
+          COUNT(*) AS product_count,
+          MAX(MSRP) AS highest_msrp,
+          MIN(buyPrice) AS lowest_buy_price
+        FROM products
+        GROUP BY productVendor
+        HAVING COUNT(*) >= 3
+        ORDER BY highest_msrp DESC, productVendor ASC;
+
+    - id: M7
+      difficulty: medium
+      question: "Summarize offices by country. Return the country, total office count, and how many offices in that country have a missing state value, whether blank or NULL. Order by office count descending, then country."
+      groundtruth_sql: |
+        SELECT
+          country,
+          COUNT(*) AS office_count,
+          SUM(CASE WHEN state IS NULL OR state = '' THEN 1 ELSE 0 END) AS missing_state_count
+        FROM offices
+        GROUP BY country
+        ORDER BY office_count DESC, country ASC;
+
+    - id: M8
+      difficulty: medium
+      question: "For each order status, show how many orders have comments filled in and how many have comments missing. Return status, total orders, commented orders, and missing-comment orders. Sort by total orders descending, then status."
+      groundtruth_sql: |
+        SELECT
+          status,
+          COUNT(*) AS total_orders,
+          SUM(CASE WHEN comments IS NOT NULL AND comments <> '' THEN 1 ELSE 0 END) AS commented_orders,
+          SUM(CASE WHEN comments IS NULL OR comments = '' THEN 1 ELSE 0 END) AS missing_comment_orders
+        FROM orders
+        GROUP BY status
+        ORDER BY total_orders DESC, status ASC;
+
+    - id: M9
+      difficulty: medium
+      question: "For each customer number in payments, show the payment count, total amount, and latest payment date. Keep only customers with at least 2 payment rows. Sort by total amount descending, then customer number."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          COUNT(*) AS payment_count,
+          SUM(amount) AS total_amount,
+          MAX(paymentDate) AS latest_payment_date
+        FROM payments
+        GROUP BY customerNumber
+        HAVING COUNT(*) >= 2
+        ORDER BY total_amount DESC, customerNumber ASC;
+
+    - id: M10
+      difficulty: medium
+      question: "For each country, count how many distinct customer cities there are and show the maximum credit limit in that country. Keep only countries with at least 2 distinct cities. Sort by distinct city count descending, then country."
+      groundtruth_sql: |
+        SELECT
+          country,
+          COUNT(DISTINCT city) AS distinct_city_count,
+          MAX(creditLimit) AS max_credit_limit
+        FROM customers
+        GROUP BY country
+        HAVING COUNT(DISTINCT city) >= 2
+        ORDER BY distinct_city_count DESC, country ASC;
+
+    - id: M11
+      difficulty: medium
+      question: "Group products into margin bands based on MSRP minus buyPrice: Low if under 20, Mid if between 20 and 60, and High for the rest. Return the band, product count, and average MSRP. Order by product count descending."
+      groundtruth_sql: |
+        SELECT
+          CASE
+            WHEN (MSRP - buyPrice) < 20 THEN 'Low'
+            WHEN (MSRP - buyPrice) BETWEEN 20 AND 60 THEN 'Mid'
+            ELSE 'High'
+          END AS margin_band,
+          COUNT(*) AS product_count,
+          AVG(MSRP) AS average_msrp
+        FROM products
+        GROUP BY
+          CASE
+            WHEN (MSRP - buyPrice) < 20 THEN 'Low'
+            WHEN (MSRP - buyPrice) BETWEEN 20 AND 60 THEN 'Mid'
+            ELSE 'High'
+          END
+        ORDER BY product_count DESC;
+
+    - id: M12
+      difficulty: medium
+      question: "In orderdetails, for each row return order number, product code, order line number, quantity ordered, and the rank of that line inside the same order when sorted by quantity ordered from highest to lowest. Break ties with smaller order line number first. Sort the final result by order number, then rank."
+      groundtruth_sql: |
+        SELECT
+          orderNumber,
+          productCode,
+          orderLineNumber,
+          quantityOrdered,
+          ROW_NUMBER() OVER (
+            PARTITION BY orderNumber
+            ORDER BY quantityOrdered DESC, orderLineNumber ASC
+          ) AS quantity_rank_in_order
+        FROM orderdetails
+        ORDER BY orderNumber ASC, quantity_rank_in_order ASC;
+
+    - id: M13
+      difficulty: medium
+      question: "Still in orderdetails, return order number, product code, order line number, priceEach, and the gap between this line's priceEach and the average priceEach of the same order. Sort by order number, then order line number."
+      groundtruth_sql: |
+        SELECT
+          orderNumber,
+          productCode,
+          orderLineNumber,
+          priceEach,
+          priceEach - AVG(priceEach) OVER (
+            PARTITION BY orderNumber
+          ) AS price_gap_from_order_average
+        FROM orderdetails
+        ORDER BY orderNumber ASC, orderLineNumber ASC;
+
+    - id: M14
+      difficulty: medium
+      question: "By order year, calculate total orders, the average number of days between orderDate and requiredDate, and how many rows have shippedDate earlier than requiredDate. Sort by year ascending."
+      groundtruth_sql: |
+        SELECT
+          YEAR(orderDate) AS order_year,
+          COUNT(*) AS total_orders,
+          AVG(DATEDIFF(requiredDate, orderDate)) AS average_required_gap_days,
+          SUM(CASE WHEN shippedDate IS NOT NULL AND shippedDate < requiredDate THEN 1 ELSE 0 END) AS early_shipped_count
+        FROM orders
+        GROUP BY YEAR(orderDate)
+        ORDER BY order_year ASC;
+
+    - id: M15
+      difficulty: medium
+      question: "Find employees whose employee number is greater than the average employee number within the same office. Return employee number, office code, first name, and last name. Sort by office code, then employee number."
+      groundtruth_sql: |
+        SELECT
+          e.employeeNumber,
+          e.officeCode,
+          e.firstName,
+          e.lastName
+        FROM employees AS e
+        WHERE e.employeeNumber > (
+          SELECT AVG(e2.employeeNumber)
+          FROM employees AS e2
+          WHERE e2.officeCode = e.officeCode
+        )
+        ORDER BY e.officeCode ASC, e.employeeNumber ASC;
+
+    - id: M16
+      difficulty: medium
+      question: "Group payments by the first 2 characters of check number. Return the prefix, number of payment rows, and total amount. Only keep prefixes that appear at least 3 times. Order by total amount descending, then prefix."
+      groundtruth_sql: |
+        SELECT
+          LEFT(checkNumber, 2) AS check_prefix,
+          COUNT(*) AS payment_count,
+          SUM(amount) AS total_amount
+        FROM payments
+        GROUP BY LEFT(checkNumber, 2)
+        HAVING COUNT(*) >= 3
+        ORDER BY total_amount DESC, check_prefix ASC;
+
+    - id: M17
+      difficulty: medium
+      question: "For each product scale, calculate the product count and average quantity in stock. Show only scales whose average stock is higher than the overall average stock across all products. Sort by average stock descending, then scale."
+      groundtruth_sql: |
+        SELECT
+          productScale,
+          COUNT(*) AS product_count,
+          AVG(quantityInStock) AS average_stock
+        FROM products
+        GROUP BY productScale
+        HAVING AVG(quantityInStock) > (
+          SELECT AVG(quantityInStock)
+          FROM products
+        )
+        ORDER BY average_stock DESC, productScale ASC;
+
+    - id: M18
+      difficulty: medium
+      question: "For each customer with a non-null credit limit, assign a rank inside the same country based on credit limit from highest to lowest. Return customer number, country, credit limit, and rank. Final output should be sorted by country, rank, and customer number."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          country,
+          creditLimit,
+          DENSE_RANK() OVER (
+            PARTITION BY country
+            ORDER BY creditLimit DESC
+          ) AS credit_rank
+        FROM customers
+        WHERE creditLimit IS NOT NULL
+        ORDER BY country ASC, credit_rank ASC, customerNumber ASC;
+
+    - id: M19
+      difficulty: medium
+      question: "For each office, return office code, city, country, and how many offices exist in the same country including that office itself. Sort by country, then office code."
+      groundtruth_sql: |
+        SELECT
+          officeCode,
+          city,
+          country,
+          COUNT(*) OVER (
+            PARTITION BY country
+          ) AS offices_in_same_country
+        FROM offices
+        ORDER BY country ASC, officeCode ASC;
+
+    - id: M20
+      difficulty: medium
+      question: "For each customer number in orders, show total orders, earliest order date, and latest required date. Keep only customers with at least 2 orders. Sort by total orders descending, then customer number."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          COUNT(*) AS total_orders,
+          MIN(orderDate) AS earliest_order_date,
+          MAX(requiredDate) AS latest_required_date
+        FROM orders
+        GROUP BY customerNumber
+        HAVING COUNT(*) >= 2
+        ORDER BY total_orders DESC, customerNumber ASC;
+
+    - id: M21
+      difficulty: medium
+      question: "For each payment row, return customer number, check number, payment date, amount, and the difference between this amount and the previous payment amount for the same customer when ordered by payment date ascending. Final result should be sorted by customer number, then payment date."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          checkNumber,
+          paymentDate,
+          amount,
+          amount - LAG(amount) OVER (
+            PARTITION BY customerNumber
+            ORDER BY paymentDate
+          ) AS amount_diff_from_previous_payment
+        FROM payments
+        ORDER BY customerNumber ASC, paymentDate ASC;
+
+    - id: M22
+      difficulty: medium
+      question: "By product vendor, calculate how many distinct product lines they have and the average MSRP. Show only vendors that have at least 2 products. Sort by average MSRP descending, then vendor."
+      groundtruth_sql: |
+        SELECT
+          productVendor,
+          COUNT(DISTINCT productLine) AS distinct_product_lines,
+          AVG(MSRP) AS average_msrp
+        FROM products
+        GROUP BY productVendor
+        HAVING COUNT(*) >= 2
+        ORDER BY average_msrp DESC, productVendor ASC;
+
+    - id: M23
+      difficulty: medium
+      question: "By office code, count total employees and how many of them have an extension that looks like x followed by exactly four digits. Sort by total employees descending, then office code."
+      groundtruth_sql: |
+        SELECT
+          officeCode,
+          COUNT(*) AS employee_count,
+          SUM(
+            CASE
+              WHEN extension REGEXP '^x[0-9]{4}$' THEN 1
+              ELSE 0
+            END
+          ) AS valid_extension_count
+        FROM employees
+        GROUP BY officeCode
+        ORDER BY employee_count DESC, officeCode ASC;
+
+    - id: M24
+      difficulty: medium
+      question: "For each job title, return the employee count and the highest employee number in that title. Order by employee count descending, then job title A-Z."
+      groundtruth_sql: |
+        SELECT
+          jobTitle,
+          COUNT(*) AS employee_count,
+          MAX(employeeNumber) AS highest_employee_number
+        FROM employees
+        GROUP BY jobTitle
+        ORDER BY employee_count DESC, jobTitle ASC;
+
+    - id: M25
+      difficulty: medium
+      question: "Group orders into shipment buckets: Open if shippedDate is NULL, Late if shippedDate is later than requiredDate, otherwise On Time. Return the bucket, number of orders, and the earliest order date in that bucket. Order by number of orders descending, then bucket."
+      groundtruth_sql: |
+        SELECT
+          CASE
+            WHEN shippedDate IS NULL THEN 'Open'
+            WHEN shippedDate > requiredDate THEN 'Late'
+            ELSE 'On Time'
+          END AS shipment_bucket,
+          COUNT(*) AS order_count,
+          MIN(orderDate) AS earliest_order_date
+        FROM orders
+        GROUP BY
+          CASE
+            WHEN shippedDate IS NULL THEN 'Open'
+            WHEN shippedDate > requiredDate THEN 'Late'
+            ELSE 'On Time'
+          END
+        ORDER BY order_count DESC, shipment_bucket ASC;
+
+    - id: M26
+      difficulty: medium
+      question: "Summarize 2004 payments by month. Return the month name, the largest payment, and the smallest payment in that month. Order the months chronologically."
+      groundtruth_sql: |
+        SELECT
+          DATE_FORMAT(paymentDate, '%M') AS month_name,
+          MAX(amount) AS max_amount,
+          MIN(amount) AS min_amount
+        FROM payments
+        WHERE YEAR(paymentDate) = 2004
+        GROUP BY MONTH(paymentDate), DATE_FORMAT(paymentDate, '%M')
+        ORDER BY MONTH(paymentDate) ASC;
+
+    - id: M27
+      difficulty: medium
+      question: "Find products whose buyPrice is higher than the average buyPrice of the same vendor. Return product code, vendor, and buy price. Order by buy price descending, then product code."
+      groundtruth_sql: |
+        SELECT
+          p.productCode,
+          p.productVendor,
+          p.buyPrice
+        FROM products AS p
+        WHERE p.buyPrice > (
+          SELECT AVG(p2.buyPrice)
+          FROM products AS p2
+          WHERE p2.productVendor = p.productVendor
+        )
+        ORDER BY p.buyPrice DESC, p.productCode ASC;
+
+    - id: M28
+      difficulty: medium
+      question: "Group payments by check number length. Return the length, payment count, and average amount. Keep only lengths that appear at least 5 times. Sort by check number length ascending."
+      groundtruth_sql: |
+        SELECT
+          CHAR_LENGTH(checkNumber) AS check_number_length,
+          COUNT(*) AS payment_count,
+          AVG(amount) AS average_amount
+        FROM payments
+        GROUP BY CHAR_LENGTH(checkNumber)
+        HAVING COUNT(*) >= 5
+        ORDER BY check_number_length ASC;
+
+    - id: M29
+      difficulty: medium
+      question: "For each product code in orderdetails, calculate total quantity ordered, average priceEach, and number of order lines. Keep only products that appear in at least 10 lines. Sort by total quantity descending, then product code."
+      groundtruth_sql: |
+        SELECT
+          productCode,
+          SUM(quantityOrdered) AS total_quantity_ordered,
+          AVG(priceEach) AS average_price_each,
+          COUNT(*) AS line_count
+        FROM orderdetails
+        GROUP BY productCode
+        HAVING COUNT(*) >= 10
+        ORDER BY total_quantity_ordered DESC, productCode ASC;
+
+    - id: M30
+      difficulty: medium
+      question: "Group customers into credit bands: No Limit if creditLimit is NULL, Low if below 50000, Mid if between 50000 and 100000, and High for the rest. Return the band and customer count. Order by customer count descending."
+      groundtruth_sql: |
+        SELECT
+          CASE
+            WHEN creditLimit IS NULL THEN 'No Limit'
+            WHEN creditLimit < 50000 THEN 'Low'
+            WHEN creditLimit BETWEEN 50000 AND 100000 THEN 'Mid'
+            ELSE 'High'
+          END AS credit_band,
+          COUNT(*) AS customer_count
+        FROM customers
+        GROUP BY
+          CASE
+            WHEN creditLimit IS NULL THEN 'No Limit'
+            WHEN creditLimit < 50000 THEN 'Low'
+            WHEN creditLimit BETWEEN 50000 AND 100000 THEN 'Mid'
+            ELSE 'High'
+          END
+        ORDER BY customer_count DESC;

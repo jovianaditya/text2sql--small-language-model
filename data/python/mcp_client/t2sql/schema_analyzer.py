@@ -32,7 +32,7 @@ class SchemaAnalyzer:
         Initialize with path to JSONL metadata file.
 
         Args:
-            jsonl_path: Path to dense JSONL file (e.g., classicmodels_dense.jsonl)
+            jsonl_path: Path to dense JSONL file (e.g., dataset_dense.jsonl)
         """
         self.jsonl_path = jsonl_path
         self._tables: Set[str] = set()

@@ -34,7 +34,7 @@ import httpx
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .config import MCP_BASE, CHROMA_DIR, COLLECTION_NAME, JSON_INPUT, OLLAMA_URL, ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_KEEP_ALIVE
+from .config import MCP_BASE, CHROMA_DIR, COLLECTION_NAME, JSON_INPUT, OLLAMA_URL, ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_KEEP_ALIVE, format_heuristic_observability
 from .state import make_state
 from .graph import build_app
 from .mcp_execution import query_db_full, _mcp_call  # Pakai FULL query tanpa LIMIT dan _mcp_call helper
@@ -156,7 +156,7 @@ def infer_base_database(
 def infer_dataset_name_from_testset(testset_path: str | None) -> str | None:
     """
     Infer dataset/base name from common test-set filenames.
-    Example: qa_classicmodels_devset_ori.yml -> classicmodels
+    Example: qa_sales_devset_ori.yml -> sales
     """
     raw = str(testset_path or "").strip()
     if not raw:
@@ -168,7 +168,10 @@ def infer_dataset_name_from_testset(testset_path: str | None) -> str | None:
 
     trailing_tags = {
         "devset", "testset", "easy", "medium", "hard",
-        "ori", "mix", "stress", "paraphrase", "validation", "val",
+        "ori", "original", "formal",
+        "mix", "mixed",
+        "stress", "stresstest", "paraphrase",
+        "validation", "val",
     }
     while tokens and tokens[-1] in trailing_tags:
         tokens.pop()
@@ -1349,6 +1352,8 @@ async def run_batch_eval(
             print(f"Using JSONL paths: {paths}")
         else:
             print("[WARN] No JSONL paths found - sparse search may not work!")
+
+    print(f"[HEURISTICS] {format_heuristic_observability()}")
     
     ts_db_list: list[str] = []
     for db in (ts_databases or []):
@@ -1650,7 +1655,7 @@ Examples:
     )
 
     args = parser.parse_args()
-    # Backward compatibility for existing commands
+    # Backward-compatible CLI alias for existing commands
     null_zero_mode = "on" if args.null_zero_equivalent else args.null_zero_mode
     base_database = str(args.base_database or "").strip() or None
     ts_databases = infer_ts_databases(

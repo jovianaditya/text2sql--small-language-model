@@ -86,6 +86,18 @@ def _profiled_domain_defaults(
     return list(agnostic_default)
 
 
+def get_domain_heuristics_profile() -> str:
+    """
+    Return the active lexical-compatibility profile name.
+
+    This does not change runtime behavior; it simply exposes the chosen profile
+    so logs and tooling can report whether the system is running in:
+      - agnostic / schema-first mode
+      - compatibility mode with extra business/domain lexical priors
+    """
+    return str(os.getenv("DOMAIN_HEURISTICS_PROFILE", "agnostic") or "agnostic").strip().lower()
+
+
 _APP_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_METADATA_DIR = _APP_ROOT / "metadata_jsonl"
 
@@ -509,6 +521,7 @@ HELPERS_COUNT_INTENT_TERMS = tuple(
 # Batch-4 ablation switch: keeps the schema-driven core intact while allowing
 # domain-compatibility lexical priors to be disabled for controlled evaluation.
 DOMAIN_HEURISTICS_ENABLED = bool(int(os.getenv("DOMAIN_HEURISTICS_ENABLED", "1")))
+DOMAIN_HEURISTICS_PROFILE = get_domain_heuristics_profile()
 
 HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES = tuple(
     _env_json_list(
@@ -827,6 +840,13 @@ HELPERS_PROBE_LOCALIZED_METRIC_TERMS = set(
     )
 )
 
+# ----------------------------------------------------------------------
+# Compatibility-layer semantic synonym packs
+#
+# These are intentional retained synonyms that help bridge natural user
+# phrasing to schema labels. They are not case-ID hacks and do not bypass
+# schema grounding. Example: "list price" -> MSRP.
+# ----------------------------------------------------------------------
 HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS = set(
     _env_json_list(
         "HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS",
@@ -854,6 +874,34 @@ HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS = set(
         ["buy price", "purchase price", "cost", "cogs", "msrp", "list price", "retail price", "catalog price"],
     )
 )
+
+
+def heuristic_observability_snapshot() -> dict[str, object]:
+    """
+    Small audit snapshot for startup logs / experiment records.
+
+    This is intentionally read-only and behavior-preserving. It helps make the
+    boundary between the agnostic core and retained compatibility vocabulary
+    explicit during evaluation.
+    """
+    return {
+        "domain_heuristics_enabled": DOMAIN_HEURISTICS_ENABLED,
+        "domain_heuristics_profile": DOMAIN_HEURISTICS_PROFILE,
+        "localized_metric_terms": sorted(HELPERS_PROBE_LOCALIZED_METRIC_TERMS),
+        "semantic_alias_listprice_include_terms": sorted(HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS),
+        "semantic_alias_price_include_terms": sorted(HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS),
+    }
+
+
+def format_heuristic_observability() -> str:
+    snapshot = heuristic_observability_snapshot()
+    return (
+        f"profile={snapshot['domain_heuristics_profile']}, "
+        f"domain_enabled={1 if snapshot['domain_heuristics_enabled'] else 0}, "
+        f"localized_metric_terms={snapshot['localized_metric_terms']}, "
+        f"semantic_aliases={{list_price:{snapshot['semantic_alias_listprice_include_terms']}, "
+        f"price:{snapshot['semantic_alias_price_include_terms']}}}"
+    )
 
 # ======================================================================
 # ======================== RETRIEVE HEURISTICS ==========================
