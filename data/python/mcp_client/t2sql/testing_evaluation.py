@@ -152,6 +152,71 @@ def infer_base_database(
         "Provide --base-database or set T2SQL_BASE_DATABASE."
     )
 
+
+def infer_dataset_name_from_testset(testset_path: str | None) -> str | None:
+    """
+    Infer dataset/base name from common test-set filenames.
+    Example: qa_classicmodels_devset_ori.yml -> classicmodels
+    """
+    raw = str(testset_path or "").strip()
+    if not raw:
+        return None
+
+    tokens = [tok for tok in Path(raw).stem.lower().split("_") if tok]
+    if tokens and tokens[0] in {"qa", "test", "eval", "evaluation"}:
+        tokens = tokens[1:]
+
+    trailing_tags = {
+        "devset", "testset", "easy", "medium", "hard",
+        "ori", "mix", "stress", "paraphrase", "validation", "val",
+    }
+    while tokens and tokens[-1] in trailing_tags:
+        tokens.pop()
+
+    dataset_name = "_".join(tokens).strip("_")
+    return dataset_name or None
+
+
+def infer_ts_databases(
+    ts_databases: list[str] | None,
+    *,
+    base_database: str | None = None,
+    testset_path: str | None = None,
+) -> list[str]:
+    """
+    Resolve TS databases without dataset-specific hardcoded defaults.
+
+    Priority:
+    1. explicit CLI list
+    2. T2SQL_TS_DATABASES environment variable
+    3. base database hint -> {base}_2, {base}_3
+    4. dataset name inferred from test-set filename -> {dataset}_2, {dataset}_3
+    """
+    ordered: list[str] = []
+    for db in (ts_databases or []):
+        db_name = str(db or "").strip()
+        if db_name and db_name not in ordered:
+            ordered.append(db_name)
+    if ordered:
+        return ordered
+
+    env_ts = [x.strip() for x in str(os.getenv("T2SQL_TS_DATABASES") or "").split(",") if x.strip()]
+    for db_name in env_ts:
+        if db_name not in ordered:
+            ordered.append(db_name)
+    if ordered:
+        return ordered
+
+    base_hint = str(base_database or "").strip()
+    if not base_hint:
+        base_hint = str(os.getenv("T2SQL_BASE_DATABASE") or "").strip()
+    if not base_hint:
+        base_hint = str(infer_dataset_name_from_testset(testset_path) or "").strip()
+    if base_hint:
+        return [f"{base_hint}_2", f"{base_hint}_3"]
+
+    return []
+
 def normalize_value(val, tolerance: float = 0.0001) -> str:
     """
     Normalize a single value for comparison.
@@ -1291,7 +1356,17 @@ async def run_batch_eval(
         if db_name and db_name not in ts_db_list:
             ts_db_list.append(db_name)
     if not ts_db_list:
-        ts_db_list = ["classicmodels_2", "classicmodels_3"]
+        ts_db_list = infer_ts_databases(
+            None,
+            base_database=base_database,
+            testset_path=testset_path,
+        )
+    if not ts_db_list:
+        raise ValueError(
+            "TS databases are not set and could not be inferred. "
+            "Provide --ts-databases, --base-database, set T2SQL_TS_DATABASES, "
+            "or use a testset filename that contains the base dataset name."
+        )
 
     base_db = infer_base_database(base_database, ts_db_list)
     ts_db_targets = [db for db in ts_db_list if db != base_db]
@@ -1470,28 +1545,28 @@ def main():
         epilog="""
 Examples:
   # Test all questions
-  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx
+  python -m t2sql.testing_evaluation --testset qa_dataset_devset.yml --output results.xlsx
 
   # Test only hard questions
-  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --hard
+  python -m t2sql.testing_evaluation --testset qa_dataset_devset.yml --output results.xlsx --hard
 
   # Test easy and medium questions
-  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy --medium
+  python -m t2sql.testing_evaluation --testset qa_dataset_devset.yml --output results.xlsx --easy --medium
 
   # Test only easy question #4
-  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy4
+  python -m t2sql.testing_evaluation --testset qa_dataset_devset.yml --output results.xlsx --easy4
 
   # Test easy questions #4-7
-  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy4-7
+  python -m t2sql.testing_evaluation --testset qa_dataset_devset.yml --output results.xlsx --easy4-7
 
   # Test specific questions: easy #1, #3, #5
-  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --easy1,3,5
+  python -m t2sql.testing_evaluation --testset qa_dataset_devset.yml --output results.xlsx --easy1,3,5
 
   # Run EX/VA on base DB and TS on distilled DBs
-  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --base-database classicmodels --ts-databases classicmodels,classicmodels_2,classicmodels_3
+  python -m t2sql.testing_evaluation --testset qa_dataset_devset.yml --output results.xlsx --base-database mydb --ts-databases mydb,mydb_2,mydb_3
 
-  # Recommended (explicit): EX/VA on classicmodels, TS only on shifted DBs
-  python -m t2sql.testing_evaluation --testset qa_classicmodels_devset.yml --output results.xlsx --base-database classicmodels --ts-databases classicmodels_2,classicmodels_3
+  # Recommended (explicit): EX/VA on base DB, TS only on shifted DBs
+  python -m t2sql.testing_evaluation --testset qa_dataset_devset.yml --output results.xlsx --base-database mydb --ts-databases mydb_2,mydb_3
         """
     )
     parser.add_argument(
@@ -1539,10 +1614,11 @@ Examples:
     )
     parser.add_argument(
         "--ts-databases",
-        default="classicmodels_2,classicmodels_3",
+        default=None,
         help=(
             "Comma-separated database list for Test Suite evaluation. "
-            "Base DB is excluded automatically from TS metrics."
+            "Base DB is excluded automatically from TS metrics. "
+            "If omitted, uses T2SQL_TS_DATABASES or infers from --base-database / testset name."
         ),
     )
     parser.add_argument(
@@ -1576,10 +1652,12 @@ Examples:
     args = parser.parse_args()
     # Backward compatibility for existing commands
     null_zero_mode = "on" if args.null_zero_equivalent else args.null_zero_mode
-    ts_databases = [
-        x.strip() for x in str(args.ts_databases or "").split(",") if x.strip()
-    ] or ["classicmodels_2", "classicmodels_3"]
     base_database = str(args.base_database or "").strip() or None
+    ts_databases = infer_ts_databases(
+        [x.strip() for x in str(args.ts_databases or "").split(",") if x.strip()],
+        base_database=base_database,
+        testset_path=args.testset,
+    )
 
     # Build difficulty filter dict with optional ID ranges
     difficulty_filters = {}

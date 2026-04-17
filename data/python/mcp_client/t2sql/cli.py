@@ -25,7 +25,7 @@ def main():
     if not paths:
         raise RuntimeError(
             "No JSONL inputs found.\n"
-            "Set EXPORT_JSONL_OUTPUT to one of:\n"
+            "Set JSON_INPUT or EXPORT_JSONL_OUTPUT to one of:\n"
             "  • a single file: ./exports/schema_export.jsonl\n"
             "  • a directory:   ./datahub_metadata\n"
             "  • a glob:        ./datahub_metadata/*.jsonl\n"

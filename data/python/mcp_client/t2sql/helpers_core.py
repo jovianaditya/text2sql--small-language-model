@@ -5631,6 +5631,16 @@ def _question_wants_winner_row(question: str) -> bool:
         r"\b(?:show|list|display|find|return)\s+(?:the\s+)?(?:top\s+)?(?:[2-9]|\d{2,})\b",
         q_rank_scope,
     ))
+    # Also treat bare global top/bottom-N asks as multi-row ranking, even when
+    # they do not start with a reporting verb.
+    explicit_multirow_rank_sig = explicit_multirow_rank_sig or bool(
+        re.search(r"^\s*(?:the\s+)?(?:top|bottom)\s+\d+\b", q_rank_scope, flags=re.I)
+        or re.search(
+            r"^\s*\d+\s+(?:highest|lowest|largest|smallest|newest|latest|earliest|oldest|most|least)\b",
+            q_rank_scope,
+            flags=re.I,
+        )
+    )
 
     # Sinyal 1: eksplisit minta atribut dari "baris yang sama"
     same_row_sig = any(k in q_rank_scope for k in [

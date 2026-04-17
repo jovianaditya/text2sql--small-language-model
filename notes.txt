@@ -62,4 +62,4 @@ docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluatio
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset qa_classicmodels_paraphrase_stress.yml --output results.xlsx --easy --warmup-models router,small" 2>&1 | tee run_paraphrase_easy.log
 
 # EVALUATION
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset test_classicmodels_easy.yml --output results.xlsx --easy" 2>&1 | tee evaluation_easy.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset test_classicmodels_easy.yml --output results.xlsx --easy4,10 --warmup-models router,small" 2>&1 | tee evaluation_easy.log

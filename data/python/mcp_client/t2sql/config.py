@@ -12,7 +12,10 @@
 # ====================== STANDARD LIBRARY IMPORT =======================
 # ======================================================================
 import os
+import glob
 import json
+import re
+from pathlib import Path
 
 
 def _env_json_list(name: str, default: list[str]) -> list[str]:
@@ -81,12 +84,73 @@ def _profiled_domain_defaults(
     if profile in {"business", "business_compat", "legacy", "compat"}:
         return list(compat_default)
     return list(agnostic_default)
+
+
+_APP_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_METADATA_DIR = _APP_ROOT / "metadata_jsonl"
+
+
+def _normalize_collection_candidate(raw: str) -> str:
+    """Normalize a JSONL-ish filename into a collection candidate."""
+    name = Path(str(raw or "").strip()).name
+    if name.lower().endswith(".jsonl"):
+        name = name[:-6]
+    name = re.sub(r"_(?:dense|sparse)$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-")
+    return name
+
+
+def _collection_candidate_from_spec(spec: str | None) -> str | None:
+    raw = str(spec or "").strip()
+    if not raw:
+        return None
+
+    resolved: list[str] = []
+    if any(ch in raw for ch in "*?[]"):
+        resolved = sorted(glob.glob(raw))
+    else:
+        path = Path(raw)
+        if path.is_file():
+            resolved = [str(path)]
+        elif path.is_dir():
+            dense = sorted(str(p) for p in path.glob("*_dense.jsonl"))
+            resolved = dense or sorted(str(p) for p in path.glob("*.jsonl"))
+        elif raw.lower().endswith(".jsonl"):
+            resolved = [raw]
+
+    resolved = sorted(
+        resolved,
+        key=lambda p: (0 if str(p).lower().endswith("_dense.jsonl") else 1, str(p)),
+    )
+    for candidate in resolved:
+        normalized = _normalize_collection_candidate(candidate)
+        if normalized:
+            return normalized
+    return None
+
+
+def _infer_default_collection_name() -> str:
+    for spec in (
+        os.getenv("JSON_INPUT"),
+        os.getenv("EXPORT_JSONL_OUTPUT"),
+        str(_DEFAULT_METADATA_DIR / "*_dense.jsonl"),
+        str(_DEFAULT_METADATA_DIR / "*.jsonl"),
+    ):
+        candidate = _collection_candidate_from_spec(spec)
+        if candidate:
+            return candidate
+    return "default_collection"
+
+
+def _infer_default_export_jsonl_output(collection_name: str) -> str:
+    name = str(collection_name or "").strip() or "default_collection"
+    return str(_DEFAULT_METADATA_DIR / f"{name}_dense.jsonl")
 # ======================================================================
 # ============================ APP/GENERAL =============================
 # ======================================================================
-JSON_INPUT        = os.getenv("EXPORT_JSONL_OUTPUT", "./metadata_jsonl/*.jsonl").strip()
+JSON_INPUT        = os.getenv("JSON_INPUT", os.getenv("EXPORT_JSONL_OUTPUT", str(_DEFAULT_METADATA_DIR / "*.jsonl"))).strip()
 CHROMA_DIR        = os.getenv("CHROMA_DIR", "./chroma_db").strip()
-COLLECTION_NAME   = os.getenv("COLLECTION_NAME", "classicmodels").strip()
+COLLECTION_NAME   = os.getenv("COLLECTION_NAME", _infer_default_collection_name()).strip()
 OLLAMA_URL        = os.getenv("OLLAMA_URL", "http://localhost:11434").strip()
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "180s")  # keep_alive 90s, model stays loaded for batch eval
 ROUTING_MODEL     = os.getenv("ROUTING_MODEL", "qwen2.5:1.5b-instruct").strip()
@@ -137,7 +201,7 @@ RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK = int(
 # >>> Bisa dimatiin kalau mau lebih silent
 SPARSE_DEBUG   = bool(int(os.getenv("SPARSE_DEBUG", "0")))
 RETRIEVE_DEBUG = bool(int(os.getenv("RETRIEVE_DEBUG", "1")))
-EXPORT_JSONL_OUTPUT = os.getenv("EXPORT_JSONL_OUTPUT", "classicmodels_dense.jsonl").strip()
+EXPORT_JSONL_OUTPUT = os.getenv("EXPORT_JSONL_OUTPUT", _infer_default_export_jsonl_output(COLLECTION_NAME)).strip()
 
 RETRIEVAL_STATS_MAX_SAMPLES = int(os.getenv("RETRIEVAL_STATS_MAX_SAMPLES", "5"))
 RETRIEVAL_DESC_KEYWORD_HEAD_WORDS = int(os.getenv("RETRIEVAL_DESC_KEYWORD_HEAD_WORDS", "5"))

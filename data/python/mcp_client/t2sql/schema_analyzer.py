@@ -904,9 +904,13 @@ def is_date_column(table: str, column: str) -> bool:
     if any(dt in dtype for dt in date_types):
         return True
     
-    # 2. Check column name patterns
-    date_patterns = ('date', 'time', 'timestamp', 'created', 'updated', 'modified',
-                    'expired', 'due', 'shipped', 'ordered', 'required', 'paid')
+    # 2. Check narrow generic temporal name patterns as a last fallback.
+    # Keep this metadata-first and avoid business-process verbs such as
+    # shipped / ordered / paid, which are more domain-lexical than temporal.
+    date_patterns = (
+        'date', 'time', 'timestamp', 'created', 'updated', 'modified',
+        'expired', 'due',
+    )
     if any(p in c for p in date_patterns):
         return True
     
