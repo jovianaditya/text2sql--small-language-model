@@ -19,6 +19,28 @@ from .ingestion import ingest_node
 from .retrieval import retrieve_node
 from .agents import draft_sql_agent, refine_sql_agent, router_agent, question_guard_node
 
+def _scenario_config(state) -> dict:
+    cfg = state.get("scenario_config") or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+def _after_guard(state) -> str:
+    if not state.get("router_decision", {}).get("is_valid_question", True):
+        return "rejected"
+    cfg = _scenario_config(state)
+    return "ingest" if cfg.get("rag_enabled", True) else "draft_sql"
+
+def _after_ingest(state) -> str:
+    cfg = _scenario_config(state)
+    return "retrieve" if cfg.get("rag_enabled", True) else "draft_sql"
+
+def _after_retrieve(state) -> str:
+    cfg = _scenario_config(state)
+    return "router" if cfg.get("multi_agent_enabled", True) else "draft_sql"
+
+def _after_draft(state) -> str:
+    cfg = _scenario_config(state)
+    return "refine_sql" if cfg.get("multi_agent_enabled", True) else "done"
+
 def build_app():
     g = StateGraph(RAGState)
     # Nodes
@@ -33,16 +55,38 @@ def build_app():
     # Conditional: if guard passes → ingest, else → END
     g.add_conditional_edges(
         "guard",
-        lambda state: "continue" if state.get("router_decision", {}).get("is_valid_question", True) else "rejected",
+        _after_guard,
         {
-            "continue": "ingest",
+            "ingest": "ingest",
+            "draft_sql": "draft_sql",
             "rejected": END,
         }
     )
     # Normal flow continues
-    g.add_edge("ingest", "retrieve")
-    g.add_edge("retrieve", "router")
+    g.add_conditional_edges(
+        "ingest",
+        _after_ingest,
+        {
+            "retrieve": "retrieve",
+            "draft_sql": "draft_sql",
+        },
+    )
+    g.add_conditional_edges(
+        "retrieve",
+        _after_retrieve,
+        {
+            "router": "router",
+            "draft_sql": "draft_sql",
+        },
+    )
     g.add_edge("router", "draft_sql")
-    g.add_edge("draft_sql", "refine_sql")
+    g.add_conditional_edges(
+        "draft_sql",
+        _after_draft,
+        {
+            "refine_sql": "refine_sql",
+            "done": END,
+        },
+    )
     g.add_edge("refine_sql", END)
     return g.compile()

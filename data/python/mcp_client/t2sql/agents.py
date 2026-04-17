@@ -2231,6 +2231,10 @@ def _is_conventional_fk_name(table_singular: str, column_name: str) -> bool:
 # ======================================================================
 # ======================== AGENT 1 - ROUTER AGENT ======================
 # ======================================================================
+def _get_scenario_config(state: RAGState) -> Dict[str, Any]:
+    cfg = state.get("scenario_config") or {}
+    return cfg if isinstance(cfg, dict) else {}
+
 def router_agent(state: RAGState) -> RAGState:
     """
     Router agent - determines query complexity and target model.
@@ -5835,6 +5839,10 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 
     question = state.get("question", "")
     ctx = state.get("context", "")
+    scenario_cfg = _get_scenario_config(state)
+    intent_ir_enabled = bool(scenario_cfg.get("intent_ir_enabled", AGENT_IR_ENABLED))
+    adaptive_model_enabled = bool(scenario_cfg.get("adaptive_model_enabled", True))
+    forced_model = str(scenario_cfg.get("forced_model") or "").strip()
     # Route telemetry defaults
     state["ir_used"] = False
     state["ir_confidence"] = 0.0
@@ -5846,7 +5854,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # ------------------------------------------------------------------
     # IR-FIRST deterministic planning (schema-agnostic)
     # ------------------------------------------------------------------
-    if AGENT_IR_ENABLED:
+    if intent_ir_enabled:
         intent_ir = build_intent_ir(
             question=question,
             ctx=ctx,
@@ -6195,10 +6203,12 @@ def draft_sql_agent(state: RAGState) -> RAGState:
                 f"[IR] gated off -> LLM. reasons={ir_log_reasons or ['unknown_ir_gate_reason']}"
             )
 
-    fallback_model = (
-        state.get("router_model_candidate")
-        or (LARGE_MODEL if (decision.get("escalation_reasons") or []) else SMALL_MODEL)
-    )
+    fallback_model = forced_model or state.get("router_model_candidate")
+    if not fallback_model:
+        if adaptive_model_enabled:
+            fallback_model = LARGE_MODEL if (decision.get("escalation_reasons") or []) else SMALL_MODEL
+        else:
+            fallback_model = LARGE_MODEL
     fallback_complexity = str(decision.get("complexity") or "").strip().lower()
     if not fallback_complexity:
         fallback_complexity = (
@@ -6207,6 +6217,8 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             else AGENT_ROUTER_COMPLEXITY_SIMPLE
         )
     target_model = str(fallback_model or LARGE_MODEL)
+    if forced_model:
+        state["router_model_candidate"] = forced_model
     state["target_model"] = target_model
     print(f"[DRAFTER] Using LLM fallback: {str(fallback_complexity).upper()} -> {target_model}")
 
@@ -6313,7 +6325,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
                         obj = {"sql": text_sql_micro, "notes": "No reasoning provided."}
                         print("[DRAFTER] CASE-bucketing micro prompt retry succeeded with 3B")
 
-    if obj is None and target_model != LARGE_MODEL:
+    if obj is None and target_model != LARGE_MODEL and not forced_model:
         recovery_model = LARGE_MODEL
         print(f"[DRAFTER] JSON recovery fallback -> {recovery_model}")
         recovery_llm = build_llm_json(model=recovery_model)

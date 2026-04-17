@@ -75,6 +75,58 @@ def load_testset(yaml_path: str) -> list[dict]:
         data = yaml.safe_load(f)
     return data.get("cases", [])
 
+
+def resolve_scenario_config(scenario: str | None) -> tuple[str, dict]:
+    """
+    Resolve thesis evaluation scenario presets.
+
+    B1:
+      - LLM-only single-shot
+      - no RAG / retrieval
+      - no intent IR
+      - no adaptive multi-model
+      - no multi-agent refinement
+      - force 7B
+
+    B2:
+      - single-shot with RAG
+      - no intent IR
+      - no adaptive multi-model
+      - no multi-agent refinement
+      - force 7B
+
+    P:
+      - current full system
+    """
+    name = str(scenario or "P").strip().upper() or "P"
+    presets = {
+        "B1": {
+            "rag_enabled": False,
+            "intent_ir_enabled": False,
+            "multi_agent_enabled": False,
+            "adaptive_model_enabled": False,
+            "forced_model": LARGE_MODEL,
+        },
+        "B2": {
+            "rag_enabled": True,
+            "intent_ir_enabled": False,
+            "multi_agent_enabled": False,
+            "adaptive_model_enabled": False,
+            "forced_model": LARGE_MODEL,
+        },
+        "P": {
+            "rag_enabled": True,
+            "intent_ir_enabled": True,
+            "multi_agent_enabled": True,
+            "adaptive_model_enabled": True,
+            "forced_model": "",
+        },
+    }
+    if name not in presets:
+        valid = ", ".join(sorted(presets))
+        raise ValueError(f"Unknown scenario '{name}'. Valid scenarios: {valid}")
+    return name, dict(presets[name])
+
 def parse_difficulty_filter(filter_spec: str | None) -> tuple[str, set[int] | None]:
     """
     Parse difficulty filter specification.
@@ -659,7 +711,7 @@ def save_to_excel(
     
     # Adjust column widths
     col_widths = {
-        "id": 8, "difficulty": 10,
+        "id": 8, "scenario": 10, "difficulty": 10,
         "question": 50,
         "groundtruth_sql": 40, "predicted_sql": 40,
         "draft_source": 14, "ir_confidence": 12, "ir_gate_reasons": 28,
@@ -734,6 +786,8 @@ async def run_single_case(
     mcp: Client,
     paths: list[str],
     case: dict,
+    scenario: str = "P",
+    scenario_config: dict | None = None,
     execute_groundtruth: bool = True,
     null_zero_mode: str = "auto",
     ts_databases: list[str] | None = None,
@@ -769,6 +823,7 @@ async def run_single_case(
 
     result = {
         "id": case_id,
+        "scenario": str(scenario or "P").strip().upper(),
         "difficulty": difficulty,
         "question": question,
         "base_database": primary_db,
@@ -812,7 +867,12 @@ async def run_single_case(
     # 1. Run pipeline
     t0 = time.perf_counter()
     try:
-        init_state = make_state(paths, question)
+        init_state = make_state(
+            paths,
+            question,
+            scenario=scenario,
+            scenario_config=scenario_config,
+        )
         state = app.invoke(init_state)
         
         # Get predicted SQL
@@ -1262,6 +1322,7 @@ async def run_batch_eval(
     testset_path: str,
     output_path: str | None = None,
     paths: list[str] | None = None,
+    scenario: str = "P",
     execute_groundtruth: bool = True,
     skip_warmup: bool = False,
     warmup_models_spec: str | None = None,
@@ -1286,6 +1347,9 @@ async def run_batch_eval(
         ts_databases: Ordered list of DB names for TS evaluation.
         base_database: Database used for VA/EX only.
     """
+    scenario_name, scenario_config = resolve_scenario_config(scenario)
+    print(f"Scenario: {scenario_name} -> {scenario_config}")
+
     # Load test cases
     all_cases = load_testset(testset_path)
     print(f"Loaded {len(all_cases)} test cases from {testset_path}")
@@ -1348,12 +1412,8 @@ async def run_batch_eval(
     # Default paths for JSONL - resolve from config like CLI does
     if paths is None or len(paths) == 0:
         paths = resolve_jsonl_paths(JSON_INPUT)
-        if paths:
-            print(f"Using JSONL paths: {paths}")
-        else:
+        if not paths:
             print("[WARN] No JSONL paths found - sparse search may not work!")
-
-    print(f"[HEURISTICS] {format_heuristic_observability()}")
     
     ts_db_list: list[str] = []
     for db in (ts_databases or []):
@@ -1395,7 +1455,9 @@ async def run_batch_eval(
         for i, case in enumerate(cases):
             print(f"\n[Progress: {i+1}/{len(cases)}]")
             result = await run_single_case(
-                app, mcp, paths, case, 
+                app, mcp, paths, case,
+                scenario=scenario_name,
+                scenario_config=scenario_config,
                 execute_groundtruth=execute_groundtruth,
                 null_zero_mode=null_zero_mode,
                 ts_databases=ts_db_targets,
@@ -1480,7 +1542,7 @@ async def run_batch_eval(
     if output_path:
         fieldnames = [
             # Keep key identifiers first to reduce horizontal scrolling.
-            "id", "difficulty",
+            "id", "scenario", "difficulty",
             "question",
             "groundtruth_sql", "predicted_sql",
             "draft_source", "final_model_used", "ir_confidence", "ir_gate_reasons",
@@ -1583,6 +1645,17 @@ Examples:
         "--output", "-o",
         default=None,
         help="Path to output file (.xlsx for Excel, .csv for CSV)"
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=["B1", "B2", "P", "b1", "b2", "p"],
+        default="P",
+        help=(
+            "Evaluation scenario preset: "
+            "B1=LLM-only 7B single-shot without RAG/IR/multi-agent/adaptive-model, "
+            "B2=7B single-shot with RAG but without IR/multi-agent/adaptive-model, "
+            "P=full current system."
+        ),
     )
     parser.add_argument(
         "--no-groundtruth-exec",
@@ -1703,6 +1776,7 @@ Examples:
             testset_path=args.testset,
             output_path=args.output,
             execute_groundtruth=not args.no_groundtruth_exec,
+            scenario=str(args.scenario or "P").upper(),
             skip_warmup=args.skip_warmup,
             warmup_models_spec=args.warmup_models,
             difficulty_filters=difficulty_filters if difficulty_filters else None,

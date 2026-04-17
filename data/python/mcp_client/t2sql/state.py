@@ -13,6 +13,8 @@ from typing import TypedDict, List, Dict, Any
 class RAGState(TypedDict, total=False):
     jsonl_paths: List[str]
     question: str
+    scenario: str
+    scenario_config: Dict[str, Any]
     added: int
     updated: int
     skipped: int
@@ -70,10 +72,18 @@ class RAGState(TypedDict, total=False):
     processing_start_time: float
     processing_time: float
 
-def make_state(paths, question: str) -> RAGState:
+def make_state(
+    paths,
+    question: str,
+    *,
+    scenario: str = "P",
+    scenario_config: Dict[str, Any] | None = None,
+) -> RAGState:
     return {
         "jsonl_paths": paths,
         "question": question,
+        "scenario": str(scenario or "P").strip().upper(),
+        "scenario_config": dict(scenario_config or {}),
         "added": 0,
         "updated": 0,
         "skipped": 0,
