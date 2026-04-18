@@ -25,6 +25,7 @@ from fastmcp.client.transports import StreamableHttpTransport
 try:
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.formatting.rule import CellIsRule
     from openpyxl.utils.dataframe import dataframe_to_rows
     HAS_EXCEL = True
 except ImportError:
@@ -593,10 +594,12 @@ def save_to_excel(
     ws_summary.title = "Summary"
     
     # Styles
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="000000")
+    header_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
     match_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     mismatch_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    match_font = Font(bold=True, color="000000")
+    mismatch_font = Font(bold=True, color="000000")
     border = Border(
         left=Side(style='thin'),
         right=Side(style='thin'),
@@ -629,6 +632,7 @@ def save_to_excel(
         for col_idx, value in enumerate(row_data, start=1):
             cell = ws_summary.cell(row=row_idx, column=col_idx, value=value)
             cell.border = border
+            cell.alignment = Alignment(vertical='center')
             if row_idx == 3:
                 cell.font = header_font
                 cell.fill = header_fill
@@ -653,6 +657,7 @@ def save_to_excel(
         cell.font = header_font
         cell.fill = header_fill
         cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
     for row_idx, (d, stats) in enumerate(sorted(by_difficulty.items()), start=12):
         t = stats["total"]
@@ -681,6 +686,7 @@ def save_to_excel(
     ws_summary.column_dimensions['G'].width = 12
     ws_summary.column_dimensions['H'].width = 18
     ws_summary.column_dimensions['I'].width = 15
+    ws_summary.freeze_panes = "A12"
     
     # ============================================================
     # Sheet 2: Detail Results
@@ -693,6 +699,10 @@ def save_to_excel(
         cell.font = header_font
         cell.fill = header_fill
         cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        cell.number_format = "@"
+    ws_detail.row_dimensions[1].height = 24
+    ws_detail.row_dimensions[1].hidden = False
     
     # Data rows
     for row_idx, result in enumerate(results, start=2):
@@ -704,10 +714,13 @@ def save_to_excel(
             
             # Highlight success flags with the same green/red behavior.
             if field in {"va_success", "exec_success", "ts_success"}:
-                if value:
+                cell.value = "TRUE" if bool(value) else "FALSE"
+                cell.font = match_font if bool(value) else mismatch_font
+                if bool(value):
                     cell.fill = match_fill
                 else:
                     cell.fill = mismatch_fill
+                cell.alignment = Alignment(horizontal='center', vertical='center')
     
     # Adjust column widths
     col_widths = {
@@ -724,9 +737,40 @@ def save_to_excel(
     }
     for col_idx, field in enumerate(fieldnames, start=1):
         ws_detail.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = col_widths.get(field, 15)
+
+    # Reinforce boolean success cells with conditional formatting so common
+    # spreadsheet viewers render the green/red cell background consistently.
+    for field in ("va_success", "exec_success", "ts_success"):
+        if field not in fieldnames:
+            continue
+        col_idx = fieldnames.index(field) + 1
+        col_letter = openpyxl.utils.get_column_letter(col_idx)
+        data_range = f"{col_letter}2:{col_letter}{max(len(results) + 1, 2)}"
+        ws_detail.conditional_formatting.add(
+            data_range,
+            CellIsRule(
+                operator="equal",
+                formula=['"TRUE"'],
+                fill=match_fill,
+                font=match_font,
+            ),
+        )
+        ws_detail.conditional_formatting.add(
+            data_range,
+            CellIsRule(
+                operator="equal",
+                formula=['"FALSE"'],
+                fill=mismatch_fill,
+                font=mismatch_font,
+            ),
+        )
     
     # Freeze header row
     ws_detail.freeze_panes = "A2"
+    ws_detail.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(len(fieldnames))}{max(len(results) + 1, 1)}"
+    ws_detail.sheet_view.showGridLines = True
+    ws_detail.sheet_view.tabSelected = True
+    wb.active = wb.sheetnames.index("Results")
     
     # Save
     wb.save(output_path)

@@ -514,7 +514,7 @@ cases:
           pl.productLine ASC;
     - id: H10
       difficulty: hard
-      question: "For each office, return the office code, city, total number of employees, and how many of them are Sales Reps (jobTitle = 'Sales Rep'). Only include offices that have at least one Sales Rep and at least one employee in that office who reports to someone (reportsTo is not NULL). Sort by Sales Rep count descending, then by office code."
+      question: "For each office, return the office code, city, total number of employees, and the number of employees whose job title is 'Sales Rep'. Keep only offices that have at least one Sales Rep and also at least one employee, not necessarily a Sales Rep, who reports to a manager. Order by Sales Rep count descending, then by office code ascending."
       groundtruth_sql: |
         SELECT
           o.officeCode,

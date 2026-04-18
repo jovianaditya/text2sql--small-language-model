@@ -3642,10 +3642,16 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str, ctx: str
 
     if re.search(r"\b(?:join|group\s+by|having|union|intersect|except|with)\b", s, flags=re.I):
         return sql
+    # Window queries have their own projection-shape repairs. Letting this
+    # flat lookup helper run on OVER(...) queries can leak partition/group
+    # columns like productLine into the final SELECT even when the question
+    # only requests the base row columns plus the derived window metric.
+    if re.search(r"\bOVER\s*\(", s, flags=re.I):
+        return sql
     if re.search(r"\b(?:row_number|rank|dense_rank)\s*\(", s, flags=re.I):
         return sql
     if (
-        re.search(r"\b(?:from|where|exists)\s*\(", s, flags=re.I)
+        re.search(r"\b(?:from|exists)\s*\(", s, flags=re.I)
         or re.search(r"\bin\s*\(\s*select\b", s, flags=re.I)
     ):
         return sql
@@ -3666,6 +3672,12 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str, ctx: str
     order_part = (m_sel.group("order") or "").strip()
     limit_part = (m_sel.group("limit") or "").strip()
     if not select_part or not from_core:
+        return sql
+
+    has_select_distinct = bool(re.match(r"(?is)^DISTINCT\b", select_part))
+    if has_select_distinct:
+        select_part = re.sub(r"(?is)^DISTINCT\s+", "", select_part, count=1).strip()
+    if not select_part:
         return sql
 
     alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
@@ -3807,10 +3819,14 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str, ctx: str
                 return seg
 
         patterns = [
-            r"\bwith\b\s+(?P<seg>.+)$",
+            r"\breturn\b\s+(?P<seg>.+)$",
+            r"\bshow\b\s+(?P<seg>.+)$",
+            r"\bdisplay\b\s+(?P<seg>.+)$",
+            r"\bget\b\s+(?P<seg>.+)$",
+            r"\bshowing\b\s+(?P<seg>.+)$",
             r"\bincluding\b\s+(?P<seg>.+)$",
             r"\binclude\b\s+(?P<seg>.+)$",
-            r"\bshowing\b\s+(?P<seg>.+)$",
+            r"\bwith\b\s+(?P<seg>.+)$",
         ]
         for pat in patterns:
             m = re.search(pat, text, flags=re.I)
@@ -3820,7 +3836,7 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str, ctx: str
             if not seg:
                 continue
             stop_pat = re.compile(
-                r"(?is)(?:,\s*|\s+)(?:sorted|ordered|starting|beginning|ranked|grouped)\b"
+                r"(?is)(?:,\s*|\.\s*|\s+)(?:sorted|ordered|starting|beginning|ranked|grouped|within|among|across|inside|only\s+include|include\s+only|keep\s+only|only\s+keep|retain\s+only)\b"
             )
             stop_m = stop_pat.search(seg)
             if stop_m:
@@ -3952,17 +3968,353 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str, ctx: str
             continue
         ordered_select_items.append(item_text)
 
+    def _select_item_semantic_key(item: str) -> str:
+        raw_item = str(item or "").strip()
+        if not raw_item:
+            return ""
+
+        expr_part, out_alias = _split_expr_alias(raw_item)
+        parsed_simple = _parse_simple_col(expr_part)
+        if parsed_simple:
+            _, col = parsed_simple
+            return str(col or "").strip().lower()
+
+        alias_label = str(out_alias or "").strip("`'\"")
+        alias_parts = _identifier_parts(alias_label)
+        if alias_parts:
+            return "".join(alias_parts)
+
+        bare_label = str(expr_part or "").strip().strip("`'\"")
+        bare_parts = _identifier_parts(bare_label)
+        if bare_parts:
+            return "".join(bare_parts)
+
+        return raw_item.lower()
+
     new_select_items = ordered_select_items
     dedup_select: List[str] = []
     seen_keys: Set[str] = set()
     for item in new_select_items:
-        key = item.strip().lower()
-        if key in seen_keys:
+        raw_key = item.strip().lower()
+        semantic_key = _select_item_semantic_key(item)
+        key = semantic_key or raw_key
+        if key in seen_keys or raw_key in seen_keys:
             continue
         seen_keys.add(key)
+        seen_keys.add(raw_key)
         dedup_select.append(item.strip())
 
-    out_lines = [f"SELECT {', '.join(dedup_select)}", f"FROM {from_core}"]
+    select_keyword = "SELECT DISTINCT" if has_select_distinct else "SELECT"
+    out_lines = [f"{select_keyword} {', '.join(dedup_select)}", f"FROM {from_core}"]
+    if where_part:
+        out_lines.append(f"WHERE {where_part}")
+    if order_part:
+        out_lines.append(f"ORDER BY {order_part}")
+    if limit_part:
+        out_lines.append(f"LIMIT {limit_part}")
+
+    fixed = "\n".join(out_lines).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _repair_misplaced_select_distinct(sql: str) -> str:
+    """
+    Repair malformed SELECT lists where DISTINCT appears mid-projection, e.g.:
+      SELECT a, b, DISTINCT c, d FROM t
+    -> SELECT DISTINCT a, b, c, d FROM t
+
+    Conservative scope:
+    - top-level single SELECT only
+    - no UNION/INTERSECT/EXCEPT
+    - only rewrites top-level projection items
+    """
+    s = str(sql or "").strip()
+    if not s:
+        return sql
+    if re.search(r"\b(?:UNION|INTERSECT|EXCEPT)\b", s, flags=re.I):
+        return sql
+
+    m = re.match(
+        r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<tail>.+?)\s*;?\s*$",
+        s,
+    )
+    if not m:
+        return sql
+
+    select_part = str(m.group("select") or "").strip()
+    tail_part = str(m.group("tail") or "").strip()
+    if not select_part or not tail_part:
+        return sql
+    if re.match(r"(?is)^DISTINCT\b", select_part):
+        return sql
+    if not re.search(r"(?is)(?:^|,)\s*DISTINCT\b", select_part):
+        return sql
+
+    items = [item.strip() for item in _split_top_level_commas(select_part) if item.strip()]
+    if not items:
+        return sql
+
+    saw_distinct = False
+    repaired_items: List[str] = []
+    for item in items:
+        if re.match(r"(?is)^DISTINCT\b", item):
+            item = re.sub(r"(?is)^DISTINCT\s+", "", item).strip()
+            saw_distinct = True
+        if item:
+            repaired_items.append(item)
+
+    if not saw_distinct or not repaired_items:
+        return sql
+
+    dedup_items: List[str] = []
+    seen: Set[str] = set()
+    for item in repaired_items:
+        key = item.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup_items.append(item.strip())
+
+    fixed = f"SELECT DISTINCT {', '.join(dedup_items)} FROM {tail_part}"
+    if str(sql).strip().endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _drop_unrequested_missing_filter_columns(sql: str, question: str, ctx: str = "") -> str:
+    """
+    For flat single-table lookup queries, drop columns from SELECT when they are
+    used only as missing/null filter predicates and are not explicitly requested
+    in the output.
+
+    Example:
+      SELECT productLine, textDescription, htmlDescription
+      FROM productlines
+      WHERE (htmlDescription IS NULL OR htmlDescription = '')
+    -> drop htmlDescription from SELECT when the question only asks for
+       "product line name and text description".
+    """
+    if not sql or not question:
+        return sql
+
+    s = str(sql or "").strip().rstrip(";").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q:
+        return sql
+
+    if re.search(r"\b(?:join|group\s+by|having|union|intersect|except|with)\b", s, flags=re.I):
+        return sql
+    # Window queries have dedicated shape/contract repairs elsewhere.
+    # Treating window SELECTs as flat lookup projections can incorrectly drop
+    # requested base columns merely because they also appear in a NULL filter.
+    if re.search(r"\bOVER\s*\(", s, flags=re.I):
+        return sql
+    if re.search(r"\b(?:row_number|rank|dense_rank)\s*\(", s, flags=re.I):
+        return sql
+    if (
+        re.search(r"\b(?:from|exists)\s*\(", s, flags=re.I)
+        or re.search(r"\bin\s*\(\s*select\b", s, flags=re.I)
+    ):
+        return sql
+
+    m_sel = re.match(
+        r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<from>.+?)"
+        r"(?:\s+WHERE\s+(?P<where>.+?))?"
+        r"(?:\s+ORDER\s+BY\s+(?P<order>.+?))?"
+        r"(?:\s+LIMIT\s+(?P<limit>.+?))?\s*$",
+        s,
+    )
+    if not m_sel:
+        return sql
+
+    select_part = (m_sel.group("select") or "").strip()
+    from_core = (m_sel.group("from") or "").strip()
+    where_part = (m_sel.group("where") or "").strip()
+    order_part = (m_sel.group("order") or "").strip()
+    limit_part = (m_sel.group("limit") or "").strip()
+    if not select_part or not from_core or not where_part:
+        return sql
+
+    alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    unique_tables = sorted(
+        {
+            str(t or "").strip().lower()
+            for a, t in alias_to_table.items()
+            if a and a.lower() == a and t
+        }
+    )
+    if not unique_tables:
+        m_base = re.match(
+            r"(?is)^\s*`?([A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?\s*$",
+            from_core,
+        )
+        if not m_base:
+            return sql
+        base_table = str(m_base.group(1) or "").strip().lower()
+        base_alias = str(m_base.group(2) or "").strip() or base_table
+        alias_to_table = {base_alias: base_table, base_alias.lower(): base_table}
+        unique_tables = [base_table]
+    if len(unique_tables) != 1:
+        return sql
+    base_table = unique_tables[0]
+    base_alias = next(
+        (
+            a for a, t in alias_to_table.items()
+            if a and a.lower() == a and str(t or "").strip().lower() == base_table
+        ),
+        base_table,
+    )
+
+    def _split_expr_alias(item: str) -> Tuple[str, Optional[str]]:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item.strip(),
+        )
+        if not m:
+            return item.strip(), None
+        return m.group(1).strip(), m.group(2).strip()
+
+    def _parse_simple_col(expr: str) -> Optional[Tuple[Optional[str], str]]:
+        m = re.match(
+            r"(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            expr.strip(),
+        )
+        if not m:
+            return None
+        return m.group(1), m.group(2)
+
+    def _identifier_parts(text: str) -> List[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        raw = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)
+        raw = raw.replace("_", " ")
+        raw = raw.lower()
+        return [tok for tok in re.findall(r"[a-z0-9]+", raw)]
+
+    def _extract_requested_output_segment(text: str) -> str:
+        head_patterns = [
+            r"\b(?:return|show|display|get)\s+(?:the\s+)?(?P<seg>.+?)\s+\bfor\b",
+            r"\b(?:return|show|display|get)\s+(?:the\s+)?(?P<seg>.+?)\s+\bwhere\b",
+        ]
+        for pat in head_patterns:
+            m = re.search(pat, text, flags=re.I)
+            if m:
+                seg = str(m.group("seg") or "").strip(" .;")
+                if seg:
+                    return seg
+        for pat in [
+            r"\breturn\b\s+(?P<seg>.+)$",
+            r"\bshow\b\s+(?P<seg>.+)$",
+            r"\bdisplay\b\s+(?P<seg>.+)$",
+            r"\bget\b\s+(?P<seg>.+)$",
+            r"\bshowing\b\s+(?P<seg>.+)$",
+            r"\bincluding\b\s+(?P<seg>.+)$",
+            r"\binclude\b\s+(?P<seg>.+)$",
+            r"\bwith\b\s+(?P<seg>.+)$",
+        ]:
+            m = re.search(pat, text, flags=re.I)
+            if not m:
+                continue
+            seg = str(m.group("seg") or "").strip(" .;")
+            if not seg:
+                continue
+            stop_m = re.search(r"(?is)(?:,\s*|\.\s*|\s+)(?:sorted|ordered|starting|beginning|ranked|grouped|only\s+include|include\s+only|keep\s+only|only\s+keep|retain\s+only)\b", seg)
+            if not stop_m:
+                stop_m = re.search(r"(?is)(?:,\s*|\.\s*|\s+)(?:within|among|across|inside)\b", seg)
+            if stop_m:
+                seg = seg[:stop_m.start()].strip(" ,.;")
+            return seg
+        return ""
+
+    requested_segment = _extract_requested_output_segment(q)
+
+    def _question_explicitly_requests_column(col_name: str) -> bool:
+        seg = str(requested_segment or "").strip().lower()
+        if not seg:
+            return False
+        clean = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(col_name or ""))
+        clean = clean.replace("_", " ").lower().strip()
+        if not clean:
+            return False
+        clean_pat = re.escape(clean).replace(r"\ ", r"\s+")
+        condition_before = re.compile(
+            r"\b(?:with|where|having|who|that|whose|average|avg|mean|overall|global)\s*$",
+            flags=re.I,
+        )
+        condition_after = re.compile(
+            r"^\s*(?:"
+            r"greater(?:\s+than)?|less(?:\s+than)?|higher(?:\s+than)?|lower(?:\s+than)?|"
+            r"above|below|over|under|between|before|after|than|"
+            r"equal(?:s|(?:\s+to)?)|not\s+null|is\s+null|is\s+not\s+null|"
+            r"like|regexp|matches?|matching|condition\b"
+            r")",
+            flags=re.I,
+        )
+        for m in re.finditer(rf"\b(?:the\s+)?{clean_pat}\b", seg, flags=re.I):
+            before = seg[max(0, m.start() - 24):m.start()]
+            after = seg[m.end():m.end() + 48]
+            if condition_before.search(before) or condition_after.search(after):
+                continue
+            return True
+        return False
+
+    missing_filter_cols: Set[str] = set()
+    for m in re.finditer(
+        r"(?is)(?:^|[\s(])(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s+IS\s+NULL\b",
+        where_part,
+    ):
+        qual = str(m.group(1) or "").strip().lower()
+        col = str(m.group(2) or "").strip().lower()
+        if not col:
+            continue
+        if qual and qual not in {base_alias.lower(), base_table}:
+            continue
+        missing_filter_cols.add(col)
+    for m in re.finditer(
+        r"""(?is)(?:^|[\s(])(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*(['"])\s*\3""",
+        where_part,
+    ):
+        qual = str(m.group(1) or "").strip().lower()
+        col = str(m.group(2) or "").strip().lower()
+        if not col:
+            continue
+        if qual and qual not in {base_alias.lower(), base_table}:
+            continue
+        missing_filter_cols.add(col)
+
+    if not missing_filter_cols:
+        return sql
+
+    select_items = _split_top_level_commas(select_part)
+    if not select_items:
+        return sql
+
+    kept_items: List[str] = []
+    changed = False
+    for item in select_items:
+        expr, _ = _split_expr_alias(item)
+        parsed = _parse_simple_col(expr)
+        if not parsed:
+            kept_items.append(item.strip())
+            continue
+        qual, col = parsed
+        qual_l = str(qual or "").strip().lower()
+        col_l = str(col or "").strip().lower()
+        if qual_l and qual_l not in {base_alias.lower(), base_table}:
+            kept_items.append(item.strip())
+            continue
+        if col_l in missing_filter_cols and not _question_explicitly_requests_column(col_l):
+            changed = True
+            continue
+        kept_items.append(item.strip())
+
+    if not changed or not kept_items:
+        return sql
+
+    out_lines = [f"SELECT {', '.join(kept_items)}", f"FROM {from_core}"]
     if where_part:
         out_lines.append(f"WHERE {where_part}")
     if order_part:
@@ -25121,9 +25473,34 @@ def _remove_top_level_order_by_if_not_requested(sql: str, question: str) -> str:
         re.search(r"\b(?:rank|row[_\s]?number|dense[_\s]?rank)\b", q, flags=re.I)
         and re.search(r"\b(?:within\s+(?:each|the\s+same)|partition\s+by|based\s+on|ordered\s+in)\b", q, flags=re.I)
     )
+    # Preserve ORDER BY for global top-N / superlative retrieval asks.
+    # These queries rely on ORDER BY + LIMIT semantics even when the user does
+    # not explicitly say "sort by ...".
+    has_top_n_superlative_intent = bool(
+        re.search(r"\b(?:top|bottom)\s+\d+\b", q, flags=re.I)
+        or re.search(
+            r"\b\d+\s+(?:[a-z][a-z0-9_]*\s+){0,4}"
+            r"(?:highest|lowest|largest|smallest|newest|latest|earliest|oldest|most|least)\b",
+            q,
+            flags=re.I,
+        )
+        or (
+            bool(re.search(r"\b\d+\b", q, flags=re.I))
+            and bool(
+                re.search(
+                    r"\b(?:most\s+expensive|cheapest|highest|lowest|largest|smallest|newest|latest|earliest|oldest)\b",
+                    q,
+                    flags=re.I,
+                )
+            )
+        )
+    )
+    has_top_level_limit = bool(re.search(r"(?is)\bLIMIT\s+\d+\b", sql or ""))
 
     # 1. Cek Intent: Kalau user minta final sort, biarkan.
     if _question_requests_ordering(question) and not (window_only_ordering_context and not explicit_final_order_request):
+        return sql
+    if has_top_level_limit and has_top_n_superlative_intent and not window_only_ordering_context:
         return sql
 
     # 2. Hapus ORDER BY

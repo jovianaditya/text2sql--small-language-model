@@ -349,6 +349,9 @@ from .helpers_core import (
     _question_requires_inner_join,
     _question_requests_ordering,
     _question_wants_include_zero,
+    _ensure_explicit_simple_projection_columns,
+    _drop_unrequested_missing_filter_columns,
+    _repair_misplaced_select_distinct,
     _enforce_requested_order_direction,
     _parse_allowed_identifiers,
     _remove_top_level_order_by_if_not_requested,
@@ -3707,6 +3710,21 @@ def router_agent(state: RAGState) -> RAGState:
             flags=re.I | re.S,
         )
     )
+    has_group_eligibility_phrase = bool(
+        re.search(
+            r"\b(?:only\s+include|include\s+only|keep\s+only|only\s+keep|retain\s+only)\b"
+            r"[^.]{0,220}\bat\s+least\s+one\b",
+            question_lower,
+            flags=re.I | re.S,
+        )
+    )
+    has_relative_existence_detail = bool(
+        re.search(
+            r"\bat\s+least\s+one\b[^.]{0,160}\b(?:who|that|whose)\b",
+            question_lower,
+            flags=re.I | re.S,
+        )
+    )
     has_conditioned_subgroup_group_metric = bool(
         is_multi_table
         and has_grouping
@@ -3716,15 +3734,12 @@ def router_agent(state: RAGState) -> RAGState:
             question_lower,
             flags=re.I | re.S,
         )
-        and re.search(
-            r"\bonly\s+include\b[^.]{0,180}\bat\s+least\s+one\b",
-            question_lower,
-            flags=re.I | re.S,
-        )
+        and has_group_eligibility_phrase
         and (
             re.search(r"\b(?:is\s+not\s+null|not\s+null|is\s+null)\b", question_lower, flags=re.I)
             or bool(re.findall(r"""['"“”][^'"“”]+['"“”]""", question or ""))
             or bool(re.search(r"=\s*['\"“”]", question or ""))
+            or has_relative_existence_detail
         )
     )
     
@@ -4196,6 +4211,10 @@ def _deterministic_sql_acceptance_gate(
     if not candidate_sql:
         verdict["reasons"].append("empty_sql")
         return verdict
+
+    repaired_distinct_sql = _repair_misplaced_select_distinct(candidate_sql)
+    if repaired_distinct_sql and repaired_distinct_sql != candidate_sql:
+        candidate_sql = str(repaired_distinct_sql).strip()
 
     ast_sql, ast_meta = _ast_guardrails(candidate_sql, ctx=ctx, question=question)
     if ast_meta.get("parse_ok", False):
@@ -6401,6 +6420,9 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     return {
         **state,
         "target_model": target_model,
+        "final_sql": draft_sql,
+        "answer": draft_sql,
+        "final_model": target_model,
         "draft_source": "llm",
         "draft_sql": draft_sql,
         "agent_notes": (obj.get("notes") or "").strip(),
@@ -6434,6 +6456,18 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # 1. HEURISTIC PIPELINE (Versi Bersih/Safe Mode)
     final_sql = normalize_sql_pipeline(draft_sql, question, ctx)
     corrections = ["Applied Heuristic Pipeline"]
+    repaired_distinct_sql = _repair_misplaced_select_distinct(final_sql)
+    if repaired_distinct_sql and repaired_distinct_sql != final_sql:
+        final_sql = str(repaired_distinct_sql).strip()
+        corrections.append("Repaired misplaced SELECT DISTINCT")
+    explicit_projection_sql = _ensure_explicit_simple_projection_columns(final_sql, question, ctx)
+    if explicit_projection_sql and explicit_projection_sql != final_sql:
+        final_sql = str(explicit_projection_sql).strip()
+        corrections.append("Applied explicit simple projection preservation")
+    dropped_filter_only_sql = _drop_unrequested_missing_filter_columns(final_sql, question, ctx)
+    if dropped_filter_only_sql and dropped_filter_only_sql != final_sql:
+        final_sql = str(dropped_filter_only_sql).strip()
+        corrections.append("Dropped unrequested missing-filter projection columns")
 
     # 1b. AST guardrails (sqlglot) for structural safety checks/fixes.
     # This pass is conservative: if AST parse fails, we keep legacy behavior.
@@ -6454,6 +6488,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     final_sql, contract_corrections, contract_violations = _apply_semantic_contract(final_sql, question, ctx)
     if contract_corrections:
         corrections.extend(contract_corrections)
+    dropped_filter_only_sql = _drop_unrequested_missing_filter_columns(final_sql, question, ctx)
+    if dropped_filter_only_sql and dropped_filter_only_sql != final_sql:
+        final_sql = str(dropped_filter_only_sql).strip()
+        corrections.append("Dropped unrequested missing-filter projection columns after semantic contract")
+    repaired_distinct_sql = _repair_misplaced_select_distinct(final_sql)
+    if repaired_distinct_sql and repaired_distinct_sql != final_sql:
+        final_sql = str(repaired_distinct_sql).strip()
+        corrections.append("Repaired misplaced SELECT DISTINCT after semantic contract")
 
     repaired_winner_projection = _repair_single_table_winner_row_projection(final_sql, question, ctx)
     if repaired_winner_projection and repaired_winner_projection != final_sql:
@@ -7213,6 +7255,93 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         if having_match:
             where_having_tokens.update(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, having_match.group(1)))
 
+        def _extract_requested_output_segment_local(text: str) -> str:
+            q_low_local = str(text or "").strip().lower()
+            if not q_low_local:
+                return ""
+
+            head_patterns = [
+                r"\b(?:return|show|display|get)\s+(?:the\s+)?(?P<seg>.+?)\s+\bfor\b",
+                r"\b(?:return|show|display|get)\s+(?:the\s+)?(?P<seg>.+?)\s+\bwhere\b",
+            ]
+            for pat in head_patterns:
+                m = re.search(pat, q_low_local, flags=re.I)
+                if not m:
+                    continue
+                seg = str(m.group("seg") or "").strip(" .;")
+                if seg:
+                    return seg
+
+            tail_patterns = [
+                r"\breturn\b\s+(?P<seg>.+)$",
+                r"\bshow\b\s+(?P<seg>.+)$",
+                r"\bdisplay\b\s+(?P<seg>.+)$",
+                r"\bget\b\s+(?P<seg>.+)$",
+                r"\bshowing\b\s+(?P<seg>.+)$",
+                r"\bincluding\b\s+(?P<seg>.+)$",
+                r"\binclude\b\s+(?P<seg>.+)$",
+                r"\bwith\b\s+(?P<seg>.+)$",
+            ]
+            for pat in tail_patterns:
+                m = re.search(pat, q_low_local, flags=re.I)
+                if not m:
+                    continue
+                seg = str(m.group("seg") or "").strip(" .;")
+                if not seg:
+                    continue
+                stop_pat = re.compile(
+                    r"(?is)(?:,\s*|\.\s*|\s+)(?:sorted|ordered|starting|beginning|ranked|grouped|within|among|across|inside|only\s+include|include\s+only|keep\s+only|only\s+keep|retain\s+only)\b"
+                )
+                stop_m = stop_pat.search(seg)
+                if stop_m:
+                    seg = seg[:stop_m.start()].strip(" ,.;")
+                return seg
+            return ""
+
+        requested_output_segment = _extract_requested_output_segment_local(question)
+
+        def _question_explicitly_requests_column(col_name: str) -> bool:
+            seg = str(requested_output_segment or "").strip().lower()
+            if not seg:
+                return False
+            clean = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r"\1 \2", str(col_name or ""))
+            clean = clean.replace("_", " ").lower().strip()
+            if not clean:
+                return False
+            parts_local = [p for p in clean.split() if p]
+            if not parts_local:
+                return False
+            phrase_patterns = {clean}
+            phrase_patterns.add(r"\s+".join(re.escape(p) for p in parts_local))
+            suffix_synonyms_local = AGENT_MISSING_COL_SUFFIX_SYNONYMS
+            last_word_local = parts_local[-1]
+            if last_word_local in suffix_synonyms_local and len(parts_local) >= 2:
+                prefix_local = r"\s+".join(re.escape(p) for p in parts_local[:-1])
+                phrase_patterns.add(rf"{prefix_local}\s*{suffix_synonyms_local[last_word_local]}")
+
+            condition_before = re.compile(
+                r"\b(?:with|where|having|who|that|whose|average|avg|mean|overall|global)\s*$",
+                flags=re.I,
+            )
+            condition_after = re.compile(
+                r"^\s*(?:"
+                r"greater(?:\s+than)?|less(?:\s+than)?|higher(?:\s+than)?|lower(?:\s+than)?|"
+                r"above|below|over|under|between|before|after|than|"
+                r"equal(?:s|(?:\s+to)?)|not\s+null|is\s+null|is\s+not\s+null|"
+                r"like|regexp|matches?|matching|condition\b"
+                r")",
+                flags=re.I,
+            )
+
+            for pat in phrase_patterns:
+                for m in re.finditer(rf"\b(?:the\s+)?{pat}\b", seg, flags=re.I):
+                    before = seg[max(0, m.start() - 24):m.start()]
+                    after = seg[m.end():m.end() + 48]
+                    if condition_before.search(before) or condition_after.search(after):
+                        continue
+                    return True
+            return False
+
         suffix_synonyms = AGENT_MISSING_COL_SUFFIX_SYNONYMS
         
         # all_valid_cols sudah disiapkan di atas
@@ -7225,7 +7354,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 continue
             
             # Skip jika kolom sudah dipakai di WHERE/HAVING (artinya dipakai sebagai filter, bukan output)
-            if col_lower in where_having_tokens:
+            if col_lower in where_having_tokens and not _question_explicitly_requests_column(col_raw):
                 continue
 
             # Treat common *_number and *_id forms as equivalent semantic outputs.
@@ -7308,15 +7437,69 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             if not missing_cols:
                 pass
             elif complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE and qtype == AGENT_ROUTER_QTYPE_LOOKUP:
-                # Avoid SQL string surgery. Regenerate so final SQL naturally includes requested columns.
-                _dbg_agent3_retry("Missing Columns", f"Retry (no auto-append): {missing_cols}")
-                extra_instruction = (
-                    f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
-                    f"But they are MISSING from the SELECT clause. "
-                    f"You MUST include: {', '.join(missing_cols)} in the SELECT output."
-                )
-                needs_regeneration = True
-                regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
+                # For flat lookup queries, prefer deterministic projection repair
+                # over regeneration so we do not accidentally rewrite a correct
+                # WHERE/REGEXP clause just to add a missing output column.
+                projection_fixed_sql = _ensure_explicit_simple_projection_columns(final_sql, question, ctx)
+                if projection_fixed_sql and projection_fixed_sql != final_sql:
+                    final_sql = str(projection_fixed_sql).strip()
+                    if final_sql and not final_sql.endswith(";"):
+                        final_sql += ";"
+                    sql_up = final_sql.upper()
+                    corrections.append("Applied deterministic projection-only repair")
+
+                    select_match_chk = re.search(
+                        AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN,
+                        final_sql,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                    select_text_chk_raw = select_match_chk.group(1) if select_match_chk else ""
+                    select_text_chk = select_text_chk_raw.lower()
+                    select_tokens_chk = set(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, select_text_chk))
+                    select_semantic_tokens = set(select_tokens_chk)
+                    select_tokens_raw_case = set(
+                        re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, select_text_chk_raw)
+                    )
+                    for tok_raw in select_tokens_raw_case:
+                        tok_low = tok_raw.lower()
+                        if not tok_low:
+                            continue
+                        select_semantic_tokens.add(tok_low)
+                        for part in tok_low.split("_"):
+                            if part:
+                                select_semantic_tokens.add(part)
+                        camel_spaced = re.sub(
+                            AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN,
+                            r"\1 \2",
+                            tok_raw,
+                        )
+                        for part in re.findall(r"[a-z0-9]+", camel_spaced.lower()):
+                            if part:
+                                select_semantic_tokens.add(part)
+
+                    still_missing_cols = []
+                    for col_raw in missing_cols:
+                        col_lower = str(col_raw or "").lower()
+                        if not col_lower:
+                            continue
+                        if col_lower in select_semantic_tokens:
+                            continue
+                        still_missing_cols.append(col_raw)
+                    missing_cols = still_missing_cols
+                    if not missing_cols:
+                        _dbg_agent3_retry(
+                            "Missing Columns",
+                            "Autofixed projection deterministically without regeneration.",
+                        )
+                if missing_cols:
+                    _dbg_agent3_retry("Missing Columns", f"Retry (no auto-append): {missing_cols}")
+                    extra_instruction = (
+                        f"STRICT REQUIREMENT: The user explicitly asked for these columns: {missing_cols}. "
+                        f"But they are MISSING from the SELECT clause. "
+                        f"You MUST include: {', '.join(missing_cols)} in the SELECT output."
+                    )
+                    needs_regeneration = True
+                    regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
             
             elif draft_model == SMALL_MODEL and complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE:
                 # MEDIUM ERROR: Regenerate dengan 3B (simple query dari 3B yang salah)

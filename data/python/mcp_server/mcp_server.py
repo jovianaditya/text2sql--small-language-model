@@ -480,8 +480,10 @@ def query_db(sql: str, database: str = "") -> dict:
 @mcp.tool()
 def query_db_full(sql: str, database: str = "") -> dict:
     """
-    Execute the SELECT (without LIMIT) and return ALL rows (capped by MAX_EXPORT_ROWS).
-    Intended for file export only—do not print these rows on client. (MySQL)
+    Execute the SELECT as-is and return all result rows (capped by MAX_EXPORT_ROWS).
+    Unlike preview mode, this MUST preserve the original query semantics,
+    including any user-provided LIMIT/OFFSET, because evaluation relies on
+    exact execution behavior. (MySQL)
     """
     req = _req_id()
     t0 = time.perf_counter()
@@ -501,10 +503,10 @@ def query_db_full(sql: str, database: str = "") -> dict:
         set_statement_timeout(conn, STATEMENT_TIMEOUT_MS)
 
         normalized_sql = _normalize_sql_for_wrapping(sql)
-        base_query = extract_base_query_without_limit(normalized_sql)
+        execution_sql = normalized_sql
 
         with conn.cursor() as data_cur:
-            data_cur.execute(base_query)
+            data_cur.execute(execution_sql)
             columns = [d[0] for d in data_cur.description] if data_cur.description else []
             rows = data_cur.fetchall()
 
@@ -528,7 +530,7 @@ def query_db_full(sql: str, database: str = "") -> dict:
             "_debug_info": {
                 "original_query": sql,
                 "normalized_query": normalized_sql,
-                "base_query": base_query,
+                "execution_sql": execution_sql,
                 "max_export_rows": MAX_EXPORT_ROWS,
                 "duration_seconds": _elapsed_ms(t0) / 1000.0
             }
@@ -556,7 +558,7 @@ def query_db_full(sql: str, database: str = "") -> dict:
         if code == 1054 or "Unknown column" in msg:
             col_m = re.search(r"Unknown column '([^']+)' in '([^']+)'", msg)
             missing_col = col_m.group(1) if col_m else ""
-            tbl_m = re.search(r"\bfrom\s+([`\"\w\.]+)", base_query, flags=re.I)
+            tbl_m = re.search(r"\bfrom\s+([`\"\w\.]+)", normalized_sql, flags=re.I)
             table_fqn = tbl_m.group(1).strip('`"') if tbl_m else ""
             col_sug = (
                 suggest_columns(conn, table_fqn, missing_col, 5, default_schema=target_db)

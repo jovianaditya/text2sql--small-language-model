@@ -17,4 +17,5 @@ __pycache__/
 data/python/mcp_client/results.xlsx
 data/python/mcp_client/results_paraphrase.xlsx
 **/run_*.log
+**/evaluation_*.log
 **/.codex
