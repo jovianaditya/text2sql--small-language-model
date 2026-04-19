@@ -22,6 +22,7 @@ from .schema_analyzer import (
     get_transaction_tables,
     get_fk_relationships,
     get_column_role,
+    get_column_datatype,
     get_columns_by_role,
     get_schema_analyzer,
     get_table_synonyms,
@@ -21978,6 +21979,21 @@ def _question_wants_missing_value(question: str) -> bool:
         "kosong", "tidak ada", "belum diisi"
     ])
 
+def _question_wants_present_value(question: str) -> bool:
+    q = (question or "").lower()
+    if not q or _question_wants_missing_value(q):
+        return False
+    return any(s in q for s in [
+        "not empty", "non-empty", "filled", "provided",
+        "has value", "have value", "with value",
+        "has text", "have text", "with text",
+        "has comments", "have comments", "with comments",
+        "has comment", "have comment", "with comment",
+        "has description", "have description", "with description",
+        "has note", "have note", "with note",
+        "has notes", "have notes", "with notes",
+    ])
+
 def _expand_missing_null_to_null_or_empty(sql: str, question: str) -> str:
     """
     Policy: untuk pertanyaan yang bermakna 'missing', treat sebagai:
@@ -22008,6 +22024,157 @@ def _expand_missing_null_to_null_or_empty(sql: str, question: str) -> str:
             flags=re.I,
         )
 
+        parts[i] = seg
+
+    return "".join(parts)
+
+def _expand_present_not_null_to_not_empty(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Symmetric policy for questions that explicitly ask for rows that HAVE some
+    text/value present.
+
+    For string-like columns in simple single-table queries:
+      col IS NOT NULL  -> (col IS NOT NULL AND col <> '')
+
+    The correct negation of (col IS NULL OR col = '') is NOT
+    (col IS NULL OR col = ''), which is equivalent to:
+      col IS NOT NULL AND col <> ''
+
+    Conservative guardrails:
+    - only when the question has clear "present value" wording
+    - only for string-like columns
+    - only for simple single-table drafts
+    - skips columns already handling empty-string explicitly
+    """
+    if not sql or not _question_wants_present_value(question):
+        return sql
+    if has_join(sql) or re.search(r"\bfrom\s*\(", sql, flags=re.I):
+        return sql
+
+    m_from = re.search(
+        r"""
+        \bFROM\s+
+        (?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+        (?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?
+        """,
+        sql,
+        flags=re.I | re.X,
+    )
+    if not m_from:
+        return sql
+
+    table_raw = (m_from.group("table") or "").replace("`", "")
+    base_table = table_raw.split(".")[-1].strip().lower()
+    alias = (m_from.group("alias") or "").strip()
+    if alias and alias.lower() in _RESERVED_ALIASES:
+        alias = ""
+    if not base_table:
+        return sql
+
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    allowed = _parse_allowed_identifiers(ctx)
+    allowed_cols = {str(c).strip("`").lower() for c in (allowed.get(base_table, set()) or set()) if str(c).strip()}
+
+    def _resolve_base_column(ref: str) -> Optional[str]:
+        raw = str(ref or "").strip()
+        if not raw:
+            return None
+        cleaned = raw.replace("`", "")
+        if "." in cleaned:
+            lhs, rhs = [p.strip() for p in cleaned.split(".", 1)]
+            if lhs.lower() not in {base_table, alias.lower() if alias else ""}:
+                return None
+            cleaned = rhs
+        col_l = cleaned.lower()
+        if allowed_cols and col_l not in allowed_cols:
+            return None
+        return cleaned
+
+    def _is_string_like_column(col: str) -> bool:
+        dtype = get_column_datatype(base_table, col)
+        dtype_up = str(dtype or "").upper()
+        if any(tok in dtype_up for tok in ("CHAR", "TEXT", "CLOB")):
+            return True
+        if analyzer is not None:
+            try:
+                role = analyzer.get_column_role(base_table, col)
+            except Exception:
+                role = ""
+            if str(role or "").strip().lower() in {"text", "name", "description"}:
+                return True
+        return False
+
+    stop_tokens = {"the", "a", "an", "of", "for", "to", "with", "that", "who", "which"}
+
+    def _mention_phrases(col: str) -> Set[str]:
+        phrases: Set[str] = set()
+        raw_candidates: List[str] = [str(col or "")]
+        if analyzer is not None:
+            try:
+                raw_candidates.extend(analyzer.get_column_synonyms(base_table, col) or [])
+            except Exception:
+                pass
+        for text in raw_candidates:
+            raw = str(text or "").strip()
+            if not raw:
+                continue
+            split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)
+            normalized = re.sub(r"[_\s]+", " ", split_camel).strip().lower()
+            if normalized:
+                phrases.add(normalized)
+            filtered_tokens = [tok for tok in re.findall(r"[a-z0-9]+", normalized) if tok and tok not in stop_tokens]
+            if filtered_tokens:
+                phrases.add(" ".join(filtered_tokens))
+        return {p for p in phrases if p}
+
+    q_low = (question or "").lower()
+
+    def _question_mentions_present_value(col: str) -> bool:
+        phrases = _mention_phrases(col)
+        if not phrases:
+            return False
+        explicit_present = bool(re.search(r"\b(?:not\s+empty|non[- ]empty|filled|provided)\b", q_low, flags=re.I))
+        for phrase in phrases:
+            pattern = re.escape(phrase).replace(r"\ ", r"\s+")
+            if explicit_present and re.search(rf"\b{pattern}\b", q_low, flags=re.I):
+                return True
+            if re.search(rf"\b(?:has|have|with)\b(?:[^.?!]{{0,40}})\b{pattern}\b", q_low, flags=re.I):
+                return True
+            if re.search(rf"\b{pattern}\b(?:[^.?!]{{0,24}})\b(?:provided|filled|available)\b", q_low, flags=re.I):
+                return True
+        return False
+
+    parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`[^`]*`)", sql)
+    qualified = r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?"
+
+    not_null_pat = re.compile(
+        rf"""(?is)\b(?P<col>{qualified})\s+IS\s+NOT\s+NULL\b"""
+    )
+    not_isnull_pat = re.compile(
+        rf"""(?is)\bNOT\s+(?P<col>{qualified})\s+IS\s+NULL\b"""
+    )
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+
+        def _repl_not_null(m: re.Match) -> str:
+            ref = (m.group("col") or "").strip()
+            base_col = _resolve_base_column(ref)
+            if not base_col or not _is_string_like_column(base_col):
+                return m.group(0)
+            if not _question_mentions_present_value(base_col):
+                return m.group(0)
+            ref_pat = re.escape(ref).replace(r"\ ", r"\s*")
+            if re.search(rf"(?is){ref_pat}\s*(?:<>|!=)\s*''", seg):
+                return m.group(0)
+            return f"({ref} IS NOT NULL AND {ref} <> '')"
+
+        seg = not_null_pat.sub(_repl_not_null, seg)
+        seg = not_isnull_pat.sub(_repl_not_null, seg)
         parts[i] = seg
 
     return "".join(parts)

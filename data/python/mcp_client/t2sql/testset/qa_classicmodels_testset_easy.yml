@@ -138,3 +138,73 @@ cases:
         SELECT orderNumber, orderDate 
         FROM orders 
         WHERE DAYOFWEEK(orderDate) = 6;
+    - id: E21
+      difficulty: easy
+      question: "Show customers in the USA. Return the customer name and city."
+      groundtruth_sql: |
+        SELECT customerName, city
+        FROM customers
+        WHERE country = 'USA';
+    - id: E22
+      difficulty: easy
+      question: "Find products with a buy price below 30. Return the product code, product name, and buy price."
+      groundtruth_sql: |
+        SELECT productCode, productName, buyPrice
+        FROM products
+        WHERE buyPrice < 30;
+    - id: E23
+      difficulty: easy
+      question: "Show employees with the job title Sales Rep. Return the employee number, first name, last name, and office code."
+      groundtruth_sql: |
+        SELECT employeeNumber, firstName, lastName, officeCode
+        FROM employees
+        WHERE jobTitle = 'Sales Rep';
+    - id: E24
+      difficulty: easy
+      question: "Show payments made before 2004-01-01. Return the customer number, payment date, and amount."
+      groundtruth_sql: |
+        SELECT customerNumber, paymentDate, amount
+        FROM payments
+        WHERE paymentDate < '2004-01-01';
+    - id: E25
+      difficulty: easy
+      question: "Show orders that have comments. Return the order number, order date, and comments."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate, comments
+        FROM orders
+        WHERE comments IS NOT NULL AND comments <> '';
+    - id: E26
+      difficulty: easy
+      question: "Show offices whose postal code starts with 9. Return the office code, city, country, and postal code."
+      groundtruth_sql: |
+        SELECT officeCode, city, country, postalCode
+        FROM offices
+        WHERE postalCode LIKE '9%';
+    - id: E27
+      difficulty: easy
+      question: "Find order details where the quantity ordered is at least 30 and the price per item is above 100. Return the order number, product code, quantity ordered, and price per item."
+      groundtruth_sql: |
+        SELECT orderNumber, productCode, quantityOrdered, priceEach
+        FROM orderdetails
+        WHERE quantityOrdered >= 30 AND priceEach > 100;
+    - id: E28
+      difficulty: easy
+      question: "Find product lines whose text description contains the word cars. Return the product line and text description."
+      groundtruth_sql: |
+        SELECT productLine, textDescription
+        FROM productlines
+        WHERE textDescription LIKE '%cars%';
+    - id: E29
+      difficulty: easy
+      question: "Find products whose listed selling price is higher than the buy price. Return the product code, product name, buy price, and listed selling price."
+      groundtruth_sql: |
+        SELECT productCode, productName, buyPrice, MSRP
+        FROM products
+        WHERE MSRP > buyPrice;
+    - id: E30
+      difficulty: easy
+      question: "Show products from Autoart Studio Design. Return the product code, product name, and product vendor."
+      groundtruth_sql: |
+        SELECT productCode, productName, productVendor
+        FROM products
+        WHERE productVendor = 'Autoart Studio Design';

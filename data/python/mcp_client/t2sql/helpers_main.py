@@ -115,7 +115,7 @@ from .helpers_core import (
     # phase 5 — Pattern, REGEXP, and Predicate Normalization
     _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _canonicalize_structural_regex, _canonicalize_boundary_regex, _guardrail_fix_mysql_regexp_literals,
     # phase 6
-    _expand_missing_null_to_null_or_empty, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _parse_from_join_aliases,
+    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _parse_from_join_aliases,
     _ast_guardrails,
     # phase 7
     _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
@@ -2013,11 +2013,40 @@ def _repair_backticked_identifier_phrases(sql: str, ctx: str) -> str:
         return sql
 
     allowed_tables_case: Dict[str, str] = {}
-    allowed_cols_case: Dict[str, str] = {}
-    for table, cols in allowed.items():
+    for table in allowed.keys():
         t_case = str(table).strip("`")
         if t_case:
             allowed_tables_case[t_case.lower()] = t_case
+
+    def _scope_allowed_tables(sql_text: str) -> Dict[str, Set[str]]:
+        """
+        Keep phrase repair table-aware by preferring tables already active in the
+        current SQL. This prevents generic multi-word phrases from drifting to
+        similarly named columns on unrelated tables.
+        """
+        scoped: Dict[str, Set[str]] = {}
+        code_parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")", sql_text or "")
+        code_only = "".join(part if idx % 2 == 0 else " " for idx, part in enumerate(code_parts))
+        table_pat = re.compile(
+            r"\b(?:FROM|JOIN)\s+((?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)",
+            flags=re.I,
+        )
+        for match in table_pat.finditer(code_only):
+            raw_ref = str(match.group(1) or "").strip()
+            if not raw_ref:
+                continue
+            parts = [p.strip().strip("`") for p in raw_ref.split(".") if p.strip()]
+            if not parts:
+                continue
+            table_name = allowed_tables_case.get(parts[-1].lower())
+            if table_name and table_name in allowed:
+                scoped[table_name] = allowed[table_name]
+        return scoped or allowed
+
+    scoped_allowed = _scope_allowed_tables(sql)
+
+    allowed_cols_case: Dict[str, str] = {}
+    for table, cols in scoped_allowed.items():
         for col in cols:
             c_case = str(col).strip("`")
             if c_case:
@@ -2028,7 +2057,7 @@ def _repair_backticked_identifier_phrases(sql: str, ctx: str) -> str:
 
     stop_tokens = {
         "the", "a", "an", "of", "for", "to", "with", "any", "all", "each",
-        "every", "single", "exactly", "display", "show", "list",
+        "every", "single", "exactly", "display", "show",
     }
 
     def _phrase_tokens(text: str, drop_stopwords: bool = False) -> List[str]:
@@ -2041,7 +2070,75 @@ def _repair_backticked_identifier_phrases(sql: str, ctx: str) -> str:
     def _phrase_key(text: str, drop_stopwords: bool = False) -> str:
         return "".join(_phrase_tokens(text, drop_stopwords=drop_stopwords))
 
+    def _semantic_token_set(text: str, drop_stopwords: bool = False) -> Set[str]:
+        out: Set[str] = set()
+        for token in _phrase_tokens(text, drop_stopwords=drop_stopwords):
+            if not token:
+                continue
+            out.add(token)
+            if len(token) >= 5 and token.endswith("ies"):
+                out.add(token[:-3] + "y")
+            if len(token) >= 5 and token.endswith("ed"):
+                stem = token[:-2]
+                if stem:
+                    out.add(stem)
+                    if len(stem) >= 3 and stem[-1] == stem[-2]:
+                        out.add(stem[:-1])
+            if len(token) >= 6 and token.endswith("ing"):
+                stem = token[:-3]
+                if stem:
+                    out.add(stem)
+                    if len(stem) >= 3 and stem[-1] == stem[-2]:
+                        out.add(stem[:-1])
+            if len(token) >= 4 and token.endswith("s") and not token.endswith("ss"):
+                out.add(token[:-1])
+        return {tok for tok in out if tok}
+
+    def _family_term_sets(terms: Set[str]) -> List[Set[str]]:
+        out: List[Set[str]] = []
+        for term in terms:
+            token_set = _semantic_token_set(term, drop_stopwords=True)
+            if token_set:
+                out.append(token_set)
+        return out
+
+    semantic_family_terms = {
+        "listprice": (
+            _family_term_sets(set(HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS)),
+            _family_term_sets(set(HELPERS_SEMANTIC_ALIAS_LISTPRICE_EXCLUDE_TERMS)),
+        ),
+        "price": (
+            _family_term_sets(set(HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS)),
+            _family_term_sets(set(HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS)),
+        ),
+    }
+
+    def _matches_family(raw_tokens: Set[str], family_term_sets: List[Set[str]]) -> bool:
+        if not raw_tokens:
+            return False
+        for term_set in family_term_sets:
+            overlap = raw_tokens.intersection(term_set)
+            if not overlap:
+                continue
+            if term_set.issubset(raw_tokens):
+                return True
+            if len(term_set) >= 2 and len(overlap) / max(1, len(term_set)) >= 0.75:
+                return True
+        return False
+
+    def _semantic_family_tags(token_set: Set[str], *, apply_excludes: bool = True) -> Set[str]:
+        tags: Set[str] = set()
+        for family, (include_sets, exclude_sets) in semantic_family_terms.items():
+            if not _matches_family(token_set, include_sets):
+                continue
+            if apply_excludes and exclude_sets and _matches_family(token_set, exclude_sets):
+                continue
+            tags.add(family)
+        return tags
+
     key_to_col: Dict[str, Optional[str]] = {}
+    col_semantic_sets: Dict[str, List[Set[str]]] = {}
+    col_family_tags: Dict[str, Set[str]] = {}
 
     def _put_key(key: str, canon_col: str) -> None:
         if not key:
@@ -2056,9 +2153,10 @@ def _repair_backticked_identifier_phrases(sql: str, ctx: str) -> str:
     for canon_col in allowed_cols_case.values():
         _put_key(_phrase_key(canon_col, drop_stopwords=False), canon_col)
         _put_key(_phrase_key(canon_col, drop_stopwords=True), canon_col)
+        col_semantic_sets.setdefault(canon_col, []).append(_semantic_token_set(canon_col, drop_stopwords=True))
 
     # Synonym-based keys from metadata.
-    for table, cols in allowed.items():
+    for table, cols in scoped_allowed.items():
         for col in cols:
             canon_col = allowed_cols_case.get(str(col).lower(), str(col))
             for syn in get_column_synonyms(table, col) or []:
@@ -2067,34 +2165,53 @@ def _repair_backticked_identifier_phrases(sql: str, ctx: str) -> str:
                     continue
                 _put_key(_phrase_key(syn_txt, drop_stopwords=False), canon_col)
                 _put_key(_phrase_key(syn_txt, drop_stopwords=True), canon_col)
+                col_semantic_sets.setdefault(canon_col, []).append(_semantic_token_set(syn_txt, drop_stopwords=True))
+
+    for canon_col, token_sets in col_semantic_sets.items():
+        merged_tokens: Set[str] = set()
+        for token_set in token_sets:
+            merged_tokens.update(token_set)
+        col_family_tags[canon_col] = _semantic_family_tags(merged_tokens, apply_excludes=True)
 
     quoted_ident = re.compile(r"`([^`]+)`")
 
     def _best_overlap_match(raw_text: str) -> Optional[str]:
-        raw_tokens = _phrase_tokens(raw_text, drop_stopwords=True)
-        if not raw_tokens:
+        raw_set = _semantic_token_set(raw_text, drop_stopwords=True)
+        if not raw_set:
             return None
-        raw_set = set(raw_tokens)
+        raw_family_tags = _semantic_family_tags(raw_set, apply_excludes=False)
 
         best_col: Optional[str] = None
         best_score = 0.0
         for canon_col in allowed_cols_case.values():
-            col_tokens = _phrase_tokens(canon_col, drop_stopwords=True)
-            if not col_tokens:
+            candidate_sets = col_semantic_sets.get(canon_col) or []
+            local_best = 0.0
+            for col_set in candidate_sets:
+                if not col_set:
+                    continue
+                overlap = raw_set.intersection(col_set)
+                if not overlap:
+                    continue
+                score = len(overlap) / max(1, len(raw_set))
+                if "amount" in raw_set and "amount" in col_set:
+                    score += 0.40
+                if "number" in raw_set and "number" in col_set:
+                    score += 0.20
+                if overlap == raw_set:
+                    score += 0.15
+                local_best = max(local_best, score)
+
+            if not local_best:
                 continue
-            col_set = set(col_tokens)
-            overlap = raw_set.intersection(col_set)
-            if not overlap:
-                continue
-            score = len(overlap) / max(1, len(raw_set))
-            if "amount" in raw_set and "amount" in col_set:
-                score += 0.40
-            if "number" in raw_set and "number" in col_set:
-                score += 0.20
-            if overlap == raw_set:
-                score += 0.15
-            if score > best_score:
-                best_score = score
+
+            matched_families = raw_family_tags.intersection(col_family_tags.get(canon_col, set()))
+            if "listprice" in matched_families:
+                local_best += 0.45
+            if "price" in matched_families:
+                local_best += 0.15
+
+            if local_best > best_score:
+                best_score = local_best
                 best_col = canon_col
 
         if best_score >= 0.65:
@@ -4528,6 +4645,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Phase 6 — NULL / DISTINCT / Result Cardinality Policies
     # ---------------------------------------------------------------------------
     s = _expand_missing_null_to_null_or_empty(s, question)
+    s = _expand_present_not_null_to_not_empty(s, question, ctx)
     s = _ensure_reasonable_distinct(s, question)
     s = _ensure_reasonable_count_distinct(s, question)
     s = _drop_redundant_group_by_for_distinct_lookup(s)
