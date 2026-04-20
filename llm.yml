@@ -12,7 +12,7 @@ services:
     container_name: ollama
     environment:
       - OLLAMA_KEEP_ALIVE=180s
-      - OLLAMA_NUM_THREADS=4
+      - OLLAMA_NUM_THREAD=6
     ports: 
       - "11434:11434" 
     volumes: 
@@ -24,7 +24,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 14g
+          memory: 20g
     networks:
       - default
       - datahub_network

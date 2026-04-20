@@ -524,6 +524,71 @@ def _extract_jsonish_sql_field(text: str) -> Optional[str]:
     return recovered
 
 
+def _trim_plain_sql_statement_candidate(text: str) -> str:
+    """
+    Keep only the SQL statement portion from a plain-text LLM response.
+
+    Text-mode models sometimes append notes/markdown or JSON tail characters
+    after a valid SQL statement. Trimming at the first semicolon outside quotes
+    lets the extractor accept the valid SQL without relaxing SQL completeness.
+    """
+    s = str(text or "").strip()
+    if not s:
+        return ""
+
+    depth = 0
+    in_sq = False
+    in_dq = False
+    in_bt = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if in_sq:
+            if ch == "'" and i + 1 < len(s) and s[i + 1] == "'":
+                i += 2
+                continue
+            if ch == "'":
+                in_sq = False
+            i += 1
+            continue
+        if in_dq:
+            if ch == "\\" and i + 1 < len(s):
+                i += 2
+                continue
+            if ch == '"':
+                in_dq = False
+            i += 1
+            continue
+        if in_bt:
+            if ch == "`":
+                in_bt = False
+            i += 1
+            continue
+
+        if ch == "'":
+            in_sq = True
+        elif ch == '"':
+            in_dq = True
+        elif ch == "`":
+            in_bt = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == ";" and depth == 0:
+            return s[: i + 1].strip()
+        i += 1
+
+    marker = re.search(
+        r"(?is)(?:\n|^)\s*(?:```|notes?\s*:|reasoning\s*:|explanation\s*:|answer\s*:)",
+        s,
+    )
+    if marker and marker.start() > 0:
+        s = s[: marker.start()].strip()
+
+    return s.rstrip().rstrip(",").rstrip("}").rstrip('"').strip()
+
+
 def _extract_plain_sql_statement(text: str) -> Optional[str]:
     txt = _strip_code_fences(str(text or "")).strip()
     if not txt:
@@ -537,10 +602,11 @@ def _extract_plain_sql_statement(text: str) -> Optional[str]:
     note_marker = re.search(r'(?is)\s+["\']?notes["\']?\s*:\s*', candidate)
     if note_marker:
         candidate = candidate[: note_marker.start()].strip().rstrip(",{")
+    candidate = _trim_plain_sql_statement_candidate(candidate)
 
     if not re.match(r"(?is)^(SELECT|WITH)\b", candidate):
         return None
-    if " FROM " not in candidate.upper() and not re.match(r"(?is)^WITH\b", candidate):
+    if not re.search(r"(?is)\bFROM\b", candidate) and not re.match(r"(?is)^WITH\b", candidate):
         return None
     return candidate
 
@@ -553,7 +619,7 @@ def _looks_complete_sql_statement(sql_text: str) -> bool:
         return False
 
     upper = s.upper()
-    if upper.startswith("SELECT") and " FROM " not in upper:
+    if upper.startswith("SELECT") and not re.search(r"\bFROM\b", upper):
         return False
 
     case_count = len(re.findall(r"\bCASE\b", upper))

@@ -338,6 +338,8 @@ from .helpers_core import (
     _question_wants_winner_row,
     _question_wants_anti_existence,
     _question_wants_dual_fact_rollup,
+    _question_has_set_operation_intent,
+    _enforce_set_operation_operator_from_question,
     _wants_distinct_from_question,
     _question_wants_count_distinct,
     _ensure_reasonable_distinct,
@@ -407,12 +409,17 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         and not wants_include_zero
         and not wants_projection_null_fill
     )
-    wants_final_order = _question_requests_ordering(question)
     wants_offset_window = _question_has_offset_window_sequence_intent(question)
+    wants_final_order = _question_requests_ordering(question)
     wants_boundary_regex = _question_requires_word_boundary_regex(question)
     wants_regex = _question_requires_regex(question)
     wants_structural_regex = _question_requires_structural_regex(question)
     wants_scalar_extrema_date_filter = _question_requires_scalar_extrema_date_filter(question)
+    if wants_offset_window:
+        # Previous/next row context is an offset-window task, not a
+        # winner-row selection. Keeping these separate avoids unnecessary
+        # ROW_NUMBER/rn retry gates on otherwise valid LAG/LEAD projections.
+        wants_winner_row = False
     # Same-group/window-partition requirements belong to window-aggregate
     # families. True winner-row questions should be governed by their
     # ROW_NUMBER / ORDER BY shape instead of an inferred PARTITION BY contract.
@@ -591,10 +598,14 @@ def _extract_same_group_phrase(question: str) -> str:
     ):
         return ""
 
+    boundary_terms = (
+        r"when|where|after|before|ordered|sorted|with|and|then|that|"
+        r"which|who|whose|including|excluding|counting|except"
+    )
     patterns = [
-        r"\b(?:within|in)\s+the\s+same\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:when|where|after|before|ordered|sorted|with|and|then|that|which|who|whose)\b|[.,;]|$)",
-        r"\b(?:that|the)\s+same\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:when|where|after|before|ordered|sorted|with|and|then|that|which|who|whose)\b|[.,;]|$)",
-        r"\bsame\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:when|where|after|before|ordered|sorted|with|and|then|that|which|who|whose)\b|[.,;]|$)",
+        rf"\b(?:within|in)\s+the\s+same\s+([a-z][a-z0-9_ ]{{1,40}}?)(?=\s+\b(?:{boundary_terms})\b|[.,;]|$)",
+        rf"\b(?:that|the)\s+same\s+([a-z][a-z0-9_ ]{{1,40}}?)(?=\s+\b(?:{boundary_terms})\b|[.,;]|$)",
+        rf"\bsame\s+([a-z][a-z0-9_ ]{{1,40}}?)(?=\s+\b(?:{boundary_terms})\b|[.,;]|$)",
     ]
     for pattern in patterns:
         match = re.search(pattern, q, flags=re.I)
@@ -609,6 +620,8 @@ def _semantic_phrase_tokens(text: str) -> List[str]:
     stop_words = {
         "a", "an", "the", "that", "this", "those", "these", "same",
         "within", "in", "of", "for", "to", "by", "on", "from",
+        "including", "include", "includes", "excluded", "excluding",
+        "except", "counting", "count", "itself", "themselves",
     }
     return [tok for tok in tokens if tok and tok not in stop_words]
 
@@ -701,21 +714,35 @@ def _resolve_required_window_partition_column(question: str, ctx: str = "", sql:
                 continue
 
             score = 0
+            matched_hint = False
             if col_spaced == hint_norm:
                 score += 100
+                matched_hint = True
             if hint_norm and hint_norm in col_spaced:
                 score += 60
+                matched_hint = True
             if hint_tokens.issubset(col_tokens):
                 score += 45 + (5 * len(hint_tokens))
+                matched_hint = True
+            if hint_tokens.intersection(col_tokens):
+                score += 10 * len(hint_tokens.intersection(col_tokens))
+                matched_hint = True
             if len(hint_tokens) == 1:
                 only_hint = next(iter(hint_tokens))
                 if only_hint in col_tokens:
                     score += 35
+                    matched_hint = True
                 if col_spaced.startswith(f"{only_hint} ") and any(
                     suffix in col_tokens for suffix in {"code", "id", "number", "key"}
                 ):
-                    score += 20
-            if _question_mentions_column(q_lower, str(col)):
+                    suffix_terms = {"code", "id", "number", "key"}
+                    descriptor_tokens = col_tokens - hint_tokens - suffix_terms
+                    # For "same <entity>", prefer the direct entity identifier
+                    # (<entity>Number/<entity>Id/...) over detail columns like
+                    # <entity>LineNumber that happen to contain the same token.
+                    score += 100 if not descriptor_tokens else max(0, 20 - (20 * len(descriptor_tokens)))
+                    matched_hint = True
+            if matched_hint and _question_mentions_column(q_lower, str(col)):
                 score += 25
 
             if score > best_score:
@@ -1424,6 +1451,466 @@ def _add_missing_final_order(sql: str, question: str) -> str:
     return out.rstrip() + trailing_semicolon
 
 
+def _identifier_similarity_distance(a: str, b: str, max_distance: int = 2) -> int:
+    """Small bounded edit-distance helper for conservative alias typo repair."""
+    a = str(a or "").lower()
+    b = str(b or "").lower()
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > max_distance:
+        return max_distance + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        best = cur[0]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            val = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            cur.append(val)
+            best = min(best, val)
+        if best > max_distance:
+            return max_distance + 1
+        prev = cur
+    return prev[-1]
+
+
+def _repair_near_miss_output_alias_references(sql: str, ctx: str = "") -> str:
+    """
+    Repair bare references that are near-miss typos of SELECT output aliases.
+
+    Guardrails:
+    - only touches WHERE/HAVING/ORDER BY clauses
+    - never rewrites real schema columns from the active context
+    - requires a unique close alias candidate
+    """
+    s = (sql or "").strip()
+    if not s:
+        return sql
+
+    alias_names = {
+        str(m.group(1) or "").strip("`").lower()
+        for m in re.finditer(
+            r"\bAS\s+`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            s,
+            flags=re.I,
+        )
+        if str(m.group(1) or "").strip()
+    }
+    relation_aliases = {
+        str(m.group(1) or "").strip("`").lower()
+        for m in re.finditer(
+            r"\b(?:FROM|JOIN)\s+(?:\([^)]*\)|`?[A-Za-z_][A-Za-z0-9_]*`?)\s+(?:AS\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            s,
+            flags=re.I | re.S,
+        )
+        if str(m.group(1) or "").strip()
+    }
+    alias_names.difference_update(relation_aliases)
+    if not alias_names:
+        return sql
+
+    schema_cols: Set[str] = set()
+    try:
+        for cols in (_parse_allowed_identifiers(ctx or "") or {}).values():
+            schema_cols.update(str(c or "").strip().lower() for c in cols if str(c or "").strip())
+    except Exception:
+        schema_cols = set()
+
+    clause_positions = [
+        pos for pos in (
+            _find_top_level_kw(s, "where"),
+            _find_top_level_kw(s, "having"),
+            _find_top_level_kw(s, "order by"),
+        )
+        if pos >= 0
+    ]
+    if not clause_positions:
+        return sql
+    start = min(clause_positions)
+    head, tail = s[:start], s[start:]
+
+    protected = {a.lower() for a in alias_names}
+    protected.update(c.lower() for c in schema_cols)
+    protected.update(str(k or "").lower() for k in _SQL_KEYWORDS)
+
+    def _replace_token(match: re.Match) -> str:
+        token = str(match.group(0) or "")
+        token_l = token.lower()
+        if token_l in protected or len(token_l) < 4:
+            return token
+        candidates = [
+            alias for alias in alias_names
+            if alias != token_l and _identifier_similarity_distance(token_l, alias, 2) <= 2
+        ]
+        if len(candidates) != 1:
+            return token
+        return candidates[0]
+
+    repaired_tail = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", _replace_token, tail)
+    return head + repaired_tail
+
+
+def _normalize_order_term_tokens(text: str) -> Set[str]:
+    raw = re.sub(AGENT_COLUMN_CAMEL_SPLIT_PATTERN, r"\1 \2", str(text or ""))
+    tokens = re.findall(r"[a-z0-9]+", raw.lower())
+    stop = {
+        "the", "a", "an", "by", "from", "to", "then", "and", "with",
+        "first", "final", "result", "results", "output", "rows", "row",
+        "sort", "sorted", "ordered", "arrange", "arranged",
+        "ascending", "descending", "asc", "desc", "highest", "lowest",
+        "largest", "smallest", "latest", "earliest", "newest", "oldest",
+    }
+    normalized = []
+    for tok in tokens:
+        if len(tok) == 1:
+            continue
+        if tok in stop:
+            continue
+        if tok.endswith("ies") and len(tok) > 4:
+            tok = tok[:-3] + "y"
+        elif tok.endswith("s") and len(tok) > 3:
+            tok = tok[:-1]
+        normalized.append(tok)
+    return set(normalized)
+
+
+def _extract_requested_final_order_terms(question: str) -> List[Tuple[str, str]]:
+    q = str(question or "").strip()
+    if not q:
+        return []
+    patterns = [
+        r"\b(?:final\s+)?(?:result|results|output|rows?)\s+(?:should\s+be\s+)?(?:sorted|ordered|arranged)\s+by\s+(?P<body>[^.]+)",
+        r"\b(?:sort|sorted|order|ordered|arrange|arranged)\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)?\s*by\s+(?P<body>[^.]+)",
+        r"\b(?:sort|order|arrange)\s+by\s+(?P<body>[^.]+)",
+    ]
+    body = ""
+    for pat in patterns:
+        m = re.search(pat, q, flags=re.I)
+        if m:
+            body = str(m.group("body") or "").strip()
+            break
+    if not body:
+        return []
+
+    body = re.sub(r"\b(if\s+there\s+is\s+a\s+tie|if\s+there\s+are\s+ties)\b.*", "", body, flags=re.I).strip()
+    raw_parts = [
+        p.strip(" ,;")
+        for p in re.split(r"\s*,?\s+then\s+|\s*,\s*", body, flags=re.I)
+        if p.strip(" ,;")
+    ]
+    out: List[Tuple[str, str]] = []
+    for part in raw_parts:
+        direction = "ASC"
+        if re.search(r"\b(?:descending|desc|highest|largest|latest|newest|most)\b", part, flags=re.I):
+            direction = "DESC"
+        elif re.search(r"\b(?:ascending|asc|a-z|alphabetical|chronological|earliest|oldest|smallest|lowest)\b", part, flags=re.I):
+            direction = "ASC"
+        clean = re.sub(
+            r"\b(?:ascending|descending|asc|desc|first|from\s+(?:highest|lowest|latest|earliest)\s+to\s+(?:lowest|highest|earliest|latest))\b",
+            " ",
+            part,
+            flags=re.I,
+        )
+        clean = re.sub(r"\s+", " ", clean).strip(" ,;")
+        if clean:
+            out.append((clean, direction))
+    return out
+
+
+def _complete_requested_final_order(sql: str, question: str) -> str:
+    """
+    Rebuild a simple top-level ORDER BY when the question gives an explicit
+    multi-key final ordering ("..., then ...") and all keys map to projected
+    columns/aliases. This is intentionally limited to flat SELECT outputs.
+    """
+    s = (sql or "").strip()
+    if not s or not _has_top_level_order_by(s):
+        return sql
+    # Ranking window ORDER BY is often part of row-number semantics.  Still
+    # allow a top-level final ORDER BY repair when the question explicitly names
+    # the final output order; the scanner below only edits the top-level tail.
+    if re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", s, flags=re.I) and not re.search(
+        r"\b(?:final\s+)?(?:result|results|output|rows?)\s+(?:should\s+be\s+)?(?:sorted|ordered|arranged)\s+by\b"
+        r"|\b(?:sort|order|arrange)\s+(?:the\s+)?final\s+(?:result|results|output|rows?)\s+by\b",
+        str(question or ""),
+        flags=re.I,
+    ):
+        return sql
+
+    requested = _extract_requested_final_order_terms(question)
+    if len(requested) < 2:
+        return sql
+
+    trailing_semicolon = ";" if s.endswith(";") else ""
+    if trailing_semicolon:
+        s = s[:-1].rstrip()
+
+    from_pos = _find_top_level_kw(s, "from")
+    order_pos = _find_top_level_kw(s, "order by")
+    if from_pos < 0 or order_pos < 0 or order_pos <= from_pos:
+        return s + trailing_semicolon
+
+    select_segment = re.sub(r"^\s*select\s+", "", s[:from_pos], flags=re.I | re.S).strip()
+    select_items = _split_top_level_csv(select_segment)
+    if not select_items:
+        return s + trailing_semicolon
+
+    limit_pos = _find_top_level_kw(s, "limit", order_pos + len("order by"))
+    order_end = limit_pos if limit_pos >= 0 else len(s)
+    suffix = s[order_end:].strip()
+
+    candidates: List[Tuple[str, Set[str]]] = []
+    for item in select_items:
+        item_clean = item.strip()
+        # SELECT modifiers are not part of the projected expression name.  When
+        # a DISTINCT query needs final ORDER BY repair, treating "DISTINCT col"
+        # as the sortable expression would generate invalid SQL.
+        item_clean = re.sub(r"(?is)^(?:DISTINCT|ALL)\s+", "", item_clean).strip()
+        if not item_clean:
+            continue
+        alias_match = re.search(r"\bAS\s+(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", item_clean, flags=re.I)
+        alias = alias_match.group(1).strip("`") if alias_match else ""
+        expr = item_clean[:alias_match.start()].strip() if alias_match else item_clean
+        simple_col_match = re.search(r"(?:^|\.)(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", expr)
+        expr_name = simple_col_match.group(1).strip("`") if simple_col_match else expr
+        order_expr = alias or expr_name
+        token_text = " ".join(x for x in [alias, expr_name, expr] if x)
+        tokens = _normalize_order_term_tokens(token_text)
+        if order_expr and tokens:
+            candidates.append((order_expr, tokens))
+
+    mapped: List[str] = []
+    for phrase, direction in requested:
+        phrase_tokens = _normalize_order_term_tokens(phrase)
+        if not phrase_tokens:
+            return s + trailing_semicolon
+        scored: List[Tuple[int, str]] = []
+        for expr, tokens in candidates:
+            overlap = len(phrase_tokens.intersection(tokens))
+            if phrase_tokens.issubset(tokens):
+                exact_bonus = 30 if tokens == phrase_tokens else 0
+                scored.append((100 + exact_bonus + overlap, expr))
+            elif overlap and overlap == len(phrase_tokens):
+                exact_bonus = 30 if tokens == phrase_tokens else 0
+                scored.append((50 + exact_bonus + overlap, expr))
+        scored.sort(reverse=True)
+        if not scored:
+            return s + trailing_semicolon
+        best_score = scored[0][0]
+        best_exprs = [expr for score, expr in scored if score == best_score]
+        if len(set(best_exprs)) != 1:
+            return s + trailing_semicolon
+        mapped.append(f"{best_exprs[0]} {direction}")
+
+    if len(mapped) != len(requested):
+        return s + trailing_semicolon
+
+    prefix = s[:order_pos].rstrip()
+    rebuilt = f"{prefix} ORDER BY {', '.join(mapped)}"
+    if suffix:
+        rebuilt += " " + suffix
+    return rebuilt.rstrip() + trailing_semicolon
+
+
+def _question_requests_offset_default_value(question: str) -> bool:
+    q = str(question or "").lower()
+    if not q:
+        return False
+    if not re.search(r"\b(?:previous|prior|next|following|lag|lead)\b", q, flags=re.I):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:default|fallback|otherwise|coalesce|fill|replace|use)\b"
+            r"[^.]{0,48}\b(?:zero|0|n/a|unknown|blank|empty)\b",
+            q,
+            flags=re.I | re.S,
+        )
+        or re.search(
+            r"\b(?:if|when)\s+(?:there\s+is\s+)?no\s+"
+            r"(?:previous|prior|next|following)\b[^.]{0,64}\b(?:zero|0|n/a|unknown|blank|empty)\b",
+            q,
+            flags=re.I | re.S,
+        )
+        or re.search(
+            r"\b(?:zero|0|n/a|unknown|blank|empty)\b[^.]{0,48}\b"
+            r"(?:when|if)\s+(?:there\s+is\s+)?no\s+"
+            r"(?:previous|prior|next|following)\b",
+            q,
+            flags=re.I | re.S,
+        )
+    )
+
+
+def _strip_unrequested_offset_window_default(sql: str, question: str) -> str:
+    """
+    Remove LAG/LEAD default arguments unless the question explicitly asks for
+    fallback values. SQL defaults to NULL for missing previous/next rows, which
+    matches plain natural-language "previous/next" semantics.
+    """
+    s = str(sql or "")
+    if not s or not _question_has_offset_window_sequence_intent(question):
+        return sql
+    if _question_requests_offset_default_value(question):
+        return sql
+    if not re.search(r"\b(?:LAG|LEAD)\s*\(", s, flags=re.I):
+        return sql
+
+    out: List[str] = []
+    idx = 0
+    changed = False
+    pattern = re.compile(r"\b(?P<func>LAG|LEAD)\s*\(", flags=re.I)
+
+    while True:
+        m = pattern.search(s, idx)
+        if not m:
+            out.append(s[idx:])
+            break
+        open_idx = s.find("(", m.start())
+        if open_idx < 0:
+            out.append(s[idx:])
+            break
+
+        depth = 0
+        in_sq = False
+        in_dq = False
+        close_idx = -1
+        i = open_idx
+        while i < len(s):
+            ch = s[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(s) and s[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+            elif ch == '"' and not in_sq:
+                in_dq = not in_dq
+            elif not in_sq and not in_dq:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = i
+                        break
+            i += 1
+
+        if close_idx < 0:
+            out.append(s[idx:])
+            break
+
+        args_body = s[open_idx + 1:close_idx]
+        args = _split_top_level_csv(args_body)
+        if len(args) == 3:
+            out.append(s[idx:m.end()])
+            out.append(", ".join(arg.strip() for arg in args[:2]))
+            out.append(")")
+            changed = True
+        else:
+            out.append(s[idx:close_idx + 1])
+        idx = close_idx + 1
+
+    return "".join(out) if changed else sql
+
+
+def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col: str) -> str:
+    """
+    Rewrite a same-table aggregate comparison into a derived window form.
+
+    This handles generic "value > average value within the same group" shapes
+    when the draft uses an ambiguous unaliased self-subquery. It only applies
+    to simple single-table queries and uses the schema-resolved group column
+    from the semantic contract.
+    """
+    s = (sql or "").strip()
+    if not s or not partition_col or re.search(r"\bJOIN\b", s, flags=re.I):
+        return sql
+
+    trailing_semicolon = ";" if s.endswith(";") else ""
+    if trailing_semicolon:
+        s = s[:-1].rstrip()
+
+    pattern = re.compile(
+        r"""(?is)^\s*SELECT\s+(?P<select>.+?)\s+
+            FROM\s+`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<outer_alias>[A-Za-z_][A-Za-z0-9_]*))?\s+
+            WHERE\s+(?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
+            (?P<op>>=|<=|<>|!=|=|>|<)\s*
+            \(\s*SELECT\s+(?P<agg>AVG|MIN|MAX|SUM)\s*\(\s*(?P<inner_metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)
+            \s+FROM\s+`?(?P=table)`?(?:\s+(?:AS\s+)?(?P<inner_alias>[A-Za-z_][A-Za-z0-9_]*))?
+            (?:\s+WHERE\s+(?P<inner_where>.*?))?
+            \s*\)\s*(?P<tail>.*)$""",
+        re.X,
+    )
+    m = pattern.match(s)
+    if not m:
+        return sql
+
+    select_items = _split_top_level_csv(m.group("select") or "")
+    if not select_items:
+        return sql
+
+    def _strip_qual(ref: str) -> str:
+        ref = str(ref or "").strip().strip("`")
+        if "." in ref:
+            ref = ref.split(".")[-1].strip("`")
+        return ref
+
+    metric_col = _strip_qual(m.group("metric"))
+    inner_metric_col = _strip_qual(m.group("inner_metric")) or metric_col
+    metric_col = metric_col or inner_metric_col
+    partition_col = str(partition_col or "").strip("`")
+    if not metric_col or not partition_col:
+        return sql
+
+    # Keep this helper for flat projections only.
+    output_items: List[str] = []
+    needed_cols: List[str] = []
+    for item in select_items:
+        raw = item.strip()
+        if re.search(r"\b(?:COUNT|SUM|AVG|MIN|MAX|OVER|CASE)\s*\(", raw, flags=re.I):
+            return sql
+        alias_match = re.search(r"\bAS\s+.+$", raw, flags=re.I)
+        expr = raw[:alias_match.start()].strip() if alias_match else raw
+        col_match = re.fullmatch(r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?", expr)
+        if not col_match:
+            return sql
+        col = col_match.group(1)
+        output_items.append(raw if "." not in raw else re.sub(r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.)", "", raw))
+        if col not in needed_cols:
+            needed_cols.append(col)
+
+    tail = str(m.group("tail") or "").strip()
+    order_pos = _find_top_level_kw(tail, "order by")
+    if order_pos >= 0:
+        order_clause = tail[order_pos + len("order by"):].strip()
+        for order_item in _split_top_level_csv(re.sub(r"\bLIMIT\b.*$", "", order_clause, flags=re.I | re.S)):
+            col_match = re.search(r"(?:^|\.|`)([A-Za-z_][A-Za-z0-9_]*)`?\s*(?:ASC|DESC)?\s*$", order_item.strip(), flags=re.I)
+            if col_match:
+                col = col_match.group(1)
+                if col not in needed_cols:
+                    needed_cols.append(col)
+
+    for col in (metric_col, partition_col):
+        if col not in needed_cols:
+            needed_cols.append(col)
+
+    agg = str(m.group("agg") or "AVG").upper()
+    avg_alias = re.sub(r"[^A-Za-z0-9_]+", "_", f"{agg.lower()}_{metric_col}_by_{partition_col}").strip("_")
+    derived_alias = "base_rows"
+    inner_select = ", ".join(needed_cols)
+    outer_select = ", ".join(output_items)
+    op = m.group("op")
+    rebuilt = (
+        f"SELECT {outer_select} FROM ("
+        f"SELECT {inner_select}, {agg}({inner_metric_col}) OVER (PARTITION BY {partition_col}) AS {avg_alias} "
+        f"FROM {m.group('table')}"
+        f") AS {derived_alias} "
+        f"WHERE {metric_col} {op} {avg_alias}"
+    )
+    if tail:
+        rebuilt += " " + re.sub(r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.)", "", tail).strip()
+    return rebuilt.rstrip() + trailing_semicolon
+
+
 def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[str, List[str], List[str]]:
     """
     Apply low-risk semantic repairs and report any remaining unmet contracts.
@@ -1436,17 +1923,30 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
     corrections: List[str] = []
     violations: List[str] = []
 
+    fixed = _repair_near_miss_output_alias_references(out_sql, ctx)
+    if fixed != out_sql:
+        out_sql = fixed
+        corrections.append("Semantic contract: repaired near-miss output alias reference")
+
     fixed = _ensure_group_by_for_non_agg(out_sql)
     if fixed != out_sql:
         out_sql = fixed
         corrections.append("Semantic contract: added missing GROUP BY for non-aggregate select")
 
     if contract["requires_projection_distinct"]:
+        fixed = _enforce_set_operation_operator_from_question(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: enforced set-operation dedupe operator")
         fixed = _ensure_reasonable_distinct(out_sql, question)
         if fixed != out_sql:
             out_sql = fixed
             corrections.append("Semantic contract: enforced projection DISTINCT")
-        if not re.search(r"^\s*SELECT\s+DISTINCT\b", out_sql, flags=re.I):
+        has_set_level_dedupe = bool(
+            _question_has_set_operation_intent(question)
+            and re.search(r"\bUNION\b(?!\s+ALL\b)", out_sql, flags=re.I)
+        )
+        if not has_set_level_dedupe and not re.search(r"^\s*SELECT\s+DISTINCT\b", out_sql, flags=re.I):
             violations.append("missing_projection_distinct")
 
     if contract["requires_count_distinct"]:
@@ -1494,6 +1994,10 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         if fixed != out_sql:
             out_sql = fixed
             corrections.append("Semantic contract: enforced final ORDER BY direction")
+        fixed = _complete_requested_final_order(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: completed requested final ORDER BY keys")
         fixed = _repair_chronological_month_order(out_sql, question)
         if fixed != out_sql:
             out_sql = fixed
@@ -1502,6 +2006,10 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
             violations.append("missing_final_order")
 
     if bool(contract.get("requires_offset_window")):
+        fixed = _strip_unrequested_offset_window_default(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: removed unrequested LAG/LEAD default value")
         if not _has_required_offset_window(out_sql, question):
             violations.append("missing_offset_window")
 
@@ -1515,6 +2023,15 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
 
     required_window_partition_col = str(contract.get("required_window_partition_col") or "").strip()
     if required_window_partition_col:
+        fixed = _rewrite_same_table_correlated_aggregate_comparison(
+            out_sql,
+            required_window_partition_col,
+        )
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append(
+                f"Semantic contract: normalized same-table aggregate comparison by {required_window_partition_col}"
+            )
         fixed = _rewrite_grouped_aggregate_to_window_partition(
             out_sql,
             required_window_partition_col,
@@ -3589,6 +4106,11 @@ def router_agent(state: RAGState) -> RAGState:
         is_winner_row = True
     if not is_winner_row and _question_wants_winner_row(question_lower):
         is_winner_row = True
+    if is_winner_row and _question_has_offset_window_sequence_intent(question_lower):
+        # LAG/LEAD-style "previous/next row" questions may contain words such
+        # as "row" and "order", but they do not ask to pick a single winner
+        # row per group. Keep them in the offset-window family.
+        is_winner_row = False
     
     # FIXED: Exclusion detection - only trigger for TRUE exclusion patterns
     # These patterns imply NOT EXISTS / NOT IN / LEFT JOIN ... IS NULL (cross-table exclusion)
@@ -3668,26 +4190,7 @@ def router_agent(state: RAGState) -> RAGState:
         and not is_simple_exists_subquery
     )
 
-    quoted_literals = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or "")
-    has_set_operation_cue = bool(
-        re.search(r"\bunion\b", question_lower, flags=re.I)
-        or re.search(r"\b(?:combine|combined|merge)\b", question_lower, flags=re.I)
-        or re.search(r"\b(?:in|into)\s+one\s+result(?:\s+set)?\b", question_lower, flags=re.I)
-    )
-    has_set_labeling_shape = bool(
-        len(quoted_literals) >= 2
-        and re.search(r"\bor\b", question_lower, flags=re.I)
-    )
-    has_dedupe_request = bool(
-        re.search(
-            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
-            question_lower,
-            flags=re.I,
-        )
-    )
-    is_set_operation_intent = bool(
-        has_set_operation_cue and (has_set_labeling_shape or has_dedupe_request)
-    )
+    is_set_operation_intent = _question_has_set_operation_intent(question)
     is_simple_set_operation = bool(
         is_set_operation_intent
         and not is_multi_table
@@ -3970,6 +4473,37 @@ def _collect_hard_identifier_errors(errors: List[str]) -> List[str]:
     ]
 
 
+def _extract_explicit_row_limit_value(question: str) -> Optional[int]:
+    """
+    Extract a row-limit value only from phrases that constrain result rows.
+    Transformation phrases like "first 2 characters" are not row limits.
+    """
+    q = str(question or "").strip().lower()
+    if not q:
+        return None
+
+    non_row_unit = r"(?!\s+(?:characters?|chars?|letters?|digits?|bytes?|positions?|tokens?|words?)\b)"
+    patterns = [
+        r"\blimit\s+(\d{1,4})\b",
+        r"\btop\s+(\d{1,4})\b",
+        r"\bbottom\s+(\d{1,4})\b",
+        rf"\b(?:first|last)\s+(\d{{1,4}})\b{non_row_unit}",
+        rf"\b(?:show|return|list|display|give\s+me)\s+(\d{{1,4}})\b{non_row_unit}",
+        r"\b(\d{1,4})\s+(?:highest|lowest|largest|smallest|most|least|newest|latest|earliest|oldest)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, q, flags=re.I)
+        if not m:
+            continue
+        try:
+            value = int(m.group(1))
+        except Exception:
+            value = 0
+        if value > 0:
+            return value
+    return None
+
+
 def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     """
     Build a conservative semantic contract directly from the NL question.
@@ -4008,23 +4542,7 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     if ordinal_per_group_pattern and not explicit_sort_phrase:
         contract["requires_order_by"] = False
 
-    required_limit: Optional[int] = None
-    for pat in (
-        r"\btop\s+(\d+)\b",
-        r"\b(?:first|last)\s+(\d+)\b",
-        r"\b(\d+)\s+(?:highest|lowest|largest|smallest|most|least)\b",
-    ):
-        m = re.search(pat, q)
-        if not m:
-            continue
-        try:
-            v = int(m.group(1))
-        except Exception:
-            v = 0
-        if v > 0:
-            required_limit = v
-            break
-    contract["required_limit"] = required_limit
+    contract["required_limit"] = _extract_explicit_row_limit_value(question)
 
     # Aggregate intent extraction (conservative to avoid lookup false positives).
     required_aggs: Set[str] = set()
@@ -5291,16 +5809,36 @@ def _question_has_case_bucketing_intent(question: str) -> bool:
 
     has_bucket_language = bool(
         re.search(r"\b(?:bucket|classify|categori[sz]e|group(?:ed|ing)?\s+into|bands?|ranges?|distribution)\b", q, flags=re.I)
+        or re.search(r"\bgroup(?:ed|ing)?\b[^.]{0,80}\bby\s+whether\b", q, flags=re.I)
+        or re.search(r"\bby\s+whether\b", q, flags=re.I)
     )
     if not has_bucket_language:
         return False
 
-    has_threshold_shape = bool(
+    has_numeric_threshold_shape = bool(
         re.search(r"[<>]=?\s*\d", q)
         or re.search(r"\bbetween\s+\d+(?:\.\d+)?\s+(?:and|-|to)\s+\d+(?:\.\d+)?\b", q, flags=re.I)
         or re.search(r"\b(?:low|mid|medium|high)\b", q, flags=re.I)
     )
-    if not has_threshold_shape:
+
+    has_conditional_bucket_shape = bool(
+        re.search(r"\b(?:if|when|whenever|otherwise|else|remaining|rest)\b", q, flags=re.I)
+        and (
+            re.search(r"\b(?:null|missing|blank|empty|not\s+available|n/?a)\b", q, flags=re.I)
+            or re.search(
+                r"\b(?:later|earlier|before|after|greater\s+than|less\s+than|above|below)\b",
+                q,
+                flags=re.I,
+            )
+            or re.search(r"\b(?:date|time|timestamp)\b", q, flags=re.I)
+            or re.search(
+                r"\b(?:match(?:es|ing)?|pattern|regex|regexp|followed\s+by|digits?|letters?)\b",
+                q,
+                flags=re.I,
+            )
+        )
+    )
+    if not (has_numeric_threshold_shape or has_conditional_bucket_shape):
         return False
 
     return bool(
@@ -5308,6 +5846,34 @@ def _question_has_case_bucketing_intent(question: str) -> bool:
         or re.search(r"\bhow\s+many\b", q, flags=re.I)
         or re.search(r"\bdistribution\b", q, flags=re.I)
     )
+
+
+def _make_case_bucketing_direct_text_prompt(base_prompt: str, question: str, ctx: str) -> str:
+    """
+    Text-mode prompt for CASE-style bucket aggregations.
+
+    Small JSON-mode models often produce valid SQL but malformed JSON for long
+    CASE expressions. Keeping this as a narrow intent-family override avoids
+    changing the normal draft path for non-bucketing queries.
+    """
+    prompt_lines = [
+        str(base_prompt or "").rstrip(),
+        "",
+        "TEMPORARY OUTPUT OVERRIDE FOR CASE BUCKET AGGREGATION:",
+        "Return ONLY one valid MySQL SELECT statement as plain text.",
+        "Do NOT return JSON. Do NOT return notes. Do NOT use Markdown.",
+        "Use a single SELECT with CASE WHEN ... THEN ... ELSE ... END for the bucket label.",
+        "Put bucket conditions inside the CASE expression, not as separate WHERE filters, unless the question explicitly asks for an additional row filter.",
+        "Do NOT use UNION/UNION ALL unless the question explicitly asks to combine separate result sets.",
+        "When grouping by the bucket, repeat the full CASE expression in GROUP BY instead of grouping by the alias.",
+        "Include every aggregate output requested by the question, such as COUNT, MIN, MAX, SUM, or AVG.",
+        "Return exactly one SQL statement; use only one semicolon, at the very end.",
+    ]
+    allowed_snapshot = _allowed_identifiers_snapshot(ctx, max_tables=2, max_cols=10)
+    if allowed_snapshot:
+        prompt_lines.extend(["", allowed_snapshot])
+    prompt_lines.extend(["", f"Question: {str(question or '').strip()}"])
+    return "\n".join(prompt_lines).strip()
 
 
 def _make_sql_only_draft_prompt(base_prompt: str) -> str:
@@ -6133,24 +6699,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         ):
             ir_gate_reasons.append("top_n_lookup_ir_unresolved")
 
-        quoted_literals = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or "")
-        has_set_operation_cue = bool(
-            re.search(r"\bunion\b", q_low, flags=re.I)
-            or re.search(r"\b(?:combine|combined|merge)\b", q_low, flags=re.I)
-            or re.search(r"\b(?:in|into)\s+one\s+result(?:\s+set)?\b", q_low, flags=re.I)
-        )
-        has_set_labeling_shape = bool(
-            len(quoted_literals) >= 2
-            and re.search(r"\bor\b", q_low, flags=re.I)
-        )
-        has_dedupe_request = bool(
-            re.search(
-                r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
-                q_low,
-                flags=re.I,
-            )
-        )
-        if has_set_operation_cue and (has_set_labeling_shape or has_dedupe_request):
+        if _question_has_set_operation_intent(question):
             ir_gate_reasons.append("set_operation_ir_unsupported")
 
         for f in ir_filters:
@@ -6241,7 +6790,15 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     state["target_model"] = target_model
     print(f"[DRAFTER] Using LLM fallback: {str(fallback_complexity).upper()} -> {target_model}")
 
-    llm = build_llm_json(model=target_model)
+    use_case_bucket_text_mode = bool(
+        target_model == SMALL_MODEL
+        and _question_has_case_bucketing_intent(question)
+    )
+    llm = (
+        build_llm_repair(model=target_model)
+        if use_case_bucket_text_mode
+        else build_llm_json(model=target_model)
+    )
 
     # ===== PRE-WARM WITH OOM RETRY =====
     # This separates cold-start time from actual inference time
@@ -6276,7 +6833,21 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 
     # ===== TIMED INFERENCE (model already loaded) =====
     _t0 = _time.perf_counter()
-    obj = try_llm_json(llm, prompt, max_attempts=AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS, oom_retry_wait=OOM_WAIT_TIME)
+    if use_case_bucket_text_mode:
+        print("[DRAFTER] CASE-bucketing direct text mode enabled for 3B")
+        text_sql_direct = try_llm_sql_text(
+            llm,
+            _make_case_bucketing_direct_text_prompt(prompt, question, ctx),
+            max_attempts=1,
+            oom_retry_wait=OOM_WAIT_TIME,
+        )
+        obj = (
+            {"sql": text_sql_direct, "notes": "No reasoning provided."}
+            if text_sql_direct
+            else None
+        )
+    else:
+        obj = try_llm_json(llm, prompt, max_attempts=AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS, oom_retry_wait=OOM_WAIT_TIME)
     _inference_time = _time.perf_counter() - _t0
 
     # Refresh warmup heartbeat after real inference.
@@ -6289,7 +6860,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     print(f"[DEBUG] Draft inference time: {_inference_time:.2f}s")
 
     if obj is None and target_model == SMALL_MODEL and _question_has_case_bucketing_intent(question):
-        print("[DRAFTER] CASE-bucketing JSON fallback -> retry 3B text mode")
+        print("[DRAFTER] CASE-bucketing fallback -> retry 3B text mode")
         text_retry_prompt = _make_sql_only_draft_prompt(prompt)
         text_llm = build_llm_repair(model=target_model)
         text_ready = _prewarm_model_with_oom_retry(text_llm, target_model)
@@ -6390,14 +6961,22 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # Pattern baru: hanya strip jika di SELECT clause (sebelum FROM)
     # Gunakan negative lookbehind untuk memastikan bukan dalam ORDER BY context
     def _strip_desc_in_select_only(sql: str) -> str:
-        """Strip DESC/ASC before comma only in SELECT clause, not in ORDER BY."""
+        """Strip invalid top-level SELECT item directions, not window ORDER BY."""
         # Find SELECT ... FROM boundary
         match = re.search(AGENT_DRAFT_SELECT_FROM_PATTERN, sql, re.IGNORECASE | re.DOTALL)
         if not match:
             return sql
         select_part = match.group(1)
-        # Strip DESC/ASC before comma only in SELECT part
-        fixed_select = re.sub(AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_COMMA_PATTERN, " ", select_part, flags=re.IGNORECASE)
+        select_items = _split_top_level_csv(select_part)
+        if not select_items:
+            return sql
+        leading_ws = re.match(r"^\s*", select_part).group(0)
+        trailing_ws = re.search(r"\s*$", select_part).group(0)
+        fixed_items = [
+            re.sub(r"\s+\b(?:DESC|ASC)\b\s*$", "", item, flags=re.I).strip()
+            for item in select_items
+        ]
+        fixed_select = leading_ws + ", ".join(fixed_items) + (trailing_ws or " ")
         if fixed_select != select_part:
             sql = sql[:match.start(1)] + fixed_select + sql[match.end(1):]
         return sql
@@ -6408,8 +6987,9 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     if match:
         limit_n = match.group(1)
         limit_terms_pattern = "|".join(re.escape(term) for term in AGENT_DRAFT_LIMIT_INTENT_TERMS if term)
+        explicit_limit_value = _extract_explicit_row_limit_value(question)
         has_limit_intent = bool(
-            re.search(rf"\b{re.escape(limit_n)}\b", question.lower()) or
+            (explicit_limit_value is not None and int(limit_n) == int(explicit_limit_value)) or
             (limit_terms_pattern and re.search(rf"\b(?:{limit_terms_pattern})\b", question.lower()))
         )
         if not has_limit_intent:
@@ -6814,7 +7394,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # --- KASUS B: Winner-Row Leak Check (HARD ERROR) ---
     is_winner_row = decision.get("is_winner_row", False)
-    wants_true_winner_row = _question_wants_winner_row(question)
+    wants_true_winner_row = (
+        _question_wants_winner_row(question)
+        and not _question_has_offset_window_sequence_intent(question)
+    )
     if wants_true_winner_row and not needs_regeneration:
         has_row_number = bool(re.search(r"\bROW_NUMBER\s*\(", sql_up))
         has_rn_filter = bool(

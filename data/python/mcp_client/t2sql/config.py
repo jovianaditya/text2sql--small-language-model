@@ -169,7 +169,7 @@ ROUTING_MODEL     = os.getenv("ROUTING_MODEL", "qwen2.5:1.5b-instruct").strip()
 SMALL_MODEL       = os.getenv("SMALL_MODEL", "qwen2.5:3b-instruct").strip()
 LARGE_MODEL       = os.getenv("LARGE_MODEL", "qwen2.5:7b-instruct").strip()
 # LLM generation budget knobs (speed vs robustness tuning)
-# Keep defaults identical to previous behavior.
+# Keep JSON-mode budget conservative by default; raise via env only when needed.
 LLM_JSON_NUM_PREDICT = int(os.getenv("LLM_JSON_NUM_PREDICT", "512"))
 LLM_REPAIR_NUM_PREDICT = int(os.getenv("LLM_REPAIR_NUM_PREDICT", "512"))
 LLM_JSON_TIMEOUT = int(os.getenv("LLM_JSON_TIMEOUT", "120"))

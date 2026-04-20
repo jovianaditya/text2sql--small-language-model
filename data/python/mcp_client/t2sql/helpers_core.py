@@ -6044,6 +6044,22 @@ def _question_wants_winner_row(question: str) -> bool:
     if any(k in q_rank_scope for k in ["total", "sum of", "count", "berapa banyak", "jumlah total"]) and not strong_winner_sig:
         return False
 
+    # Guard: group-by reports listing multiple aggregate metrics (COUNT, MAX, MIN, AVG …)
+    # are NOT winner-row queries.  E.g. "For each vendor, show how many products
+    # they have, the highest MSRP, and the lowest buy price" → GROUP BY + COUNT/MAX/MIN.
+    # A genuine winner-row ask typically names one superlative metric + row attributes,
+    # not a full report with 3+ aggregate keywords.
+    if per_group_sig and not tie_sig and not explicit_single_pick_sig:
+        _metric_keys = [
+            "how many", "count", "number of", "total",
+            "average", "avg", "sum",
+            "highest", "lowest", "largest", "smallest",
+            "maximum", "minimum", "max", "min",
+        ]
+        _metric_count = sum(1 for k in _metric_keys if k in q_rank_scope)
+        if _metric_count >= 3:
+            return False
+
     # Winner-row jika ada rank + (same_row ATAU context ATAU multi_attr)
     return strong_winner_sig
 
@@ -10944,6 +10960,599 @@ def _extract_numeric_aggregate_threshold(
     return None
 
 
+def _fix_misplaced_entity_count_threshold(sql: str, question: str) -> str:
+    """Fix WHERE col >= N → HAVING COUNT(*) >= N when the LLM misinterprets
+    'at least N entities' as a raw column filter instead of a group-count
+    threshold.
+
+    Example:  "Keep only vendors with at least 3 products"
+              LLM generates:  WHERE quantityInStock >= 3
+              Correct:        HAVING COUNT(*) >= 3
+
+    Guardrails (all must hold):
+      - GROUP BY present, no existing HAVING
+      - Question has a threshold phrase ("at least N", "N or more")
+      - WHERE contains a comparison with that exact N value
+      - The comparison column is NOT referenced anywhere in SELECT
+    """
+    s = (sql or "").strip()
+    if not s or not question:
+        return s
+
+    sl = s.lower()
+    if "group by" not in sl:
+        return s
+    if "having" in sl:
+        return s
+
+    # --- extract threshold number from question ---
+    q = question.lower()
+    tm = re.search(r"\bat\s+least\s+(\d+)\b", q, flags=re.I)
+    if not tm:
+        tm = re.search(r"\b(\d+)\s+or\s+more\b", q, flags=re.I)
+    if not tm:
+        return s
+    threshold_n = int(tm.group(1))
+    if threshold_n < 2:
+        return s
+
+    # --- extract SELECT column names (bare names, lowercased) ---
+    sel_m = re.search(r"\bSELECT\s+(.*?)\bFROM\b", s, flags=re.I | re.DOTALL)
+    if not sel_m:
+        return s
+    sel_text = sel_m.group(1).lower()
+
+    # --- locate WHERE clause (content only, with lookahead for GROUP BY) ---
+    where_m = re.search(
+        r"\bWHERE\s+(.*?)(?=\bGROUP\s+BY\b)", s, flags=re.I | re.DOTALL
+    )
+    if not where_m:
+        return s
+    where_text = where_m.group(1)
+    where_start = where_m.start()   # start of "WHERE"
+    where_end = where_m.end()       # end of content, just before "GROUP BY"
+
+    # --- split WHERE by AND, look for misplaced threshold ---
+    parts = re.split(r"\bAND\b", where_text, flags=re.I)
+    keep_parts: list[str] = []
+    replaced = False
+    having_op = ">="
+    for part in parts:
+        part_s = part.strip()
+        cmp_m = re.match(
+            r"^([\w.]+)\s*(>=|>|<=|<|=)\s*(\d+(?:\.\d+)?)\s*$",
+            part_s,
+            flags=re.I,
+        )
+        if cmp_m and not replaced:
+            col_raw = cmp_m.group(1)
+            op_raw = cmp_m.group(2)
+            val_raw = float(cmp_m.group(3))
+            col_bare = col_raw.split(".")[-1].lower()
+            if col_bare not in sel_text and int(val_raw) == threshold_n:
+                having_op = ">=" if op_raw in (">=", ">") else op_raw
+                replaced = True
+                continue
+        keep_parts.append(part_s)
+
+    if not replaced:
+        return s
+
+    # --- rebuild: strip WHERE, then insert HAVING after GROUP BY clause ---
+    if keep_parts:
+        new_where = " AND ".join(keep_parts)
+        s = s[:where_start] + "WHERE " + new_where + " " + s[where_end:]
+    else:
+        s = s[:where_start] + s[where_end:]
+
+    # Find end of GROUP BY clause (up to ORDER BY / LIMIT / ; / end)
+    gb_m = re.search(r"\bGROUP\s+BY\b", s, flags=re.I)
+    if not gb_m:
+        return s  # safety net
+    after_gb = s[gb_m.end():]
+    end_m = re.search(r"\b(?:ORDER|LIMIT|HAVING|;|$)", after_gb, flags=re.I)
+    if end_m:
+        insert_pos = gb_m.end() + end_m.start()
+        s = s[:insert_pos] + f" HAVING COUNT(*) {having_op} {threshold_n} " + s[insert_pos:]
+
+    s = re.sub(r"\s{2,}", " ", s)
+    return s
+
+
+def _find_top_level_clause(sql: str, keyword: str, start: int = 0) -> int:
+    """Find a top-level SQL keyword while ignoring quoted text and parentheses."""
+    text = str(sql or "")
+    kw = str(keyword or "").lower()
+    if not text or not kw:
+        return -1
+    depth = 0
+    in_sq = False
+    in_dq = False
+    i = max(0, start)
+    low = text.lower()
+    n = len(kw)
+    while i < len(text):
+        ch = text[i]
+        if ch == "'" and not in_dq:
+            if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                i += 2
+                continue
+            in_sq = not in_sq
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            i += 1
+            continue
+        if in_sq or in_dq:
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0 and low.startswith(kw, i):
+            left_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            right_idx = i + n
+            right_ok = right_idx >= len(text) or not (text[right_idx].isalnum() or text[right_idx] == "_")
+            if left_ok and right_ok:
+                return i
+        i += 1
+    return -1
+
+
+def _split_select_expr_alias(item: str) -> tuple[str, Optional[str]]:
+    raw = (item or "").strip()
+    m = re.match(
+        r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+        raw,
+    )
+    if not m:
+        return raw, None
+    alias = (m.group(2) or "").strip().strip("`'\"")
+    return (m.group(1) or "").strip(), alias or None
+
+
+def _normalize_sql_expr_for_match(expr: str) -> str:
+    text = re.sub(r"`", "", str(expr or ""))
+    text = re.sub(r"\bSUBSTR\s*\(", "SUBSTRING(", text, flags=re.I)
+    text = re.sub(r"\bCHAR_LENGTH\s*\(", "LENGTH(", text, flags=re.I)
+    text = re.sub(r"\s+", "", text).lower()
+    return text
+
+
+def _referenced_column_tokens(expr: str) -> Set[str]:
+    no_strings = re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"", " ", str(expr or ""))
+    tokens = {
+        tok.lower()
+        for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", no_strings)
+    }
+    stop = {
+        "select", "from", "where", "group", "by", "having", "order", "limit",
+        "as", "and", "or", "case", "when", "then", "else", "end", "is", "not",
+        "null", "in", "between", "distinct",
+        "count", "sum", "avg", "min", "max", "length", "char_length",
+        "substring", "substr", "left", "right", "concat", "concat_ws",
+        "year", "month", "quarter", "date_format", "datediff",
+    }
+    return {tok for tok in tokens if tok not in stop}
+
+
+def _canonicalize_single_computed_group_by_expression(sql: str) -> str:
+    """
+    If a flat aggregate projects one computed dimension, ensure GROUP BY uses
+    that exact expression. This avoids ONLY_FULL_GROUP_BY failures caused by
+    alias expansion or function-argument drift.
+    """
+    s = (sql or "").strip()
+    if not s or "group by" not in s.lower():
+        return sql
+    trailing = ";" if s.endswith(";") else ""
+    s0 = s[:-1].rstrip() if trailing else s
+
+    sel_pos = _find_top_level_clause(s0, "select")
+    from_pos = _find_top_level_clause(s0, "from", max(0, sel_pos + len("select")))
+    group_pos = _find_top_level_clause(s0, "group by", max(0, from_pos + len("from")))
+    if sel_pos != 0 or from_pos < 0 or group_pos < 0:
+        return sql
+
+    having_pos = _find_top_level_clause(s0, "having", group_pos + len("group by"))
+    order_pos = _find_top_level_clause(s0, "order by", group_pos + len("group by"))
+    limit_pos = _find_top_level_clause(s0, "limit", group_pos + len("group by"))
+    group_end = min([p for p in (having_pos, order_pos, limit_pos, len(s0)) if p >= 0])
+
+    select_items = _split_top_level_commas(s0[sel_pos + len("select"):from_pos].strip())
+    group_items = _split_top_level_commas(s0[group_pos + len("group by"):group_end].strip())
+    if len(group_items) != 1:
+        return sql
+
+    computed_dims: List[tuple[str, Optional[str]]] = []
+    for item in select_items:
+        expr, alias = _split_select_expr_alias(item)
+        if not expr:
+            continue
+        if re.search(r"\b(?:COUNT|SUM|AVG|MIN|MAX|STDDEV|VARIANCE|GROUP_CONCAT)\s*\(", expr, flags=re.I):
+            continue
+        if re.search(r"\bOVER\s*\(", expr, flags=re.I):
+            continue
+        if _is_simple_column_expr(expr):
+            continue
+        computed_dims.append((expr, alias))
+
+    if len(computed_dims) != 1:
+        return sql
+
+    expr, alias = computed_dims[0]
+    group_item = group_items[0].strip()
+    alias_l = (alias or "").strip("`").lower()
+    group_l = group_item.strip("`").lower()
+    if _normalize_sql_expr_for_match(group_item) == _normalize_sql_expr_for_match(expr):
+        return sql
+
+    expr_refs = _referenced_column_tokens(expr)
+    group_refs = _referenced_column_tokens(group_item)
+    alias_match = bool(alias_l and group_l == alias_l)
+    same_refs = bool(expr_refs and group_refs and expr_refs == group_refs)
+    if not (alias_match or same_refs):
+        return sql
+
+    suffix = s0[group_end:].lstrip()
+    rebuilt = s0[:group_pos + len("group by")] + " " + expr
+    if suffix:
+        rebuilt += " " + suffix
+    return rebuilt + trailing
+
+
+def _simplify_same_expression_group_threshold_subquery(sql: str) -> str:
+    """
+    Collapse redundant filters of the form:
+      WHERE expr IN (SELECT expr FROM same_table GROUP BY expr HAVING ...)
+      GROUP BY expr
+    into a direct outer HAVING. This is equivalent for grouped expression
+    thresholds and avoids dialect-sensitive ONLY_FULL_GROUP_BY behavior.
+    """
+    s = (sql or "").strip()
+    if not s or " where " not in f" {s.lower()} " or " group by " not in f" {s.lower()} ":
+        return sql
+    if _find_top_level_clause(s, "having") >= 0:
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    s0 = s[:-1].rstrip() if trailing else s
+    where_pos = _find_top_level_clause(s0, "where")
+    group_pos = _find_top_level_clause(s0, "group by", max(0, where_pos + len("where")))
+    if where_pos < 0 or group_pos < 0:
+        return sql
+
+    where_body = s0[where_pos + len("where"):group_pos].strip()
+    if re.search(r"\b(?:AND|OR)\b", where_body, flags=re.I):
+        return sql
+
+    order_pos = _find_top_level_clause(s0, "order by", group_pos + len("group by"))
+    limit_pos = _find_top_level_clause(s0, "limit", group_pos + len("group by"))
+    group_end = min([p for p in (order_pos, limit_pos, len(s0)) if p >= 0])
+    outer_group = s0[group_pos + len("group by"):group_end].strip()
+
+    pattern = re.compile(
+        r"""(?is)^\s*(?P<outer>.+?)\s+IN\s*\(\s*
+            SELECT\s+(?P<inner_select>.+?)\s+
+            FROM\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)\s+
+            GROUP\s+BY\s+(?P<inner_group>.+?)\s+
+            HAVING\s+(?P<having>.+?)\s*
+            \)\s*$""",
+        re.X,
+    )
+    m = pattern.match(where_body)
+    if not m:
+        return sql
+
+    outer_expr = (m.group("outer") or "").strip()
+    inner_select = (m.group("inner_select") or "").strip()
+    inner_group = (m.group("inner_group") or "").strip()
+    having = (m.group("having") or "").strip()
+    if not having:
+        return sql
+
+    outer_norm = _normalize_sql_expr_for_match(outer_expr)
+    if not outer_norm:
+        return sql
+    if outer_norm != _normalize_sql_expr_for_match(inner_select):
+        return sql
+    if outer_norm != _normalize_sql_expr_for_match(inner_group):
+        return sql
+    if outer_norm != _normalize_sql_expr_for_match(outer_group):
+        return sql
+
+    suffix = s0[group_end:].lstrip()
+    rebuilt = (
+        s0[:where_pos].rstrip()
+        + " "
+        + s0[group_pos:group_end].strip()
+        + f" HAVING {having}"
+    )
+    if suffix:
+        rebuilt += " " + suffix
+    rebuilt += trailing
+    return re.sub(r"\s{2,}", " ", rebuilt).strip()
+
+
+def _drop_unrequested_schema_named_count_outputs(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Remove count projections aliased as a real schema column when the question
+    did not ask to count that column. This catches hallucinated helper metrics
+    such as COUNT(*) AS requiredDate while preserving legitimate total counts.
+    """
+    s = (sql or "").strip()
+    if not s or "group by" not in s.lower() or "count" not in s.lower():
+        return sql
+
+    allowed = _parse_allowed_identifiers(ctx or "")
+    schema_cols = {
+        str(col or "").strip().lower()
+        for cols in allowed.values()
+        for col in cols
+        if str(col or "").strip()
+    }
+    if not schema_cols:
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    s0 = s[:-1].rstrip() if trailing else s
+    sel_pos = _find_top_level_clause(s0, "select")
+    from_pos = _find_top_level_clause(s0, "from", max(0, sel_pos + len("select")))
+    if sel_pos != 0 or from_pos < 0:
+        return sql
+
+    select_part = s0[sel_pos + len("select"):from_pos].strip()
+    select_items = _split_top_level_commas(select_part)
+    if len(select_items) < 2:
+        return sql
+
+    count_aliases: List[tuple[str, str, str]] = []
+    for item in select_items:
+        expr, alias = _split_select_expr_alias(item)
+        if not alias or not re.search(r"\bCOUNT\s*\(", expr, flags=re.I):
+            continue
+        count_aliases.append((item, expr, alias))
+
+    if len(count_aliases) < 2:
+        return sql
+
+    def _alias_metric_like(alias: str) -> bool:
+        a = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(alias or "")).replace("_", " ").lower()
+        return bool(re.search(r"\b(?:count|total|number|num|rows?|records?)\b", a, flags=re.I))
+
+    if not any(_alias_metric_like(alias) for _, _, alias in count_aliases):
+        return sql
+
+    def _question_explicitly_counts_alias(alias: str) -> bool:
+        phrase = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(alias or ""))
+        phrase = re.sub(r"[_`]+", " ", phrase).strip().lower()
+        if not phrase:
+            return False
+        phrase_pat = re.escape(phrase).replace(r"\ ", r"\s+")
+        q = str(question or "").lower()
+        return bool(
+            re.search(rf"\b(?:count|counts|counting|number\s+of|how\s+many)\s+(?:rows?\s+with\s+|records?\s+with\s+)?{phrase_pat}\b", q, flags=re.I)
+            or re.search(rf"\b{phrase_pat}\s+(?:count|counts|total)\b", q, flags=re.I)
+        )
+
+    drop_items: Set[str] = set()
+    for item, _expr, alias in count_aliases:
+        alias_l = alias.strip("`").lower()
+        if alias_l in schema_cols and not _alias_metric_like(alias) and not _question_explicitly_counts_alias(alias):
+            drop_items.add(item)
+
+    if not drop_items:
+        return sql
+
+    kept = [item for item in select_items if item not in drop_items]
+    if len(kept) == len(select_items) or not kept:
+        return sql
+    return "SELECT " + ", ".join(kept) + " " + s0[from_pos:].lstrip() + trailing
+
+
+def _normalize_timestampdiff_day_to_datediff(sql: str) -> str:
+    """Use DATEDIFF(end, start) for day gaps to avoid dialect/validator noise."""
+    if not sql or "timestampdiff" not in sql.lower():
+        return sql
+
+    simple_ref = r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?"
+    return re.sub(
+        rf"\bTIMESTAMPDIFF\s*\(\s*DAY\s*,\s*(?P<start>{simple_ref})\s*,\s*(?P<end>{simple_ref})\s*\)",
+        lambda m: f"DATEDIFF({m.group('end').strip()}, {m.group('start').strip()})",
+        sql,
+        flags=re.I,
+    )
+
+
+def _drop_unrequested_current_date_filters(sql: str, question: str) -> str:
+    """Remove CURRENT_DATE/CURDATE/NOW filters unless the question asks for current-time scope."""
+    s = (sql or "").strip()
+    if not s or not re.search(r"\b(?:CURRENT_DATE|CURRENT_TIMESTAMP|CURDATE|NOW)\s*(?:\(\s*\))?", s, flags=re.I):
+        return sql
+
+    q = str(question or "").lower()
+    if re.search(r"\b(?:current|today|now|this\s+(?:year|month|day|week)|latest|most\s+recent|newest|recent)\b", q, flags=re.I):
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    s0 = s[:-1].rstrip() if trailing else s
+    m = re.match(r"(?is)^(?P<head>.*?\bFROM\b.*?)(?P<tail>\s+WHERE\b.*)$", s0)
+    if not m:
+        return sql
+
+    head = (m.group("head") or "").rstrip()
+    tail = (m.group("tail") or "").strip()
+    where_body, rest = _split_where_and_rest(" " + tail)
+    if not where_body or _has_top_level_or(where_body):
+        return sql
+
+    conds = _split_top_level_and(where_body)
+    if not conds:
+        return sql
+    keep = [
+        cond.strip()
+        for cond in conds
+        if not re.search(r"\b(?:CURRENT_DATE|CURRENT_TIMESTAMP|CURDATE|NOW)\s*(?:\(\s*\))?", cond, flags=re.I)
+    ]
+    if len(keep) == len(conds):
+        return sql
+
+    rebuilt = head
+    if keep:
+        rebuilt += " WHERE " + " AND ".join(keep)
+    if rest:
+        rebuilt += " " + rest.strip()
+    rebuilt = re.sub(r"\s{2,}", " ", rebuilt).strip()
+    return rebuilt + trailing
+
+
+def _rewrite_comparison_count_metrics(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Convert a hallucinated plain COUNT into a conditional count when the
+    question explicitly asks how many rows satisfy colA <op> colB.
+    """
+    s = (sql or "").strip()
+    if not s or "count" not in s.lower() or not question:
+        return sql
+
+    q = str(question or "").lower()
+    if not re.search(r"\b(?:how\s+many|number\s+of|count)\b", q, flags=re.I):
+        return sql
+    if not re.search(r"\b(?:earlier|before|later|after|greater\s+than|less\s+than|above|below)\b", q, flags=re.I):
+        return sql
+
+    allowed = _parse_allowed_identifiers(ctx or "")
+    cols = sorted({str(c or "").strip() for cs in allowed.values() for c in cs if str(c or "").strip()}, key=len, reverse=True)
+    if len(cols) < 2:
+        return sql
+
+    def _name_variants(col: str) -> List[str]:
+        raw = str(col or "").strip("`")
+        spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw).replace("_", " ").lower()
+        compact = re.sub(r"[^a-z0-9]+", "", spaced)
+        return [v for v in {raw.lower(), spaced, compact} if v]
+
+    variant_cache = {col: _name_variants(col) for col in cols}
+    chosen: Optional[tuple[str, str, str]] = None
+
+    # Prefer an explicit local comparison pattern over global mention distance.
+    # This avoids confusing "number of days between A and B" with the actual
+    # conditional-count phrase, e.g. "how many rows have C earlier than D".
+    direct_hits: List[tuple[int, str, str, str]] = []
+    for c1 in cols:
+        for c2 in cols:
+            if c1 == c2:
+                continue
+            for v1 in variant_cache.get(c1, []):
+                v1_pat = re.escape(v1)
+                if " " in v1:
+                    v1_pat = v1_pat.replace(r"\ ", r"\s+")
+                for v2 in variant_cache.get(c2, []):
+                    v2_pat = re.escape(v2)
+                    if " " in v2:
+                        v2_pat = v2_pat.replace(r"\ ", r"\s+")
+                    pattern = (
+                        rf"\b{v1_pat}\b\s+(?:is\s+)?"
+                        rf"(?P<cmp>earlier|before|later|after|greater\s+than|less\s+than|above|below)"
+                        rf"\s+(?:than\s+)?\b{v2_pat}\b"
+                    )
+                    for m in re.finditer(pattern, q, flags=re.I):
+                        prefix = q[max(0, m.start() - 128):m.start()]
+                        if not re.search(r"\b(?:how\s+many|number\s+of|count)\b", prefix, flags=re.I):
+                            continue
+                        cmp_text = m.group("cmp").lower()
+                        op = "<" if re.search(r"\b(?:earlier|before|less\s+than|below)\b", cmp_text, flags=re.I) else ">"
+                        direct_hits.append((m.start(), c1, op, c2))
+    if direct_hits:
+        direct_hits.sort(key=lambda item: item[0])
+        _, left_direct, op_direct, right_direct = direct_hits[0]
+        chosen = (left_direct, op_direct, right_direct)
+
+    mentions: List[tuple[int, int, str]] = []
+    for col in cols:
+        for variant in variant_cache.get(col, []):
+            pat = re.escape(variant)
+            if " " in variant:
+                pat = pat.replace(r"\ ", r"\s+")
+            for m in re.finditer(rf"\b{pat}\b", q, flags=re.I):
+                mentions.append((m.start(), m.end(), col))
+                break
+            if any(item[2] == col for item in mentions):
+                break
+    mentions.sort()
+    if chosen is None:
+        if len(mentions) < 2:
+            return sql
+
+        for i, (s1, e1, c1) in enumerate(mentions):
+            prefix = q[max(0, s1 - 96):s1]
+            if not re.search(r"\b(?:how\s+many|number\s+of|count)\b", prefix, flags=re.I):
+                continue
+            for s2, _e2, c2 in mentions[i + 1:]:
+                if c1 == c2:
+                    continue
+                between = q[e1:s2]
+                if re.search(r"\b(?:earlier|before|less\s+than|below)\b", between, flags=re.I):
+                    chosen = (c1, "<", c2)
+                    break
+                if re.search(r"\b(?:later|after|greater\s+than|above)\b", between, flags=re.I):
+                    chosen = (c1, ">", c2)
+                    break
+            if chosen:
+                break
+    if not chosen:
+        return sql
+
+    left_col, op, right_col = chosen
+    trailing = ";" if s.endswith(";") else ""
+    s0 = s[:-1].rstrip() if trailing else s
+    sel_pos = _find_top_level_clause(s0, "select")
+    from_pos = _find_top_level_clause(s0, "from", max(0, sel_pos + len("select")))
+    if sel_pos != 0 or from_pos < 0:
+        return sql
+    select_items = _split_top_level_commas(s0[sel_pos + len("select"):from_pos].strip())
+    if not select_items:
+        return sql
+
+    def _alias_metric_like(alias: str) -> bool:
+        a = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(alias or "")).replace("_", " ").lower()
+        return bool(re.search(r"\b(?:total|overall|all)\b", a, flags=re.I))
+
+    changed = False
+    rebuilt: List[str] = []
+    condition_expr = f"{left_col} {op} {right_col}"
+    conditional_count = f"SUM(CASE WHEN {condition_expr} THEN 1 ELSE 0 END)"
+    for item in select_items:
+        expr, alias = _split_select_expr_alias(item)
+        if not alias or not re.match(r"(?is)^\s*COUNT\s*\(\s*(?:\*|`?[A-Za-z_][A-Za-z0-9_]*`?(?:\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`)?)\s*\)\s*$", expr):
+            rebuilt.append(item.strip())
+            continue
+        alias_l = alias.strip("`").lower()
+        if _alias_metric_like(alias_l):
+            rebuilt.append(item.strip())
+            continue
+        alias_text = alias_l.replace("_", " ")
+        if not (
+            any(tok in alias_text for tok in ("earlier", "before", "later", "after", "greater", "less", "above", "below"))
+            or left_col.lower().replace("_", "") in alias_l.replace("_", "")
+            or right_col.lower().replace("_", "") in alias_l.replace("_", "")
+        ):
+            rebuilt.append(item.strip())
+            continue
+        rebuilt.append(f"{conditional_count} AS {alias}")
+        changed = True
+
+    if not changed:
+        return sql
+    return "SELECT " + ", ".join(rebuilt) + " " + s0[from_pos:].lstrip() + trailing
+
+
 def _rewrite_missing_joined_agg_threshold_filter(sql: str, question: str, ctx: str = "") -> str:
     """
     Add a missing outer filter when the question asks to keep only rows whose
@@ -11820,6 +12429,99 @@ def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
     def _norm_sql_text(text: str) -> str:
         return re.sub(r"\s+", " ", (text or "").strip().lower())
 
+    def _find_balanced_close(text: str, open_idx: int) -> int:
+        if open_idx < 0 or open_idx >= len(text) or text[open_idx] != "(":
+            return -1
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = open_idx
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _parse_partition_order(window_sql: str) -> Optional[Tuple[str, str]]:
+        body = (window_sql or "").strip()
+        part_m = re.match(r"(?is)^\s*PARTITION\s+BY\s+", body)
+        if not part_m:
+            return None
+        order_pos = _find_top_level_clause(body, "order by", part_m.end())
+        if order_pos < 0:
+            return None
+        partition_expr = body[part_m.end():order_pos].strip()
+        order_part = body[order_pos + len("order by"):].strip()
+        if not partition_expr or not order_part:
+            return None
+        return partition_expr, order_part
+
+    def _parse_named_window_on_row_number(text: str) -> Optional[Tuple[str, str, str, str]]:
+        """
+        Parse:
+          SELECT ... FROM ... WINDOW w AS (<balanced window spec>)
+          ON ROW_NUMBER() OVER w = 1
+
+        Regex alone is brittle here because aggregate ORDER BY items often
+        contain nested parentheses, e.g. SUM(a * b).
+        """
+        sel_pos = _find_top_level_clause(text, "select")
+        if sel_pos != 0:
+            return None
+        from_pos = _find_top_level_clause(text, "from", sel_pos + len("select"))
+        if from_pos < 0:
+            return None
+        window_pos = _find_top_level_clause(text, "window", from_pos + len("from"))
+        if window_pos < 0:
+            return None
+
+        select_part = text[sel_pos + len("select"):from_pos].strip()
+        from_part = text[from_pos + len("from"):window_pos].strip()
+        after_window = text[window_pos + len("window"):].strip()
+        if not select_part or not from_part or not after_window:
+            return None
+
+        alias_m = re.match(
+            r"(?is)^([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(",
+            after_window,
+        )
+        if not alias_m:
+            return None
+        win_alias = alias_m.group(1)
+        open_idx = alias_m.end() - 1
+        close_idx = _find_balanced_close(after_window, open_idx)
+        if close_idx < 0:
+            return None
+
+        window_part = after_window[open_idx + 1:close_idx].strip()
+        tail = after_window[close_idx + 1:].strip()
+        if not window_part or not re.match(
+            rf"(?is)^ON\s+ROW_NUMBER\s*\(\s*\)\s*OVER\s+{re.escape(win_alias)}\s*=\s*1\s*$",
+            tail,
+        ):
+            return None
+
+        return select_part, from_part, win_alias, window_part
+
     def _build_grouped_ranked_winner_sql(
         *,
         select_part: str,
@@ -11975,6 +12677,20 @@ def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
         fixed_sql = _fix_outer_order_by_for_derived_alias(outer_sql)
         return fixed_sql or sql
 
+    parsed_named_window = _parse_named_window_on_row_number(s)
+    if parsed_named_window:
+        select_part, from_part, _win_alias, window_part = parsed_named_window
+        parsed_window = _parse_partition_order(window_part)
+        if not parsed_window:
+            return sql
+        partition_expr, order_part = parsed_window
+        return _build_grouped_ranked_winner_sql(
+            select_part=select_part,
+            from_part=from_part,
+            partition_expr=partition_expr,
+            order_part=order_part,
+        )
+
     bad_window_pat = re.compile(
         r"""(?is)^\s*SELECT\s+(?P<select>.*?)\s+FROM\s+(?P<from>.*?)\s+WINDOW\s+(?P<win_alias>[A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\((?P<window>.*?)\)\s+ON\s+ROW_NUMBER\s*\(\s*\)\s*OVER\s+(?P=win_alias)\s*=\s*1\s*$"""
     )
@@ -11986,17 +12702,11 @@ def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
         if not select_part or not from_part or not window_part:
             return sql
 
-        win_match = re.match(
-            r"""(?is)^\s*PARTITION\s+BY\s+(?P<partition>.*?)\s+ORDER\s+BY\s+(?P<order>.*?)\s*$""",
-            window_part,
-        )
-        if not win_match:
+        parsed_window = _parse_partition_order(window_part)
+        if not parsed_window:
             return sql
 
-        partition_expr = (win_match.group("partition") or "").strip()
-        order_part = (win_match.group("order") or "").strip()
-        if not partition_expr or not order_part:
-            return sql
+        partition_expr, order_part = parsed_window
 
         return _build_grouped_ranked_winner_sql(
             select_part=select_part,
@@ -12027,17 +12737,11 @@ def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
     if not select_part or not from_part or not group_part or not window_part:
         return sql
 
-    win_match = re.match(
-        r"""(?is)^\s*PARTITION\s+BY\s+(?P<partition>.*?)\s+ORDER\s+BY\s+(?P<order>.*?)\s*$""",
-        window_part,
-    )
-    if not win_match:
+    parsed_window = _parse_partition_order(window_part)
+    if not parsed_window:
         return sql
 
-    partition_expr = (win_match.group("partition") or "").strip()
-    order_part = (win_match.group("order") or "").strip()
-    if not partition_expr or not order_part:
-        return sql
+    partition_expr, order_part = parsed_window
 
     return _build_grouped_ranked_winner_sql(
         select_part=select_part,
@@ -16717,6 +17421,308 @@ def _canonicalize_latest_year_same_year_pattern(sql: str, question: str, ctx: st
     return fixed
 
 
+def _rewrite_bridge_subquery_latest_year_tuple_filter(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Repair malformed latest-year tuple filters where the subquery reads from a
+    bridge/fact table but the date column actually lives on a joined temporal
+    table in the outer query.
+
+    Generic shape:
+      WHERE (YEAR(t.date_col), e.entity_key) IN (
+        SELECT YEAR(MAX(date_col)), entity_key
+        FROM bridge_table
+        GROUP BY entity_key
+      )
+
+    Rewrites to a derived latest-year-per-entity join built from the observed
+    FK path between entity -> bridge -> temporal table. No schema names are
+    hardcoded; all aliases/keys come from the SQL and schema metadata.
+    """
+    if not sql or not _question_wants_latest_year_scope_with_aggregate(question):
+        return sql
+
+    s0 = (sql or "").strip().rstrip(";").strip()
+    if not s0 or " in (select" not in s0.lower() or "year(" not in s0.lower():
+        return sql
+    if re.search(r"\b(?:from|join)\s*\(", s0, flags=re.I):
+        return sql
+
+    sel_pos = _find_top_level_clause(s0, "select")
+    from_pos = _find_top_level_clause(s0, "from", max(0, sel_pos + len("select")))
+    group_pos = _find_top_level_clause(s0, "group by", max(0, from_pos + len("from")))
+    if sel_pos != 0 or from_pos < 0 or group_pos < 0:
+        return sql
+
+    having_pos = _find_top_level_clause(s0, "having", group_pos + len("group by"))
+    order_pos = _find_top_level_clause(s0, "order by", group_pos + len("group by"))
+    limit_pos = _find_top_level_clause(s0, "limit", group_pos + len("group by"))
+    tail_positions = [p for p in (having_pos, order_pos, limit_pos) if p >= 0]
+    group_end = min(tail_positions) if tail_positions else len(s0)
+
+    select_part = s0[sel_pos + len("select"):from_pos].strip()
+    from_where_part = s0[from_pos + len("from"):group_pos].strip()
+    group_part = s0[group_pos + len("group by"):group_end].strip()
+    tail_part = s0[group_end:].strip() if group_end < len(s0) else ""
+    if not select_part or not from_where_part or not group_part:
+        return sql
+
+    where_pos = _find_top_level_clause(from_where_part, "where")
+    if where_pos < 0:
+        return sql
+    from_core = from_where_part[:where_pos].strip()
+    where_body = from_where_part[where_pos + len("where"):].strip()
+    if not from_core or not where_body or _has_top_level_or(where_body):
+        return sql
+
+    alias_map = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    if len(alias_map) < 3:
+        return sql
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    allowed_cols: Dict[str, Set[str]] = {}
+    if ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            allowed_cols = {str(t).lower(): {str(c).lower() for c in cols} for t, cols in allowed.items()}
+        except Exception:
+            allowed_cols = {}
+
+    def _plain_table(table_expr: str) -> str:
+        return (table_expr or "").replace("`", "").split(".")[-1].strip()
+
+    def _table_cols(table_expr: str) -> Set[str]:
+        table_name = _plain_table(table_expr)
+        if not table_name:
+            return set()
+        if analyzer is not None:
+            try:
+                return {str(c).lower() for c in analyzer.get_table_columns(table_name)}
+            except Exception:
+                pass
+        return set(allowed_cols.get(table_name.lower(), set()))
+
+    def _split_expr_alias(item: str) -> Tuple[str, Optional[str]]:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            (item or "").strip(),
+        )
+        if not m:
+            return (item or "").strip(), None
+        return (m.group(1) or "").strip(), (m.group(2) or "").strip().strip("`'\"")
+
+    def _pick_alias(base: str, used: Set[str]) -> str:
+        b = re.sub(r"[^A-Za-z0-9_]", "", base or "") or "t"
+        if not re.match(r"[A-Za-z_]", b[0]):
+            b = f"t_{b}"
+        cand = b
+        idx = 2
+        while cand.lower() in used:
+            cand = f"{b}_{idx}"
+            idx += 1
+        used.add(cand.lower())
+        return cand
+
+    eq_pairs = list(
+        re.finditer(
+            r"""`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?""",
+            from_core,
+            flags=re.I,
+        )
+    )
+    if not eq_pairs:
+        return sql
+
+    def _replace_year_ref(text: str, date_alias: str, date_col: str, replacement: str) -> str:
+        return re.sub(
+            rf"(?is)YEAR\s*\(\s*`?{re.escape(date_alias)}`?\s*\.\s*`?{re.escape(date_col)}`?\s*\)",
+            replacement,
+            text or "",
+        )
+
+    def _year_aliases_for(date_alias: str, date_col: str) -> Set[str]:
+        aliases: Set[str] = set()
+        for item in _split_top_level_commas(select_part):
+            expr, alias = _split_expr_alias(item)
+            if not alias:
+                continue
+            if _replace_year_ref(expr, date_alias, date_col, "__YEAR__") != expr:
+                aliases.add(alias.lower())
+        return aliases
+
+    conjuncts = _split_top_level_and(where_body)
+    if not conjuncts:
+        return sql
+
+    used_aliases = {str(a).lower() for a in alias_map.keys()}
+    used_aliases.update(_plain_table(t).lower() for t in alias_map.values())
+
+    for cond_idx, cond in enumerate(conjuncts):
+        m = re.match(
+            r"""(?isx)^\s*
+                \(\s*YEAR\s*\(\s*`?(?P<date_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<date_col>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)
+                \s*,\s*`?(?P<entity_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<entity_col>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)
+                \s+IN\s*\(\s*SELECT\s+
+                (?:
+                    MAX\s*\(\s*YEAR\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<sub_date_col_1>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*\)
+                  |
+                    YEAR\s*\(\s*MAX\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<sub_date_col_2>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*\)
+                )
+                \s*,\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<sub_key_col>[A-Za-z_][A-Za-z0-9_]*)`?
+                \s+FROM\s+`?(?P<sub_table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?!GROUP\b|WHERE\b|ORDER\b|HAVING\b|LIMIT\b)`?[A-Za-z_][A-Za-z0-9_]*`?)?
+                \s+GROUP\s+BY\s+(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<group_col>[A-Za-z_][A-Za-z0-9_]*)`?
+                \s*\)\s*$""",
+            cond.strip(),
+        )
+        if not m:
+            continue
+
+        date_alias = m.group("date_alias")
+        date_col = m.group("date_col")
+        entity_alias = m.group("entity_alias")
+        entity_col = m.group("entity_col")
+        sub_date_col = (m.group("sub_date_col_1") or m.group("sub_date_col_2") or "").strip()
+        sub_key_col = (m.group("sub_key_col") or "").strip()
+        group_col = (m.group("group_col") or "").strip()
+        sub_table = (m.group("sub_table") or "").strip()
+        if not all([date_alias, date_col, entity_alias, entity_col, sub_date_col, sub_key_col, group_col, sub_table]):
+            continue
+        if sub_key_col.lower() != entity_col.lower() or group_col.lower() != entity_col.lower():
+            continue
+
+        date_table = alias_map.get(date_alias) or alias_map.get(date_alias.lower())
+        entity_table = alias_map.get(entity_alias) or alias_map.get(entity_alias.lower())
+        if not date_table or not entity_table:
+            continue
+
+        date_cols = _table_cols(date_table)
+        entity_cols = _table_cols(entity_table)
+        if date_cols and date_col.lower() not in date_cols:
+            continue
+        if entity_cols and entity_col.lower() not in entity_cols:
+            continue
+
+        bridge_candidates: List[Tuple[int, str, str, str, str]] = []
+        for m_date in eq_pairs:
+            a1, c1, a2, c2 = m_date.group(1), m_date.group(2), m_date.group(3), m_date.group(4)
+            a1l, a2l = a1.lower(), a2.lower()
+            if a1l == date_alias.lower() and a2l in alias_map:
+                bridge_alias, date_join_col, bridge_date_fk = a2, c1, c2
+            elif a2l == date_alias.lower() and a1l in alias_map:
+                bridge_alias, date_join_col, bridge_date_fk = a1, c2, c1
+            else:
+                continue
+            if bridge_alias.lower() == date_alias.lower():
+                continue
+
+            bridge_table = alias_map.get(bridge_alias) or alias_map.get(bridge_alias.lower()) or bridge_alias
+            bridge_cols = _table_cols(bridge_table)
+            if bridge_cols and bridge_date_fk.lower() not in bridge_cols:
+                continue
+
+            bridge_entity_col = ""
+            for m_entity in eq_pairs:
+                b1, d1, b2, d2 = m_entity.group(1), m_entity.group(2), m_entity.group(3), m_entity.group(4)
+                b1l, b2l = b1.lower(), b2.lower()
+                if b1l == bridge_alias.lower() and b2l == entity_alias.lower() and d2.lower() == entity_col.lower():
+                    bridge_entity_col = d1
+                    break
+                if b2l == bridge_alias.lower() and b1l == entity_alias.lower() and d1.lower() == entity_col.lower():
+                    bridge_entity_col = d2
+                    break
+            if not bridge_entity_col:
+                continue
+            if bridge_cols and bridge_entity_col.lower() not in bridge_cols:
+                continue
+
+            sub_norm = _plain_table(sub_table).lower()
+            bridge_norm = _plain_table(bridge_table).lower()
+            date_norm = _plain_table(date_table).lower()
+            if sub_norm not in {bridge_norm, date_norm}:
+                continue
+
+            score = 0
+            if sub_norm == bridge_norm:
+                score += 4
+            if bridge_entity_col.lower() == entity_col.lower():
+                score += 2
+            bridge_candidates.append((score, bridge_alias, bridge_table, date_join_col, bridge_date_fk))
+
+        if len(bridge_candidates) != 1:
+            bridge_candidates.sort(key=lambda item: item[0], reverse=True)
+            if not bridge_candidates or (len(bridge_candidates) > 1 and bridge_candidates[0][0] == bridge_candidates[1][0]):
+                continue
+
+        _score, bridge_alias, bridge_table, date_join_col, bridge_date_fk = bridge_candidates[0]
+        bridge_entity_col = ""
+        for m_entity in eq_pairs:
+            b1, d1, b2, d2 = m_entity.group(1), m_entity.group(2), m_entity.group(3), m_entity.group(4)
+            b1l, b2l = b1.lower(), b2.lower()
+            if b1l == bridge_alias.lower() and b2l == entity_alias.lower() and d2.lower() == entity_col.lower():
+                bridge_entity_col = d1
+                break
+            if b2l == bridge_alias.lower() and b1l == entity_alias.lower() and d1.lower() == entity_col.lower():
+                bridge_entity_col = d2
+                break
+        if not bridge_entity_col:
+            continue
+
+        ly_alias = _pick_alias("latest_years", used_aliases)
+        src_alias = _pick_alias("ly_src", used_aliases)
+        dt_alias = _pick_alias("ly_dt", used_aliases)
+
+        year_aliases = _year_aliases_for(date_alias, date_col)
+        rebuilt_select = _replace_year_ref(select_part, date_alias, date_col, f"{ly_alias}.latest_year")
+        rebuilt_group_items: List[str] = []
+        seen_group: Set[str] = set()
+        for item in _split_top_level_commas(group_part):
+            item_clean = item.strip()
+            if item_clean.lower() in year_aliases:
+                item_clean = f"{ly_alias}.latest_year"
+            else:
+                item_clean = _replace_year_ref(item_clean, date_alias, date_col, f"{ly_alias}.latest_year").strip()
+            if not item_clean:
+                continue
+            item_key = re.sub(r"\s+", " ", item_clean).lower()
+            if item_key in seen_group:
+                continue
+            seen_group.add(item_key)
+            rebuilt_group_items.append(item_clean)
+        if not rebuilt_group_items:
+            continue
+
+        remaining = [c.strip() for i, c in enumerate(conjuncts) if i != cond_idx and c.strip()]
+        remaining.append(f"YEAR({date_alias}.{date_col}) = {ly_alias}.latest_year")
+
+        ly_join = (
+            "JOIN (\n"
+            "  SELECT\n"
+            f"    {src_alias}.{bridge_entity_col} AS latest_key,\n"
+            f"    MAX(YEAR({dt_alias}.{date_col})) AS latest_year\n"
+            f"  FROM {bridge_table} AS {src_alias}\n"
+            f"  JOIN {date_table} AS {dt_alias}\n"
+            f"    ON {dt_alias}.{date_join_col} = {src_alias}.{bridge_date_fk}\n"
+            f"  GROUP BY {src_alias}.{bridge_entity_col}\n"
+            f") AS {ly_alias}\n"
+            f"  ON {ly_alias}.latest_key = {entity_alias}.{entity_col}"
+        )
+
+        tail_clause = f"\n{tail_part}" if tail_part else ""
+        return (
+            f"SELECT {rebuilt_select}\n"
+            f"FROM {from_core}\n"
+            f"{ly_join}\n"
+            f"WHERE {' AND '.join(remaining)}\n"
+            f"GROUP BY {', '.join(rebuilt_group_items)}"
+            f"{tail_clause};"
+        )
+
+    return sql
+
+
 def _rewrite_latest_year_tuple_in_filter(sql: str, question: str, ctx: str = "") -> str:
     """
     Rewrite tuple-IN latest-year filters into a stable derived latest-year join.
@@ -17347,8 +18353,8 @@ def _rewrite_latest_year_tuple_in_filter(sql: str, question: str, ctx: str = "")
         outer_entity_table = alias_map.get(outer_entity_alias) or alias_map.get(outer_entity_alias.lower())
         if not outer_date_table or not outer_entity_table:
             continue
-        if _plain_table_name(outer_date_table).lower() != _plain_table_name(sub_date_table).lower():
-            continue
+        sub_date_table_norm = _plain_table_name(sub_date_table).lower()
+        outer_date_table_norm = _plain_table_name(outer_date_table).lower()
 
         outer_date_cols = _table_cols(outer_date_table)
         outer_entity_cols = _table_cols(outer_entity_table)
@@ -17396,6 +18402,9 @@ def _rewrite_latest_year_tuple_in_filter(sql: str, question: str, ctx: str = "")
 
         bridge_alias, date_join_col, bridge_link_col = direct_candidates[0]
         bridge_table = alias_map.get(bridge_alias) or alias_map.get(bridge_alias.lower()) or bridge_alias
+        bridge_table_norm = _plain_table_name(bridge_table).lower()
+        if sub_date_table_norm not in {outer_date_table_norm, bridge_table_norm}:
+            continue
         ly_alias = _pick_alias("latest_years", used_aliases)
         src_alias = _pick_alias("ly_src", used_aliases)
         dt_alias = _pick_alias("ly_dt", used_aliases)
@@ -21712,6 +22721,66 @@ def _extract_structural_word_count(question: str) -> Optional[int]:
         return word_to_num.get(raw)
     return None
 
+
+def _extract_followed_by_character_class_regex(question: str) -> Optional[str]:
+    """Return a canonical anchored regex for "N letters followed by M digits" shapes."""
+    q = (question or "").lower()
+    if not q or "followed by" not in q:
+        return None
+
+    word_to_num = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+    }
+
+    def _count(raw: str) -> Optional[int]:
+        raw = (raw or "").strip().lower()
+        if raw.isdigit():
+            n = int(raw)
+            return n if 1 <= n <= 64 else None
+        return word_to_num.get(raw)
+
+    def _cls(unit: str) -> Optional[str]:
+        u = (unit or "").strip().lower()
+        if u.startswith("letter"):
+            return "[A-Z]"
+        if u.startswith("digit") or u in {"number", "numbers"}:
+            return "[0-9]"
+        if u.startswith("character") or u.startswith("char"):
+            return "."
+        return None
+
+    pattern = re.compile(
+        r"\b(?:exactly\s+)?(?P<n1>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(?P<u1>letters?|digits?|numbers?|characters?|chars?)\s+"
+        r"followed\s+by\s+(?:exactly\s+)?"
+        r"(?P<n2>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(?P<u2>letters?|digits?|numbers?|characters?|chars?)\b",
+        flags=re.I,
+    )
+    m = pattern.search(q)
+    if not m:
+        return None
+
+    n1 = _count(m.group("n1"))
+    n2 = _count(m.group("n2"))
+    c1 = _cls(m.group("u1"))
+    c2 = _cls(m.group("u2"))
+    if not n1 or not n2 or not c1 or not c2:
+        return None
+    return f"^{c1}{{{n1}}}{c2}{{{n2}}}$"
+
+
 def _question_requires_regex(question: str) -> bool:
     q = (question or "").strip().lower()
 
@@ -21793,6 +22862,21 @@ def _canonicalize_structural_regex(sql: str, question: str) -> str:
     """
     if not sql:
         return sql
+    followed_by_regex = _extract_followed_by_character_class_regex(question)
+    if followed_by_regex:
+        out = sql
+        out = re.sub(
+            r"(?is)(REGEXP_LIKE\s*\(\s*[^,]+,\s*)(N?'(?:''|[^'])*'|\"(?:[^\"\\\\]|\\\\.)*\")(\s*\))",
+            lambda m: f"{m.group(1)}'{followed_by_regex}'{m.group(3)}",
+            out,
+        )
+        out = re.sub(
+            r"(?is)(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+\b(?:REGEXP|RLIKE)\b\s*)(N?'(?:''|[^'])*'|\"(?:[^\"\\\\]|\\\\.)*\")",
+            lambda m: f"{m.group(1)}'{followed_by_regex}'",
+            out,
+        )
+        return out
+
     word_count = _extract_structural_word_count(question)
     if not word_count:
         return sql
@@ -21954,6 +23038,125 @@ def _guardrail_fix_mysql_regexp_literals(sql: str) -> str:
     out = pat_dq.sub(_repl_dq, out)
 
     return out
+
+
+def _rewrite_regex_filter_to_case_bucket(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Repair match-vs-rest bucket aggregations when the draft incorrectly turns
+    the regex bucket condition into a WHERE filter and projects only one label.
+
+    Applies only to explicit two-label questions such as:
+      Use 'X' for rows that match and 'Y' for the rest.
+    """
+    s = (sql or "").strip()
+    q = str(question or "")
+    if not s or not q or "case" in s.lower():
+        return sql
+    if not re.search(r"\b(?:group|summari[sz]e)\b[^.]{0,120}\bby\s+whether\b", q, flags=re.I):
+        return sql
+    if not re.search(r"\b(?:match(?:es|ing)?|pattern|regex|regexp|followed\s+by)\b", q, flags=re.I):
+        return sql
+
+    label_match = re.search(
+        r"""(?is)\buse\s+(['"])(?P<match>.+?)\1\s+for\s+(?:rows?|records?)\s+that\s+match(?:es)?\s+
+            (?:and|,)\s+(['"])(?P<rest>.+?)\3\s+for\s+(?:the\s+)?(?:rest|others?|remaining|non[-\s]?matches?)\b""",
+        q,
+        flags=re.X,
+    )
+    if not label_match:
+        return sql
+    match_label = (label_match.group("match") or "").strip()
+    rest_label = (label_match.group("rest") or "").strip()
+    if not match_label or not rest_label or match_label.lower() == rest_label.lower():
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    s0 = s[:-1].rstrip() if trailing else s
+    sel_pos = _find_top_level_clause(s0, "select")
+    from_pos = _find_top_level_clause(s0, "from", max(0, sel_pos + len("select")))
+    where_pos = _find_top_level_clause(s0, "where", max(0, from_pos + len("from")))
+    group_pos = _find_top_level_clause(s0, "group by", max(0, where_pos + len("where")))
+    if sel_pos != 0 or from_pos < 0 or where_pos < 0 or group_pos < 0:
+        return sql
+    if re.search(r"\bJOIN\b", s0[from_pos:where_pos], flags=re.I):
+        return sql
+
+    having_pos = _find_top_level_clause(s0, "having", group_pos + len("group by"))
+    order_pos = _find_top_level_clause(s0, "order by", group_pos + len("group by"))
+    limit_pos = _find_top_level_clause(s0, "limit", group_pos + len("group by"))
+    where_end = group_pos
+    group_end = min([p for p in (having_pos, order_pos, limit_pos, len(s0)) if p >= 0])
+
+    where_body = s0[where_pos + len("where"):where_end].strip()
+    if not where_body or _has_top_level_or(where_body):
+        return sql
+    where_parts = _split_top_level_and(where_body)
+    if len(where_parts) != 1:
+        return sql
+    regex_condition = where_parts[0].strip()
+    if not re.search(r"\b(?:REGEXP_LIKE|REGEXP|RLIKE)\b", regex_condition, flags=re.I):
+        return sql
+    if re.search(r"\bNOT\s+(?:REGEXP_LIKE|REGEXP|RLIKE)\b|\bNOT\s*\(", regex_condition, flags=re.I):
+        return sql
+
+    select_items = _split_top_level_commas(s0[sel_pos + len("select"):from_pos].strip())
+    if len(select_items) < 2:
+        return sql
+
+    def _unquote_sql_string(expr: str) -> Optional[str]:
+        raw = (expr or "").strip()
+        m_sq = re.fullmatch(r"'((?:''|[^'])*)'", raw, flags=re.S)
+        if m_sq:
+            return (m_sq.group(1) or "").replace("''", "'")
+        m_dq = re.fullmatch(r'"((?:""|[^"])*)"', raw, flags=re.S)
+        if m_dq:
+            return (m_dq.group(1) or "").replace('""', '"')
+        return None
+
+    def _quote_sql_string(value: str) -> str:
+        return "'" + str(value or "").replace("'", "''") + "'"
+
+    def _alias_sql(alias: str) -> str:
+        a = str(alias or "").strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", a):
+            return a
+        return "`" + a.replace("`", "``") + "`"
+
+    label_index = -1
+    label_alias = ""
+    for idx, item in enumerate(select_items):
+        expr, alias = _split_select_expr_alias(item)
+        literal = _unquote_sql_string(expr)
+        if literal is None or not alias:
+            continue
+        if literal.strip().lower() != match_label.lower():
+            continue
+        label_index = idx
+        label_alias = alias
+        break
+    if label_index < 0 or not label_alias:
+        return sql
+
+    case_expr = (
+        f"CASE WHEN {regex_condition} THEN {_quote_sql_string(match_label)} "
+        f"ELSE {_quote_sql_string(rest_label)} END"
+    )
+    rebuilt_items = list(select_items)
+    rebuilt_items[label_index] = f"{case_expr} AS {_alias_sql(label_alias)}"
+
+    from_part = s0[from_pos:where_pos].strip()
+    suffix = s0[group_end:].lstrip()
+    rebuilt = (
+        "SELECT "
+        + ", ".join(item.strip() for item in rebuilt_items)
+        + " "
+        + from_part
+        + " GROUP BY "
+        + case_expr
+    )
+    if suffix:
+        rebuilt += " " + suffix
+    return rebuilt.rstrip() + trailing
 # =======================================================================
 # ======= Phase 6 — NULL / DISTINCT / Result Cardinality Policies =======
 # ============== Heuristic for Missing Values and Distinct ==============
@@ -21969,6 +23172,177 @@ def _guardrail_fix_mysql_regexp_literals(sql: str) -> str:
 # - ensure_reasonable_count_distinct
 # - parse_from_join_aliases
 # - strip_unneeded_count_distinct
+
+def _question_wants_union_distinct_set_operation(question: str) -> bool:
+    """
+    True when the question explicitly asks a set operation to remove/deduplicate
+    rows. This is intentionally lexical and domain-agnostic; callers should use
+    it together with a set-operation cue.
+    """
+    q = (question or "").lower()
+    if not q:
+        return False
+    if re.search(
+        r"\b(?:keep|preserve|allow|include|including)\s+(?:the\s+)?(?:duplicate|duplicates|duplicate\s+rows|duplicated\s+rows)\b"
+        r"|\b(?:do\s+not|don't|dont)\s+remove\s+(?:the\s+)?(?:duplicate|duplicates|duplicate\s+rows|duplicated\s+rows)\b"
+        r"|\bwithout\s+removing\s+(?:the\s+)?(?:duplicate|duplicates|duplicate\s+rows|duplicated\s+rows)\b",
+        q,
+        flags=re.I,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b"
+            r"|\b(?:deduplicate|deduplicated|deduped|dedup|de[-\s]?duplicate|de[-\s]?duplicated|de[-\s]?duped|de[-\s]?dup)\b",
+            q,
+            flags=re.I,
+        )
+    )
+
+
+def _question_wants_union_all_set_operation(question: str) -> bool:
+    """
+    True when the question explicitly asks to preserve duplicates across set
+    operation branches. This distinguishes UNION ALL intent from a simple OR
+    filter, because rows matching multiple branches must remain duplicated.
+    """
+    q = (question or "").lower()
+    if not q:
+        return False
+
+    duplicate_obj = r"(?:duplicate|duplicates|duplicate\s+rows|duplicated\s+rows)"
+    patterns = [
+        r"\bunion\s+all\b",
+        rf"\b(?:keep|preserve|allow|include|including)\s+(?:the\s+)?{duplicate_obj}\b",
+        rf"\b{duplicate_obj}\s+(?:are\s+)?(?:allowed|kept|preserved|included)\b",
+        rf"\b(?:do\s+not|don't|dont)\s+remove\s+(?:the\s+)?{duplicate_obj}\b",
+        rf"\bwithout\s+removing\s+(?:the\s+)?{duplicate_obj}\b",
+    ]
+    return any(re.search(pat, q, flags=re.I) for pat in patterns)
+
+
+def _enforce_set_operation_operator_from_question(sql: str, question: str) -> str:
+    """
+    Align top-level set-operation operators with explicit duplicate semantics:
+    - remove/deduplicate rows  -> UNION
+    - keep/preserve duplicates -> UNION ALL
+
+    This avoids unsafe hybrids such as SELECT DISTINCT in one branch combined
+    with UNION ALL for the full result set.
+    """
+    s = (sql or "").strip()
+    if not s or "UNION" not in s.upper() or not _question_has_set_operation_intent(question):
+        return sql
+
+    wants_union_all = _question_wants_union_all_set_operation(question)
+    wants_union_distinct = _question_wants_union_distinct_set_operation(question)
+    if wants_union_all:
+        target = "UNION ALL"
+    elif wants_union_distinct:
+        target = "UNION"
+    else:
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    body = s[:-1].rstrip() if trailing else s
+    upper = body.upper()
+    out: List[str] = []
+    depth = 0
+    quote = ""
+    last = 0
+    i = 0
+    changed = False
+
+    while i < len(body):
+        ch = body[i]
+        if quote:
+            if ch == quote and (i == 0 or body[i - 1] != "\\"):
+                quote = ""
+            i += 1
+            continue
+        if ch in {"'", '"', "`"}:
+            quote = ch
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0 and upper.startswith("UNION", i):
+            prev_ok = i == 0 or not (upper[i - 1].isalnum() or upper[i - 1] == "_")
+            next_idx = i + len("UNION")
+            next_ok = next_idx >= len(upper) or not (upper[next_idx].isalnum() or upper[next_idx] == "_")
+            if prev_ok and next_ok:
+                op_end = next_idx
+                m_all = re.match(r"\s+ALL\b", body[op_end:], flags=re.I)
+                if m_all:
+                    op_end += m_all.end()
+                old_op = body[i:op_end]
+                out.append(body[last:i])
+                out.append(target)
+                last = op_end
+                changed = changed or old_op.upper() != target
+                i = op_end
+                continue
+        i += 1
+
+    if not changed:
+        return sql
+    out.append(body[last:])
+    return "".join(out).rstrip() + trailing
+
+
+def _question_has_set_operation_intent(question: str) -> bool:
+    """
+    Detect explicit set-operation intent without tying the logic to a schema or
+    benchmark. We require a set-operation cue plus either branch labels, dedupe
+    intent, or duplicate-preservation intent. Explicit UNION/UNION ALL wording
+    is also accepted unless the user is explicitly forbidding UNION.
+    """
+    q = (question or "").lower()
+    if not q:
+        return False
+
+    if re.search(r"\b(?:do\s+not|don't|dont)\s+use\s+union\b", q, flags=re.I):
+        return False
+
+    set_action = r"(?:combin(?:e|ed|ing)|merg(?:e|ed|ing)|append(?:ed|ing)?|stack(?:ed|ing)?|concatenat(?:e|ed|ing))"
+    explicit_union = bool(re.search(r"\bunion(?:\s+all)?\b", q, flags=re.I))
+    quoted_literals = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or "")
+    has_set_operation_cue = bool(
+        explicit_union
+        or re.search(rf"\b{set_action}\b", q, flags=re.I)
+        or re.search(r"\b(?:in|into)\s+one\s+result(?:\s+set)?\b", q, flags=re.I)
+        or re.search(r"\b(?:one|single)\s+combined\s+(?:result|list)\b", q, flags=re.I)
+    )
+    has_result_set_append_shape = bool(
+        re.search(
+            rf"\b{set_action}\b"
+            r"[^.]{0,80}\b(?:result\s+sets?|queries|lists?)\b",
+            q,
+            flags=re.I | re.S,
+        )
+    )
+    has_set_labeling_shape = bool(
+        len(quoted_literals) >= 2
+        and re.search(r"\bor\b", q, flags=re.I)
+    )
+    has_dedupe_request = _question_wants_union_distinct_set_operation(question)
+    has_duplicate_preserve_request = _question_wants_union_all_set_operation(question)
+
+    return bool(
+        explicit_union
+        or has_result_set_append_shape
+        or (
+            has_set_operation_cue
+            and (has_set_labeling_shape or has_dedupe_request or has_duplicate_preserve_request)
+        )
+    )
+
 
 def _question_wants_missing_value(question: str) -> bool:
     q = (question or "").lower()
@@ -22228,6 +23602,13 @@ def _ensure_reasonable_distinct(sql: str, question: str) -> str:
         return sql
     
     s_up = sql.upper()
+
+    # Set operations encode deduplication at the operator level. Adding
+    # SELECT DISTINCT to only one branch can create unsafe hybrids such as
+    # SELECT DISTINCT ... UNION ALL ..., so leave this to the set-op operator
+    # normalizer.
+    if re.search(r"\bUNION(?:\s+ALL)?\b", s_up):
+        return _remove_distinct(sql) if _question_has_set_operation_intent(question) else sql
     
     # Guard 1: Aggregates already handle deduplication via GROUP BY
     if any(agg in s_up for agg in ("COUNT(", "SUM(", "AVG(", "MIN(", "MAX(")):
@@ -22887,14 +24268,11 @@ def _normalize_simple_set_operation_branches(sql: str, question: str) -> str:
     alias_candidates = [info["label_alias"] for info in branch_infos if info["label_alias"]]
     label_alias = alias_candidates[0] if alias_candidates else ("year_label" if "year label" in q else "label")
 
-    prefer_union = bool(
-        re.search(
-            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
-            q,
-            flags=re.I,
-        )
+    prefer_union_all = _question_wants_union_all_set_operation(question)
+    prefer_union = (
+        _question_wants_union_distinct_set_operation(question)
+        and not prefer_union_all
     )
-    prefer_union_all = bool(re.search(r"\bunion\s+all\b", q, flags=re.I))
     if prefer_union:
         out_ops = ["UNION"] * len(operators)
     elif prefer_union_all:
@@ -23185,12 +24563,9 @@ def _rewrite_case_split_to_union(sql: str, question: str) -> str:
             return sql
 
     label_alias = "year_label" if "year label" in q else "label"
-    use_union = bool(
-        re.search(
-            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
-            q,
-            flags=re.I,
-        )
+    use_union = (
+        _question_wants_union_distinct_set_operation(question)
+        and not _question_wants_union_all_set_operation(question)
     )
     union_kw = "UNION" if use_union else "UNION ALL"
 
@@ -23365,12 +24740,11 @@ def _rewrite_union_case_label_to_literal_branches(sql: str, question: str) -> st
         id_words = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", idcol.replace("_", " ")).lower()
         id_dir = _segment_dir(q, rf"\b{re.escape(id_words)}\b", "ASC")
 
-    if re.search(
-        r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
-        q,
-        flags=re.I,
-    ):
+    wants_union_all = _question_wants_union_all_set_operation(question)
+    if _question_wants_union_distinct_set_operation(question) and not wants_union_all:
         union_kw = "UNION"
+    elif wants_union_all:
+        union_kw = "UNION ALL"
     else:
         union_kw = union_kw_raw
 
@@ -24173,6 +25547,7 @@ def _question_requests_ordering(question: str) -> bool:
     )
 
     final_output_sort_patterns = [
+        r"\b(?:final\s+)?(?:result|results|output|rows?)\s+(?:should\s+be\s+)?(?:sorted|ordered|arranged)\s+by\b",
         r"\bsort(?:ed)?\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
         r"\border(?:ed)?\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
         r"\barrange\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
@@ -24295,6 +25670,7 @@ def _question_requests_ordering(question: str) -> bool:
         r"\b(?:most\s+recent|least\s+recent|latest|earliest|newest|oldest)\s+first\b",
         r"\bfrom\s+(a\s+to\s+z|z\s+to\s+a)",
         r"\b(sorted|ordered)\s+from\b",
+        r"\bsort\s+from\b",
     ]
     configured_ordering_phrases = [
         str(p).strip()
@@ -25726,7 +27102,11 @@ def _explicit_limit_from_question(question: str) -> Optional[int]:
     if m: return max(1, min(int(m.group(1)), 1_000_000))
     m = re.search(r"\btop\s+(\d{1,4})\b", q)
     if m: return max(1, min(int(m.group(1)), 1_000_000))
-    m = re.search(r"\b(show|first|tampilkan|ambil)\s+(\d{1,4})\b", q)
+    m = re.search(
+        r"\b(show|first|tampilkan|ambil)\s+(\d{1,4})\b"
+        r"(?!\s+(?:characters?|chars?|letters?|digits?|bytes?|positions?|tokens?|words?)\b)",
+        q,
+    )
     if m: return max(1, min(int(m.group(2)), 1_000_000))
     return None
 
@@ -25738,6 +27118,40 @@ def _maybe_add_limit(question: str, sql: str) -> str:
         return sql
     s = sql.rstrip().rstrip(";")
     return s + f" LIMIT {n};"
+
+
+def _drop_unrequested_grouped_limit(sql: str, question: str) -> str:
+    """
+    Remove a top-level LIMIT from grouped summaries when the question does not
+    ask for a row limit. Numeric transformation phrases such as "first 2
+    characters" should not constrain the number of result groups.
+    """
+    s = (sql or "").strip()
+    if not s or "limit" not in s.lower() or "group by" not in s.lower():
+        return sql
+
+    q = (question or "").lower()
+    if _explicit_limit_from_question(question) is not None:
+        return sql
+    if re.search(
+        r"\b(?:top|bottom)\s+\d+\b"
+        r"|\b\d+\s+(?:highest|lowest|largest|smallest|most|least|newest|latest|earliest|oldest)\b",
+        q,
+        flags=re.I,
+    ):
+        return sql
+    if not re.search(r"\b(?:group|summari[sz]e|for\s+each|per|by|bucket|band)\b", q, flags=re.I):
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    s0 = s[:-1].rstrip() if trailing else s
+    limit_pos = _find_top_level_clause(s0, "limit")
+    if limit_pos < 0:
+        return sql
+    limit_tail = s0[limit_pos:]
+    if not re.match(r"(?is)^LIMIT\s+\d+(?:\s*,\s*\d+|\s+OFFSET\s+\d+)?\s*$", limit_tail.strip()):
+        return sql
+    return s0[:limit_pos].rstrip() + trailing
 
 def _collapse_spaces_outside_quotes(s: str) -> str:
     parts = re.split(r"('(?:''|[^'])*')", s)

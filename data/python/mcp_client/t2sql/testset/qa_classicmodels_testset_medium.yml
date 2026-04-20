@@ -26,7 +26,7 @@ cases:
         ORDER BY quarter_number ASC;
     - id: M3
       difficulty: medium
-      question: "Find countries with at least 3 customers, then show the customer count and average credit limit. Keep only countries whose average credit limit is above the overall average credit limit. Order by customer count descending, then country A-Z."
+      question: "Find countries with at least 3 customers who have a credit limit. Return the country, customer count, and average credit limit. Keep only countries whose average credit limit is above the overall non-null credit limit average. Order by customer count descending, then country A-Z."
       groundtruth_sql: |
         SELECT
           country,
@@ -122,39 +122,33 @@ cases:
         ORDER BY total_amount DESC, customerNumber ASC;
     - id: M10
       difficulty: medium
-      question: "For each country, count how many distinct customer cities there are and show the maximum credit limit in that country. Keep only countries with at least 2 distinct cities. Sort by distinct city count descending, then country."
+      question: "For each country, show total customers, how many customers have a credit limit of at least 100000, and the average credit limit. Keep only countries with at least 2 customers. Sort by high-credit customer count descending, then country."
       groundtruth_sql: |
         SELECT
           country,
-          COUNT(DISTINCT city) AS distinct_city_count,
-          MAX(creditLimit) AS max_credit_limit
+          COUNT(*) AS customer_count,
+          SUM(CASE WHEN creditLimit >= 100000 THEN 1 ELSE 0 END) AS high_credit_customer_count,
+          AVG(creditLimit) AS average_credit_limit
         FROM customers
         GROUP BY country
-        HAVING COUNT(DISTINCT city) >= 2
-        ORDER BY distinct_city_count DESC, country ASC;
+        HAVING COUNT(*) >= 2
+        ORDER BY high_credit_customer_count DESC, country ASC;
     - id: M11
       difficulty: medium
-      question: "Group products into margin bands based on MSRP minus buyPrice: Low if under 20, Mid if between 20 and 60, and High for the rest. Return the band, product count, and average MSRP. Order by product count descending."
+      question: "For each job title, return the job title, employee count, lowest employee number, and highest employee number. Keep only job titles with at least 2 employees. Sort by employee count descending, then job title."
       groundtruth_sql: |
         SELECT
-          CASE
-            WHEN (MSRP - buyPrice) < 20 THEN 'Low'
-            WHEN (MSRP - buyPrice) BETWEEN 20 AND 60 THEN 'Mid'
-            ELSE 'High'
-          END AS margin_band,
-          COUNT(*) AS product_count,
-          AVG(MSRP) AS average_msrp
-        FROM products
-        GROUP BY
-          CASE
-            WHEN (MSRP - buyPrice) < 20 THEN 'Low'
-            WHEN (MSRP - buyPrice) BETWEEN 20 AND 60 THEN 'Mid'
-            ELSE 'High'
-          END
-        ORDER BY product_count DESC;
+          jobTitle,
+          COUNT(*) AS employee_count,
+          MIN(employeeNumber) AS lowest_employee_number,
+          MAX(employeeNumber) AS highest_employee_number
+        FROM employees
+        GROUP BY jobTitle
+        HAVING COUNT(*) >= 2
+        ORDER BY employee_count DESC, jobTitle ASC;
     - id: M12
       difficulty: medium
-      question: "In orderdetails, for each row return order number, product code, order line number, quantity ordered, and the rank of that line inside the same order when sorted by quantity ordered from highest to lowest. Break ties with smaller order line number first. Sort the final result by order number, then rank."
+      question: "In orderdetails, number the lines inside each order after sorting quantity ordered from highest to lowest. Break ties with the smaller order line number first, so every line gets its own position. Return order number, product code, order line number, quantity ordered, and that position. Sort the final result by order number, then position."
       groundtruth_sql: |
         SELECT
           orderNumber,
@@ -169,7 +163,7 @@ cases:
         ORDER BY orderNumber ASC, quantity_rank_in_order ASC;
     - id: M13
       difficulty: medium
-      question: "Still in orderdetails, return order number, product code, order line number, priceEach, and the gap between this line's priceEach and the average priceEach of the same order. Sort by order number, then order line number."
+      question: "Using the orderdetails table, return order number, product code, order line number, priceEach, and the gap between each line's priceEach and the average priceEach for the same order. Sort by order number, then order line number."
       groundtruth_sql: |
         SELECT
           orderNumber,
@@ -183,7 +177,7 @@ cases:
         ORDER BY orderNumber ASC, orderLineNumber ASC;
     - id: M14
       difficulty: medium
-      question: "By order year, calculate total orders, the average number of days between orderDate and requiredDate, and how many rows have shippedDate earlier than requiredDate. Sort by year ascending."
+      question: "By order year, return the order year, total orders, average number of days between orderDate and requiredDate, and how many rows have shippedDate earlier than requiredDate. Sort by year ascending."
       groundtruth_sql: |
         SELECT
           YEAR(orderDate) AS order_year,
@@ -223,22 +217,23 @@ cases:
         ORDER BY total_amount DESC, check_prefix ASC;
     - id: M17
       difficulty: medium
-      question: "For each product scale, calculate the product count and average quantity in stock. Show only scales whose average stock is higher than the overall average stock across all products. Sort by average stock descending, then scale."
+      question: "Create one product list by appending two result sets. First include products with MSRP above 100, then include products with buyPrice below 50. Keep duplicate rows if a product appears in both result sets. Return product code and product name. Sort by product code, then product name."
       groundtruth_sql: |
         SELECT
-          productScale,
-          COUNT(*) AS product_count,
-          AVG(quantityInStock) AS average_stock
+          productCode,
+          productName
         FROM products
-        GROUP BY productScale
-        HAVING AVG(quantityInStock) > (
-          SELECT AVG(quantityInStock)
-          FROM products
-        )
-        ORDER BY average_stock DESC, productScale ASC;
+        WHERE MSRP > 100
+        UNION ALL
+        SELECT
+          productCode,
+          productName
+        FROM products
+        WHERE buyPrice < 50
+        ORDER BY productCode ASC, productName ASC;
     - id: M18
       difficulty: medium
-      question: "For each customer with a non-null credit limit, assign a rank inside the same country based on credit limit from highest to lowest. Return customer number, country, credit limit, and rank. Final output should be sorted by country, rank, and customer number."
+      question: "For customers with a credit limit, rank them inside each country by credit limit from highest to lowest. If customers tie on credit limit, give them the same rank, and the next lower credit limit should use the next rank number without skipping. Return customer number, country, credit limit, and rank. Final output should be sorted by country, rank, and customer number."
       groundtruth_sql: |
         SELECT
           customerNumber,
@@ -279,7 +274,7 @@ cases:
         ORDER BY total_orders DESC, customerNumber ASC;
     - id: M21
       difficulty: medium
-      question: "For each payment row, return customer number, check number, payment date, amount, and the difference between this amount and the previous payment amount for the same customer when ordered by payment date ascending. Final result should be sorted by customer number, then payment date."
+      question: "For each payment row, look at that customer's previous payment in payment-date order. Return customer number, check number, payment date, amount, and the difference as current amount minus previous amount. Final result should be sorted by customer number, then payment date."
       groundtruth_sql: |
         SELECT
           customerNumber,
@@ -306,7 +301,7 @@ cases:
         ORDER BY average_msrp DESC, productVendor ASC;
     - id: M23
       difficulty: medium
-      question: "By office code, count total employees and how many of them have an extension that looks like x followed by exactly four digits. Sort by total employees descending, then office code."
+      question: "By office code, return the office code, total employees, and how many employees have an extension that looks like x followed by exactly four digits. Sort by total employees descending, then office code."
       groundtruth_sql: |
         SELECT
           officeCode,
@@ -340,7 +335,7 @@ cases:
         ORDER BY total_amount DESC, pattern_label ASC;
     - id: M25
       difficulty: medium
-      question: "Group orders into shipment buckets: Open if shippedDate is NULL, Late if shippedDate is later than requiredDate, otherwise On Time. Return the bucket, number of orders, and the earliest order date in that bucket. Order by number of orders descending, then bucket."
+      question: "Group every row in the orders table into exactly three bucket labels: Open when shippedDate is NULL, Late when shippedDate is later than requiredDate, and On Time for all remaining orders. For each bucket label, return the bucket label, order count, and the earliest orderDate. Sort by order count descending, then bucket label ascending."
       groundtruth_sql: |
         SELECT
           CASE
@@ -399,7 +394,7 @@ cases:
         ORDER BY check_number_length ASC;
     - id: M29
       difficulty: medium
-      question: "For each product code in orderdetails, calculate total quantity ordered, average priceEach, and number of order lines. Keep only products that appear in at least 10 lines. Sort by total quantity descending, then product code."
+      question: "For each product code in orderdetails, return the product code, total quantity ordered, average priceEach, and number of order lines. Keep only products that appear in at least 10 lines. Sort by total quantity descending, then product code."
       groundtruth_sql: |
         SELECT
           productCode,

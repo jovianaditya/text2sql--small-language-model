@@ -74,13 +74,19 @@ from .helpers_core import (
     _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _ensure_explicit_simple_projection_columns, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
+    _canonicalize_single_computed_group_by_expression,
+    _simplify_same_expression_group_threshold_subquery,
+    _drop_unrequested_schema_named_count_outputs,
+    _normalize_timestampdiff_day_to_datediff,
+    _drop_unrequested_current_date_filters,
+    _rewrite_comparison_count_metrics,
     _normalize_alias_lengths,
     # phase 4
     _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _fix_redundant_groupby_with_rn_filter, _fix_inconsistent_subquery_alias, _fix_inner_rn_filter_scope, _looks_like_max_date_tiebreaker,
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _preexecute_sql_safety_pass,
-    _rewrite_winner_row_aggregate_misuse, _rewrite_single_table_tuple_in_winner_row, _rewrite_explicit_rank_aggregate_window, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _rewrite_winner_row_aggregate_misuse, _rewrite_single_table_tuple_in_winner_row, _rewrite_explicit_rank_aggregate_window, _rewrite_malformed_window_winner_clause, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_subquery_latest_year_tuple_filter, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _rewrite_dual_fact_rollup_fanout,
@@ -95,6 +101,7 @@ from .helpers_core import (
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
     _rewrite_role_label_count_semantics,
+    _fix_misplaced_entity_count_threshold,
     _drop_unrequested_exists_filters,
     _drop_unrequested_group_key_filters,
     _drop_unrequested_temporal_filters,
@@ -114,11 +121,12 @@ from .helpers_core import (
     _add_missing_count_for_group_by,
     # phase 5 — Pattern, REGEXP, and Predicate Normalization
     _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _canonicalize_structural_regex, _canonicalize_boundary_regex, _guardrail_fix_mysql_regexp_literals,
+    _rewrite_regex_filter_to_case_bucket,
     # phase 6
-    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _parse_from_join_aliases,
+    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
     _ast_guardrails,
     # phase 7
-    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _maybe_add_limit, _collapse_spaces_outside_quotes
+    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -222,13 +230,35 @@ def _identify_used_identifiers(sql: str) -> Dict[Optional[str], Set[str]]:
     # =======================================================================
 
     # 5) Output aliases: SELECT ... AS alias
-    m_sel = re.search(r"\bselect\b(.*?)\bfrom\b", code_only, flags=re.I | re.S)
-    if m_sel:
-        select_part = m_sel.group(1)
-        for m in re.finditer(r"\bas\s+(?:`([^`]+)`|([A-Za-z_]\w*))", select_part, flags=re.I):
-            alias = (m.group(1) or m.group(2) or "").strip().lower()
-            if alias:
-                exclude.add(alias)
+    #
+    # UNION/UNION ALL branches may define aliases in later SELECT branches even
+    # though the final result column names come from the first branch. Those
+    # aliases are still SQL output aliases, not schema identifiers, so the
+    # identifier scanner must exclude them globally instead of only scanning the
+    # first SELECT list.
+    output_aliases: Set[str] = set()
+    for m in re.finditer(r"\bas\s+(?:`([^`]+)`|([A-Za-z_]\w*))", code_only, flags=re.I):
+        alias = (m.group(1) or m.group(2) or "").strip().lower()
+        if alias and alias not in keywords and alias not in forbidden_alias_keywords:
+            exclude.add(alias)
+            output_aliases.add(alias)
+
+    # Mask quoted output aliases before token scanning. A display alias like
+    # `number of orders` is not a set of column identifiers (`number`, `of`,
+    # `orders`). Keep real backticked column identifiers intact by masking only
+    # aliases that were explicitly declared in the SELECT list.
+    if output_aliases:
+        alias_placeholder = "__output_alias__"
+        exclude.add(alias_placeholder)
+        for alias in sorted(output_aliases, key=len, reverse=True):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", alias):
+                continue
+            code_only = re.sub(
+                rf"`{re.escape(alias)}`",
+                f" {alias_placeholder} ",
+                code_only,
+                flags=re.I,
+            )
 
     # 6) Collect qualified usages: alias.col / table.col
     for m in re.finditer(
@@ -3301,15 +3331,19 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 "Do NOT reduce it to `LIKE '% %'`, because that only checks for any space and is semantically too weak."
             )
     if is_set_operation_intent:
-        union_keyword = "UNION" if re.search(
-            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b",
-            question.lower(),
-        ) else "UNION ALL"
+        wants_union_distinct = _question_wants_union_distinct_set_operation(question)
+        wants_union_all = _question_wants_union_all_set_operation(question)
+        union_keyword = "UNION" if wants_union_distinct and not wants_union_all else "UNION ALL"
         constraints.append(
             f"SET OPERATION RULE (CRITICAL): This question requires a set operation. "
             f"Use {union_keyword} to combine branch queries into one result. "
             "Each branch MUST return the same number of columns in the same order and compatible types."
         )
+        if wants_union_all:
+            constraints.append(
+                "SET OPERATION RULE (CRITICAL): Because the question asks to keep/preserve duplicates, "
+                "do NOT replace the set operation with a single OR filter and do NOT use deduplicating UNION."
+            )
         constraints.append(
             "SET OPERATION RULE (CRITICAL): If the question asks for an identifier plus a label, "
             "return them as TWO SEPARATE columns. "
@@ -3578,8 +3612,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 and not wants_include_zero
             )
 
-            # More explicit guidance - tell LLM exactly which table should be first
-            hint_msg = f"TABLE ORDER (CRITICAL): Start your query with FROM {primary_table}"
+            # Table order/type hints are schema-derived guidance. They are
+            # useful for FK path stability, but join type can be question
+            # dependent, so do not make this an unconditional hard command.
+            hint_msg = (
+                f"TABLE ORDER GUIDANCE: Prefer starting with FROM {primary_table}"
+            )
             if other_tables:
                 join_steps = []
                 for t in other_tables:
@@ -3605,32 +3643,35 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 hint_msg += ", then " + ", ".join(join_steps)
             if primary_reason:
                 hint_msg += f". Reason: {primary_reason}"
-            hint_msg += f". Follow this exact table order."
+            hint_msg += (
+                ". Use this as schema-path guidance only; prioritize the question, "
+                "schema evidence, and requested row-preservation/exclusion semantics if they conflict."
+            )
 
             print(f"[PROMPT DEBUG] Adding hint: {hint_msg}")
             constraints.append(hint_msg)
 
-            # JOIN TYPE GUIDANCE (CRITICAL)
+            # JOIN TYPE GUIDANCE
             if wants_include_zero and exclusion_tables:
                 constraints.append(
-                    "JOIN TYPE (CRITICAL): Include-zero intent detected (e.g., 'including ... with no/without'). "
+                    "JOIN TYPE GUIDANCE: Include-zero intent detected (e.g., 'including ... with no/without'). "
                     "Preserve primary rows with LEFT JOIN for optional related tables; do NOT force INNER JOIN on exclusion-target tables."
                 )
             elif force_required_inner_chain:
                 constraints.append(
-                    "JOIN TYPE (CRITICAL): This query needs a required INNER JOIN chain for the metric path. "
+                    "JOIN TYPE GUIDANCE: This query appears to need a required INNER JOIN chain for the metric path. "
                     "Use INNER JOIN for each required supporting table in that path; do NOT weaken it to LEFT JOIN "
                     "unless the question explicitly asks to preserve unmatched primary rows."
                 )
             elif mixed_intent_tables:
                 constraints.append(
-                    "JOIN TYPE (CRITICAL): Same table has mixed intent (both required and excluded in different slices). "
+                    "JOIN TYPE GUIDANCE: Same table has mixed intent (both required and excluded in different slices). "
                     "Use INNER JOIN for the positive slice and enforce exclusion with NOT EXISTS/anti-join logic; "
                     "do NOT rely on a single LEFT JOIN for both intents."
                 )
             elif exclusion_tables and (existence_tables or force_inner_all):
                 constraints.append(
-                    "JOIN TYPE (CRITICAL): Mixed intent detected. "
+                    "JOIN TYPE GUIDANCE: Mixed intent detected. "
                     "Use INNER JOIN for required-existence tables, and LEFT JOIN + IS NULL/NOT EXISTS for exclusion tables (e.g., 'no/never/without')."
                 )
                 constraints.append(
@@ -3639,27 +3680,27 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 )
             elif existence_tables:
                 constraints.append(
-                    "JOIN TYPE (CRITICAL): Use INNER JOIN only for tables explicitly required by existence intent "
+                    "JOIN TYPE GUIDANCE: Use INNER JOIN only for tables explicitly required by existence intent "
                     "(e.g., 'at least one', 'with/having/placed/paid ...'). "
                     "Use LEFT JOIN for non-target related tables to avoid dropping primary rows."
                 )
             elif force_inner_all:
                 # Filtering pattern: use INNER JOIN to exclude non-matching rows
                 constraints.append(
-                    "JOIN TYPE (CRITICAL): This query has explicit filtering intent (e.g., 'only ... that have/with ...'). "
+                    "JOIN TYPE GUIDANCE: This query has explicit filtering intent (e.g., 'only ... that have/with ...'). "
                     "Use **INNER JOIN** to exclude entities without matching data. "
                     "This takes precedence over 'for each' phrasing."
                 )
             elif exclusion_aggregate_prefers_inner_non_target:
                 constraints.append(
-                    "JOIN TYPE (CRITICAL): Exclusion + aggregate intent detected. "
+                    "JOIN TYPE GUIDANCE: Exclusion + aggregate intent detected. "
                     "Use INNER JOIN for positive-slice supporting tables (non-exclusion targets), "
                     "and keep exclusion logic with NOT EXISTS / anti-join pattern."
                 )
             else:
                 # Default: use LEFT JOIN to preserve all entities from primary table
                 constraints.append(
-                    "JOIN TYPE (CRITICAL): Use **LEFT JOIN** to preserve all entities from the primary table."
+                    "JOIN TYPE GUIDANCE: Prefer **LEFT JOIN** when the question asks to preserve all entities from the primary table."
                 )
                 constraints.append(
                     "FILTER RULE (CRITICAL): If using LEFT JOIN, filters for the JOINED table MUST be in the **ON** clause, NOT WHERE."
@@ -4012,6 +4053,22 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         return "".join(out)
 
+    def _fix_date_format_quarter(sql: str) -> str:
+        """Replace DATE_FORMAT(col, '%Q') with QUARTER(col).
+
+        MySQL has no %Q format specifier.  The correct way to extract a
+        calendar quarter is QUARTER(date).  Small LLMs (e.g. qwen 3B)
+        frequently hallucinate DATE_FORMAT(.., '%Q').
+        """
+        if not sql or "%Q" not in sql:
+            return sql
+        return re.sub(
+            r"DATE_FORMAT\s*\(\s*([\w.]+)\s*,\s*['\"]%Q['\"]\s*\)",
+            r"QUARTER(\1)",
+            sql,
+            flags=re.I,
+        )
+
     def _rewrite_pipes_concat_mysql(text: str) -> str:
         """
         Convert common string-concat style `a || b` into MySQL-safe CONCAT(a, b).
@@ -4042,6 +4099,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         return out
 
     s = _norm_kw(s)
+    s = _fix_date_format_quarter(s)
+    s = _normalize_timestampdiff_day_to_datediff(s)
     s = _rewrite_pipes_concat_mysql(s)
     s = _fix_missing_space_before_clauses(s)
     if not s.endswith(";"):
@@ -4220,6 +4279,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _prune_non_primary_dimensions_for_primary_aggregate(s, question, ctx)
     s = _drop_redundant_raw_name_columns_when_concat_present(s, question)
     s = _expand_group_by_aliases_regex(s)
+    s = _canonicalize_single_computed_group_by_expression(s)
+    s = _simplify_same_expression_group_threshold_subquery(s)
     latest_year_sum_intent = _question_wants_latest_year_scope_with_aggregate(question)
     has_correlated_max_subquery = bool(
         re.search(
@@ -4370,11 +4431,17 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     r"\1 \2",
     s)
     s = _fix_missing_space_before_clauses(s)
+    s = _canonicalize_single_computed_group_by_expression(s)
+    s = _simplify_same_expression_group_threshold_subquery(s)
+    s = _fix_missing_space_before_clauses(s)
     if DEBUG_WR: print(f"[REFINER - PH4] after re-spacing: {s[:200]}")
 
     # pre-sanity only (no rewrite)
     s = _winner_row_sanity_date_in_groupby(s, question)
     if DEBUG_WR: print("[REFINER - PH4] after sanity:", s)
+
+    s = _rewrite_malformed_window_winner_clause(s, question)
+    if DEBUG_WR: print("[REFINER - PH4] after malformed WINDOW winner fix:", s)
 
     # remove MAX(..) HAVING self-subquery hacks
     s = _strip_having_max_self_subquery(s)
@@ -4520,6 +4587,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _canonicalize_latest_year_same_year_pattern(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year canonical pattern fix:", s)
 
+        s = _rewrite_bridge_subquery_latest_year_tuple_filter(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after latest-year bridge-subquery tuple fix:", s)
+
         s = _rewrite_latest_year_bridge_tuple_runtime(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year runtime tuple fix:", s)
 
@@ -4554,6 +4624,18 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _rewrite_role_label_count_semantics(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after role-label count fix: {s}")
+
+        s = _fix_misplaced_entity_count_threshold(s, question)
+        if DEBUG_WR: print(f"[REFINER - PH4] after misplaced count-threshold fix: {s}")
+
+        s = _drop_unrequested_schema_named_count_outputs(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after unrequested schema-named count fix: {s}")
+
+        s = _rewrite_comparison_count_metrics(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after comparison-count metric fix: {s}")
+
+        s = _drop_unrequested_current_date_filters(s, question)
+        if DEBUG_WR: print(f"[REFINER - PH4] after unrequested current-date filter drop: {s}")
 
         s = _drop_unrequested_exists_filters(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested EXISTS-drop fix: {s}")
@@ -4640,12 +4722,14 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _guardrail_fix_like_regex_anchors(s, question)
         s = _canonicalize_boundary_regex(s, question)
         s = _canonicalize_structural_regex(s, question)
+        s = _rewrite_regex_filter_to_case_bucket(s, question, ctx)
         s = _guardrail_fix_mysql_regexp_literals(s)
     # ---------------------------------------------------------------------------
     # Phase 6 — NULL / DISTINCT / Result Cardinality Policies
     # ---------------------------------------------------------------------------
     s = _expand_missing_null_to_null_or_empty(s, question)
     s = _expand_present_not_null_to_not_empty(s, question, ctx)
+    s = _enforce_set_operation_operator_from_question(s, question)
     s = _ensure_reasonable_distinct(s, question)
     s = _ensure_reasonable_count_distinct(s, question)
     s = _drop_redundant_group_by_for_distinct_lookup(s)
@@ -4653,6 +4737,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _normalize_simple_set_operation_branches(s, question)
     s = _rewrite_union_case_label_to_literal_branches(s, question)
     s = _rewrite_concat_label_union(s, question)
+    s = _enforce_set_operation_operator_from_question(s, question)
     s = _strip_unneeded_count_distinct(s, question)
     s = _drop_unrequested_group_key_filters(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested group-key filter drop fix: {s}")
@@ -4768,6 +4853,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _preserve_requested_base_columns_in_running_self_join(s, question)
     s = _enforce_requested_order_direction(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
+    s = _drop_unrequested_grouped_limit(s, question)
     s = _maybe_add_limit(question, s)    
     # s = _collapse_spaces_outside_quotes(s)
     # ---------------------------------------------------------------------------
