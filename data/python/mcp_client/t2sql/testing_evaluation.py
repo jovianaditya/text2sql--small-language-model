@@ -1521,6 +1521,12 @@ async def run_batch_eval(
     ir_used_count = sum(1 for r in results if bool(r.get("ir_used", False)))
     ir_hint_passed_count = sum(1 for r in results if bool(r.get("ir_hint_passed", False)))
     llm_fallback_count = total - ir_used_count
+    final_3b_count = sum(
+        1 for r in results if str(r.get("final_model_used", "")).strip().lower() == "llm_3b"
+    )
+    final_7b_count = sum(
+        1 for r in results if str(r.get("final_model_used", "")).strip().lower() == "llm_7b"
+    )
 
     # Metrics by difficulty
     by_difficulty = {}
@@ -1562,6 +1568,10 @@ async def run_batch_eval(
     print(
         f"Route Split: LLM fallback={llm_fallback_count}/{total} ({100*llm_fallback_count/total:.1f}%), "
         f"IR hint passed={ir_hint_passed_count}/{llm_fallback_count}"
+    )
+    print(
+        f"Model Usage (Final): 3B={final_3b_count}/{total} ({100*final_3b_count/total:.1f}%), "
+        f"7B={final_7b_count}/{total} ({100*final_7b_count/total:.1f}%)"
     )
 
     print("\nBy Difficulty:")

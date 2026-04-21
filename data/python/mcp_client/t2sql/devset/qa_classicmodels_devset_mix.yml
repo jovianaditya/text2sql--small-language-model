@@ -80,8 +80,7 @@ cases:
         SELECT DISTINCT
           country
         FROM customers
-        ORDER BY
-          country ASC;
+        ORDER BY country ASC;
     - id: E12
       difficulty: easy
       question: "Show all offices, and if the state information is missing, display it as 'N/A'. Return office code, city, country, and the displayed state value. Sort by office code ascending."
@@ -92,8 +91,7 @@ cases:
           country,
           COALESCE(state, 'N/A') AS state_display
         FROM offices
-        ORDER BY
-          officeCode ASC;
+        ORDER BY officeCode ASC;
     - id: E13
       difficulty: easy
       question: "Can you show the orders that were shipped after their required date? Return order number, required date, and shipped date. Sort by shipped date descending, then order number ascending."
@@ -104,9 +102,66 @@ cases:
           shippedDate
         FROM orders
         WHERE shippedDate > requiredDate
-        ORDER BY
-          shippedDate DESC,
-          orderNumber ASC;
+        ORDER BY shippedDate DESC, orderNumber ASC;
+    - id: E14
+      difficulty: easy
+      question: "I need to see which products have a scale of either '1:10' or '1:12'. Please show the product code, name, and scale, and sort by product name descending."
+      groundtruth_sql: |
+        SELECT
+          productCode,
+          productName,
+          productScale
+        FROM products
+        WHERE productScale IN ('1:10', '1:12')
+        ORDER BY productName DESC;
+    - id: E15
+      difficulty: easy
+      question: "Can you pull the first and last names for all employees? Also, make sure the last names are in all caps and the list is sorted by first name."
+      groundtruth_sql: |
+        SELECT
+          firstName,
+          UPPER(lastName) AS lastName
+        FROM employees
+        ORDER BY firstName;
+    - id: E16
+      difficulty: easy
+      question: "I need to check our profit margins. Can you show the product code, product name, and the difference between MSRP and buy price for each product?"
+      groundtruth_sql: |
+        SELECT productCode, productName, (MSRP - buyPrice) AS markup
+        FROM products;
+    - id: E17
+      difficulty: easy
+      question: "Can you pull all the orders that were placed in the month of May, regardless of the year? Just show the order number and the order date."
+      groundtruth_sql: |
+        SELECT 
+          orderNumber, orderDate
+        FROM orders
+        WHERE MONTH(orderDate) = 5;
+    - id: E18
+      difficulty: easy
+      question: "Show me the customers who don't have a state listed but are located in either the USA or Canada. I need their name, city, and country."
+      groundtruth_sql: |
+        SELECT 
+          customerName, city, country
+        FROM customers
+        WHERE state IS NULL AND country IN ('USA', 'Canada');
+    - id: E19
+      difficulty: easy
+      question: "Can you list the product lines where the text description is longer than 200 characters? Show the product line and the first 50 characters of the text description."
+      groundtruth_sql: |
+        SELECT 
+          productLine, LEFT(textDescription, 50) AS description_preview
+        FROM productlines
+        WHERE LENGTH(textDescription) > 200;
+    - id: E20
+      difficulty: easy
+      question: "Could you list all the orders that haven't been shipped yet or were cancelled? Show the order number, status, and the order date, sorted by status ascending."
+      groundtruth_sql: |
+        SELECT 
+          orderNumber, status, orderDate
+        FROM orders
+        WHERE status IN ('Cancelled', 'In Process', 'On Hold', 'Disputed') OR shippedDate IS NULL
+        ORDER BY status;
     - id: M1
       difficulty: medium
       question: "Break 2004 orders down by month. Return the month name and number of orders, listing the months from latest to earliest."

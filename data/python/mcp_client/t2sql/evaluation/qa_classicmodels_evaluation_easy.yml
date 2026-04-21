@@ -35,7 +35,7 @@ cases:
         WHERE quantityInStock < 100;
     - id: E6
       difficulty: easy
-      question: "Find product lines where the HTML description is missing, and show the product line name and text description."
+      question: "Find product lines where the HTML description is missing, and show the product line name and text descriptions."
       groundtruth_sql: |
         SELECT productLine, textDescription 
         FROM productlines 

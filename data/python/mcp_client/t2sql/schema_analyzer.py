@@ -43,6 +43,7 @@ class SchemaAnalyzer:
         self._fk_relationships: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {fk_col: target_table}}
         self._column_roles: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: role}}
         self._column_datatypes: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: datatype}}
+        self._column_descriptions: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: description}}
         self._column_primary_key_hints: Dict[str, bool] = {}
         self._column_foreign_key_hints: Dict[str, bool] = {}
         # Store original case for column names (lowercase -> original)
@@ -93,6 +94,16 @@ class SchemaAnalyzer:
         # Dense JSONL entries often store FK cues in `text` while sparse entries
         # use `metadata.description`, so parse both sources.
         description = metadata.get("description", "")
+        description_from_text = self._next_field_after(text, "Description:")
+        merged_description = str(description or "").strip()
+        if description_from_text:
+            if merged_description:
+                if description_from_text.lower() not in merged_description.lower():
+                    merged_description = f"{merged_description}. {description_from_text}".strip(" .")
+            else:
+                merged_description = str(description_from_text).strip()
+        self._column_descriptions[table.lower()][column.lower()] = merged_description
+
         fk_source = f"{description} {text}"
         fk_match = re.search(r'FK to\s+(\w+)\.(\w+)', fk_source, re.IGNORECASE)
         if fk_match:
@@ -261,6 +272,17 @@ class SchemaAnalyzer:
         key = f"{table.lower()}.{column.lower()}"
         return self._column_synonyms.get(key, [])
 
+    def get_column_description(self, table: str, column: str) -> str:
+        """
+        Get description text for a specific column from metadata.
+
+        Returns merged metadata.description and parsed "Description:" text
+        when available.
+        """
+        t = (table or "").lower().strip()
+        c = (column or "").lower().strip()
+        return str(self._column_descriptions.get(t, {}).get(c, "")).strip()
+
     def get_anchor_columns(self, table: str) -> List[str]:
         """
         Get key columns for scoring boost (Role: Metric).
@@ -425,6 +447,11 @@ def get_table_synonyms(table: str) -> List[str]:
 def get_column_synonyms(table: str, column: str) -> List[str]:
     """Get synonyms for a specific column from metadata (schema-agnostic)."""
     return get_schema_analyzer().get_column_synonyms(table, column)
+
+
+def get_column_description(table: str, column: str) -> str:
+    """Get description text for a specific column from metadata (schema-agnostic)."""
+    return get_schema_analyzer().get_column_description(table, column)
 
 
 def get_anchor_columns(table: str) -> List[str]:
@@ -1316,6 +1343,7 @@ __all__ = [
     'get_dimension_tables',
     'get_table_synonyms',
     'get_column_synonyms',
+    'get_column_description',
     'get_anchor_columns',
     'is_transaction_table',
     'get_fk_relationships',

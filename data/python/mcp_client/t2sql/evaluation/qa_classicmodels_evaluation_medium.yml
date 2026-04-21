@@ -1,7 +1,7 @@
 cases:
     - id: M1
       difficulty: medium
-      question: "Give me a 2004 order summary by quarter. Return the quarter number, total orders, and how many orders were shipped later than the required date. Sort from Q1 to Q4."
+      question: "Group the 2004 orders by the quarter of their order date. Return the quarter number, total orders, and how many orders were shipped later than the required date. Sort from Q1 to Q4."
       groundtruth_sql: |
         SELECT
           QUARTER(orderDate) AS quarter_number,

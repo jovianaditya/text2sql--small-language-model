@@ -353,7 +353,7 @@ AGENT_TABLE_VARIANT_MIN_TAIL_LEN = int(os.getenv("AGENT_TABLE_VARIANT_MIN_TAIL_L
 AGENT_COLUMN_ORDERED_TOKEN = os.getenv("AGENT_COLUMN_ORDERED_TOKEN", "ordered").strip().lower()
 AGENT_COLUMN_ORDERED_BY_PATTERN = os.getenv(
     "AGENT_COLUMN_ORDERED_BY_PATTERN",
-    r"\bordered\s+by\b",
+    r"\bordered\s+(?:by|in\s+(?:ascending|descending)\s+order|ascending|descending)\b",
 ).strip()
 
 AGENT_MISSING_COL_SUFFIX_SYNONYMS = _env_json_dict(
@@ -496,6 +496,16 @@ HELPERS_EXISTENCE_COMPAT_VERBS = set(
         sorted(HELPERS_EXISTENCE_SUPPORT_VERBS_DOMAIN),
     )
 )
+HELPERS_EXISTENCE_IRREGULAR_BASE_FORMS = {
+    str(k).strip().lower(): str(v).strip().lower()
+    for k, v in _env_json_dict(
+        "HELPERS_EXISTENCE_IRREGULAR_BASE_FORMS",
+        {
+            "paid": "pay",
+        },
+    ).items()
+    if str(k).strip() and str(v).strip()
+}
 
 HELPERS_GROUPING_INTENT_PATTERNS = tuple(
     _env_json_list(
@@ -690,7 +700,7 @@ HELPERS_ORDERING_ROW_CONTAINER_TERMS = set(
 HELPERS_ORDERING_ALPHABETIC_TERMS = set(
     _env_json_list(
         "HELPERS_ORDERING_ALPHABETIC_TERMS",
-        ["alphabetical", "alphabetically", "a to z", "z to a"],
+        ["alphabetical", "alphabetically", "alphabetized", "alphabetize", "a to z", "z to a", "reverse alphabetical", "reversed alphabetical", "reverse"],
     )
 )
 
@@ -735,6 +745,56 @@ HELPERS_WINNER_ROW_GENERIC_OBJECT_TERMS = set(
         ],
     )
 )
+
+HELPERS_WINNER_ROW_PARTITION_STOP_TOKENS = set(
+    _env_json_list(
+        "HELPERS_WINNER_ROW_PARTITION_STOP_TOKENS",
+        [
+            "for",
+            "each",
+            "per",
+            "the",
+            "a",
+            "an",
+            "of",
+            "with",
+            "and",
+            "or",
+            "id",
+            "ids",
+            "code",
+            "codes",
+            "number",
+            "numbers",
+            "name",
+            "names",
+            "date",
+            "dates",
+            "record",
+            "row",
+            "latest",
+            "earliest",
+            "largest",
+            "highest",
+            "lowest",
+            "payment",
+            "payments",
+            "amount",
+            "total",
+        ],
+    )
+)
+
+HELPERS_WINNER_ROW_RANKING_SIGNAL_TERMS = set(
+    _env_json_list(
+        "HELPERS_WINNER_ROW_RANKING_SIGNAL_TERMS",
+        ["paymentdate", "orderdate", "amount", "quantity", "price"],
+    )
+)
+HELPERS_WINNER_ROW_RANKING_YEAR_PATTERN = os.getenv(
+    "HELPERS_WINNER_ROW_RANKING_YEAR_PATTERN",
+    r"\byear\s*\(",
+).strip()
 
 HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS = set(
     _env_json_list(
@@ -813,6 +873,73 @@ HELPERS_METRIC_AGG_IDLIKE_TOKENS = set(
             "postal",
             "check",
         ],
+    )
+)
+
+HELPERS_TEMPORAL_FALLBACK_STOP_TOKENS = set(
+    _env_json_list(
+        "HELPERS_TEMPORAL_FALLBACK_STOP_TOKENS",
+        [
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "to",
+            "of",
+            "for",
+            "with",
+            "by",
+            "from",
+            "show",
+            "list",
+            "return",
+            "display",
+            "get",
+            "find",
+            "include",
+            "including",
+            "where",
+            "which",
+            "that",
+            "whose",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "in",
+            "on",
+            "at",
+            "year",
+            "years",
+        ],
+    )
+)
+
+HELPERS_TEMPORAL_FALLBACK_META_TOKENS = set(
+    _env_json_list(
+        "HELPERS_TEMPORAL_FALLBACK_META_TOKENS",
+        ["date", "time", "timestamp", "temporal"],
+    )
+)
+
+HELPERS_TEMPORAL_FALLBACK_OVERLAP_WEIGHT = int(
+    os.getenv("HELPERS_TEMPORAL_FALLBACK_OVERLAP_WEIGHT", "8")
+)
+HELPERS_TEMPORAL_FALLBACK_DATE_BIAS = int(
+    os.getenv("HELPERS_TEMPORAL_FALLBACK_DATE_BIAS", "2")
+)
+HELPERS_TEMPORAL_FALLBACK_TIME_BIAS = int(
+    os.getenv("HELPERS_TEMPORAL_FALLBACK_TIME_BIAS", "1")
+)
+HELPERS_TEMPORAL_FALLBACK_META_BIAS = int(
+    os.getenv("HELPERS_TEMPORAL_FALLBACK_META_BIAS", "1")
+)
+HELPERS_TEMPORAL_EVENT_COLUMN_TERMS = set(
+    _env_json_list(
+        "HELPERS_TEMPORAL_EVENT_COLUMN_TERMS",
+        ["created", "updated", "posted", "shipped", "ordered"],
     )
 )
 
@@ -914,7 +1041,9 @@ RETRIEVAL_EXTRA_STOPWORDS = set(
             "include", "includes", "including", "sort", "sorted", "sorting",
             "result", "results", "record", "records", "row", "rows",
             "display", "return", "get", "give", "find", "fetch", "please", "kindly",
-            "alphabetical", "alphabetically", "ascending", "descending", "distinct",
+            "alphabetical", "alphabetically", "alphabetized", "alphabetize",
+            "reverse alphabetical", "reversed alphabetical", "reverse",
+            "ascending", "descending", "distinct",
             "yang", "dan", "atau", "ke", "dari", "di", "itu", "ini",
             "tampilkan", "daftar",
         ],
@@ -1193,7 +1322,7 @@ AGENT_ROUTER_BY_TOKEN = (os.getenv("AGENT_ROUTER_BY_TOKEN", "by ") or "by ").low
 
 AGENT_ROUTER_EXPLICIT_SORT_TERMS = _env_json_list(
     "AGENT_ROUTER_EXPLICIT_SORT_TERMS",
-    ["sort by", "ordered by", "sorted by", "order by", "sorted from"],
+    ["sort by", "ordered by", "sorted by", "order by", "sorted from", "alphabetical", "alphabetically", "reverse alphabetical", "reversed alphabetical", "descending", "ascending", "a-z", "z-a"],
 )
 
 AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS = _env_json_list(
@@ -1330,7 +1459,13 @@ AGENT_ROUTER_FK_SUFFIX_TERMS = _env_json_list(
 AGENT_ROUTER_IGNORE_PATTERNS = {
     "order": _env_json_list(
         "AGENT_ROUTER_IGNORE_PATTERNS_ORDER",
-        [r"\border(ed|s)?\s+by\b", r"\b(descending|ascending)\s+order\b", r"\bin\s+order\b"],
+        [
+            r"\border(ed|s)?\s+by\b",
+            r"\bordered\s+in\s+(?:ascending|descending)\s+order\b",
+            r"\bordered\s+(?:ascending|descending)\b",
+            r"\b(descending|ascending)\s+order\b",
+            r"\bin\s+order\b",
+        ],
     ),
     "group": _env_json_list(
         "AGENT_ROUTER_IGNORE_PATTERNS_GROUP",

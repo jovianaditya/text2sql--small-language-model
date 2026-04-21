@@ -86,6 +86,64 @@ cases:
     ORDER BY
       shippedDate DESC,
       orderNumber ASC;
+- id: PE14
+  source_id: E14
+  difficulty: easy
+  question: I'm looking for specific products in the 1:10 and 1:12 scale categories. Can you pull a list showing the product code, the full name, and the scale? Please make sure the output is organized by product name in reverse alphabetical order so I can quickly find the ones I need.
+  groundtruth_sql: |
+    SELECT 
+      productCode, 
+      productName, 
+      productScale 
+    FROM products 
+    WHERE productScale IN ('1:10', '1:12') 
+    ORDER BY productName DESC;
+- id: PE15
+  source_id: E15
+  difficulty: easy
+  question: Generate a roster of all employees. I need their first names as they are, but for the last names, I want them shouting (all caps) for better visibility. The final list must be alphabetized based on the employees' first names.
+  groundtruth_sql: |
+    SELECT 
+      firstName, 
+      UPPER(lastName) AS lastName 
+    FROM employees 
+    ORDER BY firstName ASC;
+- id: E16
+  source_id: E16
+  difficulty: easy
+  question: "We need to audit our pricing. For every product in our catalog, calculate the gap between the MSRP and the buy price. I need a report showing the product code, name, and this calculated value. Ensure the calculation correctly reflects how much the retail price exceeds our cost."
+  groundtruth_sql: |
+    SELECT productCode, productName, (MSRP - buyPrice) AS markup
+    FROM products;
+- id: E17
+  difficulty: easy
+  question: "I'm looking for all orders placed during our May sales events across all years. Give me the order numbers and the specific dates they were placed, but only for those that happened in that specific month."
+  groundtruth_sql: |
+    SELECT orderNumber, orderDate
+    FROM orders
+    WHERE MONTH(orderDate) = 5;
+- id: E18
+  difficulty: easy
+  question: "Find every customer in either the United States or Canada that doesn't have anything written in the 'state' field. I'll need their name, city, and country to follow up."
+  groundtruth_sql: |
+    SELECT customerName, city, country
+    FROM customers
+    WHERE state IS NULL AND country IN ('USA', 'Canada');
+- id: E19
+  difficulty: easy
+  question: "Our product line descriptions are too long for the new brochure. Find all product line where the text description is longer than 200 characters. For the results, just give me the product line name and a small teaser of the first 50 characters so I can see how they start."
+  groundtruth_sql: |
+    SELECT productLine, LEFT(textDescription, 50) AS description_preview
+    FROM productlines
+    WHERE LENGTH(textDescription) > 200;
+- id: E20
+  difficulty: easy
+  question: "I need to track down problematic orders. Show me everything that was either officially cancelled or is still sitting in the warehouse without a ship date. I need the order number, its current status, and when it was ordered. Make sure the results are ordered by their status alphabetically."
+  groundtruth_sql: |
+    SELECT orderNumber, status, orderDate
+    FROM orders
+    WHERE status = 'Cancelled' OR shippedDate IS NULL
+    ORDER BY status ASC;
 - id: PM1
   source_id: M1
   difficulty: medium

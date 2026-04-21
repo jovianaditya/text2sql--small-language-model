@@ -107,6 +107,61 @@ cases:
         ORDER BY
           shippedDate DESC,
           orderNumber ASC;
+    - id: E14
+      difficulty: easy
+      question: "Find products that have a '1:10' or '1:12' scale. Display the product code, product name, and scale, sorted by product name in descending order."
+      groundtruth_sql: |
+        SELECT
+          productCode,
+          productName,
+          productScale
+        FROM products
+        WHERE productScale IN ('1:10', '1:12')
+        ORDER BY productName DESC;
+    - id: E15
+      difficulty: easy
+      question: "List the first and last names of all employees, but display the last names in all uppercase letters. Sort the results by first name ascending."
+      groundtruth_sql: |
+        SELECT
+          firstName,
+          UPPER(lastName) AS lastName
+        FROM employees
+        ORDER BY firstName;
+    - id: E16
+      difficulty: easy
+      question: "Display the product code, product name, and the calculated difference between MSRP and buy price for all products."
+      groundtruth_sql: |
+        SELECT productCode, productName, (MSRP - buyPrice) AS markup
+        FROM products;
+    - id: E17
+      difficulty: easy
+      question: "Retrieve the order number and order date for all records where the order date occurs in the fifth month of any year."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate
+        FROM orders
+        WHERE MONTH(orderDate) = 5;
+    - id: E18
+      difficulty: easy
+      question: "List the customer name, city, and country for all customers residing in the USA or Canada whose state attribute is null."
+      groundtruth_sql: |
+        SELECT customerName, city, country
+        FROM customers
+        WHERE state IS NULL AND country IN ('USA', 'Canada');
+    - id: E19
+      difficulty: easy
+      question: "Identify product lines where the text description length exceeds 200 characters. Return the product line and the leading 50 characters of the text description."
+      groundtruth_sql: |
+        SELECT productLine, LEFT(textDescription, 50) AS description_preview
+        FROM productlines
+        WHERE LENGTH(textDescription) > 200;
+    - id: E20
+      difficulty: easy
+      question: "Extract the order number, status, and order date for orders with a status of 'Cancelled' or those missing a shipped date. Sort the output by status in ascending order."
+      groundtruth_sql: |
+        SELECT orderNumber, status, orderDate
+        FROM orders
+        WHERE status = 'Cancelled' OR shippedDate IS NULL
+        ORDER BY status ASC;
     - id: M1
       difficulty: medium
       question: "For each month in 2004, show the month name and the number of orders placed in that month, ordered from the latest month to the earliest."

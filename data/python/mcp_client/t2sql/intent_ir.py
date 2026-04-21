@@ -2370,6 +2370,9 @@ def _detect_ordering_and_limit(
             seg,
             flags=re.I,
         ):
+            # But check if it's reverse alphabetical first
+            if re.search(r"\b(reverse\s+alphabetical|reversed\s+alphabetical|z\s+to\s+a)\b", seg, flags=re.I):
+                return "DESC"
             return "ASC"
         return direction
 
@@ -2437,7 +2440,9 @@ def _detect_ordering_and_limit(
         visible_dims = [d for d in dimensions if bool(getattr(d, "visible", True))]
         if len(visible_dims) == 1:
             d0 = visible_dims[0]
-            ordering.append(IROrder(kind="column", by=d0.column, table=d0.table, direction="ASC"))
+            # Check for reverse alphabetical
+            direction = "DESC" if re.search(r"\b(?:reverse\s+alphabetical|reversed\s+alphabetical|z\s+to\s+a)\b", q, flags=re.I) else "ASC"
+            ordering.append(IROrder(kind="column", by=d0.column, table=d0.table, direction=direction))
             return ordering, limit
 
     # Month special ordering.

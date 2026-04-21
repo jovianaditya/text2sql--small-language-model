@@ -22,14 +22,18 @@ if TYPE_CHECKING:
     from .state import RAGState
 from .utils import _dbg_print_two
 from .config import (
+    AGENT_COLUMN_ORDERED_BY_PATTERN,
+    AGENT_COLUMN_ORDERED_TOKEN,
     AGENT_AST_GUARDS_ENABLED,
     AGENT_AST_GUARDS_DEBUG,
     AGENT_AST_SEMANTIC_FIRST,
     AGENT_NORMALIZE_REWRITE_BUDGET,
     AGENT_NORMALIZE_EARLY_STOP,
+    AGENT_ROUTER_IGNORE_PATTERNS,
     DOMAIN_HEURISTICS_ENABLED,
     HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
     HELPERS_EXISTENCE_COMPAT_VERBS,
+    HELPERS_EXISTENCE_IRREGULAR_BASE_FORMS,
     HELPERS_PROBE_GENERIC_METRIC_TERMS,
     HELPERS_PROBE_LOCALIZED_METRIC_TERMS,
     HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS,
@@ -72,21 +76,26 @@ from .helpers_core import (
     _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns, _repair_simple_single_table_column_names,
     # phase 3
     _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _ensure_explicit_simple_projection_columns, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
+    _align_requested_description_variant, _drop_unrequested_difference_operand_columns,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
     _canonicalize_single_computed_group_by_expression,
     _simplify_same_expression_group_threshold_subquery,
+    _simplify_group_key_count_threshold_subquery,
     _drop_unrequested_schema_named_count_outputs,
     _normalize_timestampdiff_day_to_datediff,
     _drop_unrequested_current_date_filters,
+    _rewrite_null_conditional_count_to_date_comparison,
     _rewrite_comparison_count_metrics,
+    _rewrite_conditional_sum_value_to_count,
+    _prefer_conditional_count_final_order,
     _normalize_alias_lengths,
     # phase 4
     _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _fix_redundant_groupby_with_rn_filter, _fix_inconsistent_subquery_alias, _fix_inner_rn_filter_scope, _looks_like_max_date_tiebreaker,
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _preexecute_sql_safety_pass,
-    _rewrite_winner_row_aggregate_misuse, _rewrite_single_table_tuple_in_winner_row, _rewrite_explicit_rank_aggregate_window, _rewrite_malformed_window_winner_clause, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_subquery_latest_year_tuple_filter, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _rewrite_winner_row_aggregate_misuse, _rewrite_single_table_tuple_in_winner_row, _rewrite_explicit_rank_aggregate_window, _rewrite_no_skip_rank_to_dense_rank, _repair_rank_window_partition_from_question, _add_rank_value_nonnull_filter_from_question, _rewrite_malformed_window_winner_clause, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_subquery_latest_year_tuple_filter, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _rewrite_dual_fact_rollup_fanout,
@@ -123,10 +132,10 @@ from .helpers_core import (
     _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _canonicalize_structural_regex, _canonicalize_boundary_regex, _guardrail_fix_mysql_regexp_literals,
     _rewrite_regex_filter_to_case_bucket,
     # phase 6
-    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
+    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _inject_not_shipped_null_predicate, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
     _ast_guardrails,
     # phase 7
-    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes
+    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes, _strip_empty_string_comparison_on_non_text, _drop_raw_column_covered_by_function
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -674,9 +683,17 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
             m = re.search(rf"\b{pattern}\b", q_text)
             if not m:
                 continue
-            if cand == "order":
-                tail = q_text[m.end(): m.end() + 12]
-                if re.match(r"\s+by\b", tail):
+            cand_key = str(get_singular_form(cand) or cand).strip().lower()
+            if cand_key and " " not in cand_key:
+                left = max(0, m.start() - 16)
+                right = min(len(q_text), m.end() + 24)
+                local_scope = q_text[left:right]
+                skip_match = False
+                for ignore_pat in AGENT_ROUTER_IGNORE_PATTERNS.get(cand_key, []):
+                    if re.search(ignore_pat, local_scope, flags=re.I):
+                        skip_match = True
+                        break
+                if skip_match:
                     continue
             return True
         if _iter_inflected_entity_mentions(q_text, t):
@@ -1137,8 +1154,9 @@ def _table_inflected_mention_terms(table: str) -> Set[str]:
             terms.add(f"{s[:-1]}ied")
 
     # Common irregulars from derived verb stems.
-    if "pay" in stems:
-        terms.add("paid")
+    for inflected, base_form in HELPERS_EXISTENCE_IRREGULAR_BASE_FORMS.items():
+        if base_form in stems:
+            terms.add(inflected)
 
     return {term for term in terms if term and len(term) >= 4}
 
@@ -1147,8 +1165,9 @@ def _base_form_from_inflected(term: str) -> str:
     t = str(term or "").strip().lower()
     if not t:
         return ""
-    if t == "paid":
-        return "pay"
+    irregular_base = HELPERS_EXISTENCE_IRREGULAR_BASE_FORMS.get(t)
+    if irregular_base:
+        return irregular_base
     if t.endswith("ied") and len(t) > 4:
         return t[:-3] + "y"
     if t.endswith("ing") and len(t) > 5:
@@ -1245,7 +1264,7 @@ def _iter_inflected_entity_mentions(q_text: str, table: str) -> List[Tuple[str, 
         pat = rf"\b{re.escape(term)}\b"
         for m in re.finditer(pat, q):
             # Avoid treating ORDER BY grammar as orders-entity mention.
-            if term == "ordered":
+            if AGENT_COLUMN_ORDERED_TOKEN and term == AGENT_COLUMN_ORDERED_TOKEN:
                 tail = q[m.end(): m.end() + 12]
                 if re.match(r"\s+by\b", tail):
                     continue
@@ -2370,7 +2389,11 @@ def _infer_tables_from_question_columns(
             if len(token) < 4 or token in stop_tokens:
                 continue
             # "ordered by ..." usually indicates sorting intent, not orderdetails semantics
-            if token == "ordered" and re.search(r"\bordered\s+by\b", q_text):
+            if (
+                AGENT_COLUMN_ORDERED_TOKEN
+                and token == AGENT_COLUMN_ORDERED_TOKEN
+                and re.search(AGENT_COLUMN_ORDERED_BY_PATTERN, q_text)
+            ):
                 continue
             if re.search(rf"\b{re.escape(token)}\b", q_text):
                 return True
@@ -2936,7 +2959,11 @@ def _find_tables_with_implicit_columns(
             if len(token) < 4 or token in stop_tokens:
                 continue
             # "ordered by ..." usually indicates sorting intent, not orderdetails semantics
-            if token == "ordered" and re.search(r"\bordered\s+by\b", q_text):
+            if (
+                AGENT_COLUMN_ORDERED_TOKEN
+                and token == AGENT_COLUMN_ORDERED_TOKEN
+                and re.search(AGENT_COLUMN_ORDERED_BY_PATTERN, q_text)
+            ):
                 continue
             if re.search(rf"\b{re.escape(token)}\b", q_text):
                 return "token"
@@ -3880,8 +3907,9 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
 
     # 6. Sorting Direction
     desc_triggers = [
-    "latest", "newest", "most recent", "descending", 
-    "highest", "greatest", "largest", "biggest"
+    "latest", "newest", "most recent", "descending",
+    "highest", "greatest", "largest", "biggest",
+    "reverse alphabetical", "reversed alphabetical", "reverse"
     ]
 
     asc_triggers = [
@@ -4276,6 +4304,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _prefer_friendly_names(s, question)
     s = _ensure_entity_id_and_name_if_requested(s, question)
     s = _ensure_explicit_simple_projection_columns(s, question, ctx)
+    s = _align_requested_description_variant(s, question, ctx)
+    s = _drop_unrequested_difference_operand_columns(s, question, ctx)
     s = _prune_non_primary_dimensions_for_primary_aggregate(s, question, ctx)
     s = _drop_redundant_raw_name_columns_when_concat_present(s, question)
     s = _expand_group_by_aliases_regex(s)
@@ -4433,6 +4463,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _fix_missing_space_before_clauses(s)
     s = _canonicalize_single_computed_group_by_expression(s)
     s = _simplify_same_expression_group_threshold_subquery(s)
+    s = _simplify_group_key_count_threshold_subquery(s)
     s = _fix_missing_space_before_clauses(s)
     if DEBUG_WR: print(f"[REFINER - PH4] after re-spacing: {s[:200]}")
 
@@ -4549,6 +4580,15 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_explicit_rank_aggregate_window(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after explicit-rank aggregate fix:", s)
 
+        s = _rewrite_no_skip_rank_to_dense_rank(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after no-skip dense-rank fix:", s)
+
+        s = _repair_rank_window_partition_from_question(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after rank partition fix:", s)
+
+        s = _add_rank_value_nonnull_filter_from_question(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after rank nonnull filter fix:", s)
+
         s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after metric-agg-column fix:", s)
 
@@ -4631,8 +4671,17 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _drop_unrequested_schema_named_count_outputs(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested schema-named count fix: {s}")
 
+        s = _rewrite_null_conditional_count_to_date_comparison(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after null-count date-comparison fix: {s}")
+
         s = _rewrite_comparison_count_metrics(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after comparison-count metric fix: {s}")
+
+        s = _rewrite_conditional_sum_value_to_count(s, question)
+        if DEBUG_WR: print(f"[REFINER - PH4] after conditional-count sum fix: {s}")
+
+        s = _prefer_conditional_count_final_order(s, question)
+        if DEBUG_WR: print(f"[REFINER - PH4] after conditional-count order fix: {s}")
 
         s = _drop_unrequested_current_date_filters(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested current-date filter drop: {s}")
@@ -4729,6 +4778,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     s = _expand_missing_null_to_null_or_empty(s, question)
     s = _expand_present_not_null_to_not_empty(s, question, ctx)
+    s = _rewrite_in_list_null_literal_as_is_null(s)
+    s = _inject_not_shipped_null_predicate(s, question, ctx)
     s = _enforce_set_operation_operator_from_question(s, question)
     s = _ensure_reasonable_distinct(s, question)
     s = _ensure_reasonable_count_distinct(s, question)
@@ -4854,7 +4905,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _enforce_requested_order_direction(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
     s = _drop_unrequested_grouped_limit(s, question)
-    s = _maybe_add_limit(question, s)    
+    s = _maybe_add_limit(question, s)
+    s = _drop_raw_column_covered_by_function(s, question)
     # s = _collapse_spaces_outside_quotes(s)
     # ---------------------------------------------------------------------------
     # Phase 8 — Remove Cosmetic Aliases (FIX UTAMA)
@@ -4943,6 +4995,13 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # ---------------------------------------------------------------------------
     # Previously standardized table aliases to match _ALIAS_OVERRIDES.
     # Now we let the LLM decide its own aliases without hardcoded overrides.
+
+    # ---------------------------------------------------------------------------
+    # Phase 8e — Strip empty string comparison on non-text columns
+    # MySQL rejects DATE/INT = '' comparisons
+    # ---------------------------------------------------------------------------
+    s = _strip_empty_string_comparison_on_non_text(s)
+    if DEBUG_WR: print("[REFINER - PH8e] after strip empty-string on non-text:", s)
 
     # ---------------------------------------------------------------------------
     # Phase 9 — Pre-Execution Safety Pass (Final Guardrail)

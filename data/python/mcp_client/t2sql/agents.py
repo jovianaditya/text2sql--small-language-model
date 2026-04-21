@@ -352,7 +352,10 @@ from .helpers_core import (
     _question_requests_ordering,
     _question_wants_include_zero,
     _ensure_explicit_simple_projection_columns,
+    _align_requested_description_variant,
+    _drop_unrequested_difference_operand_columns,
     _drop_unrequested_missing_filter_columns,
+    _drop_raw_column_covered_by_function,
     _repair_misplaced_select_distinct,
     _enforce_requested_order_direction,
     _parse_allowed_identifiers,
@@ -1391,7 +1394,7 @@ def _add_missing_final_order(sql: str, question: str) -> str:
 
     q = (question or "").lower()
     direction = "DESC" if re.search(
-        r"\b(descending|desc|highest|lowest|most|least|largest|smallest|newest|oldest)\b",
+        r"\b(descending|desc|highest|lowest|most|least|largest|smallest|newest|oldest|reverse\s+alphabetical|reversed\s+alphabetical|reverse)\b",
         q,
         flags=re.I,
     ) else "ASC"
@@ -1601,12 +1604,12 @@ def _extract_requested_final_order_terms(question: str) -> List[Tuple[str, str]]
     out: List[Tuple[str, str]] = []
     for part in raw_parts:
         direction = "ASC"
-        if re.search(r"\b(?:descending|desc|highest|largest|latest|newest|most)\b", part, flags=re.I):
+        if re.search(r"\b(?:descending|desc|highest|largest|latest|newest|most|reverse\s+alphabetical|reversed\s+alphabetical|reverse)\b", part, flags=re.I):
             direction = "DESC"
         elif re.search(r"\b(?:ascending|asc|a-z|alphabetical|chronological|earliest|oldest|smallest|lowest)\b", part, flags=re.I):
             direction = "ASC"
         clean = re.sub(
-            r"\b(?:ascending|descending|asc|desc|first|from\s+(?:highest|lowest|latest|earliest)\s+to\s+(?:lowest|highest|earliest|latest))\b",
+            r"\b(?:ascending|descending|asc|desc|first|from\s+(?:highest|lowest|latest|earliest)\s+to\s+(?:lowest|highest|earliest|latest)|reverse\s+alphabetical|reversed\s+alphabetical|reverse)\b",
             " ",
             part,
             flags=re.I,
@@ -2257,6 +2260,22 @@ def _entity_search_scope(question_lower: str, table_singular: str) -> str:
     return scope
 
 
+def _has_router_phrase_term(text: str, phrase: str) -> bool:
+    """
+    Word-boundary phrase matcher for router keyword lists.
+
+    Avoids substring false positives such as:
+    - phrase: "have no"
+    - text  : "have not been shipped"
+    """
+    txt = str(text or "")
+    phr = str(phrase or "").strip().lower()
+    if not txt or not phr:
+        return False
+    pat = re.escape(phr).replace(r"\ ", r"\s+")
+    return bool(re.search(rf"(?<![A-Za-z0-9_]){pat}(?![A-Za-z0-9_])", txt, flags=re.I))
+
+
 def _question_targets_entity_exclusion(question_lower: str, table: str) -> bool:
     """
     Return True when question expresses exclusion/absence semantics for this entity:
@@ -2282,7 +2301,7 @@ def _question_targets_entity_exclusion(question_lower: str, table: str) -> bool:
         return True
 
     # Backup: global exclusion phrase + explicit entity mention in same question.
-    if any(term in scope for term in AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS):
+    if any(_has_router_phrase_term(scope, term) for term in AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS):
         if re.search(rf"\b(?:{entity_pattern})\b", scope, flags=re.I):
             return True
 
@@ -2822,18 +2841,19 @@ def router_agent(state: RAGState) -> RAGState:
             and table_singular_token.isalpha()
             and len(table_singular_token) >= 4
         ):
-            inflected_entity_match = bool(
-                re.search(
-                    rf"\b{re.escape(table_singular_token)}(?:ed|ing)\b",
-                    search_scope,
-                )
+            inflected_hit = re.search(
+                rf"\b{re.escape(table_singular_token)}(?:ed|ing)\b",
+                search_scope,
             )
-            if (
-                inflected_entity_match
-                and table_singular_token == "order"
-                and re.search(r"\bordered\s+(?:by|in)\b", search_scope, flags=re.I)
-            ):
-                inflected_entity_match = False
+            inflected_entity_match = bool(inflected_hit)
+            if inflected_entity_match and inflected_hit is not None:
+                left = max(0, inflected_hit.start() - 16)
+                right = min(len(search_scope), inflected_hit.end() + 24)
+                local_scope = search_scope[left:right]
+                for ignore_pat in ignore_patterns.get(table_singular_token, []):
+                    if re.search(ignore_pat, local_scope, flags=re.I):
+                        inflected_entity_match = False
+                        break
 
         if direct_entity_match or inflected_entity_match:
 
@@ -4119,7 +4139,7 @@ def router_agent(state: RAGState) -> RAGState:
     
     # Pattern 1: Cross-table exclusion keywords (always need 7B)
     cross_table_exclusion = AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS
-    if any(kw in question_lower for kw in cross_table_exclusion):
+    if any(_has_router_phrase_term(question_lower, kw) for kw in cross_table_exclusion):
         has_exclusion = True
     
     # Pattern 2: "no" + entity noun (dynamic, schema-driven) → implies cross-table
@@ -6310,9 +6330,11 @@ def _repair_single_table_winner_row_projection(sql: str, question: str, ctx: str
 
     rebuilt_inner = inner_select
     rebuilt_outer = outer_select
+    rebuilt_tail = tail
     for old_col, new_col in generic_map.items():
         rebuilt_inner = _replace_identifier_token(rebuilt_inner, old_col, new_col)
         rebuilt_outer = _replace_identifier_token(rebuilt_outer, old_col, new_col)
+        rebuilt_tail = _replace_identifier_token(rebuilt_tail, old_col, new_col)
 
     outer_items_after = _split_top_level_csv(rebuilt_outer)
     inner_items_after = _split_top_level_csv(rebuilt_inner)
@@ -6330,15 +6352,19 @@ def _repair_single_table_winner_row_projection(sql: str, question: str, ctx: str
     if append_items:
         rebuilt_outer = ", ".join(_split_top_level_csv(rebuilt_outer) + append_items)
 
-    if rebuilt_outer.strip() == outer_select.strip() and rebuilt_inner.strip() == inner_select.strip():
+    if (
+        rebuilt_outer.strip() == outer_select.strip()
+        and rebuilt_inner.strip() == inner_select.strip()
+        and rebuilt_tail.strip() == tail.strip()
+    ):
         return None
 
     fixed = (
         f"SELECT {rebuilt_outer} FROM (SELECT {rebuilt_inner} FROM {inner_rest}) {alias} "
         f"WHERE {alias}.rn = {m.group('rank')}"
     ).strip()
-    if tail:
-        fixed += " " + tail
+    if rebuilt_tail:
+        fixed += " " + rebuilt_tail
     fixed = re.sub(r"\s{2,}", " ", fixed).strip()
     if s.endswith(";") and not fixed.endswith(";"):
         fixed += ";"
@@ -7044,10 +7070,24 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if explicit_projection_sql and explicit_projection_sql != final_sql:
         final_sql = str(explicit_projection_sql).strip()
         corrections.append("Applied explicit simple projection preservation")
+    aligned_description_sql = _align_requested_description_variant(final_sql, question, ctx)
+    if aligned_description_sql and aligned_description_sql != final_sql:
+        final_sql = str(aligned_description_sql).strip()
+        corrections.append("Aligned description-column variant with question wording")
+    pruned_difference_sql = _drop_unrequested_difference_operand_columns(final_sql, question, ctx)
+    if pruned_difference_sql and pruned_difference_sql != final_sql:
+        final_sql = str(pruned_difference_sql).strip()
+        corrections.append("Dropped unrequested arithmetic operand columns")
     dropped_filter_only_sql = _drop_unrequested_missing_filter_columns(final_sql, question, ctx)
     if dropped_filter_only_sql and dropped_filter_only_sql != final_sql:
         final_sql = str(dropped_filter_only_sql).strip()
         corrections.append("Dropped unrequested missing-filter projection columns")
+
+    # 1a-2. Drop raw columns already covered by function expressions (e.g., textDescription when LEFT(textDescription,50) exists)
+    pruned_func_covered_sql = _drop_raw_column_covered_by_function(final_sql, question)
+    if pruned_func_covered_sql and pruned_func_covered_sql != final_sql:
+        final_sql = str(pruned_func_covered_sql).strip()
+        corrections.append("Dropped raw columns covered by function expressions")
 
     # 1b. AST guardrails (sqlglot) for structural safety checks/fixes.
     # This pass is conservative: if AST parse fails, we keep legacy behavior.
@@ -7076,6 +7116,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if repaired_distinct_sql and repaired_distinct_sql != final_sql:
         final_sql = str(repaired_distinct_sql).strip()
         corrections.append("Repaired misplaced SELECT DISTINCT after semantic contract")
+    aligned_description_sql = _align_requested_description_variant(final_sql, question, ctx)
+    if aligned_description_sql and aligned_description_sql != final_sql:
+        final_sql = str(aligned_description_sql).strip()
+        corrections.append("Aligned description-column variant after semantic contract")
+    pruned_difference_sql = _drop_unrequested_difference_operand_columns(final_sql, question, ctx)
+    if pruned_difference_sql and pruned_difference_sql != final_sql:
+        final_sql = str(pruned_difference_sql).strip()
+        corrections.append("Dropped unrequested arithmetic operand columns after semantic contract")
 
     repaired_winner_projection = _repair_single_table_winner_row_projection(final_sql, question, ctx)
     if repaired_winner_projection and repaired_winner_projection != final_sql:
@@ -7844,8 +7892,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 return ""
 
             head_patterns = [
-                r"\b(?:return|show|display|get)\s+(?:the\s+)?(?P<seg>.+?)\s+\bfor\b",
-                r"\b(?:return|show|display|get)\s+(?:the\s+)?(?P<seg>.+?)\s+\bwhere\b",
+                r"\b(?:return|show|display|get|list|find|identify|retrieve|extract)\s+(?:the\s+)?(?P<seg>.+?)\s+\bfor\b",
+                r"\b(?:return|show|display|get|list|find|identify|retrieve|extract)\s+(?:the\s+)?(?P<seg>.+?)\s+\bwhere\b",
             ]
             for pat in head_patterns:
                 m = re.search(pat, q_low_local, flags=re.I)
@@ -8028,6 +8076,16 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     final_sql = str(projection_fixed_sql).strip()
                     if final_sql and not final_sql.endswith(";"):
                         final_sql += ";"
+                    projection_fix_post = _align_requested_description_variant(final_sql, question, ctx)
+                    if projection_fix_post and projection_fix_post != final_sql:
+                        final_sql = str(projection_fix_post).strip()
+                        if final_sql and not final_sql.endswith(";"):
+                            final_sql += ";"
+                    projection_fix_post = _drop_unrequested_difference_operand_columns(final_sql, question, ctx)
+                    if projection_fix_post and projection_fix_post != final_sql:
+                        final_sql = str(projection_fix_post).strip()
+                        if final_sql and not final_sql.endswith(";"):
+                            final_sql += ";"
                     sql_up = final_sql.upper()
                     corrections.append("Applied deterministic projection-only repair")
 
