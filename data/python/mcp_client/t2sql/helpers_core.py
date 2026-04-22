@@ -1630,6 +1630,26 @@ def _strip_string_literals(s: str) -> str:
     s = re.sub(r'"(?:""|[^"])*"', '""', s)
     return s
 
+
+def _is_unique_join_key_for_table(table_name: str, column_name: str) -> bool:
+    """
+    Conservative uniqueness check for a table join key.
+    Treat only the table identity column as unique to avoid unsafe row-count
+    changes when pruning joins.
+    """
+    table_l = str(table_name or "").replace("`", "").split(".")[-1].strip().lower()
+    col_l = str(column_name or "").replace("`", "").strip().lower()
+    if not table_l or not col_l:
+        return False
+    try:
+        id_col = get_id_column(table_l)
+    except Exception:
+        id_col = None
+    if not id_col:
+        return False
+    return str(id_col).replace("`", "").strip().lower() == col_l
+
+
 def _remove_redundant_and_ornamental_joins(sql: str) -> str:
     """
     Gabungan logic:
@@ -1648,11 +1668,65 @@ def _remove_redundant_and_ornamental_joins(sql: str) -> str:
     if re.search(r"\b(?:from|join)\s*\(", sql, flags=re.I):
         return sql
 
+    try:
+        fk_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_raw = {}
+    fk_map: Dict[str, Dict[str, str]] = {}
+    for src, rels in (fk_raw or {}).items():
+        src_l = str(src or "").replace("`", "").split(".")[-1].strip().lower()
+        if not src_l:
+            continue
+        fk_map.setdefault(src_l, {})
+        for fk_col, tgt in (rels or {}).items():
+            fk_l = str(fk_col or "").replace("`", "").strip().lower()
+            tgt_l = str(tgt or "").replace("`", "").split(".")[-1].strip().lower()
+            if fk_l and tgt_l:
+                fk_map[src_l][fk_l] = tgt_l
+
+    def _rhs_equi_join_mapping(current_sql: str, rhs_alias: str, rhs_table: str, on_expr: str) -> Optional[Tuple[str, str, str, str]]:
+        on_clean = _strip_string_literals(on_expr).replace("`", "").strip()
+        on_eq = re.fullmatch(
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)",
+            on_clean,
+            flags=re.I,
+        )
+        if not on_eq:
+            return None
+
+        a1, c1, a2, c2 = on_eq.group(1), on_eq.group(2), on_eq.group(3), on_eq.group(4)
+        rhs_alias_l = str(rhs_alias or "").strip().lower()
+        lhs_alias = ""
+        lhs_col = ""
+        rhs_col = ""
+        if a1.lower() == rhs_alias_l and a2.lower() != rhs_alias_l:
+            lhs_alias, lhs_col, rhs_col = a2, c2, c1
+        elif a2.lower() == rhs_alias_l and a1.lower() != rhs_alias_l:
+            lhs_alias, lhs_col, rhs_col = a1, c1, c2
+        else:
+            return None
+
+        alias_map = _parse_from_join_aliases(current_sql)
+        lhs_table = (alias_map.get(lhs_alias) or alias_map.get(lhs_alias.lower()) or lhs_alias or "")
+        lhs_table_l = str(lhs_table).replace("`", "").split(".")[-1].strip().lower()
+        rhs_table_l = str(rhs_table or "").replace("`", "").split(".")[-1].strip().lower()
+        lhs_col_l = str(lhs_col or "").replace("`", "").strip().lower()
+        rhs_col_l = str(rhs_col or "").replace("`", "").strip().lower()
+        if not lhs_table_l or not rhs_table_l or not lhs_col_l or not rhs_col_l:
+            return None
+
+        if fk_map.get(lhs_table_l, {}).get(lhs_col_l) != rhs_table_l:
+            return None
+        if not _is_unique_join_key_for_table(rhs_table_l, rhs_col_l):
+            return None
+
+        return (lhs_alias, lhs_col, rhs_alias, rhs_col)
+
     out = sql
     join_pat = re.compile(
         r"""
         (?P<full>
-            \s+
+            \s*
             (?P<jtype>(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN))
             \s+
             (?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)
@@ -1670,62 +1744,221 @@ def _remove_redundant_and_ornamental_joins(sql: str) -> str:
     matches = list(join_pat.finditer(out))
     for m in reversed(matches):
         alias = m.group("alias") or (m.group("table") or "").strip("`")
+        alias_l = str(alias).lower()
         jtype = (m.group("jtype") or "").upper()
         on_txt = m.group("on") or ""
         start_on = m.start("on")
         end_on = m.end("on")
         masked = out[:start_on] + (" " * (end_on - start_on)) + out[end_on:]
+        outside_on = out[:m.start("full")] + out[m.end("full"):]
+        outside_on_clean = _strip_string_literals(outside_on).replace("`", "")
 
-        # Jika alias tidak dipakai di luar ON, JOIN bisa dihapus
+        # Jika alias tidak dipakai di luar ON, drop hanya untuk redundant
+        # parent-lookup INNER JOIN (schema-validated FK direction).
         if not re.search(rf"\b{re.escape(alias)}\s*\.", masked, flags=re.I):
-            # Tambahan: Untuk INNER JOIN, cek apakah equi-join dan referensi kolom RHS hanya join key
             is_inner = ("LEFT" not in jtype and "RIGHT" not in jtype and "FULL" not in jtype)
             if is_inner:
-                # Cek apakah ON clause adalah equi-join
-                on_clean = _strip_string_literals(on_txt).replace("`", "")
-                lhs = None
-                rhs = alias
-                # Cari bentuk lhs.k = rhs.k
-                on_m = re.search(
-                    rf"([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*{re.escape(rhs)}\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)",
-                    on_clean,
+                rhs_table = m.group("table") or ""
+                mapped = _rhs_equi_join_mapping(out, alias, rhs_table, on_txt)
+                if mapped is not None:
+                    out = out[:m.start("full")] + " " + out[m.end("full"):]
+                    continue
+            continue
+
+        # INNER JOIN only: if RHS is used only on join-key and key is unique,
+        # rewrite RHS key references to LHS and drop redundant JOIN.
+        is_inner = ("LEFT" not in jtype and "RIGHT" not in jtype and "FULL" not in jtype)
+        if not is_inner:
+            continue
+
+        rhs_table = m.group("table") or ""
+        mapped = _rhs_equi_join_mapping(out, alias, rhs_table, on_txt)
+        if mapped is None:
+            continue
+        lhs_alias, lhs_col, _rhs_alias, rhs_col = mapped
+
+        rhs_refs = re.findall(
+            rf"\b{re.escape(alias)}\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+            outside_on_clean,
+            flags=re.I,
+        )
+        if not rhs_refs:
+            out = out[:m.start("full")] + " " + out[m.end("full"):]
+            continue
+        if any(str(col).lower() != str(rhs_col).lower() for col in rhs_refs):
+            continue
+
+        def _rewrite_rhs_key_to_lhs(text: str) -> str:
+            parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`[^`]*`)", text)
+            for i in range(0, len(parts), 2):
+                parts[i] = re.sub(
+                    rf"\b{re.escape(alias)}\s*\.\s*{re.escape(rhs_col)}\b",
+                    f"{lhs_alias}.{lhs_col}",
+                    parts[i],
                     flags=re.I,
                 )
-                if on_m:
-                    lhs = on_m.group(1)
-                    k_left = on_m.group(2)
-                    k_right = on_m.group(3)
-                    if k_left.lower() == k_right.lower():
-                        join_key = k_left
-                        # Cek di luar ON, referensi rhs.<col> selain join_key
-                        outside_on = out[:m.start("full")] + out[m.end("full"):]
-                        outside_on = _strip_string_literals(outside_on).replace("`", "")
-                        bad_rhs_use = re.search(
-                            rf"\b{re.escape(rhs)}\s*\.\s*(?!{re.escape(join_key)}\b)[A-Za-z_][A-Za-z0-9_]*\b",
-                            outside_on,
-                            flags=re.I,
-                        )
-                        if not bad_rhs_use:
-                            # Rewrite rhs.join_key -> lhs.join_key di luar ON
-                            def _rewrite_outside_on(text: str) -> str:
-                                parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`[^`]*`)", text)
-                                for i in range(0, len(parts), 2):
-                                    parts[i] = re.sub(
-                                        rf"\b{re.escape(rhs)}\s*\.\s*{re.escape(join_key)}\b",
-                                        f"{lhs}.{join_key}",
-                                        parts[i],
-                                        flags=re.I,
-                                    )
-                                return "".join(parts)
-                            prefix_raw = out[:m.start("full")]
-                            tail_raw = out[m.end("full"):]
-                            new_prefix = _rewrite_outside_on(prefix_raw)
-                            new_tail = _rewrite_outside_on(tail_raw)
-                            out = new_prefix + " " + new_tail
-                            continue
-            # Jika bukan equi-join, hapus JOIN saja
-            out = out[:m.start("full")] + " " + out[m.end("full"):] 
+            return "".join(parts)
+
+        prefix_raw = out[:m.start("full")]
+        tail_raw = out[m.end("full"):]
+        out = _rewrite_rhs_key_to_lhs(prefix_raw) + " " + _rewrite_rhs_key_to_lhs(tail_raw)
+    out = _prune_redundant_from_parent_inner_join(out)
     return out
+
+
+def _prune_redundant_from_parent_inner_join(sql: str) -> str:
+    """
+    Remove a redundant parent table in a single INNER/JOIN shape when:
+    - query has exactly one join and no aggregation/grouping/subquery
+    - ON is a simple equi-key predicate
+    - schema FK confirms joined table references the FROM table
+    - FROM-side references outside ON use only the join key
+
+    Example (schema-agnostic):
+      SELECT p.id, c.x FROM parent p
+      JOIN child c ON p.id = c.parent_id
+      WHERE c.x > 0
+    ->
+      SELECT c.parent_id, c.x FROM child c WHERE c.x > 0
+    """
+    if not sql:
+        return sql
+    if join_count(sql) != 1:
+        return sql
+    if re.search(r"\b(left|right|full)\s+join\b", sql, flags=re.I):
+        return sql
+    if re.search(r"\b(?:from|join)\s*\(", sql, flags=re.I):
+        return sql
+    if re.search(r"\bGROUP\s+BY\b", sql, flags=re.I):
+        return sql
+    if re.search(r"\b(SUM|COUNT|AVG|MIN|MAX|GROUP_CONCAT)\s*\(", sql, flags=re.I):
+        return sql
+
+    s = sql.strip()
+    pat = re.compile(
+        r"""
+        ^(?P<head>.*?\bFROM\s+)
+        (?P<l_table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+        (?P<l_alias_clause>\s+(?:AS\s+)?(?P<l_alias>[A-Za-z_][A-Za-z0-9_]*))?
+        \s+(?P<jtype>(?:INNER\s+JOIN|JOIN))\s+
+        (?P<r_table>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+        (?P<r_alias_clause>\s+(?:AS\s+)?(?P<r_alias>[A-Za-z_][A-Za-z0-9_]*))?
+        \s+\bON\b\s+(?P<on>.*?)
+        (?P<tail>\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b.*?|;?\s*)$
+        """,
+        flags=re.I | re.S | re.X,
+    )
+    m = pat.match(s)
+    if not m:
+        return sql
+
+    on_txt = (m.group("on") or "").strip()
+    if not on_txt:
+        return sql
+    if re.search(r"\b(?:AND|OR)\b", on_txt, flags=re.I):
+        return sql
+
+    eq_m = re.match(
+        r"""
+        ^\s*`?(?P<a1>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<c1>[A-Za-z_][A-Za-z0-9_]*)`?
+        \s*=\s*
+        `?(?P<a2>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<c2>[A-Za-z_][A-Za-z0-9_]*)`?\s*$
+        """,
+        on_txt,
+        flags=re.I | re.X,
+    )
+    if not eq_m:
+        return sql
+
+    l_table_raw = m.group("l_table") or ""
+    r_table_raw = m.group("r_table") or ""
+    l_table = l_table_raw.replace("`", "").split(".")[-1].strip().lower()
+    r_table = r_table_raw.replace("`", "").split(".")[-1].strip().lower()
+    if not l_table or not r_table:
+        return sql
+
+    l_alias = (m.group("l_alias") or "").strip()
+    r_alias = (m.group("r_alias") or "").strip()
+    l_ref = (l_alias or l_table_raw.replace("`", "").split(".")[-1]).strip()
+    r_ref = (r_alias or r_table_raw.replace("`", "").split(".")[-1]).strip()
+    if not l_ref or not r_ref:
+        return sql
+
+    a1 = (eq_m.group("a1") or "").strip().lower()
+    c1 = (eq_m.group("c1") or "").strip()
+    a2 = (eq_m.group("a2") or "").strip().lower()
+    c2 = (eq_m.group("c2") or "").strip()
+    if not a1 or not a2 or not c1 or not c2:
+        return sql
+
+    l_ref_l = l_ref.lower()
+    r_ref_l = r_ref.lower()
+    if a1 == l_ref_l and a2 == r_ref_l:
+        l_col, r_col = c1, c2
+    elif a1 == r_ref_l and a2 == l_ref_l:
+        l_col, r_col = c2, c1
+    else:
+        return sql
+
+    try:
+        fk_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_raw = {}
+    child_fks = {
+        str(k or "").strip().lower(): str(v or "").strip().lower()
+        for k, v in (fk_raw.get(r_table, {}) or {}).items()
+        if str(k or "").strip() and str(v or "").strip()
+    }
+    if child_fks.get(str(r_col).strip().lower()) != l_table:
+        return sql
+
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+    if analyzer is not None:
+        try:
+            l_cols = {str(c).strip().lower() for c in analyzer.get_table_columns(l_table) or []}
+            r_cols = {str(c).strip().lower() for c in analyzer.get_table_columns(r_table) or []}
+            if str(l_col).strip().lower() not in l_cols:
+                return sql
+            if str(r_col).strip().lower() not in r_cols:
+                return sql
+        except Exception:
+            pass
+
+    start_on = m.start("on")
+    end_on = m.end("on")
+    masked = s[:start_on] + (" " * (end_on - start_on)) + s[end_on:]
+    masked = _strip_string_literals(masked).replace("`", "")
+    lhs_refs = re.findall(
+        rf"\b{re.escape(l_ref)}\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+        masked,
+        flags=re.I,
+    )
+    if any(str(col).strip().lower() != str(l_col).strip().lower() for col in lhs_refs):
+        return sql
+
+    lhs_key_pat = re.compile(
+        rf"\b`?{re.escape(l_ref)}`?\s*\.\s*`?{re.escape(str(l_col).strip())}`?\b",
+        flags=re.I,
+    )
+    rhs_key_ref = f"{r_ref}.{str(r_col).strip()}"
+
+    def _rewrite_non_literal(text: str) -> str:
+        parts = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")", text)
+        for i in range(0, len(parts), 2):
+            parts[i] = lhs_key_pat.sub(rhs_key_ref, parts[i])
+        return "".join(parts)
+
+    new_head = _rewrite_non_literal(m.group("head") or "")
+    new_tail = _rewrite_non_literal(m.group("tail") or "")
+    right_from = (m.group("r_table") or "") + (m.group("r_alias_clause") or "")
+    if not right_from.strip():
+        return sql
+
+    return f"{new_head}{right_from}{new_tail}"
 
 
 def _rewrite_invalid_fk_join_conditions(sql: str, ctx: str = "") -> str:
@@ -29479,6 +29712,7 @@ def _enforce_requested_order_direction(sql: str, question: str) -> str:
 
     sort_clause = _extract_sort_clause(q)
     explicit_dirs: List[str] = []
+    sort_parts: List[str] = []
     if sort_clause:
         segments = re.split(r"\bthen\b", sort_clause, flags=re.I)
         for seg in segments:
@@ -29486,6 +29720,7 @@ def _enforce_requested_order_direction(sql: str, question: str) -> str:
                 s = part.strip().lower()
                 if not s:
                     continue
+                sort_parts.append(s)
                 if re.search(r"\b(?:descending|desc|z\s+to\s+a|reverse\s+alphabetical|reversed\s+alphabetical|reverse)\b", s):
                     explicit_dirs.append("DESC")
                 elif re.search(r"\b(?:ascending|asc|alphabetical|alphabetically|alphabetized|alphabetize|a\s+to\s+z)\b", s):
@@ -29508,6 +29743,21 @@ def _enforce_requested_order_direction(sql: str, question: str) -> str:
             explicit_dirs = ["DESC"]
         else:
             return sql
+
+    def _is_position_like_ordering(text: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:position|rank|row[_\s]?number|rn|sequence|seq|ordinal)\b",
+                (text or ""),
+                flags=re.I,
+            )
+        )
+
+    # Narrow fallback:
+    # If question asks final sorting by position/rank but omits direction,
+    # default that position-like ORDER item to ASC (standard ranking output order).
+    no_desc_requested_in_sort = not any(d == "DESC" for d in explicit_dirs)
+    question_requests_position_like_sort = any(_is_position_like_ordering(p) for p in sort_parts)
 
     def _find_top_level_kw(text: str, kw: str, start: int = 0) -> int:
         target = kw.upper()
@@ -29563,6 +29813,14 @@ def _enforce_requested_order_direction(sql: str, question: str) -> str:
     changed = False
     for idx, item in enumerate(order_items):
         requested = explicit_dirs[idx] if idx < len(explicit_dirs) else ""
+        if (
+            not requested
+            and sort_clause
+            and no_desc_requested_in_sort
+            and question_requests_position_like_sort
+            and _is_position_like_ordering(item)
+        ):
+            requested = "ASC"
         if not requested:
             new_items.append(item)
             continue

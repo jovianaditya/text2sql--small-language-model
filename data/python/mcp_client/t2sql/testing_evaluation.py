@@ -221,6 +221,7 @@ def infer_dataset_name_from_testset(testset_path: str | None) -> str | None:
 
     trailing_tags = {
         "devset", "testset", "easy", "medium", "hard",
+        "evaluation", "eval",
         "ori", "original", "formal",
         "mix", "mixed",
         "stress", "stresstest", "paraphrase",

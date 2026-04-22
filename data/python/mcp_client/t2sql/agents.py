@@ -4076,6 +4076,56 @@ def router_agent(state: RAGState) -> RAGState:
         if RETRIEVE_DEBUG and relevant_tables == [primary_table]:
             print(f"[ROUTER] Compact family prune: keeping only primary table {primary_table}")
 
+    # Explicit rank/window phrasing often triggers spurious table matches via
+    # inflected tokens (e.g., "ordered ..."), even when the request is truly
+    # single-table. If no strong non-primary semantic mention exists, keep only
+    # the primary table so the query can stay in the 3B lane.
+    explicit_rank_single_table_candidate = bool(
+        primary_table
+        and len(relevant_tables) > 1
+        and is_explicit_rank_function
+        and bool(within_same_match)
+        and not is_ordinal_ranking
+        and not has_exclusion
+        and not is_subquery_intent
+    )
+    if explicit_rank_single_table_candidate:
+        non_primary_semantic_mention = False
+        for tbl in relevant_tables:
+            if tbl == primary_table:
+                continue
+
+            tbl_lower = str(tbl or "").strip().lower()
+            if _question_mentions_table_entity(question_lower, tbl):
+                non_primary_semantic_mention = True
+                break
+
+            table_id_col = (get_id_column(tbl_lower) or "").strip().lower()
+            fk_like_cols = set()
+            for col in _get_table_cols(tbl):
+                col_lower = str(col or "").strip().lower()
+                if not col_lower:
+                    continue
+                if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(get_singular_form(tbl_lower), col_lower):
+                    fk_like_cols.add(col_lower)
+
+            for col in _get_table_cols(tbl):
+                col_lower = str(col or "").strip().lower()
+                if not col_lower or col_lower in fk_like_cols:
+                    continue
+                if _question_mentions_column(question_lower, str(col)):
+                    non_primary_semantic_mention = True
+                    break
+            if non_primary_semantic_mention:
+                break
+
+        if not non_primary_semantic_mention:
+            relevant_tables = [primary_table]
+            if RETRIEVE_DEBUG:
+                print(
+                    f"[ROUTER] Explicit-rank single-table compaction: keeping only {primary_table}"
+                )
+
     # ═══════════════════════════════════════════════════════════════════
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
     # ═══════════════════════════════════════════════════════════════════
