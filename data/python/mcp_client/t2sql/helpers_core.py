@@ -36,8 +36,9 @@ from .config import (
     HELPERS_AVERAGE_INTENT_PATTERNS,
     HELPERS_COUNT_INTENT_TERMS,
     HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS,
-    HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS,
+    HELPERS_DUAL_FACT_DOMAIN_METRIC_TERMS,
     HELPERS_DUAL_FACT_FAMILY_STOPWORDS,
+    HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS,
     HELPERS_ENTITY_GENERIC_FALLBACK_TERMS,
     HELPERS_EXISTENCE_COMPAT_VERBS,
     HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
@@ -1347,7 +1348,7 @@ def _inner_join_specific_object_terms(ctx: str = "", question: str = "") -> Set[
         obj_terms.update(_table_object_terms(table))
     if not obj_terms and DOMAIN_HEURISTICS_ENABLED:
         compat_terms = _question_compat_inner_join_terms(question, HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS)
-        obj_terms.update(compat_terms if question else HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS)
+        obj_terms.update(compat_terms)
     return {term for term in obj_terms if term}
 
 
@@ -1357,7 +1358,7 @@ def _inner_join_action_terms(ctx: str = "", question: str = "") -> Set[str]:
         verbs.update(_table_support_action_terms(table))
     if not verbs and DOMAIN_HEURISTICS_ENABLED:
         compat_verbs = _question_compat_inner_join_terms(question, HELPERS_EXISTENCE_COMPAT_VERBS)
-        verbs.update(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
+        verbs.update(compat_verbs)
     return {verb for verb in verbs if verb and verb not in HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC}
 
 
@@ -1384,7 +1385,7 @@ def _dual_fact_collect_families(pattern: str, text: str) -> Set[str]:
 
 def _dual_fact_metric_terms_for_table(table_name: str, analyzer: Any = None) -> Set[str]:
     metric_terms: Set[str] = set()
-    compat_terms = set(HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS)
+    compat_terms = set(HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS)
     if analyzer is None:
         return metric_terms
 
@@ -1442,9 +1443,15 @@ def _dual_fact_metric_term_universe(
     metric_words: Set[str] = set()
     for table_name in sorted(table_names):
         metric_words.update(_dual_fact_metric_terms_for_table(table_name, analyzer=analyzer))
+    active_compat_terms: Set[str] = set(HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS)
+    if DOMAIN_HEURISTICS_ENABLED and question:
+        active_compat_terms.update(
+            _question_compat_metric_terms(question, HELPERS_DUAL_FACT_DOMAIN_METRIC_TERMS)
+        )
     if not metric_words:
-        compat_terms = _question_compat_metric_terms(question, HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS)
-        metric_words.update(compat_terms if question and compat_terms else HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS)
+        metric_words.update(active_compat_terms)
+    else:
+        metric_words.update(active_compat_terms)
     return metric_words
 
 def _canonicalize_table_names(sql: str, ctx: str) -> str:

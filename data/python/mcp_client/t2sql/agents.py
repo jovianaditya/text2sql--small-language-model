@@ -77,7 +77,8 @@ from .config import (
     AGENT_ROUTER_WITHIN_SAME_PATTERN,
     AGENT_ROUTER_BY_TOKEN,
     AGENT_ROUTER_EXPLICIT_SORT_TERMS,
-    AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS,
+    AGENT_ROUTER_DOMAIN_CROSS_TABLE_EXCLUSION_TERMS,
+    AGENT_ROUTER_GENERIC_CROSS_TABLE_EXCLUSION_TERMS,
     AGENT_SQL_RESERVED_EXTRA_TOKENS,
     AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS,
     AGENT_COLUMN_STOP_TOKENS,
@@ -2401,6 +2402,22 @@ def _has_router_phrase_term(text: str, phrase: str) -> bool:
     return bool(re.search(rf"(?<![A-Za-z0-9_]){pat}(?![A-Za-z0-9_])", txt, flags=re.I))
 
 
+def _active_router_cross_table_exclusion_terms(question: str) -> List[str]:
+    active_terms: List[str] = list(AGENT_ROUTER_GENERIC_CROSS_TABLE_EXCLUSION_TERMS)
+    if DOMAIN_HEURISTICS_ENABLED:
+        q = str(question or "").lower()
+        for term in AGENT_ROUTER_DOMAIN_CROSS_TABLE_EXCLUSION_TERMS:
+            if _has_router_phrase_term(q, term):
+                active_terms.append(term)
+    return list(
+        dict.fromkeys(
+            str(term or "").strip().lower()
+            for term in active_terms
+            if str(term or "").strip()
+        )
+    )
+
+
 def _question_targets_entity_exclusion(question_lower: str, table: str) -> bool:
     """
     Return True when question expresses exclusion/absence semantics for this entity:
@@ -2426,7 +2443,8 @@ def _question_targets_entity_exclusion(question_lower: str, table: str) -> bool:
         return True
 
     # Backup: global exclusion phrase + explicit entity mention in same question.
-    if any(_has_router_phrase_term(scope, term) for term in AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS):
+    active_exclusion_terms = _active_router_cross_table_exclusion_terms(scope)
+    if any(_has_router_phrase_term(scope, term) for term in active_exclusion_terms):
         if re.search(rf"\b(?:{entity_pattern})\b", scope, flags=re.I):
             return True
 
@@ -4348,7 +4366,7 @@ def router_agent(state: RAGState) -> RAGState:
     has_exclusion = False
     
     # Pattern 1: Cross-table exclusion keywords (always need 7B)
-    cross_table_exclusion = AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS
+    cross_table_exclusion = _active_router_cross_table_exclusion_terms(question_lower)
     if any(_has_router_phrase_term(question_lower, kw) for kw in cross_table_exclusion):
         has_exclusion = True
     

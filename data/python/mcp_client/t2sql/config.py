@@ -634,6 +634,35 @@ HELPERS_ROLLUP_LEGACY_METRIC_TERMS = set(
     )
 )
 
+HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS = set(
+    _env_json_list(
+        "HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS",
+        [
+            "amount",
+            "value",
+            "price",
+            "prices",
+            "quantity",
+            "qty",
+            "volume",
+            "balance",
+            "cost",
+            "total",
+            "spend",
+        ],
+    )
+)
+
+HELPERS_DUAL_FACT_DOMAIN_METRIC_TERMS = set(
+    _env_json_list(
+        "HELPERS_DUAL_FACT_DOMAIN_METRIC_TERMS",
+        _profiled_domain_defaults(
+            [],
+            ["revenue", "sale", "sales", "paid", "payment"],
+        ),
+    )
+)
+
 HELPERS_DUAL_FACT_FAMILY_STOPWORDS = set(
     _env_json_list(
         "HELPERS_DUAL_FACT_FAMILY_STOPWORDS",
@@ -679,27 +708,7 @@ HELPERS_DUAL_FACT_FAMILY_STOPWORDS = set(
 HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS = set(
     _env_json_list(
         "HELPERS_DUAL_FACT_COMPAT_METRIC_TERMS",
-        list(
-            dict.fromkeys(
-                [
-                    "amount",
-                    "value",
-                    "price",
-                    "prices",
-                    "quantity",
-                    "qty",
-                    "volume",
-                    "balance",
-                    "cost",
-                    "total",
-                    "spend",
-                    *_profiled_domain_defaults(
-                        [],
-                        ["revenue", "sale", "sales", "paid", "payment"],
-                    ),
-                ]
-            )
-        ),
+        sorted(HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS | HELPERS_DUAL_FACT_DOMAIN_METRIC_TERMS),
     )
 )
 
@@ -1343,19 +1352,31 @@ AGENT_ROUTER_EXPLICIT_SORT_TERMS = _env_json_list(
     ["sort by", "ordered by", "sorted by", "order by", "sorted from", "alphabetical", "alphabetically", "reverse alphabetical", "reversed alphabetical", "descending", "ascending", "a-z", "z-a"],
 )
 
+AGENT_ROUTER_GENERIC_CROSS_TABLE_EXCLUSION_TERMS = _env_json_list(
+    "AGENT_ROUTER_GENERIC_CROSS_TABLE_EXCLUSION_TERMS",
+    [
+        "without any",
+        "have no",
+        "has no",
+        "tidak pernah",
+        "belum pernah",
+        "tidak ada",
+        "yang tidak punya",
+    ],
+)
+
+AGENT_ROUTER_DOMAIN_CROSS_TABLE_EXCLUSION_TERMS = _env_json_list(
+    "AGENT_ROUTER_DOMAIN_CROSS_TABLE_EXCLUSION_TERMS",
+    _profiled_domain_defaults([], ["never ordered", "never paid"]),
+)
+
 AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS = _env_json_list(
     "AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS",
     list(
         dict.fromkeys(
             [
-                "without any",
-                "have no",
-                "has no",
-                "tidak pernah",
-                "belum pernah",
-                "tidak ada",
-                "yang tidak punya",
-                *_profiled_domain_defaults([], ["never ordered", "never paid"]),
+                *AGENT_ROUTER_GENERIC_CROSS_TABLE_EXCLUSION_TERMS,
+                *AGENT_ROUTER_DOMAIN_CROSS_TABLE_EXCLUSION_TERMS,
             ]
         )
     ),

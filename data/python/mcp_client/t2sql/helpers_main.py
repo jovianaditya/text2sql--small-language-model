@@ -1242,7 +1242,7 @@ def _entity_support_verb_terms(table: str, question: str = "") -> Set[str]:
     if not has_table_grounded_match:
         compat_verbs = _question_compat_existence_verbs(question)
         if DOMAIN_HEURISTICS_ENABLED:
-            verbs.update(compat_verbs if question else HELPERS_EXISTENCE_COMPAT_VERBS)
+            verbs.update(compat_verbs)
     return {verb for verb in verbs if verb}
 
 
