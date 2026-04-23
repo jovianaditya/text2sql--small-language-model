@@ -797,8 +797,6 @@ HELPERS_WINNER_ROW_PARTITION_STOP_TOKENS = set(
             "largest",
             "highest",
             "lowest",
-            "payment",
-            "payments",
             "amount",
             "total",
         ],
@@ -808,7 +806,7 @@ HELPERS_WINNER_ROW_PARTITION_STOP_TOKENS = set(
 HELPERS_WINNER_ROW_RANKING_SIGNAL_TERMS = set(
     _env_json_list(
         "HELPERS_WINNER_ROW_RANKING_SIGNAL_TERMS",
-        ["paymentdate", "orderdate", "amount", "quantity", "price"],
+        ["date", "time", "timestamp", "amount", "quantity", "price", "value", "score"],
     )
 )
 HELPERS_WINNER_ROW_RANKING_YEAR_PATTERN = os.getenv(

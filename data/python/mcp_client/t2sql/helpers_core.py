@@ -13393,7 +13393,7 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
 
     metric_query_alt = _regex_alt_from_terms(
         metric_candidate_terms,
-        r"(?:amount|payment|total|quantity|qty|price|sales|revenue|value)",
+        r"(?:amount|total|quantity|qty|price|cost|value|score|metric)",
     )
     date_semantic_terms = {
         "date", "dates", "time", "times", "timestamp", "timestamps",
@@ -13826,9 +13826,9 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
     family_terms: Dict[str, Set[str]] = {
         "quantity": {"quantity", "quantities", "qty", "unit", "units", "volume", "stock", "stocked"},
         "value": {
-            "sales", "sale", "revenue", "revenues", "amount", "amounts",
-            "value", "values", "price", "prices", "cost", "costs",
-            "gross", "net", "paid", "payment", "payments",
+            "amount", "amounts", "value", "values", "price", "prices",
+            "cost", "costs", "gross", "net",
+            "metric", "metrics", "score", "scores",
         },
         "count": {"count", "counts", "num", "number", "numbers", "frequency", "frequencies"},
     }
@@ -13851,9 +13851,14 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
         }
         if not tokenized:
             continue
-        for family_name, base_terms in family_terms.items():
-            if tokenized & base_terms:
-                family_terms[family_name].update(tokenized)
+        if tokenized & family_terms["quantity"]:
+            family_terms["quantity"].update(tokenized)
+        elif tokenized & family_terms["count"]:
+            family_terms["count"].update(tokenized)
+        else:
+            # Schema-derived metric terms that are neither quantity nor count
+            # are treated as value-like metrics by default.
+            family_terms["value"].update(tokenized)
 
     identifier_terms = {"id", "identifier", "code", "number", "numbers", "key"}
 
@@ -13907,7 +13912,7 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
     )
     value_alt = _family_pattern(
         family_terms["value"],
-        r"(?:sales|revenue|amount|value|price|cost)",
+        r"(?:amount|value|price|cost|metric|score)",
     )
     count_alt = _family_pattern(
         family_terms["count"],
@@ -13951,7 +13956,18 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
     def _is_identifier_expr(item: str) -> bool:
         return bool(_expr_terms(item) & identifier_terms)
 
-    primary_family = _family_from_question(
+    explicit_primary_family: Optional[str] = None
+    explicit_quantity_primary = bool(
+        re.search(
+            r"\b(?:based\s+on|according\s+to)\b.{0,96}\b(?:quantity|qty|volume|unit|units|stock)\b",
+            q_primary_scope,
+            flags=re.I | re.S,
+        )
+    )
+    if explicit_quantity_primary:
+        explicit_primary_family = "quantity"
+
+    primary_family = explicit_primary_family or _family_from_question(
         r"\b(?:based\s+on|according\s+to|ranked\s+by|sorted\s+by)\b",
         q_primary_scope,
     )
@@ -13970,6 +13986,9 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
     tie_family = _family_from_question(
         r"\b(?:if\s+(?:there\s+are\s+)?multiple|if\s+multiple|if\s+there\s+is\s+still\s+a\s+tie|if\s+there\s+is\s+a\s+tie|tie|tied|same)\b",
         q_tie_scope,
+    )
+    explicit_quantity_tie_value = bool(
+        explicit_quantity_primary and tie_family == "value"
     )
     wants_smaller_identifier = bool(
         re.search(r"\b(?:smaller|lowest|smallest|lower)\b.{0,32}\b(?:code|id|number|key)\b", q, flags=re.I | re.S)
@@ -14054,6 +14073,19 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
         items = _split_top_level_commas(ob)
         if not items:
             return None
+
+        if len(items) >= 2:
+            first_item = str(items[0] or "").lower()
+            second_item = str(items[1] or "").lower()
+            first_terms = _text_semantic_terms(first_item)
+            second_terms = _text_semantic_terms(second_item)
+            first_is_quantity = bool(first_terms & family_terms["quantity"])
+            second_is_value = bool(second_terms & family_terms["value"])
+            if first_is_quantity and second_is_value and (
+                explicit_quantity_primary or primary_family == "quantity" or explicit_quantity_tie_value
+            ):
+                # Preserve already-correct quantity-primary tie-break order.
+                return None
 
         current_families = [_metric_family(it) for it in items]
         needs_rewrite = False
@@ -17142,9 +17174,53 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
     where_expr = sel.args.get("where")
     if where_expr is not None and include_zero_intent:
         where_sql = where_expr.sql(dialect="mysql").lower()
-        has_ranking_signal = bool(where_sql and HELPERS_WINNER_ROW_RANKING_SIGNAL_TERMS and any(
-            tok in where_sql for tok in HELPERS_WINNER_ROW_RANKING_SIGNAL_TERMS
-        ))
+        ranking_signal_terms: Set[str] = {
+            str(tok or "").strip().lower()
+            for tok in HELPERS_WINNER_ROW_RANKING_SIGNAL_TERMS
+            if str(tok or "").strip()
+        }
+        # Add schema-driven temporal columns from active query tables so this
+        # ranking filter check is not tied to domain-specific date names.
+        try:
+            analyzer = get_schema_analyzer()
+        except Exception:
+            analyzer = None
+        if analyzer is not None:
+            alias_to_table = _parse_from_join_aliases(sql)
+            query_tables = {
+                str(t or "").strip().lower()
+                for t in alias_to_table.values()
+                if str(t or "").strip()
+            }
+            for table_l in sorted(query_tables):
+                try:
+                    table_cols = analyzer.get_table_columns(table_l) or []
+                except Exception:
+                    table_cols = []
+                for col in table_cols:
+                    col_l = str(col or "").strip().lower()
+                    if not col_l:
+                        continue
+                    try:
+                        role_l = str(get_column_role(table_l, col) or "").strip().lower()
+                    except Exception:
+                        role_l = ""
+                    temporal_like = (
+                        role_l in {"date", "datetime", "timestamp", "time", "temporal"}
+                        or any(tok in col_l for tok in ("date", "time", "timestamp", "year", "month", "day"))
+                    )
+                    if temporal_like:
+                        ranking_signal_terms.add(col_l)
+                        ranking_signal_terms.add(col_l.replace("_", ""))
+        has_ranking_signal = bool(
+            where_sql
+            and ranking_signal_terms
+            and any(
+                re.search(rf"\b{re.escape(tok)}\b", where_sql, flags=re.I)
+                for tok in ranking_signal_terms
+                if tok
+            )
+        )
         has_year_signal = bool(HELPERS_WINNER_ROW_RANKING_YEAR_PATTERN) and bool(
             re.search(HELPERS_WINNER_ROW_RANKING_YEAR_PATTERN, where_sql, flags=re.I)
         )

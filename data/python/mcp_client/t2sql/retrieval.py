@@ -1735,14 +1735,48 @@ def retrieve_node(state: RAGState) -> RAGState:
                     is_count_like = bool(
                         re.search(r"\b(how\s+many|number\s+of|count|total\s+number)\b", q_l, flags=re.I)
                     )
-                    has_metric_intent = bool(
-                        re.search(
-                            r"\b(sum|avg|average|mean|min|max|minimum|maximum|"
-                            r"quantity|amount|price|cost|value|revenue|sales|"
-                            r"multiply|multiplied|times)\b",
-                            q_l,
-                            flags=re.I,
+                    metric_intent_terms = {
+                        "quantity", "amount", "price", "cost", "value",
+                        "total", "metric", "score",
+                        "multiply", "multiplied", "times",
+                    }
+                    metric_role_terms = {
+                        str(role or "").strip().lower()
+                        for role in RETRIEVAL_METRIC_ROLE_TAGS
+                        if str(role or "").strip()
+                    }
+                    for item in reranked[:MAX_CTX_DOCS]:
+                        md = item.get("meta") or {}
+                        table_name = _meta_table(md) or ""
+                        col_name = _meta_column(md) or ""
+                        if not table_name or not col_name:
+                            continue
+                        roles, aliases = _extract_roles_aliases(md)
+                        role_hits = {
+                            str(role or "").strip().lower()
+                            for role in roles
+                            if str(role or "").strip()
+                        }
+                        if not (role_hits & metric_role_terms):
+                            continue
+                        metric_intent_terms.update(
+                            tok for tok in re.findall(r"[a-z0-9]+", str(col_name or "").lower()) if tok
                         )
+                        for alias in aliases:
+                            metric_intent_terms.update(
+                                tok for tok in re.findall(r"[a-z0-9]+", str(alias or "").lower()) if tok
+                            )
+                        try:
+                            for syn in get_column_synonyms(table_name, col_name) or []:
+                                metric_intent_terms.update(
+                                    tok for tok in re.findall(r"[a-z0-9]+", str(syn or "").lower()) if tok
+                                )
+                        except Exception:
+                            pass
+                    q_terms = {tok for tok in re.findall(r"[a-z0-9]+", q_l) if tok}
+                    has_metric_intent = bool(
+                        re.search(r"\b(sum|avg|average|mean|min|max|minimum|maximum)\b", q_l, flags=re.I)
+                        or (q_terms & metric_intent_terms)
                     )
                     if is_count_like and not has_metric_intent:
                         score_floor = max(score_floor, 1.0)

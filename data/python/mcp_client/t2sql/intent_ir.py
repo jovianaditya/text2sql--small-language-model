@@ -1058,6 +1058,48 @@ def _detect_metrics(
                     out.append(cur)
         return out
 
+    def _count_distinct_container_terms() -> Set[str]:
+        """
+        Build container nouns for COUNT DISTINCT phrase cleanup.
+        Keep "order/orders" as generic only when they are not schema entities.
+        """
+        generic_terms = {
+            "record", "records", "row", "rows", "entry", "entries",
+            "result", "results", "dataset", "data", "year", "years",
+        }
+        schema_entity_tokens: Set[str] = set()
+        candidate_tables: Set[str] = {
+            str(t or "").strip().lower()
+            for t in (mentioned_tables or [])
+            if str(t or "").strip()
+        }
+        candidate_tables.update(
+            str(t or "").strip().lower()
+            for t in (allowed or {}).keys()
+            if str(t or "").strip()
+        )
+        if not candidate_tables:
+            try:
+                candidate_tables.update(
+                    str(t or "").strip().lower()
+                    for t in (get_all_tables() or [])
+                    if str(t or "").strip()
+                )
+            except Exception:
+                pass
+
+        for table_name in candidate_tables:
+            table_variants = _table_variants(table_name) or {table_name}
+            for variant in table_variants:
+                schema_entity_tokens.update(
+                    tok for tok in re.findall(r"[a-z0-9_'-]+", str(variant or "").lower()) if tok
+                )
+
+        terms = set(generic_terms)
+        if "order" not in schema_entity_tokens and "orders" not in schema_entity_tokens:
+            terms.update({"order", "orders"})
+        return terms
+
     def _count_distinct_phrase_candidates(phrase: str) -> List[str]:
         raw = str(phrase or "").strip()
         if not raw:
@@ -1073,12 +1115,21 @@ def _detect_metrics(
         _add(raw)
 
         lowered = raw.lower()
+        generic_container_terms = _count_distinct_container_terms()
+        tail_container_terms = {
+            t for t in generic_container_terms
+            if t not in {"year", "years"}
+        }
+        tail_container_alt = "|".join(
+            re.escape(t)
+            for t in sorted(tail_container_terms, key=len, reverse=True)
+        ) or r"records|rows|entries|results|dataset|data"
         stop_patterns = (
             r"\b(?:seen|found|present|appearing|appears|occurring|occurs|recorded)\b.*$",
             r"\b(?:in|within|for|from|during|across|among)\s+"
             r"(?:that|this|those|these|the|all|each|every|same)\b.*$",
             r"\b(?:in|within|for|from|during|across|among)\s+"
-            r"(?:[a-z][a-z0-9_'-]*\s+){0,4}(?:orders|records|rows|entries|results|dataset|data)\b.*$",
+            rf"(?:[a-z][a-z0-9_'-]*\s+){{0,4}}(?:{tail_container_alt})\b.*$",
         )
         for pat in stop_patterns:
             trimmed = re.sub(pat, "", lowered, flags=re.I).strip(" ,.;:-")
@@ -1086,10 +1137,6 @@ def _detect_metrics(
                 _add(trimmed)
 
         tokens = [tok for tok in re.findall(r"[a-z0-9_'-]+", lowered) if tok]
-        generic_container_terms = {
-            "order", "orders", "record", "records", "row", "rows", "entry", "entries",
-            "result", "results", "dataset", "data", "year", "years",
-        }
         content_tokens = [tok for tok in tokens if tok not in generic_container_terms]
         if content_tokens:
             _add(" ".join(content_tokens))
@@ -1110,10 +1157,7 @@ def _detect_metrics(
         if not raw_tokens:
             return None
 
-        generic_container_terms = {
-            "order", "orders", "record", "records", "row", "rows", "entry", "entries",
-            "result", "results", "dataset", "data", "year", "years",
-        }
+        generic_container_terms = _count_distinct_container_terms()
         raw_token_set = set(raw_tokens)
         content_tokens = {
             tok for tok in raw_tokens
