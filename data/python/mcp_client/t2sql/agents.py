@@ -92,7 +92,7 @@ from .config import (
     AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN,
     AGENT_COLUMN_TOKEN_PATTERN,
     AGENT_CONTRACT_BASE_METRIC_TERMS,
-    AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS,
+    AGENT_CONTRACT_DOMAIN_METRIC_FALLBACK_TERMS,
     AGENT_CONTRACT_GENERIC_COUNT_NOUNS,
     HELPERS_ALL_OTHER_INTENT_PATTERNS,
     HELPERS_AVERAGE_INTENT_PATTERNS,
@@ -4679,18 +4679,13 @@ def _contract_metric_terms(question_tokens: Optional[Set[str]] = None) -> Set[st
     if question_tokens is not None:
         q_tokens = {str(tok).strip().lower() for tok in question_tokens if str(tok).strip()}
         if not DOMAIN_HEURISTICS_ENABLED:
-            terms.difference_update(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
             return terms
         # Domain lexical priors are only a compatibility fallback here.
         # The schema-enriched term set above remains the primary signal.
-        schema_or_generic_hits = q_tokens.intersection(
-            terms.difference(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
-        )
-        legacy_hits = q_tokens.intersection(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
-        if legacy_hits and not schema_or_generic_hits:
-            terms.update(legacy_hits)
-        else:
-            terms.difference_update(AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS)
+        schema_or_generic_hits = q_tokens.intersection(terms)
+        domain_hits = q_tokens.intersection(AGENT_CONTRACT_DOMAIN_METRIC_FALLBACK_TERMS)
+        if domain_hits and not schema_or_generic_hits:
+            terms.update(domain_hits)
     return terms
 
 
