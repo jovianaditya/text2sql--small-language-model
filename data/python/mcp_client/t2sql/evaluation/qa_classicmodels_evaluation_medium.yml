@@ -426,3 +426,254 @@ cases:
             ELSE 'High'
           END
         ORDER BY customer_count DESC;
+    - id: M31
+      difficulty: medium
+      question: "Break 2004 orders down by month. Return the month name and number of orders, listing the months from latest to earliest."
+      groundtruth_sql: |
+        SELECT 
+          DATE_FORMAT(orderDate, '%M') AS month_name,
+          COUNT(orderNumber) AS order_count
+        FROM orders
+        WHERE YEAR(orderDate) = 2004
+        GROUP BY MONTH(orderDate), DATE_FORMAT(orderDate, '%M')
+        ORDER BY MONTH(orderDate) DESC
+    - id: M32
+      difficulty: medium
+      question: "Classify products into three MSRP bands (Low: < 50, Mid: 50-150, High: > 150), then show how many products fall into each band, ordered by product count descending."
+      groundtruth_sql: |
+        SELECT
+          CASE
+            WHEN MSRP < 50 THEN 'Low'
+            WHEN MSRP BETWEEN 50 AND 150 THEN 'Mid'
+            ELSE 'High'
+          END AS price_band,
+          COUNT(*) AS product_count
+        FROM products
+        GROUP BY
+          CASE
+            WHEN MSRP < 50 THEN 'Low'
+            WHEN MSRP BETWEEN 50 AND 150 THEN 'Mid'
+            ELSE 'High'
+          END
+        ORDER BY product_count DESC;
+    - id: M33
+      difficulty: medium
+      question: "For each customer ID, return the payment row with the highest payment amount. If there is a tie, choose the one with the latest payment date. Include the payment amount and payment date."
+      groundtruth_sql: |
+          SELECT
+            pmt.customerNumber,
+            pmt.amount,
+            pmt.paymentDate
+          FROM (
+          SELECT 
+            customerNumber, 
+            amount, 
+            paymentDate,
+            ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC, paymentDate DESC) AS rn
+          FROM payments) AS pmt
+          WHERE pmt.rn = 1;
+    - id: M34
+      difficulty: medium
+      question: "By order status, show the total number of orders and the earliest order date for that status." 
+      groundtruth_sql: |
+        SELECT
+          status,
+          COUNT(orderNumber) AS total_orders,
+          MIN(orderDate) AS earliest_order_date
+        FROM orders
+        GROUP BY status;
+    - id: M35
+      difficulty: medium
+      question: "Work out the average payment amount per customer. Return the customer ID and average payment, but only for customers whose average is above 50,000."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          AVG(amount) AS average_payment
+        FROM payments
+        GROUP BY customerNumber
+        HAVING AVG(amount) > 50000;
+    - id: M36
+      difficulty: medium
+      question: "List the customer name and customer ID for customers whose credit limit is greater than the overall average credit limit."
+      groundtruth_sql: |
+        SELECT
+          customerName,
+          customerNumber
+        FROM customers
+        WHERE creditLimit > (SELECT AVG(creditLimit) FROM customers);
+    - id: M37
+      difficulty: medium
+      question: "For each order status, calculate what percentage of orders in that status have a non-null shipped date. Return the status and percentage, ordered from highest percentage to lowest."
+      groundtruth_sql: |  
+        SELECT
+          status,
+          (SUM(CASE WHEN shippedDate IS NOT NULL THEN 1 ELSE 0 END) * 100 / COUNT(*)) AS shipped_percentage
+        FROM orders
+        GROUP BY status
+        ORDER BY shipped_percentage DESC;
+    - id: M38
+      difficulty: medium
+      question: "Count the total number of products in each product line, and return only the lines with more than 5 products."
+      groundtruth_sql: |  
+        SELECT
+          productLine,
+          COUNT(*) AS total_products
+        FROM products
+        GROUP BY productLine
+        HAVING COUNT(*) > 5;
+    - id: M39
+      difficulty: medium
+      question: "Show how many offices are located in each territory, ordered by office count descending."
+      groundtruth_sql: |
+        SELECT
+          territory,
+          COUNT(*) AS office_count
+        FROM offices
+        GROUP BY territory
+        ORDER BY office_count DESC;
+    - id: M40
+      difficulty: medium
+      question: "Return the employee number, job title, and the rank of each employee within the same job title when employee numbers are ordered in descending order."
+      groundtruth_sql: |
+        SELECT
+          employeeNumber,
+          jobTitle,
+          RANK() OVER (
+            PARTITION BY jobTitle
+            ORDER BY employeeNumber DESC
+          ) AS employee_rank
+        FROM employees;
+    - id: M41
+      difficulty: medium
+      question: "For each customer, return the customer ID and the payment amount from that customer's second payment row after sorting that customer's payments by amount descending. Exclude customers who have fewer than two payment records."
+      groundtruth_sql: |
+        SELECT
+          pmt.customerNumber,
+          pmt.amount
+        FROM (
+          SELECT 
+            customerNumber
+            ,amount
+            ,ROW_NUMBER() OVER (PARTITION BY customerNumber ORDER BY amount DESC) AS rn 
+          FROM payments) pmt
+        WHERE rn = 2;
+    - id: M42
+      difficulty: medium
+      question: "For each payment record, return the customer number, payment date, amount, and the running cumulative payment amount for that customer in payment-date order."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          paymentDate,
+          amount,
+          SUM(amount) OVER (
+            PARTITION BY customerNumber
+            ORDER BY paymentDate
+          ) AS cumulative_payment
+        FROM payments;
+    - id: M43
+      difficulty: medium
+      question: "For every employee, return the employee number, job title, and how many employees work in that same office."
+      groundtruth_sql: |
+        SELECT
+          employeeNumber,
+          jobTitle,
+          COUNT(*) OVER (
+            PARTITION BY officeCode
+          ) AS employees_in_same_office
+        FROM employees;
+    - id: M44
+      difficulty: medium
+      question: "For each product, return the product code, buy price, and the average buy price for products in the same product line."
+      groundtruth_sql: |
+        SELECT
+          productCode,
+          buyPrice,
+          AVG(buyPrice) OVER (
+            PARTITION BY productLine
+          ) AS average_buy_price_per_line
+        FROM products; 
+    - id: M45
+      difficulty: medium
+      question: "For each product, return the product code, quantity in stock, and what percentage of the total stock across all products that quantity accounts for."
+      groundtruth_sql: |
+        SELECT
+          productCode,
+          quantityInStock,
+          (quantityInStock * 100.0 / SUM(quantityInStock) OVER ()) AS stock_percentage
+        FROM products;
+    - id: M46
+      difficulty: medium
+      question: "Put orders from 2003 and 2004 into one result set. Return the order number and a year label ('2003' or '2004'). Remove duplicate rows and sort by year label ascending, then order number ascending."
+      groundtruth_sql: |
+        SELECT
+          orderNumber,
+          '2003' AS year_label
+        FROM orders
+        WHERE YEAR(orderDate) = 2003
+        UNION
+        SELECT
+          orderNumber,
+          '2004' AS year_label
+        FROM orders
+        WHERE YEAR(orderDate) = 2004
+        ORDER BY
+          year_label ASC,
+          orderNumber ASC;
+    - id: M47
+      difficulty: medium
+      question: "For each order year, show how many distinct order statuses appear in that year. Return the year and distinct status count, ordered by year ascending."
+      groundtruth_sql: |
+        SELECT
+          YEAR(orderDate) AS order_year,
+          COUNT(DISTINCT status) AS distinct_status_count
+        FROM orders
+        GROUP BY
+          YEAR(orderDate)
+        ORDER BY
+          order_year ASC;
+    - id: M48
+      difficulty: medium
+      question: "For every payment record, return the customer number, payment date, amount, and the previous payment amount in that customer's payment-date sequence. Sort the final result by customer number ascending, then payment date descending."
+      groundtruth_sql: |
+        SELECT
+          customerNumber,
+          paymentDate,
+          amount,
+          LAG(amount) OVER (
+            PARTITION BY customerNumber
+            ORDER BY paymentDate
+          ) AS previous_payment_amount
+        FROM payments
+        ORDER BY
+          customerNumber ASC,
+          paymentDate DESC;
+    - id: M49
+      difficulty: medium
+      question: "Return the orders placed on the most recent order date in the dataset. Show order number, order date, and status, then sort by order number ascending."
+      groundtruth_sql: |
+        SELECT
+          orderNumber,
+          orderDate,
+          status
+        FROM orders
+        WHERE orderDate = (
+          SELECT MAX(orderDate)
+          FROM orders
+        )
+        ORDER BY
+          orderNumber ASC;
+    - id: M50
+      difficulty: medium
+      question: "For each country, count how many distinct customer cities we have there. Return only countries with customers in more than 3 distinct cities, and show the country plus distinct city count, ordered by distinct city count descending and then country ascending."
+      groundtruth_sql: |
+        SELECT
+          country,
+          COUNT(DISTINCT city) AS distinct_city_count
+        FROM customers
+        GROUP BY
+          country
+        HAVING
+          COUNT(DISTINCT city) > 3
+        ORDER BY
+          distinct_city_count DESC,
+          country ASC;

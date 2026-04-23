@@ -208,3 +208,166 @@ cases:
         SELECT productCode, productName, productVendor
         FROM products
         WHERE productVendor = 'Autoart Studio Design';
+    - id: E31
+      difficulty: easy
+      question: "Can you list the customers in Japan and show their names and cities, sorted by city?"
+      groundtruth_sql: |
+        SELECT customerName, city 
+        FROM customers 
+        WHERE country = 'Japan' 
+        ORDER BY city; 
+    - id: E32
+      difficulty: easy
+      question: "Show the 10 products with the highest stock levels. Include the product code, name, and quantity in stock."
+      groundtruth_sql: |
+        SELECT productCode, productName, quantityInStock 
+        FROM products 
+        ORDER BY quantityInStock 
+        DESC LIMIT 10;
+    - id: E33
+      difficulty: easy
+      question: "Pull all orders placed in 2004 and show the order number and order date, starting from the latest order date."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate 
+        FROM orders 
+        WHERE YEAR(orderDate) = 2004 
+        ORDER BY orderDate DESC;
+    - id: E34
+      difficulty: easy
+      question: "Give me all payments above 10,000, along with the customer number, check number, and amount, sorted from highest amount to lowest."
+      groundtruth_sql: |
+        SELECT customerNumber, checkNumber, amount 
+        FROM payments 
+        WHERE amount > 10000 
+        ORDER BY amount DESC;
+    - id: E35
+      difficulty: easy
+      question: "Find the offices where the state information is missing, and show the office code, city, country, and state."
+      groundtruth_sql: |
+        SELECT officeCode, city, country, state 
+        FROM offices 
+        WHERE (state IS NULL OR state = '');
+    - id: E36
+      difficulty: easy
+      question: "Find all products whose names start with '196'. Return the product codes and names."
+      groundtruth_sql: |
+        SELECT productCode, productName 
+        FROM products 
+        WHERE productName LIKE '196%';
+    - id: E37
+      difficulty: easy
+      question: "Which employees work in offices 1, 2, or 3? Show the employee number, first name, last name, and office code."
+      groundtruth_sql: |
+        SELECT employeeNumber, firstName, lastName, officeCode 
+        FROM employees 
+        WHERE officeCode IN ('1', '2', '3');
+    - id: E38
+      difficulty: easy
+      question: "Find employees whose phone extension starts with 'x' and is followed by exactly three digits. Show the employee number, first name, last name, and extension."
+      groundtruth_sql: |
+        SELECT employeeNumber, firstName, lastName, extension 
+        FROM employees 
+        WHERE extension REGEXP '^x[0-9]{3}$';
+    - id: E39
+      difficulty: easy
+      question: "Show orders that are either in status 'Cancelled' or 'On Hold'. Return the order number, order date, and status."
+      groundtruth_sql: |
+        SELECT orderNumber, orderDate, status 
+        FROM orders 
+        WHERE status IN('Cancelled','On Hold');
+    - id: E40
+      difficulty: easy
+      question: "I want to see the products with stock between 500 and 1000 units, inclusive. Show the product code, name, and quantity in stock."
+      groundtruth_sql: |
+        SELECT productCode, productName, quantityInStock 
+        FROM products 
+        WHERE quantityInStock BETWEEN 500 AND 1000;
+    - id: E41
+      difficulty: easy
+      question: "Which countries do we currently have customers in? Return one row per country, sorted alphabetically."
+      groundtruth_sql: |
+        SELECT DISTINCT
+          country
+        FROM customers
+        ORDER BY country ASC;
+    - id: E42
+      difficulty: easy
+      question: "Show all offices, and if the state information is missing, display it as 'N/A'. Return office code, city, country, and the displayed state value. Sort by office code ascending."
+      groundtruth_sql: |
+        SELECT
+          officeCode,
+          city,
+          country,
+          COALESCE(state, 'N/A') AS state_display
+        FROM offices
+        ORDER BY officeCode ASC;
+    - id: E43
+      difficulty: easy
+      question: "Can you show the orders that were shipped after their required date? Return order number, required date, and shipped date. Sort by shipped date descending, then order number ascending."
+      groundtruth_sql: |
+        SELECT
+          orderNumber,
+          requiredDate,
+          shippedDate
+        FROM orders
+        WHERE shippedDate > requiredDate
+        ORDER BY shippedDate DESC, orderNumber ASC;
+    - id: E44
+      difficulty: easy
+      question: "I need to see which products have a scale of either '1:10' or '1:12'. Please show the product code, name, and scale, and sort by product name descending."
+      groundtruth_sql: |
+        SELECT
+          productCode,
+          productName,
+          productScale
+        FROM products
+        WHERE productScale IN ('1:10', '1:12')
+        ORDER BY productName DESC;
+    - id: E45
+      difficulty: easy
+      question: "Can you pull the first and last names for all employees? Also, make sure the last names are in all caps and the list is sorted by first name."
+      groundtruth_sql: |
+        SELECT
+          firstName,
+          UPPER(lastName) AS lastName
+        FROM employees
+        ORDER BY firstName;
+    - id: E46
+      difficulty: easy
+      question: "I need to check our profit margins. Can you show the product code, product name, and the difference between MSRP and buy price for each product?"
+      groundtruth_sql: |
+        SELECT productCode, productName, (MSRP - buyPrice) AS markup
+        FROM products;
+    - id: E47
+      difficulty: easy
+      question: "Can you pull all the orders that were placed in the month of May, regardless of the year? Just show the order number and the order date."
+      groundtruth_sql: |
+        SELECT 
+          orderNumber, orderDate
+        FROM orders
+        WHERE MONTH(orderDate) = 5;
+    - id: E48
+      difficulty: easy
+      question: "Show me the customers who don't have a state listed but are located in either the USA or Canada. I need their name, city, and country."
+      groundtruth_sql: |
+        SELECT 
+          customerName, city, country
+        FROM customers
+        WHERE state IS NULL AND country IN ('USA', 'Canada');
+    - id: E49
+      difficulty: easy
+      question: "Can you list the product lines where the text description is longer than 200 characters? Show the product line and the first 50 characters of the text description."
+      groundtruth_sql: |
+        SELECT 
+          productLine, LEFT(textDescription, 50) AS description_preview
+        FROM productlines
+        WHERE LENGTH(textDescription) > 200;
+    - id: E50
+      difficulty: easy
+      question: "Could you list all the orders that haven't been shipped yet or were cancelled? Show the order number, status, and the order date, sorted by status ascending."
+      groundtruth_sql: |
+        SELECT 
+          orderNumber, status, orderDate
+        FROM orders
+        WHERE status IN ('Cancelled', 'In Process', 'On Hold', 'Disputed') OR shippedDate IS NULL
+        ORDER BY status;

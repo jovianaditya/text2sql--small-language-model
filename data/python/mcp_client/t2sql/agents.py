@@ -93,6 +93,9 @@ from .config import (
     AGENT_CONTRACT_BASE_METRIC_TERMS,
     AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS,
     AGENT_CONTRACT_GENERIC_COUNT_NOUNS,
+    HELPERS_ALL_OTHER_INTENT_PATTERNS,
+    HELPERS_AVERAGE_INTENT_PATTERNS,
+    HELPERS_SAME_GROUP_INTENT_PATTERNS,
     DOMAIN_HEURISTICS_ENABLED,
     AGENT_ROUTER_FK_SUFFIX_TERMS,
     AGENT_ROUTER_IGNORE_PATTERNS,
@@ -317,6 +320,8 @@ def _attempt_confidence_retry(
 
 from .schema_analyzer import (
     get_all_tables,
+    get_column_description,
+    get_column_role,
     get_singular_form,
     get_schema_analyzer,
     get_id_column,
@@ -353,6 +358,7 @@ from .helpers_core import (
     _question_wants_include_zero,
     _ensure_explicit_simple_projection_columns,
     _align_requested_description_variant,
+    _align_requested_joined_description_variant,
     _drop_unrequested_difference_operand_columns,
     _drop_unrequested_missing_filter_columns,
     _drop_raw_column_covered_by_function,
@@ -427,7 +433,15 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
     # families. True winner-row questions should be governed by their
     # ROW_NUMBER / ORDER BY shape instead of an inferred PARTITION BY contract.
     required_window_partition_col = ""
-    if not wants_winner_row:
+    # "all other ... average ... same <group>" questions are validly solved
+    # with correlated subqueries that exclude the current row, so forcing a
+    # PARTITION BY contract here would cause unnecessary regeneration.
+    all_other_same_group_avg = (
+        any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_ALL_OTHER_INTENT_PATTERNS)
+        and any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_AVERAGE_INTENT_PATTERNS)
+        and any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_SAME_GROUP_INTENT_PATTERNS)
+    )
+    if not wants_winner_row and not all_other_same_group_avg:
         required_window_partition_col = _resolve_required_window_partition_column(question, ctx)
     return {
         "requires_projection_distinct": wants_projection_distinct,
@@ -1406,12 +1420,30 @@ def _add_missing_final_order(sql: str, question: str) -> str:
         )
     )
 
+    reserved_tokens = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS))
+
+    def _quote_order_identifier_if_reserved(expr: str) -> str:
+        token = str(expr or "").strip()
+        if not token:
+            return token
+        if token.startswith("`") and token.endswith("`"):
+            return token
+        # Keep non-identifier expressions intact (qualified refs/functions/etc.).
+        if "." in token or re.search(r"[()\s]", token):
+            return token
+        bare = token.strip("`")
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", bare):
+            return token
+        if bare.lower() in reserved_tokens:
+            return f"`{bare}`"
+        return bare
+
     def _extract_alias(expr: str) -> str:
-        m = re.search(r"\bAS\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$", expr, flags=re.I)
+        m = re.search(r"\bAS\s+(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", expr, flags=re.I)
         if m:
-            return m.group(1)
-        m = re.search(r"\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$", expr.strip())
-        return m.group(1) if m else ""
+            return _quote_order_identifier_if_reserved(m.group(1))
+        m = re.search(r"\s+(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", expr.strip())
+        return _quote_order_identifier_if_reserved(m.group(1)) if m else ""
 
     def _looks_temporal(expr: str, alias: str = "") -> bool:
         text = " ".join(x for x in [expr, alias] if x)
@@ -1449,7 +1481,7 @@ def _add_missing_final_order(sql: str, question: str) -> str:
 
     limit_pos = _find_top_level_kw(s, "limit")
     insert_pos = limit_pos if limit_pos >= 0 else len(s)
-    order_clause = f" ORDER BY {order_expr} {direction} "
+    order_clause = f" ORDER BY {_quote_order_identifier_if_reserved(order_expr)} {direction} "
     out = s[:insert_pos].rstrip() + order_clause + s[insert_pos:].lstrip()
     return out.rstrip() + trailing_semicolon
 
@@ -1584,21 +1616,53 @@ def _extract_requested_final_order_terms(question: str) -> List[Tuple[str, str]]
     patterns = [
         r"\b(?:final\s+)?(?:result|results|output|rows?)\s+(?:should\s+be\s+)?(?:sorted|ordered|arranged)\s+by\s+(?P<body>[^.]+)",
         r"\b(?:sort|sorted|order|ordered|arrange|arranged)\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)?\s*by\s+(?P<body>[^.]+)",
+        r"\b(?:sort|sorted|order|ordered|arrange|arranged)\s+(?:so|such\s+that)\s+(?P<body>[^.]+)",
         r"\b(?:sort|order|arrange)\s+by\s+(?P<body>[^.]+)",
     ]
-    body = ""
-    for pat in patterns:
-        m = re.search(pat, q, flags=re.I)
-        if m:
-            body = str(m.group("body") or "").strip()
-            break
+    # Prefer the latest explicit ordering command in the question text.
+    # This avoids choosing earlier window-sequence phrases such as
+    # "... ordered by payment date. Sort by customer number ...".
+    matches: List[Tuple[int, int, str]] = []
+    for idx, pat in enumerate(patterns):
+        # Higher priority for stronger final-output phrasing patterns.
+        priority = 3 - idx
+        for m in re.finditer(pat, q, flags=re.I):
+            body_txt = str(m.group("body") or "").strip()
+            if not body_txt:
+                continue
+            matches.append((priority, m.start(), body_txt))
+    if not matches:
+        return []
+
+    def _has_tiebreaker_body(text: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:if\s+there\s+is\s+a\s+tie|if\s+there\s+are\s+ties|tie(?:breaker)?|then)\b",
+                str(text or ""),
+                flags=re.I,
+            )
+        )
+
+    # Prefer explicit tie-breaker phrasing when present; otherwise keep the
+    # prior behavior of using the latest explicit ordering command.
+    matches.sort(key=lambda x: (_has_tiebreaker_body(x[2]), x[1], x[0], len(x[2])), reverse=True)
+    body = matches[0][2]
     if not body:
         return []
 
-    body = re.sub(r"\b(if\s+there\s+is\s+a\s+tie|if\s+there\s+are\s+ties)\b.*", "", body, flags=re.I).strip()
+    # Preserve tie-breaker ordering phrases as additional ORDER BY keys.
+    # Example: "... appear first; if there is a tie, sort by name A-Z"
+    # should map to two keys, not truncate after the tie marker.
+    body = re.sub(
+        r"\b(?:if\s+there\s+is\s+a\s+tie|if\s+there\s+are\s+ties)\b\s*,?\s*",
+        " then ",
+        body,
+        flags=re.I,
+    ).strip()
+    body = body.replace(";", ", ")
     raw_parts = [
         p.strip(" ,;")
-        for p in re.split(r"\s*,?\s+then\s+|\s*,\s*", body, flags=re.I)
+        for p in re.split(r"\s*[;,]?\s+then\s+|\s*[;,]\s*", body, flags=re.I)
         if p.strip(" ,;")
     ]
     out: List[Tuple[str, str]] = []
@@ -1606,7 +1670,11 @@ def _extract_requested_final_order_terms(question: str) -> List[Tuple[str, str]]
         direction = "ASC"
         if re.search(r"\b(?:descending|desc|highest|largest|latest|newest|most|reverse\s+alphabetical|reversed\s+alphabetical|reverse)\b", part, flags=re.I):
             direction = "DESC"
+        elif re.search(r"\bmore\b.*\bfirst\b", part, flags=re.I):
+            direction = "DESC"
         elif re.search(r"\b(?:ascending|asc|a-z|alphabetical|chronological|earliest|oldest|smallest|lowest)\b", part, flags=re.I):
+            direction = "ASC"
+        elif re.search(r"\b(?:less|fewer|lower|smaller)\b.*\bfirst\b", part, flags=re.I):
             direction = "ASC"
         clean = re.sub(
             r"\b(?:ascending|descending|asc|desc|first|from\s+(?:highest|lowest|latest|earliest)\s+to\s+(?:lowest|highest|earliest|latest)|reverse\s+alphabetical|reversed\s+alphabetical|reverse)\b",
@@ -1614,6 +1682,13 @@ def _extract_requested_final_order_terms(question: str) -> List[Tuple[str, str]]
             part,
             flags=re.I,
         )
+        clean = re.sub(
+            r"^\s*(?:sort|sorted|order|ordered|arrange|arranged)\s+by\s+",
+            "",
+            clean,
+            flags=re.I,
+        )
+        clean = re.sub(r"^\s*(?:so|that)\s+", "", clean, flags=re.I)
         clean = re.sub(r"\s+", " ", clean).strip(" ,;")
         if clean:
             out.append((clean, direction))
@@ -1629,19 +1704,19 @@ def _complete_requested_final_order(sql: str, question: str) -> str:
     s = (sql or "").strip()
     if not s or not _has_top_level_order_by(s):
         return sql
+    requested = _extract_requested_final_order_terms(question)
+    if not requested:
+        return sql
     # Ranking window ORDER BY is often part of row-number semantics.  Still
     # allow a top-level final ORDER BY repair when the question explicitly names
     # the final output order; the scanner below only edits the top-level tail.
     if re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", s, flags=re.I) and not re.search(
         r"\b(?:final\s+)?(?:result|results|output|rows?)\s+(?:should\s+be\s+)?(?:sorted|ordered|arranged)\s+by\b"
+        r"|\b(?:sort|sorted|order|ordered|arrange|arranged)\s+by\b"
         r"|\b(?:sort|order|arrange)\s+(?:the\s+)?final\s+(?:result|results|output|rows?)\s+by\b",
         str(question or ""),
         flags=re.I,
     ):
-        return sql
-
-    requested = _extract_requested_final_order_terms(question)
-    if len(requested) < 2:
         return sql
 
     trailing_semicolon = ";" if s.endswith(";") else ""
@@ -1662,6 +1737,23 @@ def _complete_requested_final_order(sql: str, question: str) -> str:
     order_end = limit_pos if limit_pos >= 0 else len(s)
     suffix = s[order_end:].strip()
 
+    reserved_tokens = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS))
+
+    def _quote_order_identifier_if_reserved(expr: str) -> str:
+        token = str(expr or "").strip()
+        if not token:
+            return token
+        if token.startswith("`") and token.endswith("`"):
+            return token
+        if "." in token or re.search(r"[()\s]", token):
+            return token
+        bare = token.strip("`")
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", bare):
+            return token
+        if bare.lower() in reserved_tokens:
+            return f"`{bare}`"
+        return bare
+
     candidates: List[Tuple[str, Set[str]]] = []
     for item in select_items:
         item_clean = item.strip()
@@ -1672,11 +1764,12 @@ def _complete_requested_final_order(sql: str, question: str) -> str:
         if not item_clean:
             continue
         alias_match = re.search(r"\bAS\s+(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", item_clean, flags=re.I)
-        alias = alias_match.group(1).strip("`") if alias_match else ""
+        alias_sql = alias_match.group(1).strip() if alias_match else ""
+        alias = alias_sql.strip("`")
         expr = item_clean[:alias_match.start()].strip() if alias_match else item_clean
         simple_col_match = re.search(r"(?:^|\.)(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", expr)
         expr_name = simple_col_match.group(1).strip("`") if simple_col_match else expr
-        order_expr = alias or expr_name
+        order_expr = _quote_order_identifier_if_reserved(alias_sql or expr_name)
         token_text = " ".join(x for x in [alias, expr_name, expr] if x)
         tokens = _normalize_order_term_tokens(token_text)
         if order_expr and tokens:
@@ -1703,7 +1796,7 @@ def _complete_requested_final_order(sql: str, question: str) -> str:
         best_exprs = [expr for score, expr in scored if score == best_score]
         if len(set(best_exprs)) != 1:
             return s + trailing_semicolon
-        mapped.append(f"{best_exprs[0]} {direction}")
+        mapped.append(f"{_quote_order_identifier_if_reserved(best_exprs[0])} {direction}")
 
     if len(mapped) != len(requested):
         return s + trailing_semicolon
@@ -2179,6 +2272,38 @@ def _table_entity_pattern(table: str) -> str:
 
     escaped = [re.escape(v).replace(r"\ ", r"\s+") for v in variants]
     return "(?:" + "|".join(escaped) + ")"
+
+
+def _is_detail_child_entity(base_table: str, candidate_table: str) -> bool:
+    """
+    Detect schema-driven "detail/line/item" child naming relationship.
+    Example: base=orders, candidate=orderdetails -> True.
+    """
+    base = (base_table or "").strip().lower()
+    cand = (candidate_table or "").strip().lower()
+    if not base or not cand or base == cand:
+        return False
+
+    base_singular = (get_singular_form(base) or "").strip().lower()
+    if not base_singular:
+        return False
+
+    detail_suffixes = (
+        "detail", "details",
+        "line", "lines",
+        "item", "items",
+        "entry", "entries",
+    )
+    candidate_variants = {v.replace("_", " ").strip().lower() for v in _table_name_variants(cand)}
+    candidate_variants.add(cand.replace("_", " ").strip().lower())
+    candidate_variants.add(cand.replace("_", "").strip().lower())
+
+    expected_variants: Set[str] = set()
+    for suffix in detail_suffixes:
+        expected_variants.add(f"{base_singular} {suffix}")
+        expected_variants.add(f"{base_singular}{suffix}")
+
+    return bool(candidate_variants.intersection(expected_variants))
 
 
 def _question_mentions_entity_display_name(question_lower: str, table: str) -> bool:
@@ -3179,14 +3304,49 @@ def router_agent(state: RAGState) -> RAGState:
         # Preserve weak-evidence parent table when it is explicitly the
         # output subject in the question (e.g., "Show product lines ...")
         # and has table+attribute evidence.
+        #
+        # Exception:
+        # If this "explicit subject" is only a base-entity token inside a
+        # composite detail phrase (e.g., "order details") and another detail
+        # sibling table has strong evidence, keep the detail table and allow
+        # pruning of the weak parent to avoid unnecessary joins.
         table_entity_pattern = _table_entity_pattern(tbl_lower)
         has_table_attr_evidence = AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE in evidence_list
         explicit_subject_score = _explicit_subject_match_score(question_lower, table_entity_pattern)
         is_explicit_subject = has_table_attr_evidence and (explicit_subject_score > 0)
         if is_explicit_subject:
-            if RETRIEVE_DEBUG:
-                print(f"[ROUTER] Keeping {tbl_lower}: explicit subject entity in question")
-            continue
+            detail_sibling_override = False
+            for other_tbl in relevant_tables:
+                other_lower = other_tbl.lower()
+                if other_lower == tbl_lower:
+                    continue
+                if not _is_detail_child_entity(tbl_lower, other_lower):
+                    continue
+                other_entity_pattern = _table_entity_pattern(other_lower)
+                if not other_entity_pattern or not re.search(rf"\b{other_entity_pattern}\b", question_lower):
+                    continue
+
+                other_evidence = evidence_details.get(other_lower, [])
+                other_has_strong_evidence = any(
+                    (e not in weak_evidence) and (not e.startswith(AGENT_ROUTER_FK_EVIDENCE_PREFIX))
+                    for e in other_evidence
+                )
+                if other_has_strong_evidence:
+                    detail_sibling_override = True
+                    if RETRIEVE_DEBUG:
+                        print(
+                            f"[ROUTER] Explicit subject override: {tbl_lower} appears as base entity "
+                            f"inside detail phrase; prefer strong detail table {other_lower}"
+                        )
+                    break
+
+            if detail_sibling_override:
+                # continue evaluating weak-evidence pruning below
+                pass
+            else:
+                if RETRIEVE_DEBUG:
+                    print(f"[ROUTER] Keeping {tbl_lower}: explicit subject entity in question")
+                continue
 
         # Preserve weak tables that are explicitly the target of exclusion intent
         # (e.g., "customers with no orders", "never paid").
@@ -4938,6 +5098,48 @@ def _deterministic_sql_acceptance_gate(
             c = (col_name or "").lower()
             return bool(c) and (c.endswith("id") or c.endswith("number") or c.endswith("code"))
 
+        hierarchy_question = bool(
+            re.search(
+                r"\b(?:manager|subordinate|supervisor|parent|child|owner|member|leader|mentor|boss|report(?:s|ing)?\s+to)\b",
+                str(question or ""),
+                flags=re.I,
+            )
+        )
+
+        def _looks_like_self_reference_col(table_name: str, col_name: str, id_col_name: str) -> bool:
+            table_l = str(table_name or "").strip().lower()
+            col_l = str(col_name or "").strip().lower()
+            id_l = str(id_col_name or "").strip().lower()
+            if not table_l or not col_l or not id_l or col_l == id_l:
+                return False
+
+            role_l = ""
+            desc_l = ""
+            try:
+                role_l = str(get_column_role(table_l, col_l) or "").strip().lower()
+            except Exception:
+                role_l = ""
+            try:
+                desc_l = str(get_column_description(table_l, col_l) or "").strip().lower()
+            except Exception:
+                desc_l = ""
+
+            semantic_text = " ".join(part for part in (col_l, role_l, desc_l) if part).strip()
+            if not semantic_text:
+                return False
+
+            if re.search(
+                r"\b(?:manager|subordinate|supervisor|parent|child|owner|member|leader|mentor|boss|report(?:s|ing)?\s+to|hierarch)\b",
+                semantic_text,
+                flags=re.I,
+            ):
+                return True
+
+            if id_l and id_l in semantic_text.replace("`", ""):
+                return True
+
+            return False
+
         def _is_plausible_join_edge(lt: str, lc: str, rt: str, rc: str) -> bool:
             lt_l = (lt or "").lower()
             rt_l = (rt or "").lower()
@@ -4962,6 +5164,24 @@ def _deterministic_sql_acceptance_gate(
             if lc_l == rc_l and _is_id_like(lc_l):
                 if lc_l in table_cols.get(lt_l, set()) and rc_l in table_cols.get(rt_l, set()):
                     return True
+
+            # Conservative self-join fallback when metadata misses explicit
+            # self-referential FK edges (e.g., hierarchy parent pointers).
+            if lt_l == rt_l:
+                table_id = (get_id_column(lt_l) or "").strip("`").lower()
+                if table_id:
+                    for fk_col, id_col in ((lc_l, rc_l), (rc_l, lc_l)):
+                        if id_col != table_id:
+                            continue
+                        if fk_col == table_id:
+                            continue
+                        if fk_col in table_cols.get(lt_l, set()) and id_col in table_cols.get(rt_l, set()):
+                            if (
+                                _is_id_like(fk_col)
+                                or _looks_like_self_reference_col(lt_l, fk_col, table_id)
+                                or hierarchy_question
+                            ):
+                                return True
 
             return False
 
@@ -6117,6 +6337,404 @@ def _recover_missing_outer_winner_row_columns(sql: str, missing_cols: List[str])
     return fixed
 
 
+def _recover_missing_joined_lookup_columns(
+    sql: str,
+    missing_cols: List[str],
+    question: str,
+    ctx: str = "",
+) -> Optional[str]:
+    """
+    Deterministically recover missing output columns for flat joined lookup SQL.
+
+    Scope is intentionally narrow:
+    - top-level SELECT ... FROM ... with JOINs
+    - no GROUP BY/HAVING/UNION/WINDOW/subquery shapes
+    - add at most one-hop FK LEFT JOIN per missing column
+    """
+    s = str(sql or "").strip()
+    if not s or not missing_cols:
+        return None
+    if not has_join(s):
+        return None
+    if re.search(r"\b(?:group\s+by|having|union|intersect|except|with)\b", s, flags=re.I):
+        return None
+    if re.search(r"\bOVER\s*\(", s, flags=re.I):
+        return None
+    if re.search(r"(?is)\b(?:from|exists|in)\s*\(\s*select\b", s):
+        return None
+
+    s_core = s.rstrip().rstrip(";").strip()
+    if not re.match(r"(?is)^SELECT\b", s_core):
+        return None
+
+    def _find_top_level_keyword(text: str, keyword: str, start: int = 0) -> int:
+        kw = str(keyword or "").upper()
+        if not kw:
+            return -1
+        t = str(text or "")
+        up = t.upper()
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = max(0, int(start))
+        while i < len(t):
+            ch = t[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(t) and t[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and up.startswith(kw, i):
+                left_ok = i == 0 or not up[i - 1].isalnum()
+                right_idx = i + len(kw)
+                right_ok = right_idx >= len(up) or not up[right_idx].isalnum()
+                if left_ok and right_ok:
+                    return i
+            i += 1
+        return -1
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    buf.append(ch)
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if in_sq and i > 0 and text[i - 1] == "\\":
+                    buf.append(ch)
+                    i += 1
+                    continue
+                in_sq = not in_sq
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                if in_dq and i > 0 and text[i - 1] == "\\":
+                    buf.append(ch)
+                    i += 1
+                    continue
+                in_dq = not in_dq
+                buf.append(ch)
+                i += 1
+                continue
+            if not in_sq and not in_dq:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif ch == "," and depth == 0:
+                    item = "".join(buf).strip()
+                    if item:
+                        items.append(item)
+                    buf = []
+                    i += 1
+                    continue
+            buf.append(ch)
+            i += 1
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    from_pos = _find_top_level_keyword(s_core, "FROM", start=0)
+    if from_pos < 0:
+        return None
+    select_part_full = s_core[len("SELECT"):from_pos].strip()
+    rest = s_core[from_pos + len("FROM"):].strip()
+    if not select_part_full or not rest:
+        return None
+
+    clause_positions: List[Tuple[int, str]] = []
+    for kw in ("WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT"):
+        pos = _find_top_level_keyword(rest, kw, start=0)
+        if pos >= 0:
+            clause_positions.append((pos, kw))
+    clause_positions.sort(key=lambda x: x[0])
+    if clause_positions:
+        first_pos = clause_positions[0][0]
+        from_core = rest[:first_pos].strip()
+        tail = rest[first_pos:].strip()
+    else:
+        from_core = rest
+        tail = ""
+    if not from_core:
+        return None
+
+    has_select_distinct = bool(re.match(r"(?is)^DISTINCT\b", select_part_full))
+    select_part = re.sub(r"(?is)^DISTINCT\s+", "", select_part_full, count=1).strip() if has_select_distinct else select_part_full
+    select_items = _split_top_level_csv(select_part)
+    if not select_items:
+        return None
+
+    alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
+    if not alias_to_table:
+        return None
+
+    source_pairs: List[Tuple[str, str]] = []
+    seen_aliases: Set[str] = set()
+    reserved_alias_tokens = {
+        "left", "right", "inner", "outer", "full", "cross", "join",
+        "on", "where", "group", "order", "having", "limit",
+    }
+    for m_tbl in re.finditer(
+        r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?""",
+        f"FROM {from_core}",
+    ):
+        raw_tbl = (m_tbl.group(1) or "").replace("`", "").strip()
+        tbl = raw_tbl.split(".")[-1].lower()
+        if not tbl:
+            continue
+        alias_raw = (m_tbl.group(2) or "").strip()
+        if alias_raw.lower() in reserved_alias_tokens:
+            alias_raw = ""
+        alias = (alias_raw or tbl).strip()
+        alias_l = alias.lower()
+        if not alias_l or alias_l in seen_aliases:
+            continue
+        seen_aliases.add(alias_l)
+        source_pairs.append((alias, tbl))
+    if not source_pairs:
+        return None
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+    allowed_identifiers = _parse_allowed_identifiers(ctx or "")
+
+    def _table_cols_lower(table_name: str) -> Set[str]:
+        t_l = str(table_name or "").strip().lower()
+        if not t_l:
+            return set()
+        if analyzer is not None:
+            try:
+                return {
+                    str(c).strip("`").lower()
+                    for c in analyzer.get_table_columns(t_l)
+                    if str(c or "").strip()
+                }
+            except Exception:
+                pass
+        for t_ctx, cols_ctx in (allowed_identifiers or {}).items():
+            if str(t_ctx or "").strip().lower() != t_l:
+                continue
+            return {
+                str(c).strip("`").lower()
+                for c in (cols_ctx or set())
+                if str(c or "").strip()
+            }
+        return set()
+
+    try:
+        all_tables = {str(t).strip().lower() for t in (get_all_tables() or []) if str(t).strip()}
+    except Exception:
+        all_tables = {str(t).strip().lower() for t in (allowed_identifiers or {}).keys() if str(t).strip()}
+
+    joined_tables = {tbl for _alias, tbl in source_pairs}
+    alias_keys = {str(k or "").strip().lower() for k in alias_to_table.keys() if str(k or "").strip()}
+    order_segment = ""
+    m_order = re.search(r"(?is)\bORDER\s+BY\b\s+(?P<ord>.+?)(?:\bLIMIT\b.+)?$", tail)
+    if m_order:
+        order_segment = str(m_order.group("ord") or "").strip()
+
+    preferred_table_for_col: Dict[str, str] = {}
+    if order_segment:
+        for m_ref in re.finditer(
+            r"(?is)\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+            order_segment,
+        ):
+            qual = str(m_ref.group(1) or "").strip().lower()
+            col = str(m_ref.group(2) or "").strip().lower()
+            if not qual or not col:
+                continue
+            if qual in alias_keys:
+                continue
+            if qual in all_tables and col in _table_cols_lower(qual):
+                preferred_table_for_col.setdefault(col, qual)
+
+    try:
+        fk_map_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_map_raw = {}
+    fk_map: Dict[str, Dict[str, str]] = {}
+    for src, mapping in (fk_map_raw or {}).items():
+        src_l = str(src or "").strip().lower()
+        if not src_l:
+            continue
+        fk_map[src_l] = {}
+        for fk_col, tgt in (mapping or {}).items():
+            fk_l = str(fk_col or "").strip().lower()
+            tgt_l = str(tgt or "").strip().lower()
+            if fk_l and tgt_l:
+                fk_map[src_l][fk_l] = tgt_l
+
+    used_aliases: Set[str] = {a.lower() for a, _t in source_pairs}
+    used_aliases.update(alias_keys)
+
+    def _next_alias_for_table(table_name: str) -> str:
+        t_l = str(table_name or "").strip().lower() or "t"
+        if t_l and t_l not in used_aliases:
+            used_aliases.add(t_l)
+            return t_l
+        base = re.sub(r"[^a-z0-9_]", "", t_l) or "t"
+        first = base[0]
+        if first not in used_aliases:
+            used_aliases.add(first)
+            return first
+        for i in range(2, 200):
+            cand = f"{first}{i}"
+            if cand not in used_aliases:
+                used_aliases.add(cand)
+                return cand
+        fallback = f"{first}_x"
+        used_aliases.add(fallback)
+        return fallback
+
+    def _find_join_plan(target_table: str) -> Optional[Tuple[str, str, str, str]]:
+        t_l = str(target_table or "").strip().lower()
+        if not t_l:
+            return None
+        target_cols = _table_cols_lower(t_l)
+        for conn_alias, conn_table in source_pairs:
+            conn_l = str(conn_table or "").strip().lower()
+            conn_cols = _table_cols_lower(conn_l)
+            for fk_col, tgt in (fk_map.get(conn_l, {}) or {}).items():
+                if tgt != t_l:
+                    continue
+                if fk_col not in conn_cols:
+                    continue
+                try:
+                    target_key = str(get_id_column(t_l) or "").strip().lower()
+                except Exception:
+                    target_key = ""
+                if not target_key or target_key not in target_cols:
+                    target_key = fk_col if fk_col in target_cols else ""
+                if target_key:
+                    return ("conn_to_target", conn_alias, fk_col, target_key)
+            for fk_col, tgt in (fk_map.get(t_l, {}) or {}).items():
+                if tgt != conn_l:
+                    continue
+                if fk_col not in target_cols:
+                    continue
+                try:
+                    conn_key = str(get_id_column(conn_l) or "").strip().lower()
+                except Exception:
+                    conn_key = ""
+                if not conn_key or conn_key not in conn_cols:
+                    conn_key = fk_col if fk_col in conn_cols else ""
+                if conn_key:
+                    return ("target_to_conn", conn_alias, fk_col, conn_key)
+        return None
+
+    select_low = select_part.lower()
+    rebuilt_select_items = list(select_items)
+    rebuilt_tail = tail
+    rebuilt_from = from_core
+    additions = 0
+
+    for col_raw in missing_cols:
+        col = str(col_raw or "").strip().strip("`")
+        col_l = col.lower()
+        if not col_l:
+            continue
+        if re.search(rf"(?is)\b{re.escape(col_l)}\b", select_low):
+            continue
+
+        preferred_table = preferred_table_for_col.get(col_l, "")
+        candidate_tables: List[str] = []
+        if preferred_table and preferred_table not in joined_tables:
+            candidate_tables.append(preferred_table)
+        for t in sorted(all_tables):
+            if t in joined_tables:
+                continue
+            if col_l not in _table_cols_lower(t):
+                continue
+            if t not in candidate_tables:
+                candidate_tables.append(t)
+        if not candidate_tables:
+            continue
+
+        chosen_table = ""
+        chosen_plan = None
+        for cand_table in candidate_tables:
+            plan = _find_join_plan(cand_table)
+            if plan is None:
+                continue
+            chosen_table = cand_table
+            chosen_plan = plan
+            break
+        if not chosen_table or chosen_plan is None:
+            continue
+
+        join_alias = (
+            chosen_table
+            if chosen_table not in used_aliases
+            else _next_alias_for_table(chosen_table)
+        )
+        used_aliases.add(join_alias)
+        alias_keys.add(join_alias)
+        alias_to_table[join_alias] = chosen_table
+
+        join_mode, conn_alias, lhs_col, rhs_col = chosen_plan
+        if join_mode == "conn_to_target":
+            on_clause = f"{conn_alias}.{lhs_col} = {join_alias}.{rhs_col}"
+        else:
+            on_clause = f"{join_alias}.{lhs_col} = {conn_alias}.{rhs_col}"
+
+        rebuilt_from = f"{rebuilt_from} LEFT JOIN {chosen_table} AS {join_alias} ON {on_clause}"
+        joined_tables.add(chosen_table)
+        source_pairs.append((join_alias, chosen_table))
+
+        rebuilt_select_items.append(f"{join_alias}.{col}")
+        select_low += f" {col_l}"
+        additions += 1
+
+        if preferred_table and preferred_table != join_alias and rebuilt_tail:
+            rebuilt_tail = re.sub(
+                rf"(?is)\b{re.escape(preferred_table)}\s*\.\s*{re.escape(col)}\b",
+                f"{join_alias}.{col}",
+                rebuilt_tail,
+            )
+
+    if additions <= 0:
+        return None
+
+    rebuilt_select = ", ".join(rebuilt_select_items)
+    distinct_prefix = "DISTINCT " if has_select_distinct else ""
+    out = f"SELECT {distinct_prefix}{rebuilt_select} FROM {rebuilt_from}"
+    if rebuilt_tail:
+        out += f" {rebuilt_tail}"
+    out = out.strip()
+    if sql.rstrip().endswith(";") and not out.endswith(";"):
+        out += ";"
+    return out
+
+
 def _repair_single_table_winner_row_projection(sql: str, question: str, ctx: str = "") -> Optional[str]:
     """
     Repair narrow winner-row near-misses for single-table ranked queries.
@@ -7124,6 +7742,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if aligned_description_sql and aligned_description_sql != final_sql:
         final_sql = str(aligned_description_sql).strip()
         corrections.append("Aligned description-column variant with question wording")
+    aligned_joined_description_sql = _align_requested_joined_description_variant(final_sql, question, ctx)
+    if aligned_joined_description_sql and aligned_joined_description_sql != final_sql:
+        final_sql = str(aligned_joined_description_sql).strip()
+        corrections.append("Aligned joined description-column variant with question wording")
     pruned_difference_sql = _drop_unrequested_difference_operand_columns(final_sql, question, ctx)
     if pruned_difference_sql and pruned_difference_sql != final_sql:
         final_sql = str(pruned_difference_sql).strip()
@@ -7170,6 +7792,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if aligned_description_sql and aligned_description_sql != final_sql:
         final_sql = str(aligned_description_sql).strip()
         corrections.append("Aligned description-column variant after semantic contract")
+    aligned_joined_description_sql = _align_requested_joined_description_variant(final_sql, question, ctx)
+    if aligned_joined_description_sql and aligned_joined_description_sql != final_sql:
+        final_sql = str(aligned_joined_description_sql).strip()
+        corrections.append("Aligned joined description-column variant after semantic contract")
     pruned_difference_sql = _drop_unrequested_difference_operand_columns(final_sql, question, ctx)
     if pruned_difference_sql and pruned_difference_sql != final_sql:
         final_sql = str(pruned_difference_sql).strip()
@@ -7923,8 +8549,9 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 for req in required_parts
             )
         
-        # STEP 1b: Ambil tokens dari WHERE/HAVING/subquery (kolom yang dipakai sebagai filter)
-        # Kolom yang sudah dipakai di WHERE tidak perlu ada di SELECT (bukan "missing")
+        # STEP 1b: Ambil tokens dari WHERE/HAVING/JOIN ON (kolom predicate/filter)
+        # Kolom yang sudah dipakai sebagai predicate tidak perlu dipaksa keluar
+        # sebagai output jika pertanyaan tidak memintanya secara eksplisit.
         sql_lower = final_sql.lower()
         where_having_tokens = set()
         # Extract WHERE clause
@@ -7935,6 +8562,14 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         having_match = re.search(AGENT_REFINE_LOWER_HAVING_PATTERN, sql_lower, re.DOTALL)
         if having_match:
             where_having_tokens.update(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, having_match.group(1)))
+        # Extract JOIN ON predicates
+        for on_match in re.finditer(
+            r"(?is)\bON\b\s+(.*?)(?=\b(?:INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|JOIN|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT)\b|$)",
+            sql_lower,
+        ):
+            where_having_tokens.update(
+                re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, on_match.group(1))
+            )
 
         def _extract_requested_output_segment_local(text: str) -> str:
             q_low_local = str(text or "").strip().lower()
@@ -8114,6 +8749,59 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     if not missing_cols:
                         _dbg_agent3_retry("Missing Columns", "Autofixed winner-row projection deterministically.")
 
+        if missing_cols and complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE and qtype == AGENT_ROUTER_QTYPE_LOOKUP:
+            recovered_joined_lookup_sql = _recover_missing_joined_lookup_columns(
+                final_sql,
+                missing_cols,
+                question,
+                ctx,
+            )
+            if recovered_joined_lookup_sql:
+                final_sql = str(recovered_joined_lookup_sql).strip()
+                if final_sql and not final_sql.endswith(";"):
+                    final_sql += ";"
+                sql_up = final_sql.upper()
+                corrections.append("Applied deterministic joined-lookup projection recovery")
+
+                select_match_chk = re.search(
+                    AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN,
+                    final_sql,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                select_text_chk_raw = select_match_chk.group(1) if select_match_chk else ""
+                select_text_chk = select_text_chk_raw.lower()
+                select_tokens_chk = set(re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, select_text_chk))
+                select_semantic_tokens = set(select_tokens_chk)
+                select_tokens_raw_case = set(
+                    re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, select_text_chk_raw)
+                )
+                for tok_raw in select_tokens_raw_case:
+                    tok_low = tok_raw.lower()
+                    if not tok_low:
+                        continue
+                    select_semantic_tokens.add(tok_low)
+                    for part in tok_low.split("_"):
+                        if part:
+                            select_semantic_tokens.add(part)
+                    camel_spaced = re.sub(
+                        AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN,
+                        r"\1 \2",
+                        tok_raw,
+                    )
+                    for part in re.findall(r"[a-z0-9]+", camel_spaced.lower()):
+                        if part:
+                            select_semantic_tokens.add(part)
+
+                missing_cols = [
+                    c for c in missing_cols
+                    if str(c or "").lower() not in select_semantic_tokens
+                ]
+                if not missing_cols:
+                    _dbg_agent3_retry(
+                        "Missing Columns",
+                        "Autofixed joined lookup projection deterministically.",
+                    )
+
             # TIERING LOGIC - Smart escalation based on complexity
             if not missing_cols:
                 pass
@@ -8191,6 +8879,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     )
                     needs_regeneration = True
                     regeneration_model = draft_model if draft_model in {SMALL_MODEL, LARGE_MODEL} else SMALL_MODEL
+                    if has_join(final_sql) and regeneration_model == SMALL_MODEL:
+                        regeneration_model = LARGE_MODEL
+                        _dbg_agent3_retry(
+                            "Missing Columns",
+                            "Escalating regeneration to 7B for joined lookup query.",
+                        )
             
             elif draft_model == SMALL_MODEL and complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE:
                 # MEDIUM ERROR: Regenerate dengan 3B (simple query dari 3B yang salah)

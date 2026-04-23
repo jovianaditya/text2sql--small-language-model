@@ -448,7 +448,7 @@ def _extract_loose_json_string_value(text: str, key: str) -> Optional[str]:
                 .replace("\\t", "\t")
                 .replace('\\"', '"')
             )
-            recovered_sql = recovered_piece.strip()
+            recovered_sql = _trim_plain_sql_statement_candidate(recovered_piece.strip())
             if not re.match(r"(?is)^(SELECT|WITH)\b", recovered_sql):
                 return None
             if not (
@@ -457,7 +457,7 @@ def _extract_loose_json_string_value(text: str, key: str) -> Optional[str]:
                 or re.search(r"\bORDER\s+BY\b", recovered_sql, flags=re.I)
             ):
                 return None
-            pieces.append(recovered_piece)
+            pieces.append(recovered_sql)
             break
 
         raw_piece = "".join(buf)
@@ -477,6 +477,8 @@ def _extract_loose_json_string_value(text: str, key: str) -> Optional[str]:
         break
 
     joined = "".join(pieces).strip()
+    if str(key or "").strip().lower() == "sql":
+        joined = _trim_plain_sql_statement_candidate(joined)
     return joined or None
 
 
@@ -519,6 +521,7 @@ def _extract_jsonish_sql_field(text: str) -> Optional[str]:
         .replace("\\t", "\t")
         .replace('\\"', '"')
     ).strip()
+    recovered = _trim_plain_sql_statement_candidate(recovered)
     if not re.match(r"(?is)^(SELECT|WITH)\b", recovered):
         return None
     return recovered
@@ -544,6 +547,11 @@ def _trim_plain_sql_statement_candidate(text: str) -> str:
     while i < len(s):
         ch = s[i]
         if in_sq:
+            if ch == "\\" and i + 1 < len(s):
+                # LLM JSON payloads often escape apostrophes as \'
+                # inside SQL single-quoted aliases/literals.
+                i += 2
+                continue
             if ch == "'" and i + 1 < len(s) and s[i + 1] == "'":
                 i += 2
                 continue
@@ -585,6 +593,11 @@ def _trim_plain_sql_statement_candidate(text: str) -> str:
     )
     if marker and marker.start() > 0:
         s = s[: marker.start()].strip()
+    else:
+        # Also trim malformed JSON tails like: ;","notes":"...
+        json_tail = re.search(r'(?is),\s*["\'](?:notes|reasoning|explanation|answer)["\']\s*:\s*', s)
+        if json_tail and json_tail.start() > 0:
+            s = s[: json_tail.start()].strip()
 
     return s.rstrip().rstrip(",").rstrip("}").rstrip('"').strip()
 
@@ -599,7 +612,7 @@ def _extract_plain_sql_statement(text: str) -> Optional[str]:
         return None
 
     candidate = m.group(0).strip()
-    note_marker = re.search(r'(?is)\s+["\']?notes["\']?\s*:\s*', candidate)
+    note_marker = re.search(r'(?is)(?:\s+|,\s*)["\']?notes["\']?\s*:\s*', candidate)
     if note_marker:
         candidate = candidate[: note_marker.start()].strip().rstrip(",{")
     candidate = _trim_plain_sql_statement_candidate(candidate)

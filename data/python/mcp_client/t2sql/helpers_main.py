@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from .state import RAGState
 from .utils import _dbg_print_two
 from .config import (
+    AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS,
+    AGENT_COLUMN_STOP_TOKENS,
     AGENT_COLUMN_ORDERED_BY_PATTERN,
     AGENT_COLUMN_ORDERED_TOKEN,
     AGENT_AST_GUARDS_ENABLED,
@@ -65,7 +67,7 @@ from .helpers_core import (
     _question_wants_dual_fact_rollup,
     _SQL_KEYWORDS,  # SQL keywords constant
     # phase 0
-    _fix_bad_backticks, _canonicalize_table_names, _escape_reserved_column_aliases,
+    _fix_bad_backticks, _canonicalize_table_names, _escape_reserved_column_aliases, _canonicalize_unsafe_output_aliases,
     # phase 1
     _move_rhs_filter_from_where_to_on,  # Only triggers for "ALL entities" questions
     _rewrite_left_join_to_inner_if_not_needed, _rewrite_left_join_to_inner_if_rhs_filtered,
@@ -76,10 +78,12 @@ from .helpers_core import (
     _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns, _repair_simple_single_table_column_names,
     # phase 3
     _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _ensure_explicit_simple_projection_columns, _prune_non_primary_dimensions_for_primary_aggregate, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
-    _align_requested_description_variant, _drop_unrequested_difference_operand_columns,
+    _align_requested_description_variant, _align_requested_joined_description_variant, _drop_unrequested_difference_operand_columns,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
     _canonicalize_single_computed_group_by_expression,
+    _drop_unrequested_secondary_self_join_identifier_columns,
+    _rewrite_missing_ordered_lookup_join,
     _simplify_same_expression_group_threshold_subquery,
     _simplify_group_key_count_threshold_subquery,
     _drop_unrequested_schema_named_count_outputs,
@@ -96,6 +100,7 @@ from .helpers_core import (
     _force_restore_groupby_if_aggregate_without_groupby,
     _preexecute_sql_safety_pass,
     _rewrite_winner_row_aggregate_misuse, _rewrite_single_table_tuple_in_winner_row, _rewrite_explicit_rank_aggregate_window, _rewrite_no_skip_rank_to_dense_rank, _repair_rank_window_partition_from_question, _add_rank_value_nonnull_filter_from_question, _rewrite_malformed_window_winner_clause, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_subquery_latest_year_tuple_filter, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _fix_grouped_aggregate_rank_direction,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
     _rewrite_dual_fact_rollup_fanout,
@@ -120,6 +125,7 @@ from .helpers_core import (
     _rewrite_temporal_year_exclusion_antijoin,
     _prefer_not_exists_for_simple_exclusion,
     _repair_temporal_not_exists_scope,
+    _repair_invalid_year_filter_via_fk_bridge,
     _question_wants_latest_year_scope_with_aggregate,
     _split_top_level_and,
     _split_top_level_commas,
@@ -1306,6 +1312,16 @@ def _question_targets_table_exclusion(question: str, table: str) -> bool:
     entity_alt = "|".join(
         sorted((re.escape(c).replace(r"\ ", r"\s+") for c in candidates), key=len, reverse=True)
     )
+
+    # Offset-window NULL fallback phrasing (e.g., "if there is no next payment")
+    # should not be treated as exclusion of the table entity itself.
+    if re.search(
+        rf"\b(?:no|without(?:\s+any)?)\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
+        rf"\b(?:next|previous|prior|following)\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+(?:{entity_alt})\b",
+        q,
+        flags=re.I,
+    ):
+        return False
 
     # Negation followed by entity mention.
     if re.search(
@@ -2929,13 +2945,7 @@ def _find_tables_with_implicit_columns(
             return "exact"
 
         # Guardrail: avoid false positives like customerName matching only "customer id".
-        semantic_suffix_keywords = {
-            "name": {"name", "names", "nama"},
-            "date": {"date", "dates", "tanggal", "tgl", "time", "waktu"},
-            "number": {"number", "numbers", "id", "ids", "code", "codes", "nomor", "kode", "no"},
-            "code": {"code", "codes", "id", "ids", "number", "numbers", "nomor", "kode", "no"},
-            "id": {"id", "ids", "number", "numbers", "code", "codes", "nomor", "kode", "no"},
-        }
+        semantic_suffix_keywords = AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS
         col_tokens = re.findall(r"[a-z0-9]+", spaced)
         if len(col_tokens) >= 2:
             suffix = col_tokens[-1]
@@ -2949,12 +2959,7 @@ def _find_tables_with_implicit_columns(
                     return "none"
 
         # Token boundary match for informative tokens only
-        stop_tokens = {
-            "id", "ids", "code", "codes", "number", "numbers",
-            "name", "names", "date", "dates", "line", "lines",
-            "type", "types", "status", "each", "table", "order",
-            "quantity", "price", "amount", "total", "average", "value"
-        }
+        stop_tokens = AGENT_COLUMN_STOP_TOKENS
         for token in re.findall(r"[a-z0-9]+", spaced):
             if len(token) < 4 or token in stop_tokens:
                 continue
@@ -3278,6 +3283,9 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     is_set_operation_intent = router_decision.get("is_set_operation_intent", False)
     is_simple_set_operation = router_decision.get("is_simple_set_operation", False)
     is_simple_scalar_subquery_single_table = router_decision.get("is_simple_scalar_subquery_single_table", False)
+    is_simple_multi_table_candidate = bool(
+        router_decision.get("simple_multi_table_candidate", False)
+    )
     router_tables = state.get("router_tables", []) if state else []
     
     # Detect tiebreaker pattern: "if multiple...choose the one with latest/earliest"
@@ -3471,8 +3479,18 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     )
     # [B] SIMPLE QUERY RULES
     if complexity == "simple":
-        constraints.append("SCOPE: This query requires ONE TABLE ONLY. DO NOT JOIN.")
-        constraints.append("FILTERING: Filter by ID/Code directly in the main table.")
+        if is_simple_multi_table_candidate:
+            constraints.append(
+                "SIMPLE MULTI-TABLE RULE (CRITICAL): This is still a simple query, but requested columns come from multiple routed tables. "
+                "You MUST include explicit JOINs for those tables in the FIRST draft."
+            )
+            constraints.append(
+                "SIMPLE MULTI-TABLE RULE (CRITICAL): Do NOT collapse to a single table if any requested projection column belongs to another table. "
+                "Use FK-consistent JOIN predicates only."
+            )
+        else:
+            constraints.append("SCOPE: This query requires ONE TABLE ONLY. DO NOT JOIN.")
+            constraints.append("FILTERING: Filter by ID/Code directly in the main table.")
 
         if qtype == "lookup" and not is_top_n_global_ranking:
             constraints.append(
@@ -3587,7 +3605,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     # [D] PRIMARY TABLE GUIDANCE (CRITICAL FOR ALL MULTI-TABLE QUERIES)
     # Apply to ALL non-simple queries (lookup, aggregate, ranking) to prevent wrong FROM clause order
     # This ensures the LLM uses the correct primary table as the first table in FROM clause
-    if complexity != "simple" and state:
+    if (complexity != "simple" or is_simple_multi_table_candidate) and state:
         primary_table = state.get("primary_table")
         primary_reason = state.get("primary_table_reason")
         join_key_hints = _build_join_key_hints_for_prompt(state, max_edges=8)
@@ -4137,6 +4155,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Phase 0 — Syntax & Canonicalization
     # Normalize tokens and table naming early
     # ---------------------------------------------------------------------------
+    s = _canonicalize_unsafe_output_aliases(s)
     s = _fix_bad_backticks(s)
     s = _canonicalize_table_names(s, ctx)
     s = _repair_invalid_qualified_columns(s, ctx)
@@ -4304,7 +4323,10 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _prefer_friendly_names(s, question)
     s = _ensure_entity_id_and_name_if_requested(s, question)
     s = _ensure_explicit_simple_projection_columns(s, question, ctx)
+    s = _rewrite_missing_ordered_lookup_join(s, question, ctx)
+    s = _drop_unrequested_secondary_self_join_identifier_columns(s, question, ctx)
     s = _align_requested_description_variant(s, question, ctx)
+    s = _align_requested_joined_description_variant(s, question, ctx)
     s = _drop_unrequested_difference_operand_columns(s, question, ctx)
     s = _prune_non_primary_dimensions_for_primary_aggregate(s, question, ctx)
     s = _drop_redundant_raw_name_columns_when_concat_present(s, question)
@@ -4433,10 +4455,15 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             r'\b(MIN|MAX|COUNT|SUM|AVG)\s*\(\s*([^()]*(?:\([^()]*\)[^()]*)*)\s*\)\s+OVER\s*\(\s*PARTITION\s+BY\s+[^)]+\)',
             re.IGNORECASE | re.DOTALL
         )
+        nested_agg_pattern = re.compile(r"\b(?:MIN|MAX|COUNT|SUM|AVG)\s*\(", re.IGNORECASE)
 
         def remove_over_clause(match):
             func_name = match.group(1)  # MIN, MAX, etc.
             func_args = match.group(2)  # column name(s)
+            # Keep nested aggregate windows intact (e.g., MAX(SUM(...)) OVER (...)).
+            # Stripping OVER here would create invalid aggregate nesting.
+            if nested_agg_pattern.search(func_args):
+                return match.group(0)
             return f"{func_name}({func_args})"
 
         # Apply fix to the entire SQL
@@ -4580,6 +4607,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_explicit_rank_aggregate_window(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after explicit-rank aggregate fix:", s)
 
+        s = _fix_grouped_aggregate_rank_direction(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after grouped aggregate rank direction fix:", s)
+
         s = _rewrite_no_skip_rank_to_dense_rank(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after no-skip dense-rank fix:", s)
 
@@ -4705,6 +4735,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         if DEBUG_WR: print(f"[REFINER - PH4] after NOT EXISTS anti-join preference: {s}")
         s = _repair_temporal_not_exists_scope(s, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after temporal NOT EXISTS scope repair: {s}")
+        s = _repair_invalid_year_filter_via_fk_bridge(s, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after invalid YEAR alias repair: {s}")
 
         s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after grouped winner-row fallback:", s)
@@ -4750,6 +4782,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
             s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after include-zero winner-row id-source fix: {s}")
+
+            s = _repair_invalid_year_filter_via_fk_bridge(s, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after invalid YEAR alias repair: {s}")
 
             s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after grouped winner-row fallback: {s}")

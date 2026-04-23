@@ -528,6 +528,26 @@ HELPERS_COUNT_INTENT_TERMS = tuple(
     )
 )
 
+# Intent lexical gates for "all other ... same group ... average" semantics.
+HELPERS_ALL_OTHER_INTENT_PATTERNS = tuple(
+    _env_json_list(
+        "HELPERS_ALL_OTHER_INTENT_PATTERNS",
+        [r"\ball\s+other\b"],
+    )
+)
+HELPERS_AVERAGE_INTENT_PATTERNS = tuple(
+    _env_json_list(
+        "HELPERS_AVERAGE_INTENT_PATTERNS",
+        [r"\b(?:average|avg|mean)\b"],
+    )
+)
+HELPERS_SAME_GROUP_INTENT_PATTERNS = tuple(
+    _env_json_list(
+        "HELPERS_SAME_GROUP_INTENT_PATTERNS",
+        [r"\bsame\b"],
+    )
+)
+
 # Batch-4 ablation switch: keeps the schema-driven core intact while allowing
 # domain-compatibility lexical priors to be disabled for controlled evaluation.
 DOMAIN_HEURISTICS_ENABLED = bool(int(os.getenv("DOMAIN_HEURISTICS_ENABLED", "1")))
@@ -1418,6 +1438,9 @@ AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS = {
     "number": set(_env_json_list("AGENT_COLUMN_SUFFIX_NUMBER_TERMS", ["number", "numbers", "id", "ids", "code", "codes", "nomor", "kode", "no"])),
     "code": set(_env_json_list("AGENT_COLUMN_SUFFIX_CODE_TERMS", ["code", "codes", "id", "ids", "number", "numbers", "nomor", "kode", "no"])),
     "id": set(_env_json_list("AGENT_COLUMN_SUFFIX_ID_TERMS", ["id", "ids", "number", "numbers", "code", "codes", "nomor", "kode", "no"])),
+    "description": set(_env_json_list("AGENT_COLUMN_SUFFIX_DESCRIPTION_TERMS", ["description", "descriptions", "detail", "details", "desc", "text"])),
+    "detail": set(_env_json_list("AGENT_COLUMN_SUFFIX_DETAIL_TERMS", ["detail", "details", "description", "descriptions", "desc", "text"])),
+    "text": set(_env_json_list("AGENT_COLUMN_SUFFIX_TEXT_TERMS", ["text", "description", "descriptions", "detail", "details", "desc"])),
 }
 
 AGENT_COLUMN_STOP_TOKENS = set(
