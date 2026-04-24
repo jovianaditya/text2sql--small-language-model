@@ -1004,7 +1004,7 @@ HELPERS_PROBE_LOCALIZED_METRIC_TERMS = set(
 HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS = set(
     _env_json_list(
         "HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS",
-        ["msrp", "list price", "retail price", "catalog price"],
+        ["msrp", "list price"],
     )
 )
 
@@ -1018,7 +1018,7 @@ HELPERS_SEMANTIC_ALIAS_LISTPRICE_EXCLUDE_TERMS = set(
 HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS = set(
     _env_json_list(
         "HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS",
-        ["unit price", "selling price", "deal price", "sale price", "sales price"],
+        ["unit price"],
     )
 )
 
