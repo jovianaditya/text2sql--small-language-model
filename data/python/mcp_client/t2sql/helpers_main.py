@@ -43,6 +43,7 @@ from .config import (
     HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS,
     HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS,
     HELPERS_WINNER_ROW_GENERIC_OBJECT_TERMS,
+    AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS,
 )
 from .schema_analyzer import (
     get_transaction_tables,
@@ -82,6 +83,7 @@ from .helpers_core import (
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
     _canonicalize_single_computed_group_by_expression,
+    _ensure_unique_output_column_labels,
     _drop_unrequested_secondary_self_join_identifier_columns,
     _rewrite_missing_ordered_lookup_join,
     _simplify_same_expression_group_threshold_subquery,
@@ -92,6 +94,7 @@ from .helpers_core import (
     _rewrite_null_conditional_count_to_date_comparison,
     _rewrite_comparison_count_metrics,
     _rewrite_conditional_sum_value_to_count,
+    _rewrite_existence_sum_to_distinct_entity_count,
     _prefer_conditional_count_final_order,
     _normalize_alias_lengths,
     # phase 4
@@ -108,7 +111,10 @@ from .helpers_core import (
     _sanitize_order_by_alias_assignment,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
+    _rewrite_missing_metric_join_for_unqualified_rollup,
+    _rewrite_missing_metric_join_for_unqualified_setop_rollup,
     _rewrite_missing_joined_agg_threshold_filter,
+    _rewrite_average_ratio_to_sum_over_distinct_count,
     _rewrite_missing_overall_avg_having,
     _rewrite_employee_latest_payment_customer_identity,
     _drop_tuple_in_filter_from_include_zero_ranked_winner,
@@ -136,9 +142,9 @@ from .helpers_core import (
     _add_missing_count_for_group_by,
     # phase 5 — Pattern, REGEXP, and Predicate Normalization
     _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _canonicalize_structural_regex, _canonicalize_boundary_regex, _guardrail_fix_mysql_regexp_literals,
-    _rewrite_regex_filter_to_case_bucket,
+    _rewrite_regex_filter_to_case_bucket, _rewrite_half_open_between_bounds,
     # phase 6
-    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _inject_not_shipped_null_predicate, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
+    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _inject_not_shipped_null_predicate, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _strip_redundant_distinct_in_in_not_in_subqueries, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
     _ast_guardrails,
     # phase 7
     _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes, _strip_empty_string_comparison_on_non_text, _drop_raw_column_covered_by_function
@@ -2631,9 +2637,19 @@ def _build_join_key_hints_for_prompt(
     question = state.get("question", "") or ""
     ctx = state.get("context", "") or ""
     ranked_cols = state.get("ranked_cols", []) or []
-    router_tables = [str(t).strip().lower() for t in (state.get("router_tables", []) or []) if str(t).strip()]
+    router_tables_raw = [str(t).strip().lower() for t in (state.get("router_tables", []) or []) if str(t).strip()]
     primary_table = str(state.get("primary_table", "") or "").strip().lower()
 
+    if not router_tables_raw:
+        return []
+
+    router_tables = _expand_router_tables_for_join_hints(
+        question=question,
+        ranked_cols=ranked_cols,
+        router_tables=router_tables_raw,
+        ctx=ctx,
+        primary_table=primary_table,
+    )
     if not router_tables:
         return []
 
@@ -2711,6 +2727,105 @@ def _build_join_key_hints_for_prompt(
                 return edges
 
     return edges
+
+
+def _expand_router_tables_for_join_hints(
+    question: str,
+    ranked_cols: list,
+    router_tables: list,
+    ctx: str,
+    primary_table: str = "",
+) -> List[str]:
+    """
+    Expand hint table scope conservatively for prompt guidance:
+    - start from router tables
+    - add implicit tables from question-column matches
+    - ensure FK connector tables are included along shortest primary->target path
+    """
+    base_tables = [str(t).strip().lower() for t in (router_tables or []) if str(t).strip()]
+    if not base_tables:
+        return []
+
+    expanded: List[str] = []
+    seen: Set[str] = set()
+
+    def _add_table(name: str) -> None:
+        t = str(name or "").strip().lower()
+        if not t or t in seen:
+            return
+        seen.add(t)
+        expanded.append(t)
+
+    for t in base_tables:
+        _add_table(t)
+
+    try:
+        implicit_tables = sorted(
+            _find_tables_with_implicit_columns(
+                question=question,
+                ranked_cols=ranked_cols or [],
+                relevant_tables=base_tables,
+                ctx=ctx,
+            )
+        )
+    except Exception:
+        implicit_tables = []
+
+    for t in implicit_tables:
+        _add_table(t)
+
+    # Include one-hop connected tables that retrieval already kept in
+    # ALLOWED IDENTIFIERS. This improves hint completeness when router table
+    # mention is conservative but retrieval context already carries a needed
+    # supporting table.
+    try:
+        allowed_ids = _parse_allowed_identifiers(ctx)
+        allowed_tables = {
+            str(t or "").strip().lower()
+            for t in (allowed_ids or {}).keys()
+            if str(t or "").strip()
+        }
+    except Exception:
+        allowed_tables = set()
+
+    try:
+        fk_map_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_map_raw = {}
+    fk_map: Dict[str, Set[str]] = defaultdict(set)
+    for src, rels in (fk_map_raw or {}).items():
+        src_l = str(src or "").strip().lower()
+        if not src_l:
+            continue
+        for _fk_col, tgt in (rels or {}).items():
+            tgt_l = str(tgt or "").strip().lower()
+            if not tgt_l:
+                continue
+            fk_map[src_l].add(tgt_l)
+            fk_map[tgt_l].add(src_l)
+
+    if allowed_tables and fk_map:
+        current = set(expanded)
+        for cand in sorted(allowed_tables):
+            if cand in current:
+                continue
+            if any(cand in fk_map.get(base, set()) for base in current):
+                _add_table(cand)
+
+    primary = str(primary_table or "").strip().lower()
+    if not primary:
+        return expanded
+
+    # Add connector nodes so hints can represent a complete FK path.
+    targets = [t for t in list(expanded) if t != primary]
+    for target in targets:
+        path = _shortest_fk_table_path(primary, target)
+        if len(path) <= 2:
+            continue
+        for connector in path[1:-1]:
+            _add_table(connector)
+
+    return expanded
 
 
 def _order_tables_by_fk_distance(primary_table: str, tables: List[str]) -> List[str]:
@@ -2794,6 +2909,70 @@ def _should_force_required_inner_join_chain(
     return False
 
 
+def _question_has_aggregate_threshold_intent(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    has_agg_cue = bool(
+        re.search(
+            r"\b(?:count|sum|total|avg|average|mean|number\s+of)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    if not has_agg_cue:
+        return False
+    has_cmp_cue = bool(
+        re.search(
+            r"\b(?:more\s+than|over|greater\s+than|at\s+least|less\s+than|under|below|exceeds?)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    if not has_cmp_cue:
+        return False
+    return bool(re.search(r"\b(?:where|whose|having|with)\b", q, flags=re.I))
+
+
+def _should_prefer_inner_for_metric_support_table(
+    question: str,
+    table_name: str,
+    qtype: str,
+    *,
+    ctx: str = "",
+) -> bool:
+    """
+    Prompt-hint heuristic only (non-binding):
+    prefer INNER JOIN for transaction-like supporting tables when the question
+    asks aggregate threshold filtering.
+    """
+    qtype_l = str(qtype or "").strip().lower()
+    tbl_l = str(table_name or "").strip().lower()
+    if qtype_l != "aggregate" or not tbl_l:
+        return False
+    if _question_wants_include_zero(question, ctx):
+        return False
+    if not _question_has_aggregate_threshold_intent(question):
+        return False
+
+    try:
+        txn_tables = {
+            str(t or "").strip().lower()
+            for t in (get_transaction_tables() or [])
+            if str(t or "").strip()
+        }
+    except Exception:
+        txn_tables = set()
+    if tbl_l in txn_tables:
+        return True
+
+    try:
+        agg_cols = get_aggregatable_columns(tbl_l) or []
+    except Exception:
+        agg_cols = []
+    return bool(agg_cols)
+
+
 def _shortest_fk_table_path(primary_table: str, target_table: str) -> List[str]:
     primary = str(primary_table or "").strip().lower()
     target = str(target_table or "").strip().lower()
@@ -2864,6 +3043,69 @@ def _build_connector_path_rules(primary_table: str, ordered_tables: List[str]) -
             seen_rules.add(rule)
             rules.append(rule)
     return rules
+
+
+def _classify_guidance_hop_role(primary_table: str, target_table: str) -> str:
+    """
+    Classify the final FK hop used to reach target_table from primary_table.
+    Returns:
+      - "child" when target is a child/supporting table on that final hop
+      - "parent" when target is a parent/reference table on that final hop
+      - "unknown" when schema direction is unavailable or ambiguous
+    """
+    primary = str(primary_table or "").strip().lower()
+    target = str(target_table or "").strip().lower()
+    if not primary or not target or primary == target:
+        return "unknown"
+
+    path = _shortest_fk_table_path(primary, target)
+    if len(path) < 2:
+        return "unknown"
+
+    parent = str(path[-2] or "").strip().lower()
+    if not parent:
+        return "unknown"
+
+    try:
+        schema_fk = get_fk_relationships() or {}
+    except Exception:
+        return "unknown"
+
+    def _has_fk_edge(src: str, dst: str) -> bool:
+        src_l = str(src or "").strip().lower()
+        dst_l = str(dst or "").strip().lower()
+        if not src_l or not dst_l:
+            return False
+        return any(
+            str(tgt or "").strip().lower() == dst_l
+            for tgt in (schema_fk.get(src_l, {}) or {}).values()
+        )
+
+    parent_to_target = _has_fk_edge(parent, target)
+    target_to_parent = _has_fk_edge(target, parent)
+
+    if target_to_parent and not parent_to_target:
+        return "child"
+    if parent_to_target and not target_to_parent:
+        return "parent"
+    return "unknown"
+
+
+def _prefer_left_join_for_include_zero_guidance(primary_table: str, target_table: str) -> bool:
+    """
+    Prompt-hint heuristic only (non-binding):
+    when the question asks to preserve all primary rows, prefer LEFT JOIN only
+    for child/supporting branches. Keep reference/parent hops as INNER JOIN.
+    """
+    return _classify_guidance_hop_role(primary_table, target_table) == "child"
+
+
+def _prefer_inner_join_for_reference_guidance(primary_table: str, target_table: str) -> bool:
+    """
+    Prompt-hint heuristic only (non-binding):
+    prefer INNER JOIN for schema-reference hops, e.g. fact -> dimension.
+    """
+    return _classify_guidance_hop_role(primary_table, target_table) == "parent"
 
 
 def _find_tables_with_implicit_columns(
@@ -3613,9 +3855,18 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         print(f"[PROMPT DEBUG] complexity={complexity}, state provided, primary_table={primary_table}")
 
         if primary_table:
-            other_tables = state.get("router_tables", [])
-            other_tables = [t for t in other_tables if t != primary_table]
-            other_tables = _order_tables_by_fk_distance(primary_table, other_tables)
+            primary_table_l = str(primary_table or "").strip().lower()
+            if not primary_table_l:
+                primary_table_l = str(primary_table)
+            router_tables_hint = _expand_router_tables_for_join_hints(
+                question=question,
+                ranked_cols=state.get("ranked_cols", []) or [],
+                router_tables=state.get("router_tables", []) or [],
+                ctx=ctx,
+                primary_table=primary_table_l,
+            )
+            other_tables = [t for t in router_tables_hint if str(t).strip() and t != primary_table_l]
+            other_tables = _order_tables_by_fk_distance(primary_table_l, other_tables)
             requires_inner_join = _question_requires_inner_join(question, ctx)
             wants_include_zero = _question_wants_include_zero(question, ctx)
             exclusion_tables = {t for t in other_tables if _question_targets_table_exclusion(question, t)}
@@ -3633,7 +3884,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 router_tables=state.get("router_tables", []) or [],
                 ctx=ctx,
             )
-            connector_path_rules = _build_connector_path_rules(primary_table, other_tables)
+            connector_path_rules = _build_connector_path_rules(primary_table_l, other_tables)
             if wants_include_zero and exclusion_tables:
                 # Preserve include-zero semantics:
                 # if a table is explicitly in exclusion/no-data intent, do not also
@@ -3661,7 +3912,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             # useful for FK path stability, but join type can be question
             # dependent, so do not make this an unconditional hard command.
             hint_msg = (
-                f"TABLE ORDER GUIDANCE: Prefer starting with FROM {primary_table}"
+                f"TABLE ORDER GUIDANCE: Prefer starting with FROM {primary_table_l}"
             )
             if other_tables:
                 join_steps = []
@@ -3673,6 +3924,11 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                         join_steps.append(f"INNER JOIN {join_target}")
                     elif t in mixed_intent_tables:
                         join_steps.append(f"INNER JOIN {join_target}")
+                    elif (
+                        wants_include_zero
+                        and _prefer_left_join_for_include_zero_guidance(primary_table_l, join_target)
+                    ):
+                        join_steps.append(f"LEFT JOIN {join_target}")
                     elif t in exclusion_tables:
                         join_steps.append(f"LEFT JOIN {join_target}")
                     elif t in existence_tables:
@@ -3683,14 +3939,24 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                         # In exclusion+aggregate questions, non-target supporting tables
                         # are usually part of required positive slice (e.g., metric fact tables).
                         join_steps.append(f"INNER JOIN {join_target}")
+                    elif _prefer_inner_join_for_reference_guidance(primary_table_l, join_target):
+                        join_steps.append(f"INNER JOIN {join_target}")
+                    elif _should_prefer_inner_for_metric_support_table(
+                        question,
+                        join_target,
+                        qtype_l,
+                        ctx=ctx,
+                    ):
+                        join_steps.append(f"INNER JOIN {join_target}")
                     else:
                         join_steps.append(f"LEFT JOIN {join_target}")
                 hint_msg += ", then " + ", ".join(join_steps)
             if primary_reason:
                 hint_msg += f". Reason: {primary_reason}"
             hint_msg += (
-                ". Use this as schema-path guidance only; prioritize the question, "
-                "schema evidence, and requested row-preservation/exclusion semantics if they conflict."
+                ". Use this as base schema-path guidance only (it may be a partial path); "
+                "if selected metrics require additional supporting tables, extend the chain "
+                "through FK-consistent edges from JOIN KEY HINTS."
             )
 
             print(f"[PROMPT DEBUG] Adding hint: {hint_msg}")
@@ -3764,6 +4030,10 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 "JOIN PATH RULE (CRITICAL): Use the listed FK edges as an actual connected path. "
                 "Do NOT invent a direct join between two tables unless that direct FK edge is listed."
             )
+            constraints.append(
+                "PATH COMPLETENESS RULE (CRITICAL): Treat table-order guidance as the starting path, not always the full path. "
+                "If a requested metric runs at a finer grain than current joins, add the missing FK-connected supporting table(s) before aggregating."
+            )
 
     # [E] REPORTING/AGGREGATION RULES
     # Skip aggregation rules for winner-row queries (they use ROW_NUMBER, not GROUP BY)
@@ -3789,6 +4059,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "   - For month filtering: Use `MONTH(date_column) = M`.\n"
         "   - For range filtering: Use `date_column BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`."
     )
+    if any(re.search(pat, question, flags=re.I) for pat in AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS if pat):
+        constraints.append(
+            "RANGE BOUNDARY RULE (CRITICAL): If the question says a range is 'between X and less than Y' "
+            "or otherwise makes the upper bound exclusive, do NOT use BETWEEN X AND Y because SQL BETWEEN is inclusive. "
+            "Use `column >= X AND column < Y` for that bucket/filter."
+        )
     constraints.append(
         "JOIN ALIAS RULE (CRITICAL): In each JOIN ... ON clause, only reference aliases that are already introduced "
         "(current table alias + previously joined aliases). NEVER reference a future alias."
@@ -4330,6 +4606,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _drop_unrequested_difference_operand_columns(s, question, ctx)
     s = _prune_non_primary_dimensions_for_primary_aggregate(s, question, ctx)
     s = _drop_redundant_raw_name_columns_when_concat_present(s, question)
+    s = _ensure_unique_output_column_labels(s)
     s = _expand_group_by_aliases_regex(s)
     s = _canonicalize_single_computed_group_by_expression(s)
     s = _simplify_same_expression_group_threshold_subquery(s)
@@ -4622,11 +4899,17 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after metric-agg-column fix:", s)
 
+        s = _rewrite_missing_metric_join_for_unqualified_rollup(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after unqualified metric-join fix:", s)
+
         s = _rewrite_missing_joined_agg_threshold_filter(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after joined-agg threshold fix:", s)
 
         s = _rewrite_missing_overall_avg_having(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after overall-avg baseline fix:", s)
+
+        s = _rewrite_average_ratio_to_sum_over_distinct_count(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after avg-ratio rollup fix:", s)
 
         s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after include-zero winner-row id-source fix:", s)
@@ -4710,6 +4993,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_conditional_sum_value_to_count(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after conditional-count sum fix: {s}")
 
+        s = _rewrite_existence_sum_to_distinct_entity_count(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after existence distinct-count fix: {s}")
+
         s = _prefer_conditional_count_final_order(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after conditional-count order fix: {s}")
 
@@ -4774,14 +5060,23 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             s = _fix_winner_row_window_order_priority(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after winner-row window order fix: {s}")
 
+            s = _rewrite_missing_metric_join_for_unqualified_rollup(s, question, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after unqualified metric-join fix: {s}")
+
             s = _rewrite_missing_joined_agg_threshold_filter(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after joined-agg threshold fix: {s}")
 
             s = _rewrite_missing_overall_avg_having(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after overall-avg baseline fix: {s}")
 
+            s = _rewrite_average_ratio_to_sum_over_distinct_count(s, question, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after avg-ratio rollup fix: {s}")
+
             s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after include-zero winner-row id-source fix: {s}")
+
+            s = _rewrite_existence_sum_to_distinct_entity_count(s, question, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after existence distinct-count fix: {s}")
 
             s = _repair_invalid_year_filter_via_fk_bridge(s, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after invalid YEAR alias repair: {s}")
@@ -4808,6 +5103,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _canonicalize_structural_regex(s, question)
         s = _rewrite_regex_filter_to_case_bucket(s, question, ctx)
         s = _guardrail_fix_mysql_regexp_literals(s)
+    s = _rewrite_half_open_between_bounds(s, question)
     # ---------------------------------------------------------------------------
     # Phase 6 — NULL / DISTINCT / Result Cardinality Policies
     # ---------------------------------------------------------------------------
@@ -4819,8 +5115,10 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _ensure_reasonable_distinct(s, question)
     s = _ensure_reasonable_count_distinct(s, question)
     s = _drop_redundant_group_by_for_distinct_lookup(s)
+    s = _strip_redundant_distinct_in_in_not_in_subqueries(s)
     s = _rewrite_case_split_to_union(s, question)
     s = _normalize_simple_set_operation_branches(s, question)
+    s = _rewrite_missing_metric_join_for_unqualified_setop_rollup(s, question, ctx)
     s = _rewrite_union_case_label_to_literal_branches(s, question)
     s = _rewrite_concat_label_union(s, question)
     s = _enforce_set_operation_operator_from_question(s, question)

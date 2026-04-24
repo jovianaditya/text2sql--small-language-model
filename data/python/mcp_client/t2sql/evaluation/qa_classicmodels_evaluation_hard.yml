@@ -498,3 +498,53 @@ cases:
         JOIN employees AS m ON m.employeeNumber = e.reportsTo
         JOIN offices AS o ON o.officeCode = e.officeCode
         ORDER BY office_city ASC, e.employeeNumber ASC;
+    - id: H26
+      difficulty: hard
+      question: "Find customers who have placed more than 3 orders and whose average order value exceeds 30000, where average order value is the total revenue across all order lines divided by number of orders. Return the customer number, customer name, total number of orders, and average order value. Sort by average order value descending, then customer number ascending."
+      groundtruth_sql: |
+        SELECT
+          c.customerNumber,
+          c.customerName,
+          COUNT(DISTINCT o.orderNumber) AS total_orders,
+          SUM(od.quantityOrdered * od.priceEach) / COUNT(DISTINCT o.orderNumber) AS avg_order_value
+        FROM customers AS c
+        JOIN orders AS o ON o.customerNumber = c.customerNumber
+        JOIN orderdetails AS od ON od.orderNumber = o.orderNumber
+        GROUP BY c.customerNumber, c.customerName
+        HAVING
+          COUNT(DISTINCT o.orderNumber) > 3
+          AND SUM(od.quantityOrdered * od.priceEach) / COUNT(DISTINCT o.orderNumber) > 30000
+        ORDER BY avg_order_value DESC, c.customerNumber ASC;
+    - id: H27
+      difficulty: hard
+      question: "Classify all ordered products into three price tiers based on MSRP: 'Budget' if less than 50, 'Mid-range' if between 50 and less than 100, and 'Premium' if 100 or above. For each tier, return the tier label, number of distinct products, total quantity ordered, and average MSRP rounded to 2 decimal places. Sort by average MSRP ascending."
+      groundtruth_sql: |
+        SELECT
+          CASE
+            WHEN p.MSRP < 50  THEN 'Budget'
+            WHEN p.MSRP < 100 THEN 'Mid-range'
+            ELSE 'Premium'
+          END AS price_tier,
+          COUNT(DISTINCT p.productCode) AS product_count,
+          SUM(od.quantityOrdered) AS total_quantity_ordered,
+          ROUND(AVG(p.MSRP), 2) AS avg_msrp
+        FROM products AS p
+        JOIN orderdetails AS od ON od.productCode = p.productCode
+        GROUP BY price_tier
+        ORDER BY avg_msrp ASC;
+    - id: H28
+      difficulty: hard
+      question: "For each product line, return the product line name, total number of products in that line, and the number of those products that have ever been ordered. Include all product lines even if none of their products have been ordered. Sort by total products descending, then product line ascending."
+      groundtruth_sql: |
+        SELECT
+          pl.productLine,
+          COUNT(p.productCode) AS total_products,
+          SUM(CASE WHEN od.productCode IS NOT NULL THEN 1 ELSE 0 END) AS ordered_products
+        FROM productlines AS pl
+        JOIN products AS p ON p.productLine = pl.productLine
+        LEFT JOIN (
+          SELECT DISTINCT productCode
+          FROM orderdetails
+        ) AS od ON od.productCode = p.productCode
+        GROUP BY pl.productLine
+        ORDER BY total_products DESC, pl.productLine ASC;

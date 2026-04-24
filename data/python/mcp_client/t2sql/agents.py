@@ -119,6 +119,7 @@ from .config import (
     AGENT_ROUTER_ESCALATE_ON_WINDOW_AGGREGATE,
     AGENT_ROUTER_ESCALATE_ON_EXPLICIT_RANK,
     AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT,
+    AGENT_ROUTER_ESCALATE_ON_INCLUDE_ZERO_AGGREGATE,
     AGENT_ROUTER_SUBQUERY_INTENT_PATTERN,
     AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B,
     AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES,
@@ -138,6 +139,7 @@ from .config import (
     AGENT_DRAFT_LIMIT_NULL_ZERO_PATTERN,
     AGENT_DRAFT_LIMIT_CAPTURE_PATTERN,
     AGENT_DRAFT_LIMIT_REMOVE_PATTERN,
+    AGENT_CASE_BUCKET_AGGREGATE_REQUEST_PATTERN,
     AGENT_DRAFT_LIMIT_INTENT_TERMS,
     AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS,
     AGENT_KEEP_ALIVE_PARSE_PATTERN,
@@ -2025,10 +2027,16 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         out_sql = fixed
         corrections.append("Semantic contract: repaired near-miss output alias reference")
 
-    fixed = _ensure_group_by_for_non_agg(out_sql)
-    if fixed != out_sql:
-        out_sql = fixed
-        corrections.append("Semantic contract: added missing GROUP BY for non-aggregate select")
+    has_set_operation = bool(
+        re.search(r"\b(?:UNION(?:\s+ALL)?|INTERSECT|EXCEPT)\b", out_sql, flags=re.I)
+    )
+    # GROUP-BY backfill is unsafe on set-operation chains because each branch
+    # is a full SELECT unit; applying a flat rewrite can corrupt branch tails.
+    if not has_set_operation:
+        fixed = _ensure_group_by_for_non_agg(out_sql)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: added missing GROUP BY for non-aggregate select")
 
     if contract["requires_projection_distinct"]:
         fixed = _enforce_set_operation_operator_from_question(out_sql, question)
@@ -4493,6 +4501,11 @@ def router_agent(state: RAGState) -> RAGState:
             or has_relative_existence_detail
         )
     )
+    has_include_zero_aggregate_intent = bool(
+        is_multi_table
+        and has_grouping
+        and _question_wants_include_zero(question_raw, ctx)
+    )
     
     # ESCALATION LOGIC
     # Keep 3B for simple multi-table joins; escalate to 7B only for hard patterns.
@@ -4528,6 +4541,8 @@ def router_agent(state: RAGState) -> RAGState:
         escalation_reasons.append("latest_year_same_year_aggregate")
     if has_conditioned_subgroup_group_metric:
         escalation_reasons.append("conditioned_subgroup_group_metric")
+    if AGENT_ROUTER_ESCALATE_ON_INCLUDE_ZERO_AGGREGATE and has_include_zero_aggregate_intent:
+        escalation_reasons.append("include_zero_aggregate")
 
     # keep order, remove duplicates
     escalation_reasons = list(dict.fromkeys(escalation_reasons))
@@ -4827,8 +4842,20 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     if has_how_many or has_count_word or has_number_of_entity or has_total_number_of_entity:
         required_aggs.add("COUNT")
 
+    defines_average_as_ratio = bool(
+        re.search(r"\b(?:average|avg|mean)\b", q)
+        and re.search(r"\b(?:number|count|total\s+number)\s+of\b", q)
+        and (
+            re.search(r"\b(?:defined\s+as|where)\b[^.]{0,140}\b(?:divided\s+by|over|per)\b", q)
+            or re.search(
+                r"\b(?:divided\s+by|over|per)\s+(?:the\s+)?(?:number|count|total\s+number)\s+of\b",
+                q,
+            )
+        )
+    )
+
     # AVG intent.
-    if re.search(r"\b(average|avg|mean)\b", q):
+    if re.search(r"\b(average|avg|mean)\b", q) and not defines_average_as_ratio:
         required_aggs.add("AVG")
 
     # SUM intent:
@@ -4973,6 +5000,58 @@ def _deterministic_sql_acceptance_gate(
         verdict["reasons"].append("empty_sql")
         return verdict
 
+    def _find_top_level_kw_local(text: str, kw: str, start: int = 0) -> int:
+        target = str(kw or "").upper()
+        if not target:
+            return -1
+        t = str(text or "")
+        t_up = t.upper()
+        depth = 0
+        quote = ""
+        i = max(0, int(start))
+        while i < len(t):
+            ch = t[i]
+            if quote:
+                if ch == quote and (i == 0 or t[i - 1] != "\\"):
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and t_up.startswith(target, i):
+                prev_ok = i == 0 or not (t_up[i - 1].isalnum() or t_up[i - 1] == "_")
+                after = i + len(target)
+                next_ok = after >= len(t_up) or not (t_up[after].isalnum() or t_up[after] == "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
+
+    def _top_level_union_count_local(text: str) -> int:
+        body = str(text or "")
+        count = 0
+        idx = 0
+        while idx < len(body):
+            pos_all = _find_top_level_kw_local(body, "UNION ALL", idx)
+            pos_union = _find_top_level_kw_local(body, "UNION", idx)
+            candidates = [p for p in (pos_all, pos_union) if p >= 0]
+            if not candidates:
+                break
+            pos = min(candidates)
+            count += 1
+            idx = pos + 5
+        return count
+
     repaired_distinct_sql = _repair_misplaced_select_distinct(candidate_sql)
     if repaired_distinct_sql and repaired_distinct_sql != candidate_sql:
         candidate_sql = str(repaired_distinct_sql).strip()
@@ -4980,8 +5059,29 @@ def _deterministic_sql_acceptance_gate(
     ast_sql, ast_meta = _ast_guardrails(candidate_sql, ctx=ctx, question=question)
     if ast_meta.get("parse_ok", False):
         if ast_meta.get("fixes"):
-            verdict["ast_fixes"] = list(ast_meta.get("fixes") or [])
-            candidate_sql = ast_sql
+            original_sql = candidate_sql
+            ast_fixed_sql = str(ast_sql or "").strip()
+            original_union_cnt = _top_level_union_count_local(original_sql)
+            ast_union_cnt = _top_level_union_count_local(ast_fixed_sql)
+            original_has_setop = original_union_cnt > 0
+            original_has_group = bool(_find_top_level_kw_local(original_sql, "GROUP BY") >= 0)
+            original_has_having = bool(_find_top_level_kw_local(original_sql, "HAVING") >= 0)
+            ast_has_group = bool(_find_top_level_kw_local(ast_fixed_sql, "GROUP BY") >= 0)
+            ast_has_having = bool(_find_top_level_kw_local(ast_fixed_sql, "HAVING") >= 0)
+
+            # Keep AST fixes, except when they reshape top-level set-operation
+            # queries in a way that can corrupt branch semantics.
+            if original_has_setop and (
+                ast_union_cnt != original_union_cnt
+                or (not original_has_group and ast_has_group)
+                or (not original_has_having and ast_has_having)
+            ):
+                verdict["ast_warnings"] = list(verdict.get("ast_warnings") or []) + [
+                    "ast_fix_skipped:setop_shape_change"
+                ]
+            else:
+                verdict["ast_fixes"] = list(ast_meta.get("fixes") or [])
+                candidate_sql = ast_fixed_sql
     else:
         verdict["parse_error"] = str(ast_meta.get("error") or "parse_failed")
         verdict["reasons"].append("parse_error")
@@ -5198,6 +5298,147 @@ def _deterministic_sql_acceptance_gate(
 
             return False
 
+        child_to_parents_alias: Dict[str, Set[str]] = {}
+
+        def _record_fk_alias_edge(
+            lt_alias: str,
+            lc: str,
+            rt_alias: str,
+            rc: str,
+            lt_table: str,
+            rt_table: str,
+        ) -> None:
+            lt_alias_l = str(lt_alias or "").strip().lower()
+            rt_alias_l = str(rt_alias or "").strip().lower()
+            lc_l = str(lc or "").strip().lower()
+            rc_l = str(rc or "").strip().lower()
+            lt_table_l = str(lt_table or "").strip().lower()
+            rt_table_l = str(rt_table or "").strip().lower()
+            if not lt_alias_l or not rt_alias_l or not lc_l or not rc_l:
+                return
+            if not lt_table_l or not rt_table_l:
+                return
+            if fk_map.get(lt_table_l, {}).get(lc_l) == rt_table_l:
+                child_to_parents_alias.setdefault(lt_alias_l, set()).add(rt_alias_l)
+            if fk_map.get(rt_table_l, {}).get(rc_l) == lt_table_l:
+                child_to_parents_alias.setdefault(rt_alias_l, set()).add(lt_alias_l)
+
+        def _has_parent_path(child_alias: str, parent_alias: str) -> bool:
+            child_l = str(child_alias or "").strip().lower()
+            parent_l = str(parent_alias or "").strip().lower()
+            if not child_l or not parent_l:
+                return False
+            if child_l == parent_l:
+                return True
+            seen = {child_l}
+            queue = [child_l]
+            q_idx = 0
+            while q_idx < len(queue):
+                cur = queue[q_idx]
+                q_idx += 1
+                for nxt in child_to_parents_alias.get(cur, set()):
+                    if nxt == parent_l:
+                        return True
+                    if nxt in seen:
+                        continue
+                    seen.add(nxt)
+                    queue.append(nxt)
+            return False
+
+        def _is_top_level_expr(node: Optional["exp.Expression"]) -> bool:
+            if node is None:
+                return False
+            anc = getattr(node, "parent", None)
+            while anc is not None:
+                if anc is sel:
+                    return True
+                if isinstance(anc, exp.Subquery):
+                    return False
+                anc = getattr(anc, "parent", None)
+            return False
+
+        def _expr_aliases(expr_node: Optional["exp.Expression"]) -> Set[str]:
+            aliases: Set[str] = set()
+            if expr_node is None:
+                return aliases
+            for col in expr_node.find_all(exp.Column):
+                if _is_nested_subquery_column(col):
+                    continue
+                alias_name = str(col.table or "").strip("`").lower()
+                if alias_name:
+                    aliases.add(alias_name)
+            return aliases
+
+        def _has_safe_ratio_rollup_pattern() -> bool:
+            # Accept fanout-sensitive multi-table rollups when the SQL already
+            # expresses average-like metric as SUM(...) / COUNT(DISTINCT parent_key)
+            # over a valid FK parent chain.
+            def _is_count_distinct_node(node: "exp.Count") -> bool:
+                if not isinstance(node, exp.Count):
+                    return False
+                if bool(node.args.get("distinct")):
+                    return True
+                this_arg = node.args.get("this")
+                return isinstance(this_arg, exp.Distinct)
+
+            for div_node in sel.find_all(exp.Div):
+                if not _is_top_level_expr(div_node):
+                    continue
+
+                sum_nodes = [
+                    s for s in div_node.find_all(exp.Sum)
+                    if _is_top_level_expr(s)
+                ]
+                count_nodes = [
+                    c for c in div_node.find_all(exp.Count)
+                    if _is_top_level_expr(c) and _is_count_distinct_node(c)
+                ]
+                if not sum_nodes or not count_nodes:
+                    continue
+
+                for sum_node in sum_nodes:
+                    sum_aliases = _expr_aliases(sum_node.this)
+                    if not sum_aliases:
+                        continue
+                    for count_node in count_nodes:
+                        count_cols = [
+                            c for c in count_node.find_all(exp.Column)
+                            if not _is_nested_subquery_column(c)
+                        ]
+                        if len(count_cols) != 1:
+                            continue
+                        count_alias = str(count_cols[0].table or "").strip("`").lower()
+                        if not count_alias:
+                            continue
+                        for sum_alias in sum_aliases:
+                            if sum_alias == count_alias or _has_parent_path(sum_alias, count_alias):
+                                return True
+            return False
+
+        def _has_safe_single_branch_rollup_pattern(
+            agg_nodes: List["exp.AggFunc"],
+        ) -> bool:
+            sum_like_aliases: Set[str] = set()
+            count_aliases: Set[str] = set()
+
+            for agg in agg_nodes:
+                alias_refs = _expr_aliases(agg)
+                if not alias_refs:
+                    continue
+                if isinstance(agg, (exp.Sum, exp.Avg)):
+                    sum_like_aliases.update(alias_refs)
+                elif isinstance(agg, exp.Count):
+                    count_aliases.update(alias_refs)
+
+            if len(sum_like_aliases) != 1 or not count_aliases:
+                return False
+
+            sum_alias = next(iter(sum_like_aliases))
+            return all(
+                count_alias == sum_alias or _has_parent_path(sum_alias, count_alias)
+                for count_alias in count_aliases
+            )
+
         invalid_join_edges: List[str] = []
         joins = sel.args.get("joins") or []
         for j in joins:
@@ -5220,6 +5461,7 @@ def _deterministic_sql_acceptance_gate(
                 rt = str(alias_to_table.get(rt_alias, rt_alias))
                 if lt.startswith("__derived__:") or rt.startswith("__derived__:"):
                     continue
+                _record_fk_alias_edge(lt_alias, lc, rt_alias, rc, lt, rt)
                 eq_pairs.append((lt_alias, lc, rt_alias, rc, lt.lower(), rt.lower()))
 
             if not eq_pairs:
@@ -5281,7 +5523,8 @@ def _deterministic_sql_acceptance_gate(
                             txn_tables_in_metrics.add(c_table)
 
                 has_group_or_agg = bool(group_arg is not None or top_level_aggs)
-                if has_group_or_agg and len(txn_tables_in_metrics) >= 2:
+                safe_ratio_rollup = _has_safe_ratio_rollup_pattern()
+                if has_group_or_agg and len(txn_tables_in_metrics) >= 2 and not safe_ratio_rollup:
                     verdict["fanout_risk_tables"] = sorted(txn_tables_in_metrics)
                     verdict["reasons"].append("fanout_risk_dual_fact")
 
@@ -5306,6 +5549,8 @@ def _deterministic_sql_acceptance_gate(
         has_group_or_agg_fb = bool(group_arg is not None or top_level_aggs_fb)
         has_multi_join_fb = len(sel.args.get("joins") or []) >= 2
         if has_group_or_agg_fb and has_multi_join_fb:
+            safe_ratio_rollup_fb = _has_safe_ratio_rollup_pattern()
+            safe_single_branch_rollup_fb = _has_safe_single_branch_rollup_pattern(top_level_aggs_fb)
             agg_kinds_by_table: Dict[str, Set[str]] = {}
             for agg in top_level_aggs_fb:
                 if isinstance(agg, exp.Count):
@@ -5331,7 +5576,12 @@ def _deterministic_sql_acceptance_gate(
             if len(agg_kinds_by_table) >= 2:
                 has_count = any("COUNT" in ks for ks in agg_kinds_by_table.values())
                 has_sum_like = any(bool({"SUM", "AVG"} & ks) for ks in agg_kinds_by_table.values())
-                if has_count and has_sum_like:
+                if (
+                    has_count
+                    and has_sum_like
+                    and not safe_ratio_rollup_fb
+                    and not safe_single_branch_rollup_fb
+                ):
                     existing = set(verdict.get("fanout_risk_tables") or [])
                     existing.update(agg_kinds_by_table.keys())
                     verdict["fanout_risk_tables"] = sorted(existing)
@@ -6145,7 +6395,7 @@ def _question_has_case_bucketing_intent(question: str) -> bool:
         return False
 
     return bool(
-        re.search(r"\bcount\b", q, flags=re.I)
+        re.search(AGENT_CASE_BUCKET_AGGREGATE_REQUEST_PATTERN, q, flags=re.I)
         or re.search(r"\bhow\s+many\b", q, flags=re.I)
         or re.search(r"\bdistribution\b", q, flags=re.I)
     )
@@ -6167,6 +6417,7 @@ def _make_case_bucketing_direct_text_prompt(base_prompt: str, question: str, ctx
         "Do NOT return JSON. Do NOT return notes. Do NOT use Markdown.",
         "Use a single SELECT with CASE WHEN ... THEN ... ELSE ... END for the bucket label.",
         "Put bucket conditions inside the CASE expression, not as separate WHERE filters, unless the question explicitly asks for an additional row filter.",
+        "For ranges like 'between X and less than Y', use `col >= X AND col < Y`; do NOT use `BETWEEN X AND Y` because BETWEEN includes Y.",
         "Do NOT use UNION/UNION ALL unless the question explicitly asks to combine separate result sets.",
         "When grouping by the bucket, repeat the full CASE expression in GROUP BY instead of grouping by the alias.",
         "Include every aggregate output requested by the question, such as COUNT, MIN, MAX, SUM, or AVG.",
@@ -6197,6 +6448,7 @@ def _make_case_bucketing_ultra_minimal_prompt(question: str, ctx: str) -> str:
         "Do NOT return JSON. Do NOT return notes. Do NOT use Markdown.",
         f"Question: {str(question or '').strip()}",
         "Use CASE WHEN ... THEN ... ELSE ... END for the bucket labels.",
+        "For half-open ranges like 'between X and less than Y', use `col >= X AND col < Y`, not BETWEEN.",
         "If grouping by the bucket, repeat the full CASE expression inside GROUP BY instead of using the alias.",
         "If the question asks for counts per bucket, return the bucket label column and a COUNT(...) metric.",
         "If the question asks for descending count order, sort by COUNT(...) DESC.",
@@ -6218,6 +6470,7 @@ def _make_case_bucketing_micro_prompt(question: str, ctx: str) -> str:
         "Do NOT return JSON. Do NOT return notes. Do NOT use Markdown.",
         f"Question: {q}",
         "Use CASE WHEN ... THEN ... ELSE ... END to assign the bucket labels requested by the question.",
+        "For half-open ranges like 'between X and less than Y', use `col >= X AND col < Y`, not BETWEEN.",
         "Return exactly two outputs: the bucket label and a count metric.",
         "Repeat the full CASE expression inside GROUP BY instead of using the alias.",
         "If descending count order is requested, use ORDER BY COUNT(...) DESC.",

@@ -1682,6 +1682,9 @@ AGENT_ROUTER_ESCALATE_ON_EXCLUSION = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_O
 AGENT_ROUTER_ESCALATE_ON_WINDOW_AGGREGATE = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_ON_WINDOW_AGGREGATE", "1")))
 AGENT_ROUTER_ESCALATE_ON_EXPLICIT_RANK = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_ON_EXPLICIT_RANK", "1")))
 AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT = bool(int(os.getenv("AGENT_ROUTER_ESCALATE_ON_SUBQUERY_INTENT", "1")))
+AGENT_ROUTER_ESCALATE_ON_INCLUDE_ZERO_AGGREGATE = bool(
+    int(os.getenv("AGENT_ROUTER_ESCALATE_ON_INCLUDE_ZERO_AGGREGATE", "1"))
+)
 AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B = bool(int(os.getenv("AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B", "1")))
 AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES = int(os.getenv("AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES", "3"))
 AGENT_ROUTER_ALLOW_SIMPLE_SINGLE_TABLE_SUBQUERY_3B = bool(
@@ -1736,6 +1739,24 @@ AGENT_DRAFT_LIMIT_CAPTURE_PATTERN = os.getenv(
 AGENT_DRAFT_LIMIT_REMOVE_PATTERN = os.getenv(
     "AGENT_DRAFT_LIMIT_REMOVE_PATTERN",
     r"LIMIT\s+\d+\s*;?",
+).strip()
+
+AGENT_CASE_BUCKET_AGGREGATE_REQUEST_PATTERN = os.getenv(
+    "AGENT_CASE_BUCKET_AGGREGATE_REQUEST_PATTERN",
+    r"\b(?:count|counts|number\s+of|total\s+(?:number\s+of)?|sum|average|avg|mean|min(?:imum)?|max(?:imum)?|distinct)\b",
+).strip()
+
+AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS = _env_json_list(
+    "AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS",
+    [
+        r"\bbetween\s+([-+]?\d+(?:\.\d+)?)\s+(?:and|-|to)\s+(?:less\s+than|below|under)\s+([-+]?\d+(?:\.\d+)?)\b",
+        r"\bfrom\s+([-+]?\d+(?:\.\d+)?)\s+(?:to|through)\s+(?:less\s+than|below|under)\s+([-+]?\d+(?:\.\d+)?)\b",
+    ],
+)
+
+AGENT_SQL_NUMERIC_BETWEEN_PATTERN = os.getenv(
+    "AGENT_SQL_NUMERIC_BETWEEN_PATTERN",
+    r"(?P<expr>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s+BETWEEN\s+(?P<low>[-+]?\d+(?:\.\d+)?)\s+AND\s+(?P<high>[-+]?\d+(?:\.\d+)?)",
 ).strip()
 
 AGENT_DRAFT_LIMIT_INTENT_TERMS = _env_json_list(
