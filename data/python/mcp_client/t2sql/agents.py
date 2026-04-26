@@ -72,6 +72,7 @@ from .config import (
     AGENT_ROUTER_VALUE_RANK_TERMS,
     AGENT_ROUTER_TIME_RANK_TERMS,
     AGENT_ROUTER_EXPLICIT_RANK_PATTERNS,
+    AGENT_ROUTER_TOP_N_PER_GROUP_PATTERNS,
     AGENT_ROUTER_ORDINAL_WORDS,
     AGENT_ROUTER_ORDINAL_TARGET_TERMS,
     AGENT_ROUTER_WITHIN_SAME_PATTERN,
@@ -530,15 +531,43 @@ def _router_has_dual_fact_rollup(question: str, relevant_tables: List[str]) -> b
 
 
 def _has_winner_row_shape(sql: str) -> bool:
-    s_up = (sql or "").upper()
+    s = str(sql or "")
+    s_up = s.upper()
     if not s_up:
         return False
-    has_row_number = bool(re.search(r"\bROW_NUMBER\s*\(", s_up))
-    has_rn_filter = bool(
-        re.search(r"\bWHERE\b[^;]*\brn\s*=\s*\d+\b", s_up, flags=re.I | re.S)
-        or re.search(r"\bQUALIFY\b[^;]*\brn\s*=\s*\d+\b", s_up, flags=re.I | re.S)
+    has_rank_window = bool(re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", s_up))
+    if not has_rank_window:
+        return False
+
+    rank_aliases = {
+        "rn",
+        "rank",
+        "row_num",
+        "row_number",
+    }
+    for m_alias in re.finditer(
+        r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\([^)]*\)\s*OVER\s*\([\s\S]{0,500}?\)\s+AS\s+`?([A-Za-z_][A-Za-z0-9_]*)`?",
+        s,
+        flags=re.I | re.S,
+    ):
+        alias = (m_alias.group(1) or "").strip().lower()
+        if alias:
+            rank_aliases.add(alias)
+
+    alias_alt = "|".join(re.escape(a) for a in sorted(rank_aliases, key=len, reverse=True))
+    has_rank_filter = bool(
+        re.search(
+            rf"\bWHERE\b[^;]*\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?(?:{alias_alt})`?\s*(?:=|<=)\s*\d+\b",
+            s,
+            flags=re.I | re.S,
+        )
+        or re.search(
+            rf"\bQUALIFY\b[^;]*\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?(?:{alias_alt})`?\s*(?:=|<=)\s*\d+\b",
+            s,
+            flags=re.I | re.S,
+        )
     )
-    return has_row_number and has_rn_filter
+    return has_rank_filter
 
 
 def _has_top_level_order_by(sql: str) -> bool:
@@ -4316,6 +4345,8 @@ def router_agent(state: RAGState) -> RAGState:
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
     # ═══════════════════════════════════════════════════════════════════
     is_multi_table = len(relevant_tables) > 1
+    effective_table_scope_count = max(len(relevant_tables), len(allowed_identifiers or {}))
+    has_multi_table_scope = effective_table_scope_count > 1
     has_numeric_threshold = _question_has_numeric_threshold(question_lower)
     has_distinct_term = bool(
         re.search(r"\b(?:distinct|unique|different)\b", question_lower, flags=re.I)
@@ -4506,6 +4537,11 @@ def router_agent(state: RAGState) -> RAGState:
         and has_grouping
         and _question_wants_include_zero(question_raw, ctx)
     )
+    has_top_n_per_group_intent = bool(
+        has_multi_table_scope
+        and has_grouping
+        and any(re.search(pat, question_lower, flags=re.I | re.S) for pat in AGENT_ROUTER_TOP_N_PER_GROUP_PATTERNS)
+    )
     
     # ESCALATION LOGIC
     # Keep 3B for simple multi-table joins; escalate to 7B only for hard patterns.
@@ -4543,6 +4579,8 @@ def router_agent(state: RAGState) -> RAGState:
         escalation_reasons.append("conditioned_subgroup_group_metric")
     if AGENT_ROUTER_ESCALATE_ON_INCLUDE_ZERO_AGGREGATE and has_include_zero_aggregate_intent:
         escalation_reasons.append("include_zero_aggregate")
+    if has_top_n_per_group_intent:
+        escalation_reasons.append("top_n_per_group_multi_table")
 
     # keep order, remove duplicates
     escalation_reasons = list(dict.fromkeys(escalation_reasons))
@@ -4573,6 +4611,7 @@ def router_agent(state: RAGState) -> RAGState:
         f"SetOp:{is_set_operation_intent}, "
         f"SimpleScalarSubquery:{is_simple_scalar_subquery_single_table}, "
         f"SimpleExistsSubquery:{is_simple_exists_subquery}, "
+        f"TopNPerGroup:{has_top_n_per_group_intent}, "
         f"DualFactRollup:{has_dual_fact_rollup}"
     )
     print(f"[ROUTER] LLM Fallback Candidate: {complexity.upper()} -> {chosen_model}")
@@ -8389,12 +8428,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         and not _question_has_offset_window_sequence_intent(question)
     )
     if wants_true_winner_row and not needs_regeneration:
-        has_row_number = bool(re.search(r"\bROW_NUMBER\s*\(", sql_up))
-        has_rn_filter = bool(
-            re.search(r"\bWHERE\b[^;]*\brn\s*=\s*\d+\b", sql_up, flags=re.I | re.S)
-            or re.search(r"\bQUALIFY\b[^;]*\brn\s*=\s*\d+\b", sql_up, flags=re.I | re.S)
-        )
-        if not (has_row_number and has_rn_filter):
+        if not _has_winner_row_shape(final_sql):
             rewritten_winner_sql = _rewrite_grouped_winner_row_ranked_aggregate(final_sql, question)
             if rewritten_winner_sql != final_sql:
                 final_sql = rewritten_winner_sql

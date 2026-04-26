@@ -970,6 +970,32 @@ HELPERS_TEMPORAL_EVENT_COLUMN_TERMS = set(
     )
 )
 
+HELPERS_ZERO_FILL_OUTPUT_PATTERNS = tuple(
+    _env_json_list(
+        "HELPERS_ZERO_FILL_OUTPUT_PATTERNS",
+        [
+            r"\btreat\s+(?:it|them|missing\s+values?|no\s+\w+|nulls?)\s+as\s+0\b",
+            r"\btreat\s+(?:it|them|missing\s+values?|no\s+\w+|nulls?)\s+as\s+zero\b",
+            r"\binclude\b[\s\S]{0,100}\b(?:never|no|without)\b[\s\S]{0,140}\b(?:treat(?:ing)?|show|return)\b[\s\S]{0,40}\b(?:0|zero)\b",
+            r"\b(?:never|no|without)\b[\s\S]{0,140}\b(?:treat(?:ing)?|show|return)\b[\s\S]{0,40}\b(?:0|zero)\b",
+            r"\bif\s+(?:a|an|the)?\s*\w+\s+has\s+no\b[\s\S]{0,80}\b(?:treat|show|return)\b[\s\S]{0,40}\b(?:0|zero)\b",
+            r"\b(?:missing|no)\s+\w+\s+(?:should\s+)?(?:be|count\s+as|treated\s+as)\s+(?:0|zero)\b",
+        ],
+    )
+)
+
+HELPERS_TOP_N_PER_GROUP_PATTERNS = tuple(
+    _env_json_list(
+        "HELPERS_TOP_N_PER_GROUP_PATTERNS",
+        [
+            r"\b(?:for\s+(?:each|every)|each|every|per|within\s+each|within\s+every)\b[\s\S]{0,160}\b(?:top|bottom)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+            r"\b(?:top|bottom)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b[\s\S]{0,160}\b(?:for\s+(?:each|every)|per|within\s+each|within\s+every)\b",
+            r"\b(?:list|return|show|give)\s+(?:exactly\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b[\s\S]{0,80}\b(?:largest|smallest|highest|lowest|most|least|best|worst)\b[\s\S]{0,160}\b(?:for\s+(?:each|every)|per|within\s+each|within\s+every)\b",
+            r"\b(?:for\s+(?:each|every)|each|every|per|within\s+each|within\s+every)\b[\s\S]{0,160}\b(?:list|return|show|give)\s+(?:exactly\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b[\s\S]{0,80}\b(?:largest|smallest|highest|lowest|most|least|best|worst)\b",
+        ],
+    )
+)
+
 HELPERS_PROBE_GENERIC_METRIC_TERMS = set(
     _env_json_list(
         "HELPERS_PROBE_GENERIC_METRIC_TERMS",
@@ -1326,6 +1352,11 @@ AGENT_ROUTER_EXPLICIT_RANK_PATTERNS = _env_json_list(
         r"\brank\s+the\s+\w+\b",
         r"\branked\s+by\b",
     ],
+)
+
+AGENT_ROUTER_TOP_N_PER_GROUP_PATTERNS = _env_json_list(
+    "AGENT_ROUTER_TOP_N_PER_GROUP_PATTERNS",
+    list(HELPERS_TOP_N_PER_GROUP_PATTERNS),
 )
 
 AGENT_ROUTER_ORDINAL_WORDS = _env_json_list(

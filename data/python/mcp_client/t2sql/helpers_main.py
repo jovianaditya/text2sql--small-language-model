@@ -94,6 +94,8 @@ from .helpers_core import (
     _rewrite_null_conditional_count_to_date_comparison,
     _rewrite_comparison_count_metrics,
     _rewrite_conditional_sum_value_to_count,
+    _coalesce_zero_fill_conditional_sums,
+    _wrap_same_level_window_rank_filter,
     _rewrite_existence_sum_to_distinct_entity_count,
     _prefer_conditional_count_final_order,
     _normalize_alias_lengths,
@@ -124,6 +126,7 @@ from .helpers_core import (
     _fix_misplaced_entity_count_threshold,
     _drop_unrequested_exists_filters,
     _drop_unrequested_group_key_filters,
+    _drop_tautological_positive_count_having,
     _drop_unrequested_temporal_filters,
     _repair_unbalanced_not_exists_order_by,
     _rewrite_two_table_grouped_temporal_exclusion,
@@ -132,6 +135,8 @@ from .helpers_core import (
     _prefer_not_exists_for_simple_exclusion,
     _repair_temporal_not_exists_scope,
     _repair_invalid_year_filter_via_fk_bridge,
+    _add_having_for_required_temporal_left_join,
+    _repair_malformed_fk_join_path,
     _question_wants_latest_year_scope_with_aggregate,
     _split_top_level_and,
     _split_top_level_commas,
@@ -2774,20 +2779,6 @@ def _expand_router_tables_for_join_hints(
     for t in implicit_tables:
         _add_table(t)
 
-    # Include one-hop connected tables that retrieval already kept in
-    # ALLOWED IDENTIFIERS. This improves hint completeness when router table
-    # mention is conservative but retrieval context already carries a needed
-    # supporting table.
-    try:
-        allowed_ids = _parse_allowed_identifiers(ctx)
-        allowed_tables = {
-            str(t or "").strip().lower()
-            for t in (allowed_ids or {}).keys()
-            if str(t or "").strip()
-        }
-    except Exception:
-        allowed_tables = set()
-
     try:
         fk_map_raw = get_fk_relationships() or {}
     except Exception:
@@ -2803,14 +2794,6 @@ def _expand_router_tables_for_join_hints(
                 continue
             fk_map[src_l].add(tgt_l)
             fk_map[tgt_l].add(src_l)
-
-    if allowed_tables and fk_map:
-        current = set(expanded)
-        for cand in sorted(allowed_tables):
-            if cand in current:
-                continue
-            if any(cand in fk_map.get(base, set()) for base in current):
-                _add_table(cand)
 
     primary = str(primary_table or "").strip().lower()
     if not primary:
@@ -4993,6 +4976,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_conditional_sum_value_to_count(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after conditional-count sum fix: {s}")
 
+        s = _coalesce_zero_fill_conditional_sums(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after zero-fill conditional SUM coalesce fix: {s}")
+
         s = _rewrite_existence_sum_to_distinct_entity_count(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after existence distinct-count fix: {s}")
 
@@ -5023,6 +5009,17 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         if DEBUG_WR: print(f"[REFINER - PH4] after temporal NOT EXISTS scope repair: {s}")
         s = _repair_invalid_year_filter_via_fk_bridge(s, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after invalid YEAR alias repair: {s}")
+        s = _add_having_for_required_temporal_left_join(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after required temporal LEFT JOIN having fix: {s}")
+
+        s = _repair_malformed_fk_join_path(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after malformed FK join-path repair:", s)
+        s = _remove_redundant_and_ornamental_joins(s)
+        if DEBUG_WR: print("[REFINER - PH4] after post-repair ornamental-join cleanup:", s)
+        s = _drop_unrequested_group_key_filters(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after post-repair group-key filter drop:", s)
+        s = _drop_tautological_positive_count_having(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after post-repair tautological HAVING drop:", s)
 
         s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after grouped winner-row fallback:", s)
@@ -5030,6 +5027,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         if DEBUG_WR: print("[REFINER - PH4] after post-fallback window order fix:", s)
         s = _fix_winner_row_metric_order_priority(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after post-fallback metric priority fix:", s)
+        s = _wrap_same_level_window_rank_filter(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after same-level window-rank filter wrap:", s)
         s = _rewrite_having_alias_to_expr(s)
         s = _winner_row_final_sanity(s, question)
 
@@ -5125,6 +5124,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _strip_unneeded_count_distinct(s, question)
     s = _drop_unrequested_group_key_filters(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested group-key filter drop fix: {s}")
+    s = _drop_tautological_positive_count_having(s, question, ctx)
+    if DEBUG_WR: print(f"[REFINER - PH6] after tautological count HAVING drop fix: {s}")
     # ---------------------------------------------------------------------------
     # Phase 6.5 — Strip Hallucinated WHERE on GROUP BY Column for "For Each" Queries
     # ---------------------------------------------------------------------------

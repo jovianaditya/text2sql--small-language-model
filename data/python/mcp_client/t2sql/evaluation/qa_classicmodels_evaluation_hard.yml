@@ -548,3 +548,48 @@ cases:
         ) AS od ON od.productCode = p.productCode
         GROUP BY pl.productLine
         ORDER BY total_products DESC, pl.productLine ASC;
+    - id: H29
+      difficulty: hard
+      question: "For each customer who made at least one payment in 2003 or 2004, return the customer number, customer name, total amount paid in 2003, total amount paid in 2004, and the difference calculated as 2004 total minus 2003 total. If a customer has no payment in a given year, treat it as 0. Sort by difference descending, then customer number ascending."
+      groundtruth_sql: |
+        SELECT
+          c.customerNumber,
+          c.customerName,
+          COALESCE(SUM(CASE WHEN YEAR(p.paymentDate) = 2003 THEN p.amount ELSE 0 END), 0) AS total_2003,
+          COALESCE(SUM(CASE WHEN YEAR(p.paymentDate) = 2004 THEN p.amount ELSE 0 END), 0) AS total_2004,
+          COALESCE(SUM(CASE WHEN YEAR(p.paymentDate) = 2004 THEN p.amount ELSE 0 END), 0)
+            - COALESCE(SUM(CASE WHEN YEAR(p.paymentDate) = 2003 THEN p.amount ELSE 0 END), 0) AS difference
+        FROM customers AS c
+        LEFT JOIN payments AS p
+          ON p.customerNumber = c.customerNumber
+          AND YEAR(p.paymentDate) IN (2003, 2004)
+        GROUP BY c.customerNumber, c.customerName
+        HAVING
+          SUM(CASE WHEN YEAR(p.paymentDate) IN (2003, 2004) THEN 1 ELSE 0 END) > 0
+        ORDER BY difference DESC, c.customerNumber ASC;
+    - id: H30
+      difficulty: hard
+      question: "For each product line, list exactly two products with the largest total ordered quantity. Include products that have never been ordered by treating their ordered quantity as 0. If products have the same total ordered quantity, choose the product with the smaller product code first. Return the product line, product code, product name, total ordered quantity, and the product's position within its product line. Sort by product line ascending, then position ascending."
+      groundtruth_sql: |
+        SELECT
+          productLine,
+          productCode,
+          productName,
+          total_quantity,
+          rn AS rank_in_line
+        FROM (
+          SELECT
+            p.productLine,
+            p.productCode,
+            p.productName,
+            SUM(od.quantityOrdered) AS total_quantity,
+            ROW_NUMBER() OVER (
+              PARTITION BY p.productLine
+              ORDER BY SUM(od.quantityOrdered) DESC, p.productCode ASC
+            ) AS rn
+          FROM products AS p
+          LEFT JOIN orderdetails AS od ON od.productCode = p.productCode
+          GROUP BY p.productLine, p.productCode, p.productName
+        ) AS ranked
+        WHERE rn <= 2
+        ORDER BY productLine ASC, rn ASC;

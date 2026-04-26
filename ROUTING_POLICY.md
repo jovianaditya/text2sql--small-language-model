@@ -181,6 +181,10 @@ Exact current escalation labels:
 8. `multi_table_distinct_threshold`
 9. `set_operation`
 10. `multi_fact_rollup_fanout_risk`
+11. `latest_year_same_year_aggregate`
+12. `conditioned_subgroup_group_metric`
+13. `include_zero_aggregate`
+14. `top_n_per_group_multi_table`
 
 Operational nuance:
 
