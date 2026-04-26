@@ -10,8 +10,6 @@ data/python/mcp_client/chroma_db/
 __pycache__/
 *.py[cod]
 *$py.class
-.env
-**/.env
 *.ipynb_checkpoints
 
 **/results*.xlsx
@@ -19,3 +17,5 @@ __pycache__/
 **/evaluation_*.log
 **/.codex
 AGENTS.md
+**/hitl_review_log_*.json
+**/t2sql_result_*.csv

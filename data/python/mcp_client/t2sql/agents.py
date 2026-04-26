@@ -2583,7 +2583,12 @@ def _check_instant_reject(question: str) -> Tuple[bool, str]:
     
     # --- Check 1: Pattern-based rejection (greetings, etc) ---
     for pattern in _INSTANT_REJECT_PATTERNS:
-        if re.match(pattern, q_lower, re.IGNORECASE):
+        try:
+            is_match = re.match(pattern, q_lower, re.IGNORECASE)
+        except re.error as exc:
+            print(f"[ROUTER - GUARD] Skipping invalid reject regex {pattern!r}: {exc}")
+            continue
+        if is_match:
             return True, (
                 "This doesn't look like a data query. Please ask about your data, for example:\n"
                 + _format_example_block()

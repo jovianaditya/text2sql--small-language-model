@@ -651,14 +651,37 @@ def _doc_tokens_from_meta(meta: Dict[str, Any]) -> List[str]:
     if RETRIEVAL_META_KEYWORDS_KEY in meta:
         # Langsung pakai field 'keywords' yang sudah kaya nutrisi (sample values, aliases, dll)
         return _tokenize_bm25_query(str(meta[RETRIEVAL_META_KEYWORDS_KEY]))
+
+    # Dense exports commonly store the searchable text separately and keep
+    # table/column details under a nested metadata object.
+    if meta.get("text"):
+        return _tokenize_bm25_query(str(meta.get("text") or ""))
+
+    nested_meta = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
     
     # --- Fallback: Legacy Logic (jika jsonl belum di-update) ---
-    table = (_meta_table(meta) or "").lower()
-    column = (_meta_column(meta) or "").lower()
-    desc = str(meta.get(RETRIEVAL_META_DESCRIPTION_KEY) or "").lower()
+    table = (_meta_table(meta) or _meta_table(nested_meta) or "").lower()
+    column = (_meta_column(meta) or _meta_column(nested_meta) or "").lower()
+    desc = str(
+        meta.get(RETRIEVAL_META_DESCRIPTION_KEY)
+        or nested_meta.get(RETRIEVAL_META_DESCRIPTION_KEY)
+        or ""
+    ).lower()
 
-    aliases = _parse_str_or_list_lower(meta.get("tags_alias") or meta.get("aliases") or [])
-    roles   = _parse_str_or_list_lower(meta.get("tags_role")  or meta.get("roles")   or [])
+    aliases = _parse_str_or_list_lower(
+        meta.get("tags_alias")
+        or meta.get("aliases")
+        or nested_meta.get("tags_alias")
+        or nested_meta.get("aliases")
+        or []
+    )
+    roles   = _parse_str_or_list_lower(
+        meta.get("tags_role")
+        or meta.get("roles")
+        or nested_meta.get("tags_role")
+        or nested_meta.get("roles")
+        or []
+    )
 
     extra: List[str] = []
     has_semantic = bool(aliases or roles)
@@ -721,6 +744,8 @@ def jsonl_sparse_search(q: str, jsonl_paths: List[str], max_hits: int = SPARSE_M
                             
                             doc_id = str(doc_id_raw)
                             tokens = _doc_tokens_from_meta(item)
+                            if not tokens:
+                                continue
                             tokenized_corpus.append(tokens)
                             ids.append(doc_id)
                         continue 
@@ -740,6 +765,8 @@ def jsonl_sparse_search(q: str, jsonl_paths: List[str], max_hits: int = SPARSE_M
                 
                 doc_id = str(doc_id_raw)
                 tokens = _doc_tokens_from_meta(obj)
+                if not tokens:
+                    continue
                 tokenized_corpus.append(tokens)
                 ids.append(doc_id)
 

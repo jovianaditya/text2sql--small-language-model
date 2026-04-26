@@ -15,6 +15,7 @@ import os
 import glob
 import json
 import re
+import ast
 from pathlib import Path
 
 
@@ -33,6 +34,14 @@ def _env_json_list(name: str, default: list[str]) -> list[str]:
 
     try:
         parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            items = [str(x).strip() for x in parsed if str(x).strip()]
+            return items or default
+    except Exception:
+        pass
+
+    try:
+        parsed = ast.literal_eval(raw)
         if isinstance(parsed, list):
             items = [str(x).strip() for x in parsed if str(x).strip()]
             return items or default
@@ -168,6 +177,18 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "180s")  # keep_alive 90s, mo
 ROUTING_MODEL     = os.getenv("ROUTING_MODEL", "qwen2.5:1.5b-instruct").strip()
 SMALL_MODEL       = os.getenv("SMALL_MODEL", "qwen2.5:3b-instruct").strip()
 LARGE_MODEL       = os.getenv("LARGE_MODEL", "qwen2.5:7b-instruct").strip()
+# Optional post-failure Human-in-the-Loop review for REPL execution failures.
+HITL_ENABLED      = bool(int(os.getenv("HITL_ENABLED", "1")))
+HITL_LOG_FILENAME_PREFIX = os.getenv("HITL_LOG_FILENAME_PREFIX", "hitl_review_log").strip()
+HITL_LOG_PATH     = os.getenv("HITL_LOG_PATH", str(_APP_ROOT / "t2sql" / "reports")).strip()
+HITL_SUCCESS_REVIEW_ENABLED = bool(int(os.getenv("HITL_SUCCESS_REVIEW_ENABLED", "1")))
+CSV_EXPORT_DIR = os.getenv("CSV_EXPORT_DIR", os.getenv("HITL_CSV_EXPORT_DIR", "hitl_exports")).strip()
+CSV_EXPORT_FILENAME_PREFIX = os.getenv("CSV_EXPORT_FILENAME_PREFIX", "t2sql_result").strip()
+HITL_TEST_FORCE_FAILURE = bool(int(os.getenv("HITL_TEST_FORCE_FAILURE", "0")))
+HITL_GENERATED_ERROR_SQL_PATTERN = os.getenv(
+    "HITL_GENERATED_ERROR_SQL_PATTERN",
+    r"^\s*SELECT\s+['\"]Error:",
+).strip()
 # LLM generation budget knobs (speed vs robustness tuning)
 # Keep JSON-mode budget conservative by default; raise via env only when needed.
 LLM_JSON_NUM_PREDICT = int(os.getenv("LLM_JSON_NUM_PREDICT", "512"))

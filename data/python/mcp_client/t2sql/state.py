@@ -65,6 +65,11 @@ class RAGState(TypedDict, total=False):
     validation_errors: List[str]
     # Ringkasan apa saja yang dikoreksi Agent 2 (join/regex/whitelist)
     critic_feedback: str
+    # Optional post-failure Human-in-the-Loop review telemetry
+    execution_error: Dict[str, Any]
+    hitl_used: bool
+    hitl_action: str
+    hitl_feedback: str
     # Benchmark policy / audit trail
     group_by_policy: str
     group_by_added_exprs: List[str]
@@ -123,6 +128,10 @@ def make_state(
         "agent_notes": "",
         "validation_errors": [],
         "critic_feedback": "",
+        "execution_error": {},
+        "hitl_used": False,
+        "hitl_action": "",
+        "hitl_feedback": "",
         # Benchmark policy / audit trail
         "group_by_policy": "explicit_select_cols",
         "group_by_added_exprs": [],
