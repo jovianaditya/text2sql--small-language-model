@@ -86,6 +86,7 @@ from .helpers_core import (
     _ensure_unique_output_column_labels,
     _drop_unrequested_secondary_self_join_identifier_columns,
     _rewrite_missing_ordered_lookup_join,
+    _rewrite_ordered_quantity_stock_aggregate,
     _simplify_same_expression_group_threshold_subquery,
     _simplify_group_key_count_threshold_subquery,
     _drop_unrequested_schema_named_count_outputs,
@@ -3437,7 +3438,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if c == "*" and agg != "COUNT":
                 continue
             if agg:
-                met_strs.append(f"{agg}({t}.{c})")
+                distinct_kw = "DISTINCT " if agg == "COUNT" and bool(m.get("distinct")) else ""
+                met_strs.append(f"{agg}({distinct_kw}{t}.{c})")
         if met_strs:
             parts.append(f"Metrics: {', '.join(met_strs)}")
             has_structural = True
@@ -4583,6 +4585,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _ensure_entity_id_and_name_if_requested(s, question)
     s = _ensure_explicit_simple_projection_columns(s, question, ctx)
     s = _rewrite_missing_ordered_lookup_join(s, question, ctx)
+    s = _rewrite_ordered_quantity_stock_aggregate(s, question, ctx)
     s = _drop_unrequested_secondary_self_join_identifier_columns(s, question, ctx)
     s = _align_requested_description_variant(s, question, ctx)
     s = _align_requested_joined_description_variant(s, question, ctx)

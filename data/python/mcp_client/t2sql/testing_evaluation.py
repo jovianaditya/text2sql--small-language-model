@@ -35,7 +35,24 @@ import httpx
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .config import MCP_BASE, CHROMA_DIR, COLLECTION_NAME, JSON_INPUT, OLLAMA_URL, ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL, OLLAMA_KEEP_ALIVE, format_heuristic_observability
+from .config import (
+    MCP_BASE,
+    CHROMA_DIR,
+    COLLECTION_NAME,
+    JSON_INPUT,
+    OLLAMA_URL,
+    ROUTING_MODEL,
+    SMALL_MODEL,
+    LARGE_MODEL,
+    ROUTING_MODEL_P2,
+    SMALL_MODEL_P2,
+    LARGE_MODEL_P2,
+    ROUTING_MODEL_P3,
+    SMALL_MODEL_P3,
+    LARGE_MODEL_P3,
+    OLLAMA_KEEP_ALIVE,
+    format_heuristic_observability,
+)
 from .state import make_state
 from .graph import build_app
 from .mcp_execution import query_db_full, _mcp_call  # Pakai FULL query tanpa LIMIT dan _mcp_call helper
@@ -81,52 +98,72 @@ def resolve_scenario_config(scenario: str | None) -> tuple[str, dict]:
     """
     Resolve thesis evaluation scenario presets.
 
-    B1:
-      - LLM-only single-shot
-      - no RAG / retrieval
-      - no intent IR
-      - no adaptive multi-model
-      - no multi-agent refinement
-      - force 7B
-
-    B2:
-      - single-shot with RAG
-      - no intent IR
-      - no adaptive multi-model
-      - no multi-agent refinement
-      - force 7B
-
-    P:
+    P1/P2/P3:
       - current full system
+      - differs only by router/small/large model family
     """
-    name = str(scenario or "P").strip().upper() or "P"
+    name = str(scenario or "P1").strip().upper() or "P1"
+    base_flags = {
+        "rag_enabled": True,
+        "intent_ir_enabled": True,
+        "multi_agent_enabled": True,
+        "adaptive_model_enabled": True,
+        "forced_model": "",
+    }
     presets = {
-        "B1": {
-            "rag_enabled": False,
-            "intent_ir_enabled": False,
-            "multi_agent_enabled": False,
-            "adaptive_model_enabled": False,
-            "forced_model": LARGE_MODEL,
+        "P1": {
+            **base_flags,
+            "routing_model": ROUTING_MODEL,
+            "small_model": SMALL_MODEL,
+            "large_model": LARGE_MODEL,
         },
-        "B2": {
-            "rag_enabled": True,
-            "intent_ir_enabled": False,
-            "multi_agent_enabled": False,
-            "adaptive_model_enabled": False,
-            "forced_model": LARGE_MODEL,
+        "P2": {
+            **base_flags,
+            "routing_model": ROUTING_MODEL_P2,
+            "small_model": SMALL_MODEL_P2,
+            "large_model": LARGE_MODEL_P2,
         },
-        "P": {
-            "rag_enabled": True,
-            "intent_ir_enabled": True,
-            "multi_agent_enabled": True,
-            "adaptive_model_enabled": True,
-            "forced_model": "",
+        "P3": {
+            **base_flags,
+            "routing_model": ROUTING_MODEL_P3,
+            "small_model": SMALL_MODEL_P3,
+            "large_model": LARGE_MODEL_P3,
         },
     }
     if name not in presets:
         valid = ", ".join(sorted(presets))
         raise ValueError(f"Unknown scenario '{name}'. Valid scenarios: {valid}")
     return name, dict(presets[name])
+
+
+def apply_scenario_models(scenario_config: dict) -> dict:
+    """
+    Activate scenario-specific model names for evaluation runtime.
+
+    agents.py imports model constants at module load time, so evaluation must
+    update both this module's warmup globals and the agents module globals.
+    """
+    global ROUTING_MODEL, SMALL_MODEL, LARGE_MODEL
+
+    routing_model = str(scenario_config.get("routing_model") or ROUTING_MODEL).strip()
+    small_model = str(scenario_config.get("small_model") or SMALL_MODEL).strip()
+    large_model = str(scenario_config.get("large_model") or LARGE_MODEL).strip()
+
+    ROUTING_MODEL = routing_model
+    SMALL_MODEL = small_model
+    LARGE_MODEL = large_model
+
+    from . import agents
+
+    agents.ROUTING_MODEL = routing_model
+    agents.SMALL_MODEL = small_model
+    agents.LARGE_MODEL = large_model
+
+    return {
+        "routing_model": routing_model,
+        "small_model": small_model,
+        "large_model": large_model,
+    }
 
 def parse_difficulty_filter(filter_spec: str | None) -> tuple[str, set[int] | None]:
     """
@@ -831,7 +868,7 @@ async def run_single_case(
     mcp: Client,
     paths: list[str],
     case: dict,
-    scenario: str = "P",
+    scenario: str = "P1",
     scenario_config: dict | None = None,
     execute_groundtruth: bool = True,
     null_zero_mode: str = "auto",
@@ -868,7 +905,7 @@ async def run_single_case(
 
     result = {
         "id": case_id,
-        "scenario": str(scenario or "P").strip().upper(),
+        "scenario": str(scenario or "P1").strip().upper(),
         "difficulty": difficulty,
         "question": question,
         "base_database": primary_db,
@@ -881,7 +918,7 @@ async def run_single_case(
         "ir_gate_reasons": "",
         "ir_hint_passed": False,
         "initial_model_used": "",  # Initial model chosen by router (3b/7b)
-        "final_model_used": "",    # Standardized route label: ir_planner | llm_3b | llm_7b
+        "final_model_used": "",    # Standardized route label: ir_planner | llm_small | llm_large
         "va_success": False,       # Valid SQL (EXPLAIN)
         "va_notes": None,          # Notes/message from VA check
         "exec_success": False,
@@ -965,38 +1002,49 @@ async def run_single_case(
         )
         target_model = str(state.get("target_model", "") or "").strip()
 
-        # Get router LLM fallback candidate (extract short name: 3b/7b)
-        if "3b" in router_model_candidate.lower():
-            result["initial_model_used"] = "3b"
-        elif "7b" in router_model_candidate.lower():
-            result["initial_model_used"] = "7b"
+        active_small_model = str((scenario_config or {}).get("small_model") or SMALL_MODEL).strip()
+        active_large_model = str((scenario_config or {}).get("large_model") or LARGE_MODEL).strip()
+
+        # Get router LLM fallback candidate by active scenario role.
+        if router_model_candidate == active_small_model:
+            result["initial_model_used"] = "small"
+        elif router_model_candidate == active_large_model:
+            result["initial_model_used"] = "large"
+        elif "3b" in router_model_candidate.lower():
+            result["initial_model_used"] = "small"
+        elif "7b" in router_model_candidate.lower() or "8b" in router_model_candidate.lower():
+            result["initial_model_used"] = "large"
         else:
             result["initial_model_used"] = router_model_candidate or "unknown"
 
         # Standardize final model/route label to match draft_source format.
         final_model = str(state.get("final_model", target_model) or "").strip()
         final_model_lower = final_model.lower()
-        if "3b" in final_model_lower:
-            result["final_model_used"] = "llm_3b"
-        elif "7b" in final_model_lower:
-            result["final_model_used"] = "llm_7b"
+        if final_model == active_small_model:
+            result["final_model_used"] = "llm_small"
+        elif final_model == active_large_model:
+            result["final_model_used"] = "llm_large"
+        elif "3b" in final_model_lower:
+            result["final_model_used"] = "llm_small"
+        elif "7b" in final_model_lower or "8b" in final_model_lower:
+            result["final_model_used"] = "llm_large"
         elif final_model_lower == "ir_planner":
             result["final_model_used"] = "ir_planner"
         elif final_model_lower == "gate_blocked":
             result["final_model_used"] = "gate_blocked"
-        elif result["initial_model_used"] == "3b":
-            result["final_model_used"] = "llm_3b"
-        elif result["initial_model_used"] == "7b":
-            result["final_model_used"] = "llm_7b"
+        elif result["initial_model_used"] == "small":
+            result["final_model_used"] = "llm_small"
+        elif result["initial_model_used"] == "large":
+            result["final_model_used"] = "llm_large"
         else:
             result["final_model_used"] = final_model or (result["draft_source"] or "unknown")
 
-        # Make draft_source explicit for LLM path (llm_3b / llm_7b),
+        # Make draft_source explicit for LLM path (llm_small / llm_large),
         # with the same label standard as final_model_used.
         if result["draft_source"] == "llm":
-            if result["final_model_used"] in {"llm_3b", "llm_7b"}:
+            if result["final_model_used"] in {"llm_small", "llm_large"}:
                 result["draft_source"] = result["final_model_used"]
-            elif result["initial_model_used"] in {"3b", "7b"}:
+            elif result["initial_model_used"] in {"small", "large"}:
                 result["draft_source"] = f"llm_{result['initial_model_used']}"
             else:
                 result["draft_source"] = "llm"
@@ -1266,13 +1314,13 @@ def resolve_warmup_targets(warmup_models_spec: str | None) -> list[tuple[str, st
     Unknown tokens raise ValueError so the caller gets a clear CLI failure.
     """
     available_targets = {
-        "router": (ROUTING_MODEL, "Router (1.5b)"),
-        "small": (SMALL_MODEL, "Simple SQL (3b)"),
-        "3b": (SMALL_MODEL, "Simple SQL (3b)"),
-        "simple": (SMALL_MODEL, "Simple SQL (3b)"),
-        "large": (LARGE_MODEL, "Complex SQL (7b)"),
-        "7b": (LARGE_MODEL, "Complex SQL (7b)"),
-        "complex": (LARGE_MODEL, "Complex SQL (7b)"),
+        "router": (ROUTING_MODEL, "Router"),
+        "small": (SMALL_MODEL, "Simple SQL"),
+        "3b": (SMALL_MODEL, "Simple SQL"),
+        "simple": (SMALL_MODEL, "Simple SQL"),
+        "large": (LARGE_MODEL, "Complex SQL"),
+        "7b": (LARGE_MODEL, "Complex SQL"),
+        "complex": (LARGE_MODEL, "Complex SQL"),
     }
     default_order = ["router", "small", "large"]
 
@@ -1367,7 +1415,7 @@ async def run_batch_eval(
     testset_path: str,
     output_path: str | None = None,
     paths: list[str] | None = None,
-    scenario: str = "P",
+    scenario: str = "P1",
     execute_groundtruth: bool = True,
     skip_warmup: bool = False,
     warmup_models_spec: str | None = None,
@@ -1393,6 +1441,8 @@ async def run_batch_eval(
         base_database: Database used for VA/EX only.
     """
     scenario_name, scenario_config = resolve_scenario_config(scenario)
+    active_models = apply_scenario_models(scenario_config)
+    scenario_config.update(active_models)
     print(f"Scenario: {scenario_name} -> {scenario_config}")
 
     # Load test cases
@@ -1522,11 +1572,11 @@ async def run_batch_eval(
     ir_used_count = sum(1 for r in results if bool(r.get("ir_used", False)))
     ir_hint_passed_count = sum(1 for r in results if bool(r.get("ir_hint_passed", False)))
     llm_fallback_count = total - ir_used_count
-    final_3b_count = sum(
-        1 for r in results if str(r.get("final_model_used", "")).strip().lower() == "llm_3b"
+    final_small_count = sum(
+        1 for r in results if str(r.get("final_model_used", "")).strip().lower() == "llm_small"
     )
-    final_7b_count = sum(
-        1 for r in results if str(r.get("final_model_used", "")).strip().lower() == "llm_7b"
+    final_large_count = sum(
+        1 for r in results if str(r.get("final_model_used", "")).strip().lower() == "llm_large"
     )
 
     # Metrics by difficulty
@@ -1571,8 +1621,8 @@ async def run_batch_eval(
         f"IR hint passed={ir_hint_passed_count}/{llm_fallback_count}"
     )
     print(
-        f"Model Usage (Final): 3B={final_3b_count}/{total} ({100*final_3b_count/total:.1f}%), "
-        f"7B={final_7b_count}/{total} ({100*final_7b_count/total:.1f}%)"
+        f"Model Usage (Final): small={final_small_count}/{total} ({100*final_small_count/total:.1f}%), "
+        f"large={final_large_count}/{total} ({100*final_large_count/total:.1f}%)"
     )
 
     print("\nBy Difficulty:")
@@ -1703,13 +1753,11 @@ Examples:
     )
     parser.add_argument(
         "--scenario",
-        choices=["B1", "B2", "P", "b1", "b2", "p"],
-        default="P",
+        choices=["P1", "P2", "P3", "p1", "p2", "p3"],
+        default="P1",
         help=(
             "Evaluation scenario preset: "
-            "B1=LLM-only 7B single-shot without RAG/IR/multi-agent/adaptive-model, "
-            "B2=7B single-shot with RAG but without IR/multi-agent/adaptive-model, "
-            "P=full current system."
+            "P1=qwen2.5, P2=qwen2.5-coder, P3=llama."
         ),
     )
     parser.add_argument(
@@ -1831,7 +1879,7 @@ Examples:
             testset_path=args.testset,
             output_path=args.output,
             execute_groundtruth=not args.no_groundtruth_exec,
-            scenario=str(args.scenario or "P").upper(),
+            scenario=str(args.scenario or "P1").upper(),
             skip_warmup=args.skip_warmup,
             warmup_models_spec=args.warmup_models,
             difficulty_filters=difficulty_filters if difficulty_filters else None,

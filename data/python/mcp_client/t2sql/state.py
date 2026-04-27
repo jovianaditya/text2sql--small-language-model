@@ -81,13 +81,13 @@ def make_state(
     paths,
     question: str,
     *,
-    scenario: str = "P",
+    scenario: str = "P1",
     scenario_config: Dict[str, Any] | None = None,
 ) -> RAGState:
     return {
         "jsonl_paths": paths,
         "question": question,
-        "scenario": str(scenario or "P").strip().upper(),
+        "scenario": str(scenario or "P1").strip().upper(),
         "scenario_config": dict(scenario_config or {}),
         "added": 0,
         "updated": 0,

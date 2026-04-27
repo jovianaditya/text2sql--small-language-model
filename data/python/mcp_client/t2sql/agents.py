@@ -3517,6 +3517,26 @@ def router_agent(state: RAGState) -> RAGState:
             and not non_fk_mentioned
             and neighbor_count_in_relevant <= 1
         ):
+            covering_child_lowers: List[str] = []
+            for other_tbl in relevant_tables:
+                other_lower = other_tbl.lower()
+                if other_lower == tbl_lower:
+                    continue
+                for col in _get_table_cols(other_tbl):
+                    col_lower = str(col).lower()
+                    if (table_id_col and col_lower == table_id_col) or _is_conventional_fk_name(table_singular, col_lower):
+                        covering_child_lowers.append(other_lower)
+                        break
+
+            for child_lower in dict.fromkeys(covering_child_lowers):
+                evidence_tables.add(child_lower)
+                child_evidence = evidence_details.setdefault(child_lower, [])
+                if AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT not in child_evidence:
+                    child_evidence.append(AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT)
+                if RETRIEVE_DEBUG:
+                    print(
+                        f"[ROUTER] Promoting {child_lower}: aggregate support for {tbl_lower}"
+                    )
             tables_to_remove.append(tbl_lower)
             if RETRIEVE_DEBUG:
                 print(
@@ -4235,6 +4255,45 @@ def router_agent(state: RAGState) -> RAGState:
     if RETRIEVE_DEBUG:
         print(f"[ROUTER] Primary Table: {primary_table} (reason: {primary_reason})")
 
+    def _detect_router_exclusion(is_multi_table_context: bool) -> bool:
+        # Exclusion detection - only trigger for TRUE exclusion patterns.
+        # These patterns imply NOT EXISTS / NOT IN / LEFT JOIN ... IS NULL (cross-table exclusion)
+        # NOT triggered by: "missing" in single-table context (just IS NULL check)
+        cross_table_exclusion = _active_router_cross_table_exclusion_terms(question_lower)
+        if any(_has_router_phrase_term(question_lower, kw) for kw in cross_table_exclusion):
+            return True
+
+        # "no" + entity noun (dynamic, schema-driven) implies cross-table exclusion.
+        entity_terms = set()
+        for tbl in whitelisted_tables:
+            for v in _table_name_variants(tbl):
+                entity_terms.add(re.escape(v).replace(r"\ ", r"\s+"))
+
+        if entity_terms:
+            entity_pattern = "|".join(sorted(entity_terms, key=len, reverse=True))
+            if re.search(rf"\bno\s+(?:{entity_pattern})\b", question_lower):
+                return True
+
+        # "missing" or "empty" only implies exclusion in multi-table context.
+        return bool(
+            is_multi_table_context
+            and re.search(AGENT_ROUTER_MISSING_EMPTY_PATTERN, question_lower)
+        )
+
+    has_exclusion = _detect_router_exclusion(len(relevant_tables) > 1)
+
+    # Subquery intent cues (e.g., compare against average/overall baseline, EXISTS wording).
+    # This is intentionally lightweight and only used for escalation policy.
+    has_global_avg_baseline = _question_has_global_avg_baseline_compare(question_lower)
+    is_subquery_intent = bool(
+        re.search(AGENT_ROUTER_SUBQUERY_INTENT_PATTERN, question_lower)
+        or has_global_avg_baseline
+    )
+    has_complex_subquery_cue = bool(
+        re.search(AGENT_ROUTER_COMPLEX_SUBQUERY_CUE_PATTERN, question_lower)
+    )
+    has_exists_keyword = bool(re.search(r"\b(?:exists|not\s+exists)\b", question_lower))
+
     compact_single_table_family = bool(
         primary_table
         and len(relevant_tables) > 1
@@ -4350,6 +4409,7 @@ def router_agent(state: RAGState) -> RAGState:
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
     # ═══════════════════════════════════════════════════════════════════
     is_multi_table = len(relevant_tables) > 1
+    has_exclusion = _detect_router_exclusion(is_multi_table)
     effective_table_scope_count = max(len(relevant_tables), len(allowed_identifiers or {}))
     has_multi_table_scope = effective_table_scope_count > 1
     has_numeric_threshold = _question_has_numeric_threshold(question_lower)
@@ -4404,47 +4464,6 @@ def router_agent(state: RAGState) -> RAGState:
         # row per group. Keep them in the offset-window family.
         is_winner_row = False
     
-    # FIXED: Exclusion detection - only trigger for TRUE exclusion patterns
-    # These patterns imply NOT EXISTS / NOT IN / LEFT JOIN ... IS NULL (cross-table exclusion)
-    # NOT triggered by: "missing" in single-table context (just IS NULL check)
-    has_exclusion = False
-    
-    # Pattern 1: Cross-table exclusion keywords (always need 7B)
-    cross_table_exclusion = _active_router_cross_table_exclusion_terms(question_lower)
-    if any(_has_router_phrase_term(question_lower, kw) for kw in cross_table_exclusion):
-        has_exclusion = True
-    
-    # Pattern 2: "no" + entity noun (dynamic, schema-driven) → implies cross-table
-    # Examples: "no orders", "no payments", "no customers"
-    if not has_exclusion:
-        entity_terms = set()
-        for tbl in whitelisted_tables:
-            for v in _table_name_variants(tbl):
-                entity_terms.add(re.escape(v).replace(r"\ ", r"\s+"))
-
-        if entity_terms:
-            entity_pattern = "|".join(sorted(entity_terms, key=len, reverse=True))
-            if re.search(rf"\bno\s+(?:{entity_pattern})\b", question_lower):
-                has_exclusion = True
-    
-    # Pattern 3: "missing" or "empty" ONLY if multi-table context
-    # Single-table "missing" = just IS NULL (simple, 3B can handle)
-    if not has_exclusion and is_multi_table:
-        if re.search(AGENT_ROUTER_MISSING_EMPTY_PATTERN, question_lower):
-            has_exclusion = True
-
-    # Subquery intent cues (e.g., compare against average/overall baseline, EXISTS wording).
-    # This is intentionally lightweight and only used for escalation policy.
-    has_global_avg_baseline = _question_has_global_avg_baseline_compare(question_lower)
-    is_subquery_intent = bool(
-        re.search(AGENT_ROUTER_SUBQUERY_INTENT_PATTERN, question_lower)
-        or has_global_avg_baseline
-    )
-    has_complex_subquery_cue = bool(
-        re.search(AGENT_ROUTER_COMPLEX_SUBQUERY_CUE_PATTERN, question_lower)
-    )
-    has_exists_keyword = bool(re.search(r"\b(?:exists|not\s+exists)\b", question_lower))
-
     # Keep simple single-table scalar subquery in 3B lane:
     # e.g. "creditLimit greater than the average creditLimit".
     is_simple_scalar_subquery_single_table = (

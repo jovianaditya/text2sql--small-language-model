@@ -16931,8 +16931,6 @@ def _repair_malformed_fk_join_path(sql: str, question: str, ctx: str = "") -> st
         and alias_l not in {"select", "from", "where", "group", "order", "having", "limit", "on", "and", "or"}
     }
     malformed_on_chain = bool(re.search(r"(?is)\bON\b(?:(?!\bJOIN\b).)*\bON\b", from_core))
-    if not undefined_aliases and not malformed_on_chain:
-        return sql
     undefined_in_from_core = any(
         re.search(rf"""(?is)\b`?{re.escape(alias_l)}`?\s*\.""", from_core)
         for alias_l in undefined_aliases
@@ -17047,6 +17045,73 @@ def _repair_malformed_fk_join_path(sql: str, question: str, ctx: str = "") -> st
                     return f"{right_alias}.{_case_col(right_table, fk_col)} = {left_alias}.{_case_col(left_table, target_id)}"
         return ""
 
+    def _fk_table_path(start_table: str, end_table: str, max_edges: int = 3) -> List[str]:
+        start_l = str(start_table or "").strip().lower()
+        end_l = str(end_table or "").strip().lower()
+        if not start_l or not end_l or start_l == end_l:
+            return []
+        neighbors: Dict[str, Set[str]] = {}
+        for src_l, mapping in (fk_map or {}).items():
+            for target_l in (mapping or {}).values():
+                if not src_l or not target_l:
+                    continue
+                neighbors.setdefault(src_l, set()).add(target_l)
+                neighbors.setdefault(target_l, set()).add(src_l)
+        queue: List[List[str]] = [[start_l]]
+        seen: Set[str] = {start_l}
+        while queue:
+            path = queue.pop(0)
+            if len(path) - 1 >= max_edges:
+                continue
+            for nxt in sorted(neighbors.get(path[-1], set())):
+                if nxt in seen:
+                    continue
+                new_path = path + [nxt]
+                if nxt == end_l:
+                    return new_path
+                seen.add(nxt)
+                queue.append(new_path)
+        return []
+
+    if not undefined_aliases and not malformed_on_chain:
+        # Repair a flat direct join that skips a required connector table,
+        # e.g. child.order_id = grandparent.id where child -> parent -> grandparent.
+        if len(source_pairs) == 2 and not _edge(source_pairs[0], source_pairs[1]):
+            path = _fk_table_path(source_pairs[0][1], source_pairs[1][1])
+            if len(path) > 2:
+                used_aliases = {source_pairs[0][0].lower(), source_pairs[1][0].lower()}
+
+                def _connector_alias(table_l: str) -> str:
+                    base = re.sub(r"[^A-Za-z0-9_]+", "_", table_l).strip("_") or "t"
+                    alias = base
+                    idx = 2
+                    while alias.lower() in used_aliases:
+                        alias = f"{base}_{idx}"
+                        idx += 1
+                    used_aliases.add(alias.lower())
+                    return alias
+
+                path_pairs: List[Tuple[str, str]] = [source_pairs[0]]
+                for table_l in path[1:-1]:
+                    path_pairs.append((_connector_alias(table_l), table_l))
+                path_pairs.append(source_pairs[1])
+
+                rebuilt_from = f"{path_pairs[0][1]} AS {path_pairs[0][0]}"
+                for prev, curr in zip(path_pairs, path_pairs[1:]):
+                    on_clause = _edge(prev, curr)
+                    if not on_clause:
+                        return sql
+                    rebuilt_from += f" JOIN {curr[1]} AS {curr[0]} ON {on_clause}"
+
+                rebuilt = s0[:from_pos + len("from")] + " " + rebuilt_from
+                if from_end < len(s0):
+                    rebuilt += " " + s0[from_end:].lstrip()
+                rebuilt = re.sub(r"\s{2,}", " ", rebuilt).strip()
+                if trailing and not rebuilt.endswith(";"):
+                    rebuilt += ";"
+                return rebuilt
+        return sql
+
     if undefined_aliases and not malformed_on_chain and not undefined_in_from_core:
         connected = [pair for pair in source_pairs if pair[0].strip().lower() not in inferred_aliases]
         missing = [pair for pair in source_pairs if pair[0].strip().lower() in inferred_aliases]
@@ -17105,6 +17170,136 @@ def _repair_malformed_fk_join_path(sql: str, question: str, ctx: str = "") -> st
     rebuilt = re.sub(r"\s{2,}", " ", rebuilt).strip()
     if trailing and not rebuilt.endswith(";"):
         rebuilt += ";"
+    return rebuilt
+
+
+def _rewrite_ordered_quantity_stock_aggregate(
+    sql: str,
+    question: str,
+    ctx: str = "",
+) -> str:
+    """
+    Repair aggregate queries that ask for ordered quantity but use an inventory
+    stock column from the entity table instead of the child transaction table.
+
+    The rewrite is schema-driven:
+    - base table must be a single table aggregate;
+    - a child table must FK to the base table;
+    - the child table must expose a quantity/ordered metric column.
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").lower()
+    if not s or not q:
+        return sql
+    if "join" in s.lower() or "group by" not in s.lower():
+        return sql
+    if not (
+        re.search(r"\b(?:ordered|order(?:ed)?\s+quantity|quantity\s+ordered|total\s+quantity\s+ordered)\b", q)
+        and re.search(r"\bproducts?\b", q)
+    ):
+        return sql
+    if not re.search(r"(?is)\bSUM\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*stock[A-Za-z0-9_]*`?\s*\)", s):
+        return sql
+
+    parsed = _parse_select_from_groupby(s)
+    if not parsed:
+        return sql
+    from_core = (parsed.get("from_core") or "").strip()
+    m_from = re.match(
+        r"""(?is)^`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?\s*$""",
+        from_core,
+    )
+    if not m_from:
+        return sql
+    base_table = (m_from.group("table") or "").strip().lower()
+    base_alias = (m_from.group("alias") or m_from.group("table") or "").strip()
+    if not base_table or not base_alias:
+        return sql
+
+    try:
+        analyzer = get_schema_analyzer()
+        fk_raw = get_fk_relationships() or {}
+    except Exception:
+        return sql
+
+    def _table_cols(table_l: str) -> Set[str]:
+        try:
+            return {str(c).strip("`").lower() for c in analyzer.get_table_columns(table_l) if str(c).strip()}
+        except Exception:
+            return set()
+
+    def _case_col(table_l: str, col_l: str) -> str:
+        return str(getattr(analyzer, "_column_original_case", {}).get(f"{table_l}.{col_l}", col_l))
+
+    def _terms(text: str) -> Set[str]:
+        return {tok for tok in re.split(r"[^a-z0-9]+", str(text or "").lower()) if tok}
+
+    child_candidates: List[Tuple[int, str, str, str]] = []
+    for child_table_raw, mapping in (fk_raw or {}).items():
+        child_table = str(child_table_raw or "").strip().lower()
+        for fk_col_raw, target_raw in (mapping or {}).items():
+            fk_col = str(fk_col_raw or "").strip().lower()
+            target = str(target_raw or "").strip().lower()
+            if target != base_table or not fk_col:
+                continue
+            for col_l in _table_cols(child_table):
+                col_terms = _terms(col_l)
+                try:
+                    col_terms.update(_terms(get_column_description(child_table, col_l)))
+                except Exception:
+                    pass
+                has_quantity_signal = (
+                    "quantity" in col_terms
+                    or "qty" in col_terms
+                    or "unit" in col_terms
+                    or "units" in col_terms
+                    or "quantity" in col_l
+                )
+                if not has_quantity_signal:
+                    continue
+                score = 10
+                if "quantity" in col_l or "qty" in col_l:
+                    score += 12
+                if "ordered" in col_terms or "order" in col_terms:
+                    score += 8
+                if "price" in col_l or "price" in col_terms or "cost" in col_terms:
+                    score -= 10
+                if "stock" in col_terms or "inventory" in col_terms:
+                    score -= 6
+                child_candidates.append((score, child_table, fk_col, col_l))
+    if not child_candidates:
+        return sql
+    child_candidates.sort(key=lambda item: (-item[0], item[1], item[3]))
+    _score, child_table, child_fk_col, qty_col = child_candidates[0]
+
+    base_id = str(get_id_column(base_table) or "").strip("`").lower()
+    if not base_id:
+        return sql
+    child_alias = child_table
+    if child_alias.lower() == base_alias.lower():
+        child_alias = f"{child_table}_detail"
+
+    new_from = (
+        f"{m_from.group('table')} JOIN {child_table} AS {child_alias} "
+        f"ON {child_alias}.{_case_col(child_table, child_fk_col)} = {base_alias}.{_case_col(base_table, base_id)}"
+    )
+    rebuilt = re.sub(
+        rf"(?is)\bFROM\s+{re.escape(from_core)}\b",
+        f"FROM {new_from}",
+        s,
+        count=1,
+    )
+    rebuilt = re.sub(
+        r"(?is)\bSUM\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*stock[A-Za-z0-9_]*`?\s*\)",
+        f"SUM({child_alias}.{_case_col(child_table, qty_col)})",
+        rebuilt,
+        count=1,
+    )
+    rebuilt = re.sub(
+        rf"(?is)\bCOUNT\s*\(\s*DISTINCT\s+`?{re.escape(base_id)}`?\s*\)",
+        f"COUNT(DISTINCT {base_alias}.{_case_col(base_table, base_id)})",
+        rebuilt,
+    )
     return rebuilt
 
 
@@ -31978,6 +32173,8 @@ def _ensure_reasonable_count_distinct(sql: str, question: str) -> str:
         alias = _get_alias(item)
         raw = f"{base} {alias}".lower()
         tokens = {t for t in re.findall(r"[a-z0-9]+", raw) if t}
+        for piece in re.findall(r"[A-Za-z][A-Za-z0-9_]*", f"{base} {alias}"):
+            tokens.update(t.lower() for t in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+", piece) if t)
         expanded = set(tokens)
         for t in list(tokens):
             if t.endswith("ies") and len(t) > 3:
@@ -32019,18 +32216,13 @@ def _ensure_reasonable_count_distinct(sql: str, question: str) -> str:
     window_pat = re.compile(r"\bOVER\s*\(", flags=re.I)
 
     count_idx = -1
+    count_indices: List[int] = []
     for idx, item in enumerate(select_items):
         if re.search(r"\bCOUNT\s*\(", item, flags=re.I) and not window_pat.search(item):
-            count_idx = idx
-            break
+            count_indices.append(idx)
+            if count_idx < 0:
+                count_idx = idx
     if count_idx < 0:
-        return sql
-
-    non_agg_indices = [
-        idx for idx, item in enumerate(select_items)
-        if not agg_pat.search(item) and not window_pat.search(item)
-    ]
-    if len(non_agg_indices) < 2:
         return sql
 
     hint_tokens: Set[str] = set()
@@ -32051,6 +32243,44 @@ def _ensure_reasonable_count_distinct(sql: str, question: str) -> str:
             elif t.endswith("s") and len(t) > 1 and not t.endswith(("ss", "us")):
                 expanded.add(t[:-1])
         hint_tokens = expanded
+
+    def _plain_count_inner(item: str) -> str:
+        m_count = re.search(
+            r"\bCOUNT\s*\(\s*(?!DISTINCT\b)(?P<inner>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)",
+            item,
+            flags=re.I,
+        )
+        return (m_count.group("inner") if m_count else "").strip()
+
+    def _expr_matches_hint(expr: str) -> bool:
+        if not hint_tokens:
+            return False
+        return bool(_tokenize_expr(expr).intersection(hint_tokens))
+
+    # If the draft already has the intended metric column in COUNT(col), keep
+    # the query shape and only add DISTINCT to that aggregate. This covers
+    # joined threshold queries without mistaking displayed dimensions for the
+    # distinct-count target.
+    if len(count_indices) == 1:
+        count_item = select_items[count_idx]
+        count_inner = _plain_count_inner(count_item)
+        if count_inner and _expr_matches_hint(count_inner):
+            inner_pat = re.escape(count_inner).replace(r"\ ", r"\s*")
+            fixed = re.sub(
+                rf"\bCOUNT\s*\(\s*(?!DISTINCT\b){inner_pat}\s*\)",
+                f"COUNT(DISTINCT {count_inner})",
+                s,
+                flags=re.I,
+            )
+            if fixed != s:
+                return fixed
+
+    non_agg_indices = [
+        idx for idx, item in enumerate(select_items)
+        if not agg_pat.search(item) and not window_pat.search(item)
+    ]
+    if len(non_agg_indices) < 2:
+        return sql
 
     candidate_idx = -1
     best_score = 0

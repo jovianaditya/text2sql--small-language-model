@@ -177,6 +177,12 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "180s")  # keep_alive 90s, mo
 ROUTING_MODEL     = os.getenv("ROUTING_MODEL", "qwen2.5:1.5b-instruct").strip()
 SMALL_MODEL       = os.getenv("SMALL_MODEL", "qwen2.5:3b-instruct").strip()
 LARGE_MODEL       = os.getenv("LARGE_MODEL", "qwen2.5:7b-instruct").strip()
+ROUTING_MODEL_P2  = os.getenv("ROUTING_MODEL_P2", "qwen2.5-coder:1.5b-instruct").strip()
+SMALL_MODEL_P2    = os.getenv("SMALL_MODEL_P2", "qwen2.5-coder:3b-instruct").strip()
+LARGE_MODEL_P2    = os.getenv("LARGE_MODEL_P2", "qwen2.5-coder:7b-instruct").strip()
+ROUTING_MODEL_P3  = os.getenv("ROUTING_MODEL_P3", "llama3.2:1b").strip()
+SMALL_MODEL_P3    = os.getenv("SMALL_MODEL_P3", "llama3.2:3b").strip()
+LARGE_MODEL_P3    = os.getenv("LARGE_MODEL_P3", "llama3.1:8b").strip()
 # Optional post-failure Human-in-the-Loop review for REPL execution failures.
 HITL_ENABLED      = bool(int(os.getenv("HITL_ENABLED", "1")))
 HITL_LOG_FILENAME_PREFIX = os.getenv("HITL_LOG_FILENAME_PREFIX", "hitl_review_log").strip()
