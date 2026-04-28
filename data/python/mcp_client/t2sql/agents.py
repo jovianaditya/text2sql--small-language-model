@@ -273,6 +273,7 @@ def _attempt_confidence_retry(
     current_sql: str,
     confidence_result: dict,
     make_prompt_fn,
+    prompt_kwargs: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """
     Attempt one retry with 7B model when confidence is below threshold.
@@ -291,6 +292,7 @@ def _attempt_confidence_retry(
         ctx,
         question,
         instruction,
+        prompt_kwargs=prompt_kwargs,
     )
     
     if not new_sql:
@@ -5831,6 +5833,7 @@ def _is_critical_gate_failure(gate: Dict[str, Any]) -> bool:
     reasons = {str(r) for r in (gate.get("reasons") or [])}
     critical_reasons = {
         "parse_error",
+        "no_select",
         "hard_identifier",
         "ambiguous_unqualified",
         "group_projection_mismatch",
@@ -5979,6 +5982,8 @@ def _attempt_last_chance_rescue_7b(
     current_sql: str,
     gate: Dict[str, Any],
     strict_join_key: bool = False,
+    router_decision: Optional[Dict[str, Any]] = None,
+    state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     One-shot rescue with 7B when final gate fails critically.
@@ -6013,6 +6018,10 @@ def _attempt_last_chance_rescue_7b(
         ctx,
         question,
         rescue_instruction,
+        prompt_kwargs={
+            "router_decision": dict(router_decision or {}),
+            "state": state,
+        },
     )
     if not rescued_sql:
         result["error"] = "rescue_empty_sql"
@@ -9519,6 +9528,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 ctx,
                 question,
                 packed_instruction,
+                prompt_kwargs={
+                    "router_decision": decision,
+                    "state": state,
+                },
             )
             if not new_sql_local:
                 return None
@@ -9690,6 +9703,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             current_sql=final_sql,
             gate=final_gate,
             strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+            router_decision=decision,
+            state=state,
         )
         rescue_7b_used = bool(rescue.get("used", False))
         if rescue_7b_used:
@@ -9747,6 +9762,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             current_sql=final_sql,
             confidence_result=confidence_result,
             make_prompt_fn=make_generation_prompt,
+            prompt_kwargs={
+                "router_decision": decision,
+                "state": state,
+            },
         )
         confidence_retry_used = retry_result.get("used", False)
         if retry_result.get("accepted", False):

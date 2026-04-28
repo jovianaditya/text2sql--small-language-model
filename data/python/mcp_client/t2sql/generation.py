@@ -107,6 +107,7 @@ def regenerate_with_extra_constraint(
     ctx: str,
     question: str,
     extra_msg: str,
+    prompt_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """
     Regenerate SQL with extra constraint message.
@@ -123,7 +124,8 @@ def regenerate_with_extra_constraint(
     Returns:
         Tuple of (sql, notes)
     """
-    strict_prompt = make_prompt_fn(ctx + "\n\n" + extra_msg, question)
+    kwargs = dict(prompt_kwargs or {})
+    strict_prompt = make_prompt_fn(ctx + "\n\n" + extra_msg, question, **kwargs)
     obj = try_llm_json(llm, strict_prompt, max_attempts=2)
     if obj is None:
         return "", ""

@@ -71,6 +71,21 @@ def _print_latency_debug(state: dict):
             f"postprocess={postproc_time:.3f}s"
         )
 
+
+def _is_executable_sql_candidate(sql_text: str) -> tuple[bool, str]:
+    """
+    Conservative runtime guard:
+    only allow SELECT / WITH...SELECT statements to reach MCP execution.
+    """
+    s = str(sql_text or "").strip().rstrip(";").strip()
+    if not s:
+        return False, "empty_sql_candidate"
+    if re.match(r"^\s*SELECT\b", s, flags=re.I):
+        return True, ""
+    if re.match(r"^\s*WITH\b", s, flags=re.I) and re.search(r"\bSELECT\b", s, flags=re.I):
+        return True, ""
+    return False, "non_select_sql_candidate"
+
 async def _exec_via_mcp(
     mcp: Client,
     sql_block: str,
@@ -80,6 +95,16 @@ async def _exec_via_mcp(
     sql_only = (sql_block or "").split("\n\n-- notes:")[0].strip()
     sql_clean = (final_sql or sql_only).rstrip(";").strip()
     sql_clean = _preexecute_sql_safety_pass(sql_clean, question).rstrip(";").strip()
+
+    executable, reason = _is_executable_sql_candidate(sql_clean)
+    if not executable:
+        print(f"query_db skipped: {reason}")
+        return {
+            "success": False,
+            "sql": sql_clean,
+            "error_type": "non_executable_sql_candidate",
+            "error_message": reason,
+        }
 
     print("\n[SQL EXEC] Final query sent to MCP:")
     print(sql_clean + ";")
@@ -208,6 +233,10 @@ def _print_failure_summary(state: dict, execution_result: dict) -> None:
     if error_type == "generation_failure_sql":
         print("SQL query was not produced successfully.")
         print("The system generated an internal error marker instead of a valid data query.")
+    elif error_type == "question_rejected":
+        print("Question was rejected by the query-intent guard before SQL execution.")
+    elif error_type == "non_executable_sql_candidate":
+        print("SQL was generated, but it is not an executable read-only SELECT query.")
     elif error_type == "pipeline_exception":
         print("The text-to-SQL pipeline failed before SQL execution.")
     elif error_type in {"execution_error", "timeout", "exception"}:
@@ -402,6 +431,52 @@ async def _run_question_with_optional_review(
                 "traceback": traceback.format_exc(limit=12),
             }
             _log_total(current_label, t0_total)
+            action, next_question = _prompt_hitl_review(state, execution_result)
+            if action == "exit":
+                print("Bye.")
+                return "exit"
+            if action == "rephrase" and next_question:
+                current_question = next_question
+                current_label = "End-to-end total time (rephrased question)"
+                continue
+            return "continue"
+
+        decision = state.get("router_decision", {}) or {}
+        if decision.get("is_valid_question") is False:
+            rejection_reason = str(
+                decision.get("rejection_reason")
+                or state.get("answer")
+                or "Question rejected by guard."
+            ).strip()
+            execution_result = {
+                "success": False,
+                "sql": str(state.get("final_sql") or "").strip(),
+                "error_type": "question_rejected",
+                "error_message": rejection_reason,
+            }
+            _log_total(current_label, t0_total)
+            _print_latency_debug(state)
+            action, next_question = _prompt_hitl_review(state, execution_result)
+            if action == "exit":
+                print("Bye.")
+                return "exit"
+            if action == "rephrase" and next_question:
+                current_question = next_question
+                current_label = "End-to-end total time (rephrased question)"
+                continue
+            return "continue"
+
+        sql_candidate = str(state.get("final_sql") or state.get("answer") or "").strip()
+        executable_sql, executable_reason = _is_executable_sql_candidate(sql_candidate)
+        if not executable_sql:
+            execution_result = {
+                "success": False,
+                "sql": sql_candidate,
+                "error_type": "non_executable_sql_candidate",
+                "error_message": executable_reason,
+            }
+            _log_total(current_label, t0_total)
+            _print_latency_debug(state)
             action, next_question = _prompt_hitl_review(state, execution_result)
             if action == "exit":
                 print("Bye.")
