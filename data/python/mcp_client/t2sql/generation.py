@@ -12,72 +12,24 @@
 # ====================== STANDARD LIBRARY IMPORT =======================
 # ======================================================================
 from __future__ import annotations
-import json
 from typing import Dict, Any, Optional, Tuple
 from langchain_ollama import ChatOllama
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .utils import try_llm_json
+from .utils import (
+    try_llm_json,
+    _strip_code_fences as _utils_strip_code_fences,
+    _extract_json_object as _utils_extract_json_object,
+)
 
 def _strip_code_fences(s: str) -> str:
-    """Remove markdown code fences from string."""
-    s = (s or "").strip()
-    if s.startswith("```"):
-        # remove first fence line
-        lines = s.splitlines()
-        if lines:
-            lines = lines[1:]
-        # drop trailing fence if present
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        return "\n".join(lines).strip()
-    return s
+    """Remove markdown code fences from string (delegates to utils helper)."""
+    return _utils_strip_code_fences(s)
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Robust JSON extractor:
-    - handle ```json fences
-    - handle extra text before/after
-    - brace-matching to find first valid JSON object
-    """
-    txt = _strip_code_fences(text)
-
-    # Fast path: whole string is JSON
-    try:
-        obj = json.loads(txt)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-
-    # Brace-matching scan for first valid {...}
-    n = len(txt)
-    i = 0
-    while i < n:
-        if txt[i] != "{":
-            i += 1
-            continue
-        depth = 0
-        j = i
-        while j < n:
-            ch = txt[j]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = txt[i : j + 1]
-                    try:
-                        obj = json.loads(candidate)
-                        if isinstance(obj, dict):
-                            return obj
-                    except Exception:
-                        break  # stop expanding this start; try next "{"
-            j += 1
-        i += 1
-
-    return None
+    """Robust JSON extractor (delegates to utils helper)."""
+    return _utils_extract_json_object(text)
 
 def _validate_sql_notes(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Validate that object has at least sql or notes field."""

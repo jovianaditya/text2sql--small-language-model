@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple, Any, Optional
 from collections import defaultdict
 from .config import (
+    SCHEMA_PATH_STRICT,
     SCHEMA_ANALYZER_INVALID_JSONL_PREVIEW,
     SCHEMA_ANALYZER_STRICT_JSONL,
 )
@@ -401,12 +402,27 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
     """
     global _analyzer_instances
 
+    strict_path_mode = bool(SCHEMA_PATH_STRICT)
+
     if jsonl_path is None:
         from .config import SCHEMA_METADATA_JSONL
         jsonl_path = SCHEMA_METADATA_JSONL
 
     # Convert to Path object
     jsonl_path_obj = Path(jsonl_path)
+
+    # If caller provides an explicit file path, keep it as source of truth.
+    if (
+        "*" not in str(jsonl_path)
+        and "?" not in str(jsonl_path)
+        and jsonl_path_obj.exists()
+        and jsonl_path_obj.is_file()
+    ):
+        final_path = jsonl_path_obj
+        cache_key = str(final_path.resolve())
+        if cache_key not in _analyzer_instances:
+            _analyzer_instances[cache_key] = SchemaAnalyzer(cache_key)
+        return _analyzer_instances[cache_key]
 
     # Handle case where path is a directory (not a file)
     if jsonl_path_obj.is_dir():
@@ -417,23 +433,41 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
         jsonl_dir = jsonl_path_obj.parent
 
     # Priority 1: Look for *_dense.jsonl first (rich metadata with synonyms/roles)
-    dense_files = list(jsonl_dir.glob("*_dense.jsonl"))
+    dense_files = sorted(jsonl_dir.glob("*_dense.jsonl"))
 
     if dense_files:
-        # Use the dense JSONL file (prioritizes rich metadata)
+        if strict_path_mode and len(dense_files) > 1:
+            preview = ", ".join(str(p.name) for p in dense_files[:5])
+            raise ValueError(
+                f"Ambiguous dense schema metadata in '{jsonl_dir}': found {len(dense_files)} files ({preview}). "
+                "Set SCHEMA_METADATA_JSONL to an explicit file path or disable SCHEMA_PATH_STRICT."
+            )
+        # Use the first dense JSONL file in sorted order (deterministic)
         jsonl_path = str(dense_files[0])
     else:
         # Priority 2: Use any .jsonl file
         # Handle wildcard patterns or find any jsonl file
         if "*" in jsonl_path or "?" in jsonl_path:
             # It's a wildcard pattern, use it as-is
-            jsonl_files = list(jsonl_dir.glob(Path(jsonl_path).name))
+            jsonl_files = sorted(jsonl_dir.glob(Path(jsonl_path).name))
             if jsonl_files:
+                if strict_path_mode and len(jsonl_files) > 1:
+                    preview = ", ".join(str(p.name) for p in jsonl_files[:5])
+                    raise ValueError(
+                        f"Ambiguous schema metadata wildcard '{jsonl_path}': found {len(jsonl_files)} files ({preview}). "
+                        "Set SCHEMA_METADATA_JSONL to an explicit file path or disable SCHEMA_PATH_STRICT."
+                    )
                 jsonl_path = str(jsonl_files[0])
         elif jsonl_path_obj.is_dir() or not jsonl_path_obj.exists():
             # Path is a directory or doesn't exist, find any jsonl file
-            jsonl_files = list(jsonl_dir.glob("*.jsonl"))
+            jsonl_files = sorted(jsonl_dir.glob("*.jsonl"))
             if jsonl_files:
+                if strict_path_mode and len(jsonl_files) > 1:
+                    preview = ", ".join(str(p.name) for p in jsonl_files[:5])
+                    raise ValueError(
+                        f"Ambiguous schema metadata in '{jsonl_dir}': found {len(jsonl_files)} jsonl files ({preview}). "
+                        "Set SCHEMA_METADATA_JSONL to an explicit file path or disable SCHEMA_PATH_STRICT."
+                    )
                 jsonl_path = str(jsonl_files[0])
 
     # Validate the final path

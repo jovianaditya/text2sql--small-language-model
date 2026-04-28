@@ -63,6 +63,7 @@ class RAGState(TypedDict, total=False):
     agent_notes: str
     # Daftar error whitelist (identifier tidak ada di ALLOWED IDENTIFIERS)
     validation_errors: List[str]
+    final_gate_reason_tags: List[str]
     # Ringkasan apa saja yang dikoreksi Agent 2 (join/regex/whitelist)
     critic_feedback: str
     # Optional post-failure Human-in-the-Loop review telemetry
@@ -127,6 +128,7 @@ def make_state(
         "confidence_retry_used": False,
         "agent_notes": "",
         "validation_errors": [],
+        "final_gate_reason_tags": [],
         "critic_feedback": "",
         "execution_error": {},
         "hitl_used": False,

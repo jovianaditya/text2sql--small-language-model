@@ -4796,6 +4796,35 @@ def _collect_hard_identifier_errors(errors: List[str]) -> List[str]:
     ]
 
 
+def _categorize_gate_reasons(reasons: List[str]) -> List[str]:
+    """
+    Stable reason taxonomy for retry/analysis observability.
+    This is metadata only; it does not affect acceptance behavior.
+    """
+    tags: Set[str] = set()
+    for reason in (reasons or []):
+        r = str(reason or "").strip().lower()
+        if not r:
+            continue
+        if r.startswith("parse_") or "parse" in r:
+            tags.add("syntax")
+        if "identifier" in r:
+            tags.add("identifier")
+        if "join" in r or "fanout" in r:
+            tags.add("join_path")
+        if "semantic" in r:
+            tags.add("semantic")
+        if "group" in r:
+            tags.add("grouping")
+        if "ambiguous" in r:
+            tags.add("ambiguity")
+        if "select" in r:
+            tags.add("select_shape")
+    if not tags and (reasons or []):
+        tags.add("other")
+    return sorted(tags)
+
+
 def _extract_explicit_row_limit_value(question: str) -> Optional[int]:
     """
     Extract a row-limit value only from phrases that constrain result rows.
@@ -9734,6 +9763,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     final_validation_errors = list(final_gate.get("identifier_errors") or validate_identifiers(final_sql, ctx))
     final_gate_pass = bool(final_gate.get("accepted", False))
     final_gate_reasons = list(final_gate.get("reasons") or [])
+    final_gate_reason_tags = _categorize_gate_reasons(final_gate_reasons)
 
     # END TIMER: Calculate processing time (Model ready → Final SQL complete)
     # This is the core text-to-SQL processing latency for thesis benchmark
@@ -9785,6 +9815,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         "final_model": final_model,
         "final_gate_pass": final_gate_pass,
         "final_gate_reasons": final_gate_reasons,
+        "final_gate_reason_tags": final_gate_reason_tags,
         "rescue_7b_used": bool(rescue_7b_used),
         "sql_confidence": confidence_result["confidence"],
         "confidence_signals": confidence_result["signals"],

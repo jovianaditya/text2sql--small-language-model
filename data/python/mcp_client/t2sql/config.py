@@ -263,6 +263,10 @@ SCHEMA_METADATA_JSONL = os.getenv(
     "SCHEMA_METADATA_JSONL",
     DENSE_METADATA_JSONL,
 ).strip()
+# Strict schema-path resolution:
+# - 0 (default): preserve legacy auto-discovery fallback behavior
+# - 1: fail fast when schema metadata path resolution is ambiguous
+SCHEMA_PATH_STRICT = bool(int(os.getenv("SCHEMA_PATH_STRICT", "0")))
 # Backward-compatible aliases for older code paths:
 # - JSON_INPUT now defaults to the sparse BM25 metadata input.
 # - EXPORT_JSONL_OUTPUT continues to point at the dense metadata export.

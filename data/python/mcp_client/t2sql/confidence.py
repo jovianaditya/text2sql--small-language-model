@@ -13,6 +13,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .schema_analyzer import is_numeric_column, is_date_column, get_all_tables
+from .helpers_main import validate_identifiers
 
 # ======================================================================
 # ======================= SIGNAL WEIGHTS (TUNABLE) =====================
@@ -102,55 +103,34 @@ def _check_identifiers_valid(sql: str, ctx: str) -> Tuple[float, List[str]]:
         (score, warnings) where score is ratio of valid identifiers
     """
     warnings: List[str] = []
-    
+
     if not sql or not ctx:
         return 0.5, ["Missing SQL or context"]
-    
-    # Parse ALLOWED IDENTIFIERS from context
-    allowed: Dict[str, Set[str]] = {}
-    m = re.search(r"### ALLOWED IDENTIFIERS(.*?)(?:\n### |\Z)", ctx, flags=re.S)
-    if m:
-        block = m.group(1)
-        for line in block.splitlines():
-            line = line.strip()
-            if not line.startswith("- "):
-                continue
-            parts = line[2:].split(":", 1)
-            if len(parts) == 2:
-                table = parts[0].strip().strip("`").lower()
-                cols = {c.strip().strip("`").lower() for c in parts[1].split(",") if c.strip()}
-                if table:
-                    allowed[table] = cols
-    
-    if not allowed:
-        return 0.5, ["No ALLOWED IDENTIFIERS found in context"]
-    
-    # Extract tables and columns from SQL
+
+    # Reuse the same identifier validator used by the postprocess/gate flow
+    # so confidence scoring remains aligned with acceptance decisions.
+    errors = list(validate_identifiers(sql, ctx) or [])
+    if not errors:
+        return 1.0, []
+
     sql_tables = _extract_sql_tables(sql)
     sql_columns = _extract_sql_columns(sql)
-    
-    # Check tables
-    allowed_tables = set(allowed.keys())
-    invalid_tables = sql_tables - allowed_tables
-    if invalid_tables:
-        warnings.append(f"Unknown tables: {', '.join(invalid_tables)}")
-    
-    # Check columns (simplified - check if column exists in any allowed table)
-    all_allowed_cols: Set[str] = set()
-    for cols in allowed.values():
-        all_allowed_cols.update(cols)
-    
-    invalid_cols = sql_columns - all_allowed_cols
-    if invalid_cols:
-        warnings.append(f"Unknown columns: {', '.join(list(invalid_cols)[:5])}")
-    
-    # Score: ratio of valid identifiers
     total_ids = len(sql_tables) + len(sql_columns)
-    invalid_ids = len(invalid_tables) + len(invalid_cols)
-    if total_ids == 0:
-        return 1.0, []
-    
-    score = max(0.0, 1.0 - (invalid_ids / total_ids))
+    if total_ids <= 0:
+        total_ids = max(1, len(errors))
+
+    hard_errors = [
+        e for e in errors
+        if "not in ALLOWED" in str(e)
+        or "invalid column" in str(e).lower()
+        or "invalid columns" in str(e).lower()
+    ]
+
+    weighted_invalid = float(len(hard_errors)) + 0.5 * float(max(0, len(errors) - len(hard_errors)))
+    score = max(0.0, 1.0 - (weighted_invalid / float(total_ids)))
+    warnings.extend(f"Identifier validation: {str(e)}" for e in errors[:8])
+    if len(errors) > 8:
+        warnings.append(f"Identifier validation: ... and {len(errors) - 8} more")
     return score, warnings
 
 
