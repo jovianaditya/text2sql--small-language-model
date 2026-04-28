@@ -17,6 +17,11 @@ import json
 import re
 import ast
 from pathlib import Path
+from .rulebook import (
+    retrieval_extra_stopwords,
+    retrieval_generic_mention_terms,
+    retrieval_join_signals,
+)
 
 
 def _env_json_list(name: str, default: list[str]) -> list[str]:
@@ -243,6 +248,18 @@ RETRIEVAL_SINGLE_LOCK_MAX_NON_PRIMARY_SPARSE_HITS = int(
 )
 RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK = int(
     os.getenv("RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK", "1")
+)
+RETRIEVAL_EXPAND_ON_FAIL_ENABLED = bool(int(os.getenv("RETRIEVAL_EXPAND_ON_FAIL_ENABLED", "0")))
+RETRIEVAL_EXPAND_MAX_TABLES = int(os.getenv("RETRIEVAL_EXPAND_MAX_TABLES", "5"))
+RETRIEVAL_EXPAND_TRIGGER_REASONS = _env_json_list(
+    "RETRIEVAL_EXPAND_TRIGGER_REASONS",
+    [
+        "hard_identifier",
+        "identifier",
+        "ambiguous_unqualified",
+        "invalid_join_path",
+        "group_projection_mismatch",
+    ],
 )
 # Optional retrieval debug switches.
 SPARSE_DEBUG   = bool(int(os.getenv("SPARSE_DEBUG", "0")))
@@ -1151,40 +1168,20 @@ def format_heuristic_observability() -> str:
 RETRIEVAL_EXTRA_STOPWORDS = set(
     _env_json_list(
         "RETRIEVAL_EXTRA_STOPWORDS",
-        [
-            "show", "all", "list", "their", "that", "have", "no",
-            "include", "includes", "including", "sort", "sorted", "sorting",
-            "result", "results", "record", "records", "row", "rows",
-            "display", "return", "get", "give", "find", "fetch", "please", "kindly",
-            "alphabetical", "alphabetically", "alphabetized", "alphabetize",
-            "reverse alphabetical", "reversed alphabetical", "reverse",
-            "ascending", "descending", "distinct",
-            "yang", "dan", "atau", "ke", "dari", "di", "itu", "ini",
-            "tampilkan", "daftar",
-        ],
+        retrieval_extra_stopwords(),
     )
 )
 
 RETRIEVAL_GENERIC_MENTION_TERMS = set(
     _env_json_list(
         "RETRIEVAL_GENERIC_MENTION_TERMS",
-        [
-            "name", "names", "id", "ids", "code", "codes", "number", "numbers",
-            "date", "dates", "time", "status", "type", "types", "value", "values",
-            "amount", "amounts", "total", "totals", "count", "counts", "description",
-            "descriptions", "detail", "details", "record", "records", "row", "rows",
-            "address", "city", "country", "state", "phone", "email", "contact",
-        ],
+        retrieval_generic_mention_terms(),
     )
 )
 
 RETRIEVAL_JOIN_SIGNALS = _env_json_list(
     "RETRIEVAL_JOIN_SIGNALS",
-    [
-        "join", "gabung", "combine", "combine with", "along with", "together with",
-        "and their", "with their", "beserta", "bersama", "dengan",
-        "for each", "per ", "setiap",
-    ],
+    retrieval_join_signals(),
 )
 
 # Additional low-risk retrieval literals (externalized from retrieval.py)

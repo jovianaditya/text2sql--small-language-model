@@ -22,6 +22,8 @@ from .config import (
     OLLAMA_URL,
     OLLAMA_KEEP_ALIVE,
     RETRIEVE_DEBUG,
+    RETRIEVAL_EXPAND_ON_FAIL_ENABLED,
+    RETRIEVAL_EXPAND_TRIGGER_REASONS,
     OOM_WAIT_TIME,
     OOM_MAX_RETRIES,
     AGENT_IR_ENABLED,
@@ -205,6 +207,7 @@ from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
 from .utils import _dbg_print_two, try_llm_json, try_llm_sql_text, build_router_schema
 from .generation import regenerate_with_extra_constraint
+from .retrieval import build_expanded_context_from_state
 from .intent_ir import build_intent_ir, is_ir_plannable
 from .confidence import compute_sql_confidence
 
@@ -4825,6 +4828,29 @@ def _categorize_gate_reasons(reasons: List[str]) -> List[str]:
     return sorted(tags)
 
 
+def _should_expand_retrieval_context(gate_reasons: List[str]) -> bool:
+    if not RETRIEVAL_EXPAND_ON_FAIL_ENABLED:
+        return False
+
+    reasons = [str(r or "").strip().lower() for r in (gate_reasons or []) if str(r or "").strip()]
+    if not reasons:
+        return False
+
+    triggers = [
+        str(t or "").strip().lower()
+        for t in (RETRIEVAL_EXPAND_TRIGGER_REASONS or [])
+        if str(t or "").strip()
+    ]
+    if not triggers:
+        return False
+
+    for trig in triggers:
+        for reason in reasons:
+            if reason == trig or reason.startswith(f"{trig}:") or trig in reason:
+                return True
+    return False
+
+
 def _extract_explicit_row_limit_value(question: str) -> Optional[int]:
     """
     Extract a row-limit value only from phrases that constrain result rows.
@@ -8082,6 +8108,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     ctx = state.get("context", "")
     draft_sql = (state.get("draft_sql") or "").strip()
     draft_source = (state.get("draft_source") or "").strip().lower()
+    retrieval_context_mode = str(state.get("retrieval_context_mode") or "primary")
+    retrieval_retry_used = bool(state.get("retrieval_retry_used", False))
+    retrieval_retry_reason = str(state.get("retrieval_retry_reason") or "")
+    retrieval_expanded_table_count = int(state.get("retrieval_expanded_table_count") or 0)
 
     # DYNAMIC MODEL SELECTION berdasarkan draft quality
     draft_model = state.get("target_model") or SMALL_MODEL  # Track model asal
@@ -9611,10 +9641,33 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
         # Single targeted retry with the SAME model when gate still fails.
         if current_attempt and not current_attempt.get("gate_accepted", False):
+            current_reasons = list(current_attempt.get("gate_reasons") or [])
+            if _should_expand_retrieval_context(current_reasons):
+                expanded_ctx_result = build_expanded_context_from_state(state)
+                if expanded_ctx_result.get("used", False):
+                    ctx = str(expanded_ctx_result.get("context") or ctx)
+                    state["context"] = ctx
+                    retrieval_context_mode = "expanded"
+                    retrieval_retry_used = True
+                    retrieval_retry_reason = str(expanded_ctx_result.get("reason") or "expanded_on_gate_failure")
+                    retrieval_expanded_table_count = int(expanded_ctx_result.get("expanded_table_count") or 0)
+                    state["retrieval_context_mode"] = retrieval_context_mode
+                    state["retrieval_retry_used"] = retrieval_retry_used
+                    state["retrieval_retry_reason"] = retrieval_retry_reason
+                    state["retrieval_expanded_table_count"] = retrieval_expanded_table_count
+                    corrections.append(
+                        f"Expanded retrieval context fallback used ({retrieval_expanded_table_count} tables)"
+                    )
+                elif RETRIEVE_DEBUG:
+                    print(
+                        "[RETRIEVAL - EXPAND] Skipped: "
+                        f"{expanded_ctx_result.get('reason') or 'unknown_reason'}"
+                    )
+
             retry_instruction = _build_gate_retry_instruction(
                 extra_instruction,
                 {
-                    "reasons": current_attempt.get("gate_reasons") or [],
+                    "reasons": current_reasons,
                     "hard_identifier_errors": current_attempt.get("hard_identifier_errors") or [],
                     "identifier_errors": current_attempt.get("identifier_errors") or [],
                     "ambiguous_unqualified_columns": current_attempt.get("ambiguous_unqualified_columns") or [],
@@ -9811,6 +9864,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         "validation_errors": final_validation_errors,
         "final_sql": final_sql,
         "answer": final_sql,
+        "retrieval_context_mode": retrieval_context_mode,
+        "retrieval_retry_used": retrieval_retry_used,
+        "retrieval_retry_reason": retrieval_retry_reason,
+        "retrieval_expanded_table_count": retrieval_expanded_table_count,
         "critic_feedback": " | ".join(corrections),
         "final_model": final_model,
         "final_gate_pass": final_gate_pass,

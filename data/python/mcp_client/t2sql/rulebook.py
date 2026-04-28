@@ -227,6 +227,44 @@ def name_request_terms() -> list[str]:
     return [normalized_text(x) for x in merged if normalized_text(x)]
 
 
+@lru_cache(maxsize=1)
+def retrieval_extra_stopwords() -> list[str]:
+    defaults = [
+        "show", "all", "list", "their", "that", "have", "no",
+        "include", "includes", "including", "sort", "sorted", "sorting",
+        "result", "results", "record", "records", "row", "rows",
+        "display", "return", "get", "give", "find", "fetch", "please", "kindly",
+        "alphabetical", "alphabetically", "alphabetized", "alphabetize",
+        "reverse alphabetical", "reversed alphabetical", "reverse",
+        "ascending", "descending", "distinct",
+        "yang", "dan", "atau", "ke", "dari", "di", "itu", "ini",
+        "tampilkan", "daftar",
+    ]
+    return rule_list(("retrieval_intent", "extra_stopwords"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_generic_mention_terms() -> list[str]:
+    defaults = [
+        "name", "names", "id", "ids", "code", "codes", "number", "numbers",
+        "date", "dates", "time", "status", "type", "types", "value", "values",
+        "amount", "amounts", "total", "totals", "count", "counts", "description",
+        "descriptions", "detail", "details", "record", "records", "row", "rows",
+        "address", "city", "country", "state", "phone", "email", "contact",
+    ]
+    return rule_list(("retrieval_intent", "generic_mention_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_join_signals() -> list[str]:
+    defaults = [
+        "join", "gabung", "combine", "combine with", "along with", "together with",
+        "and their", "with their", "beserta", "bersama", "dengan",
+        "for each", "per ", "setiap",
+    ]
+    return rule_list(("retrieval_intent", "join_signals"), defaults)
+
+
 def question_wants_split_name_components(question: str) -> bool:
     q = normalized_text(question)
     if not q:
@@ -310,4 +348,7 @@ def rulebook_debug_snapshot() -> Dict[str, Any]:
         "loaded": bool(_load_rules()),
         "name_component_lexical_tokens": sorted(name_component_lexical_tokens()),
         "name_component_synonym_hints": sorted(name_component_synonym_hints()),
+        "retrieval_extra_stopwords_count": len(retrieval_extra_stopwords()),
+        "retrieval_generic_mention_terms_count": len(retrieval_generic_mention_terms()),
+        "retrieval_join_signals_count": len(retrieval_join_signals()),
     }

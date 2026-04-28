@@ -20,6 +20,10 @@ class RAGState(TypedDict, total=False):
     skipped: int
     # retrieval output (context untuk LLM)
     context: str
+    retrieval_context_mode: str
+    retrieval_retry_used: bool
+    retrieval_retry_reason: str
+    retrieval_expanded_table_count: int
     # ROUTING
     router_decision: Dict[str, Any]  # Output JSON Router
     router_tables: List[str]
@@ -94,6 +98,10 @@ def make_state(
         "updated": 0,
         "skipped": 0,
         "context": "",
+        "retrieval_context_mode": "primary",
+        "retrieval_retry_used": False,
+        "retrieval_retry_reason": "",
+        "retrieval_expanded_table_count": 0,
         "router_decision": {},
         "router_tables": [],
         "primary_table": "",

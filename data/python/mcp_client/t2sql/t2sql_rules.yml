@@ -129,6 +129,109 @@ identifier_intent:
     - code
     - number
 
+retrieval_intent:
+  extra_stopwords:
+    - show
+    - all
+    - list
+    - their
+    - that
+    - have
+    - no
+    - include
+    - includes
+    - including
+    - sort
+    - sorted
+    - sorting
+    - result
+    - results
+    - record
+    - records
+    - row
+    - rows
+    - display
+    - return
+    - get
+    - give
+    - find
+    - fetch
+    - please
+    - kindly
+    - alphabetical
+    - alphabetically
+    - alphabetized
+    - alphabetize
+    - reverse alphabetical
+    - reversed alphabetical
+    - reverse
+    - ascending
+    - descending
+    - distinct
+    - yang
+    - dan
+    - atau
+    - ke
+    - dari
+    - di
+    - itu
+    - ini
+    - tampilkan
+    - daftar
+  generic_mention_terms:
+    - name
+    - names
+    - id
+    - ids
+    - code
+    - codes
+    - number
+    - numbers
+    - date
+    - dates
+    - time
+    - status
+    - type
+    - types
+    - value
+    - values
+    - amount
+    - amounts
+    - total
+    - totals
+    - count
+    - counts
+    - description
+    - descriptions
+    - detail
+    - details
+    - record
+    - records
+    - row
+    - rows
+    - address
+    - city
+    - country
+    - state
+    - phone
+    - email
+    - contact
+  join_signals:
+    - join
+    - gabung
+    - combine
+    - combine with
+    - along with
+    - together with
+    - and their
+    - with their
+    - beserta
+    - bersama
+    - dengan
+    - for each
+    - "per "
+    - setiap
+
 ordering_intent:
   explicit_sort_keywords:
     - order by

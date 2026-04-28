@@ -125,6 +125,7 @@ from .config import (
     RETRIEVAL_SINGLE_LOCK_MIN_SCORE_GAP,
     RETRIEVAL_SINGLE_LOCK_MAX_NON_PRIMARY_SPARSE_HITS,
     RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK,
+    RETRIEVAL_EXPAND_MAX_TABLES,
     AGENT_ROUTER_QTYPE_LOOKUP,
     AGENT_ROUTER_QTYPE_AGGREGATE,
     AGENT_ROUTER_QTYPE_RANK,
@@ -158,6 +159,133 @@ def _build_allowed_block(filtered_allowed: Dict[str, List[str]]) -> str:
         lines.append(f"- {t}: {', '.join(uniq)}")
     body = "\n".join(lines) if lines else "- (none)"
     return "### ALLOWED IDENTIFIERS\n" + body
+
+
+def _parse_allowed_block(ctx: str) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    text = str(ctx or "")
+    m = re.search(r"### ALLOWED IDENTIFIERS(.*?)(?:\n### |\Z)", text, flags=re.S)
+    if not m:
+        return out
+    for raw in (m.group(1) or "").splitlines():
+        line = raw.strip()
+        if not line.startswith("- "):
+            continue
+        body = line[2:]
+        parts = body.split(":", 1)
+        table = str(parts[0] if parts else "").strip().strip("`").lower()
+        if not table:
+            continue
+        cols: List[str] = []
+        if len(parts) == 2:
+            cols = [
+                str(c or "").strip().strip("`")
+                for c in parts[1].split(",")
+                if str(c or "").strip()
+            ]
+        out[table] = cols
+    return out
+
+
+def _extract_cards_and_hint(ctx: str) -> tuple[str, str]:
+    text = str(ctx or "")
+    cards_text = ""
+    hint_text = ""
+
+    cards_marker = "\n\n### CARDS\n"
+    hint_marker = "\n\n### _INTERNAL_HINT\n"
+
+    cards_idx = text.find(cards_marker)
+    hint_idx = text.find(hint_marker)
+
+    if cards_idx >= 0:
+        cards_start = cards_idx + len(cards_marker)
+        if hint_idx > cards_start:
+            cards_text = text[cards_start:hint_idx].strip()
+        else:
+            cards_text = text[cards_start:].strip()
+
+    if hint_idx >= 0:
+        hint_start = hint_idx + len(hint_marker)
+        hint_text = text[hint_start:].strip()
+
+    return cards_text, hint_text
+
+
+def build_expanded_context_from_state(state: RAGState) -> Dict[str, Any]:
+    """
+    Build a broader ALLOWED IDENTIFIERS context from current retrieval state.
+    Used as an optional fallback when acceptance fails due to tight context.
+    """
+    current_ctx = str(state.get("context") or "")
+    allowed_current = _parse_allowed_block(current_ctx)
+    if not allowed_current:
+        return {
+            "used": False,
+            "reason": "no_allowed_identifiers",
+            "context": current_ctx,
+            "expanded_table_count": 0,
+        }
+
+    table_order: List[str] = []
+    seen: set[str] = set()
+
+    for t in allowed_current.keys():
+        tl = str(t or "").strip().lower()
+        if tl and tl not in seen:
+            seen.add(tl)
+            table_order.append(tl)
+
+    for tbl, _ in (state.get("ranked_cols") or []):
+        tl = str(tbl or "").strip().lower()
+        if tl and tl not in seen:
+            seen.add(tl)
+            table_order.append(tl)
+
+    max_tables = max(1, int(RETRIEVAL_EXPAND_MAX_TABLES))
+    selected_tables = table_order[:max_tables]
+
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    expanded_allowed: Dict[str, List[str]] = {}
+    for table in selected_tables:
+        cols: List[str] = []
+        if analyzer is not None:
+            try:
+                cols = [str(c).strip() for c in (analyzer.get_table_columns(table) or []) if str(c).strip()]
+            except Exception:
+                cols = []
+        if not cols:
+            cols = [str(c).strip() for c in (allowed_current.get(table) or []) if str(c).strip()]
+        if cols:
+            expanded_allowed[table] = sorted(set(cols))
+
+    if not expanded_allowed:
+        return {
+            "used": False,
+            "reason": "no_expandable_tables",
+            "context": current_ctx,
+            "expanded_table_count": 0,
+        }
+
+    cards_text, hint_text = _extract_cards_and_hint(current_ctx)
+    allowed_block = _build_allowed_block(expanded_allowed)
+    cards_block = cards_text or "(cards retained from primary retrieval context)"
+    new_ctx = (allowed_block + "\n\n### CARDS\n" + cards_block).strip()
+    if hint_text:
+        new_ctx += f"\n\n### _INTERNAL_HINT\n{hint_text}"
+
+    return {
+        "used": True,
+        "reason": "expanded_allowed_identifiers",
+        "context": new_ctx,
+        "expanded_table_count": len(expanded_allowed),
+        "tables": sorted(expanded_allowed.keys()),
+    }
 # ==============================================================================
 # 1. HELPER: FORMAT STATISTICS
 # ==============================================================================
@@ -1945,4 +2073,8 @@ def retrieve_node(state: RAGState) -> RAGState:
             print(f"[DEBUG] {tbl}: {len(cols)} columns")
 
     state["context"] = context
+    state["retrieval_context_mode"] = "primary"
+    state["retrieval_retry_used"] = False
+    state["retrieval_retry_reason"] = ""
+    state["retrieval_expanded_table_count"] = 0
     return state
