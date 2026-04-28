@@ -44,6 +44,9 @@ from .config import (
     HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS,
     HELPERS_WINNER_ROW_GENERIC_OBJECT_TERMS,
     AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS,
+    AGENT_PROMPT_V2_ENABLED,
+    AGENT_PROMPT_ABSTAIN_ENABLED,
+    AGENT_PROMPT_ABSTAIN_NOTES_PREFIX,
 )
 from .schema_analyzer import (
     get_transaction_tables,
@@ -4270,7 +4273,45 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             )
             print(f"[IR-HINT] Skipped: {skip_reason}")
 
+    def _build_generation_output_contract() -> str:
+        base = (
+            'Return EXACTLY one JSON object:\n'
+            '{"sql":"<final MySQL query>","notes":"<brief rationale, max 12 words>"}\n'
+            "No Markdown. End SQL with a semicolon.\n"
+            'If NO JOINs, notes MUST be exactly: "No joins used."'
+        )
+        if AGENT_PROMPT_ABSTAIN_ENABLED:
+            prefix = AGENT_PROMPT_ABSTAIN_NOTES_PREFIX or "CANNOT_ANSWER:"
+            base += (
+                "\nABSTAIN CONTRACT (ONLY when schema evidence is truly insufficient):\n"
+                '{"sql":"","notes":"'
+                + prefix
+                + ' <short reason>","cannot_answer":true,"cannot_answer_reason":"<short reason>"}'
+            )
+        return base
+
+    def _assemble_prompt_v2() -> str:
+        return (
+            "You are a senior SQL assistant for MySQL 8.0.\n\n"
+            "Use ONLY tables/columns listed under ALLOWED IDENTIFIERS in Context.\n"
+            "If Context lists aliases, use the canonical column name.\n\n"
+            "Output:\n"
+            + _build_generation_output_contract()
+            + "\n\nContext:\n"
+            + str(ctx or "")
+            + "\n"
+            + str(join_context or "")
+            + "\n\nQuestion:\n"
+            + str(question or "")
+            + "\n"
+            + str(constraint_block or "")
+            + "\n"
+            + str(intent_hint or "")
+        ).strip()
+
     # --- 4. RETURN PROMPT LENGKAP ---
+    if AGENT_PROMPT_V2_ENABLED:
+        return _assemble_prompt_v2()
     return fr"""
 You are a senior SQL assistant for MySQL 8.0.
 
@@ -4278,10 +4319,7 @@ Use ONLY tables/columns listed under ALLOWED IDENTIFIERS in Context.
 If Context lists aliases, use the canonical column name.
 
 Output:
-Return EXACTLY one JSON object:
-{{"sql":"<final MySQL query>","notes":"<brief rationale, max 12 words>"}}
-No Markdown. End SQL with a semicolon.
-If NO JOINs, notes MUST be exactly: "No joins used."
+{_build_generation_output_contract()}
 
 Context:
 {ctx}

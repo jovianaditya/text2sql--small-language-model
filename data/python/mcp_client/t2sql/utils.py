@@ -654,6 +654,19 @@ def _extract_loose_json_object(text: str) -> Optional[Dict[str, Any]]:
     if not txt:
         return None
 
+    # Absent SQL fallback for explicit abstain contracts.
+    # Supports malformed/partial JSON where cannot_answer is present.
+    abstain_bool = re.search(r'(?is)["\']cannot_answer["\']\s*:\s*true\b', txt)
+    if abstain_bool:
+        out: Dict[str, Any] = {"sql": "", "cannot_answer": True}
+        notes_value = _extract_loose_json_string_value(txt, "notes")
+        reason_value = _extract_loose_json_string_value(txt, "cannot_answer_reason")
+        if notes_value:
+            out["notes"] = notes_value
+        if reason_value:
+            out["cannot_answer_reason"] = reason_value
+        return out
+
     sql_value = _extract_loose_json_string_value(txt, "sql")
     plain_sql = _extract_plain_sql_statement(txt)
     jsonish_sql = _extract_jsonish_sql_field(txt)
@@ -672,6 +685,9 @@ def _extract_loose_json_object(text: str) -> Optional[Dict[str, Any]]:
         notes_value = _extract_loose_json_string_value(txt, "notes")
         if notes_value:
             out["notes"] = notes_value
+        cannot_answer_value = _extract_loose_json_string_value(txt, "cannot_answer_reason")
+        if cannot_answer_value:
+            out["cannot_answer_reason"] = cannot_answer_value
         return out
 
     if plain_sql and _looks_complete_sql_statement(plain_sql):

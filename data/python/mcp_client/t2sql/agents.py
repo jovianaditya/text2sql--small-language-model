@@ -37,6 +37,8 @@ from .config import (
     AGENT_B4_CANNOT_ANSWER_ENABLED,
     AGENT_B4_AMBIGUITY_ABSTAIN_ENABLED,
     AGENT_B4_AMBIGUITY_MIN_SIGNALS,
+    AGENT_PROMPT_ABSTAIN_ENABLED,
+    AGENT_PROMPT_ABSTAIN_NOTES_PREFIX,
     AGENT_AST_GUARDS_ENABLED,
     AGENT_AST_GUARDS_DEBUG,
     AGENT_REGEN_PRECHECK_ENABLED,
@@ -4876,6 +4878,30 @@ def _evaluate_cannot_answer_from_ir(intent_ir: Dict[str, Any]) -> Tuple[bool, st
     return False, "", signals
 
 
+def _extract_llm_cannot_answer_reason(obj: Dict[str, Any]) -> str:
+    reason = str(obj.get("cannot_answer_reason") or "").strip()
+    notes = str(obj.get("notes") or "").strip()
+    prefix = str(AGENT_PROMPT_ABSTAIN_NOTES_PREFIX or "CANNOT_ANSWER:").strip()
+    if not reason and prefix and notes.upper().startswith(prefix.upper()):
+        reason = notes[len(prefix):].strip(" :-")
+    if not reason and notes:
+        reason = notes
+    return reason
+
+
+def _llm_output_is_cannot_answer(obj: Dict[str, Any]) -> bool:
+    if not AGENT_PROMPT_ABSTAIN_ENABLED:
+        return False
+    if not isinstance(obj, dict):
+        return False
+    if bool(obj.get("cannot_answer", False)):
+        return True
+    sql_text = str(obj.get("sql") or "").strip()
+    notes = str(obj.get("notes") or "").strip()
+    prefix = str(AGENT_PROMPT_ABSTAIN_NOTES_PREFIX or "CANNOT_ANSWER:").strip()
+    return (not sql_text) and bool(prefix) and notes.upper().startswith(prefix.upper())
+
+
 def _extract_explicit_row_limit_value(question: str) -> Optional[int]:
     """
     Extract a row-limit value only from phrases that constrain result rows.
@@ -8079,6 +8105,23 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             "target_model": target_model,
             "draft_source": "llm",
             "draft_sql": "SELECT 'Error: LLM failed';",
+        }
+
+    if _llm_output_is_cannot_answer(obj):
+        reason = _extract_llm_cannot_answer_reason(obj) or "Cannot answer from available schema evidence"
+        print(f"[DRAFTER] LLM abstain contract triggered: {reason}")
+        updated_decision = dict(decision or {})
+        updated_decision["is_valid_question"] = False
+        updated_decision["rejection_reason"] = reason
+        return {
+            **state,
+            "router_decision": updated_decision,
+            "draft_source": "cannot_answer_llm",
+            "draft_sql": "",
+            "final_sql": "",
+            "answer": reason,
+            "cannot_answer": True,
+            "cannot_answer_reason": reason,
         }
         
     draft_sql = (obj.get("sql") or "SELECT 1;").strip()
