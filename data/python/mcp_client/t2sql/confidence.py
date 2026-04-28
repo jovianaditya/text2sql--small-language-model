@@ -12,7 +12,7 @@ import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from t2sql.schema_analyzer import is_numeric_column, is_date_column, get_all_tables
+from .schema_analyzer import is_numeric_column, is_date_column, get_all_tables
 
 # ======================================================================
 # ======================= SIGNAL WEIGHTS (TUNABLE) =====================

@@ -16,9 +16,14 @@
 from __future__ import annotations
 import json
 import re
+import warnings
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Any, Optional
 from collections import defaultdict
+from .config import (
+    SCHEMA_ANALYZER_INVALID_JSONL_PREVIEW,
+    SCHEMA_ANALYZER_STRICT_JSONL,
+)
 
 class SchemaAnalyzer:
     """
@@ -53,15 +58,38 @@ class SchemaAnalyzer:
 
     def _parse_jsonl(self):
         """Parse JSONL file and extract all metadata."""
-        with open(self.jsonl_path, 'r') as f:
-            for line in f:
+        invalid_lines: List[Tuple[int, str]] = []
+        with open(self.jsonl_path, 'r', encoding='utf-8') as f:
+            for line_no, line in enumerate(f, 1):
                 if not line.strip():
                     continue
                 try:
                     data = json.loads(line)
                     self._process_entry(data)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as e:
+                    invalid_lines.append((line_no, str(e)))
+
+        if invalid_lines:
+            preview_count = max(0, int(SCHEMA_ANALYZER_INVALID_JSONL_PREVIEW))
+            preview_items = invalid_lines[:preview_count]
+            preview_text = "; ".join(
+                f"line {line_no}: {err}"
+                for line_no, err in preview_items
+            )
+            more_count = max(0, len(invalid_lines) - len(preview_items))
+            if more_count:
+                preview_text = f"{preview_text}; ... and {more_count} more" if preview_text else f"... and {more_count} more"
+
+            message = (
+                f"Invalid JSONL entries found in schema metadata '{self.jsonl_path}': "
+                f"{len(invalid_lines)} invalid line(s)"
+            )
+            if preview_text:
+                message = f"{message}. {preview_text}"
+
+            if SCHEMA_ANALYZER_STRICT_JSONL:
+                raise ValueError(message)
+            warnings.warn(message, RuntimeWarning)
 
         # Post-processing: infer table types
         self._infer_table_types()
@@ -354,7 +382,7 @@ class SchemaAnalyzer:
         return None
 
 # ============================ GLOBAL INSTANCE ============================
-_analyzer_instance: Optional[SchemaAnalyzer] = None
+_analyzer_instances: Dict[str, SchemaAnalyzer] = {}
 
 def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
     """
@@ -371,56 +399,57 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
     Returns:
         SchemaAnalyzer instance
     """
-    global _analyzer_instance
+    global _analyzer_instances
 
-    if _analyzer_instance is None:
-        if jsonl_path is None:
-            from .config import JSON_INPUT
-            jsonl_path = JSON_INPUT
+    if jsonl_path is None:
+        from .config import SCHEMA_METADATA_JSONL
+        jsonl_path = SCHEMA_METADATA_JSONL
 
-        # Convert to Path object
-        jsonl_path_obj = Path(jsonl_path)
+    # Convert to Path object
+    jsonl_path_obj = Path(jsonl_path)
 
-        # Handle case where path is a directory (not a file)
-        if jsonl_path_obj.is_dir():
-            # It's a directory, search for jsonl files inside
-            jsonl_dir = jsonl_path_obj
-        else:
-            # It's a file path (or wildcard pattern), get the parent directory
-            jsonl_dir = jsonl_path_obj.parent
+    # Handle case where path is a directory (not a file)
+    if jsonl_path_obj.is_dir():
+        # It's a directory, search for jsonl files inside
+        jsonl_dir = jsonl_path_obj
+    else:
+        # It's a file path (or wildcard pattern), get the parent directory
+        jsonl_dir = jsonl_path_obj.parent
 
-        # Priority 1: Look for *_dense.jsonl first (rich metadata with synonyms/roles)
-        dense_files = list(jsonl_dir.glob("*_dense.jsonl"))
+    # Priority 1: Look for *_dense.jsonl first (rich metadata with synonyms/roles)
+    dense_files = list(jsonl_dir.glob("*_dense.jsonl"))
 
-        if dense_files:
-            # Use the dense JSONL file (prioritizes rich metadata)
-            jsonl_path = str(dense_files[0])
-        else:
-            # Priority 2: Use any .jsonl file
-            # Handle wildcard patterns or find any jsonl file
-            if "*" in jsonl_path or "?" in jsonl_path:
-                # It's a wildcard pattern, use it as-is
-                jsonl_files = list(jsonl_dir.glob(Path(jsonl_path).name))
-                if jsonl_files:
-                    jsonl_path = str(jsonl_files[0])
-            elif jsonl_path_obj.is_dir() or not jsonl_path_obj.exists():
-                # Path is a directory or doesn't exist, find any jsonl file
-                jsonl_files = list(jsonl_dir.glob("*.jsonl"))
-                if jsonl_files:
-                    jsonl_path = str(jsonl_files[0])
+    if dense_files:
+        # Use the dense JSONL file (prioritizes rich metadata)
+        jsonl_path = str(dense_files[0])
+    else:
+        # Priority 2: Use any .jsonl file
+        # Handle wildcard patterns or find any jsonl file
+        if "*" in jsonl_path or "?" in jsonl_path:
+            # It's a wildcard pattern, use it as-is
+            jsonl_files = list(jsonl_dir.glob(Path(jsonl_path).name))
+            if jsonl_files:
+                jsonl_path = str(jsonl_files[0])
+        elif jsonl_path_obj.is_dir() or not jsonl_path_obj.exists():
+            # Path is a directory or doesn't exist, find any jsonl file
+            jsonl_files = list(jsonl_dir.glob("*.jsonl"))
+            if jsonl_files:
+                jsonl_path = str(jsonl_files[0])
 
-        # Validate the final path
-        final_path = Path(jsonl_path)
-        if not final_path.exists() or final_path.is_dir():
-            raise ValueError(
-                f"Cannot find valid JSONL file. Path: {jsonl_path}. "
-                f"Directory: {jsonl_dir}. "
-                f"Please ensure at least one .jsonl file exists."
-            )
+    # Validate the final path
+    final_path = Path(jsonl_path)
+    if not final_path.exists() or final_path.is_dir():
+        raise ValueError(
+            f"Cannot find valid JSONL file. Path: {jsonl_path}. "
+            f"Directory: {jsonl_dir}. "
+            f"Please ensure at least one .jsonl file exists."
+        )
 
-        _analyzer_instance = SchemaAnalyzer(str(jsonl_path))
+    cache_key = str(final_path.resolve())
+    if cache_key not in _analyzer_instances:
+        _analyzer_instances[cache_key] = SchemaAnalyzer(cache_key)
 
-    return _analyzer_instance
+    return _analyzer_instances[cache_key]
 
 # ==================== CONVENIENCE FUNCTIONS ============================
 

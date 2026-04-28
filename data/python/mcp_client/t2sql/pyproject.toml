@@ -32,17 +32,11 @@ dev = [
 ]
 
 [project.scripts]
-t2sql-rag = "t2sql_rag.cli:main"
-
-# -------------------------
-# setuptools packaging
-# Best practice: src-layout
-# -------------------------
-[tool.setuptools]
-package-dir = {"" = "src"}
+t2sql-rag = "t2sql.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["t2sql*"]
 
 # -------------------------
 # tooling (optional)

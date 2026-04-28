@@ -16,6 +16,5 @@ __pycache__/
 **/run_*.log
 **/evaluation_*.log
 **/.codex
-AGENTS.md
 **/hitl_review_log_*.json
 **/t2sql_result_*.csv

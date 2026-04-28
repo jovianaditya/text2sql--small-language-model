@@ -11,44 +11,93 @@
 # ======================================================================
 import os
 import json
+import hashlib
 import requests
 from typing import Any, Dict, List
+from pathlib import Path
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 import chromadb
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .config import CHROMA_DIR, COLLECTION_NAME, OLLAMA_URL, EXPORT_JSONL_OUTPUT, JSON_INPUT
-from .utils import resolve_jsonl_paths
+from .config import CHROMA_DIR, COLLECTION_NAME, OLLAMA_URL, DENSE_METADATA_JSONL
 _CHROMA_COL = None
+_CHROMA_SOURCE_SIGNATURE = ""
 
 
 def _resolve_ingest_jsonl_paths() -> List[str]:
     """
-    Resolve JSONL inputs safely for file/dir/glob configurations.
-    Priority:
-    1) dense files (*_dense.jsonl) when available
-    2) otherwise any resolved .jsonl files
+    Resolve the explicit dense JSONL input for vector ingestion.
     """
-    specs = []
-    for raw in (EXPORT_JSONL_OUTPUT, JSON_INPUT):
-        s = str(raw or "").strip()
-        if s:
-            specs.append(s)
-
-    seen = set()
-    resolved: List[str] = []
-    for spec in specs:
-        for p in resolve_jsonl_paths(spec):
-            if p not in seen:
-                seen.add(p)
-                resolved.append(p)
-
-    if not resolved:
+    dense_path = str(DENSE_METADATA_JSONL or "").strip()
+    if not dense_path:
         return []
+    path_obj = Path(dense_path)
+    if path_obj.is_file():
+        return [str(path_obj)]
+    return []
 
-    dense = [p for p in resolved if p.lower().endswith("_dense.jsonl")]
-    return dense if dense else resolved
+
+def _stamp_path() -> Path:
+    return Path(CHROMA_DIR) / f".{COLLECTION_NAME}.dense_source_stamp.json"
+
+
+def _compute_source_signature(paths: List[str]) -> str:
+    sig_parts: List[str] = []
+    for raw_path in paths:
+        try:
+            path = Path(raw_path).resolve()
+            digest = hashlib.sha256()
+            with path.open("rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    if chunk:
+                        digest.update(chunk)
+            sig_parts.append(f"{path}:{digest.hexdigest()}")
+        except OSError:
+            sig_parts.append(str(raw_path))
+    return "||".join(sig_parts)
+
+
+def _load_source_signature() -> str:
+    stamp = _stamp_path()
+    if not stamp.is_file():
+        return ""
+    try:
+        payload = json.loads(stamp.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("signature") or "").strip()
+
+
+def _save_source_signature(signature: str, paths: List[str]) -> None:
+    payload = {
+        "signature": str(signature or "").strip(),
+        "paths": [str(p) for p in paths if str(p).strip()],
+    }
+    _stamp_path().write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def _rebuild_collection(client, emb_fn, ingest_paths: List[str]):
+    try:
+        client.delete_collection(name=COLLECTION_NAME)
+    except Exception:
+        pass
+    client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        embedding_function=emb_fn,
+        metadata={"hnsw:space": "cosine"}
+    )
+    if ingest_paths:
+        print(f"[STATUS - CHROMA] Rebuilding collection '{COLLECTION_NAME}' from dense metadata:")
+        for p in ingest_paths:
+            print(f"  - {p}")
+        ingest_dense_data(jsonl_paths=ingest_paths)
+    return client.get_collection(
+        name=COLLECTION_NAME,
+        embedding_function=emb_fn,
+    )
 
 # ==============================================================================
 #  1. MODIFIED BUILD_VECTOR_STORE (AUTO-INGEST LOGIC)
@@ -57,19 +106,26 @@ def build_vector_store():
     """
     Singleton koneksi ChromaDB + Auto-Ingest jika kosong.
     """
-    global _CHROMA_COL
-    if _CHROMA_COL is not None:
-        return _CHROMA_COL
+    global _CHROMA_COL, _CHROMA_SOURCE_SIGNATURE
 
     os.makedirs(CHROMA_DIR, exist_ok=True)
-    
+    ingest_paths = _resolve_ingest_jsonl_paths()
+    source_signature = _compute_source_signature(ingest_paths)
+    stored_signature = _load_source_signature()
+
+    if (
+        _CHROMA_COL is not None
+        and _CHROMA_SOURCE_SIGNATURE == source_signature
+        and stored_signature == source_signature
+    ):
+        return _CHROMA_COL
+
     client = chromadb.PersistentClient(path=CHROMA_DIR)
-    
     emb_fn = OllamaEmbeddingFunction(
         base_url=OLLAMA_URL,
         model="snowflake-arctic-embed2:568m",
     )
-    
+
     # 1. Connect / Create Container
     _CHROMA_COL = client.get_or_create_collection(
         name=COLLECTION_NAME,
@@ -79,31 +135,40 @@ def build_vector_store():
     
     # 2. CEK ISI & LOGGING
     current_count = _CHROMA_COL.count()
-    
+
+    needs_rebuild = bool(ingest_paths) and stored_signature != source_signature
+
     if current_count == 0:
         print(f"[STATUS - CHROMA] Collection '{COLLECTION_NAME}' is EMPTY.")
-        ingest_paths = _resolve_ingest_jsonl_paths()
         if not ingest_paths:
             print(
                 f"[STATUS - CHROMA] No JSONL files found for ingestion. "
-                f"Checked specs: EXPORT_JSONL_OUTPUT='{EXPORT_JSONL_OUTPUT}', JSON_INPUT='{JSON_INPUT}'"
+                f"Checked dense metadata path: DENSE_METADATA_JSONL='{DENSE_METADATA_JSONL}'"
             )
         else:
             print(f"[STATUS - CHROMA] Triggering AUTO-INGEST from {len(ingest_paths)} file(s):")
             for p in ingest_paths:
                 print(f"  - {p}")
             ingest_dense_data(jsonl_paths=ingest_paths)
-        
+            _save_source_signature(source_signature, ingest_paths)
+
         # Refresh object collection
         _CHROMA_COL = client.get_collection(
             name=COLLECTION_NAME,
             embedding_function=emb_fn
         )
+    elif needs_rebuild:
+        print(
+            f"[STATUS - CHROMA] Dense metadata source changed for collection '{COLLECTION_NAME}'. "
+            f"Refreshing vector index."
+        )
+        _CHROMA_COL = _rebuild_collection(client, emb_fn, ingest_paths)
+        _save_source_signature(source_signature, ingest_paths)
     else:
-        # --- [INI TAMBAHAN LOGS YANG ANDA MINTA] ---
         print(f"[STATUS - CHROMA] Collection '{COLLECTION_NAME}' ready. Contains {current_count} docs.")
-        print(f"[STATUS - CHROMA] No update needed. Skipping auto-ingest.")
+        print(f"[STATUS - CHROMA] Dense source unchanged. Skipping auto-ingest.")
 
+    _CHROMA_SOURCE_SIGNATURE = source_signature
     return _CHROMA_COL
 # ==============================================================================
 # 2. INGESTION LOGIC (SAMA SEPERTI SEBELUMNYA)

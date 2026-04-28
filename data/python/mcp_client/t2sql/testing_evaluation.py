@@ -20,8 +20,10 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import yaml
+from dotenv import load_dotenv, find_dotenv
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+load_dotenv(find_dotenv(), override=False)
 try:
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -39,7 +41,7 @@ from .config import (
     MCP_BASE,
     CHROMA_DIR,
     COLLECTION_NAME,
-    JSON_INPUT,
+    SPARSE_METADATA_JSONL,
     OLLAMA_URL,
     ROUTING_MODEL,
     SMALL_MODEL,
@@ -1506,9 +1508,9 @@ async def run_batch_eval(
     
     # Default paths for JSONL - resolve from config like CLI does
     if paths is None or len(paths) == 0:
-        paths = resolve_jsonl_paths(JSON_INPUT)
+        paths = resolve_jsonl_paths(SPARSE_METADATA_JSONL)
         if not paths:
-            print("[WARN] No JSONL paths found - sparse search may not work!")
+            print("[WARN] No sparse JSONL paths found - BM25 retrieval may not work!")
     
     ts_db_list: list[str] = []
     for db in (ts_databases or []):

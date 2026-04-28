@@ -12,6 +12,7 @@
 import os
 import re
 import json
+import hashlib
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from collections import defaultdict
@@ -127,6 +128,7 @@ from .config import (
     AGENT_ROUTER_QTYPE_LOOKUP,
     AGENT_ROUTER_QTYPE_AGGREGATE,
     AGENT_ROUTER_QTYPE_RANK,
+    SPARSE_METADATA_JSONL,
 )
 from .state import RAGState
 from .chroma_embedding import build_vector_store
@@ -703,12 +705,17 @@ def _doc_tokens_from_meta(meta: Dict[str, Any]) -> List[str]:
     return _tokenize_bm25_query(bag)
 
 def jsonl_sparse_search(q: str, jsonl_paths: List[str], max_hits: int = SPARSE_MAX_HITS) -> List[str]:
-    # cache key by files + mtime
+    # Cache key by sparse file content hash so any metadata edit invalidates BM25.
     sig = []
     for p in jsonl_paths:
         try:
-            st = os.stat(p)
-            sig.append(f"{p}:{int(st.st_mtime)}:{int(st.st_size)}")
+            path = Path(p).resolve()
+            digest = hashlib.sha256()
+            with path.open("rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    if chunk:
+                        digest.update(chunk)
+            sig.append(f"{path}:{digest.hexdigest()}")
         except Exception:
             sig.append(p)
     cache_key = "||".join(sorted(sig))
@@ -1398,9 +1405,12 @@ def retrieve_node(state: RAGState) -> RAGState:
 
     # --- [MODIFIED 2] Filter Paths: Hanya ambil file yang namanya mengandung "_sparse" ---
     all_paths = state.get("jsonl_paths", [])
+    if not all_paths and str(SPARSE_METADATA_JSONL or "").strip():
+        all_paths = [SPARSE_METADATA_JSONL]
     sparse_target_paths = [p for p in all_paths if RETRIEVAL_SPARSE_FILENAME_MARKER in str(p)]
     
-    # Fallback: Jika tidak ada file _sparse, pakai semua (backward compat)
+    # Fallback: if caller passed only the explicit sparse path without marker filtering,
+    # or when running with a custom sparse filename, keep using the configured inputs.
     if not sparse_target_paths:
         sparse_target_paths = all_paths
 

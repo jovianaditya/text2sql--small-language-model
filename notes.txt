@@ -78,5 +78,6 @@ tmux new -s thesis
 tmux ls
 # continue session
 tmux attach -d -t thesis
+tmux new-window -t thesis
 tmux select-window -t thesis:1
 tmux kill-session -t thesis

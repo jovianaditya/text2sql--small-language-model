@@ -15,8 +15,10 @@ import re
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+load_dotenv(find_dotenv(), override=False)
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================

@@ -16,19 +16,17 @@ load_dotenv(find_dotenv(), override=False)
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
-from .config import JSON_INPUT
+from .config import SPARSE_METADATA_JSONL
 from .utils import resolve_jsonl_paths
 from .repl import repl
 
 def main():
-    paths = resolve_jsonl_paths(JSON_INPUT)
+    paths = resolve_jsonl_paths(SPARSE_METADATA_JSONL)
     if not paths:
         raise RuntimeError(
-            "No JSONL inputs found.\n"
-            "Set JSON_INPUT or EXPORT_JSONL_OUTPUT to one of:\n"
-            "  • a single file: ./exports/schema_export.jsonl\n"
-            "  • a directory:   ./datahub_metadata\n"
-            "  • a glob:        ./datahub_metadata/*.jsonl\n"
+            "No sparse JSONL input found.\n"
+            "Set SPARSE_METADATA_JSONL to the lexical metadata file, for example:\n"
+            "  • ./metadata_jsonl/classicmodels_sparse.jsonl\n"
         )
 
     try:

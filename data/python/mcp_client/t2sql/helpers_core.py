@@ -1914,7 +1914,7 @@ def _self_fk_columns_by_table(ctx: str = "") -> Dict[str, List[Tuple[str, str]]]
 
     analyzer = None
     try:
-        analyzer = get_schema_analyzer(str(Path(__file__).resolve().parents[1] / "metadata_jsonl"))
+        analyzer = get_schema_analyzer()
     except Exception:
         analyzer = None
 
@@ -2023,7 +2023,7 @@ def _self_fk_role_terms_from_schema(ctx: str = "") -> Set[str]:
 
     analyzer = None
     try:
-        analyzer = get_schema_analyzer(str(Path(__file__).resolve().parents[1] / "metadata_jsonl"))
+        analyzer = get_schema_analyzer()
     except Exception:
         analyzer = None
 
@@ -6102,7 +6102,7 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str, ctx: str
         ]
     except Exception:
         try:
-            analyzer = get_schema_analyzer(str(Path(__file__).resolve().parents[1] / "metadata_jsonl"))
+            analyzer = get_schema_analyzer()
             table_cols = [
                 str(c).strip("`")
                 for c in analyzer.get_table_columns(base_table)
@@ -7079,7 +7079,7 @@ def _align_requested_description_variant(sql: str, question: str, ctx: str = "")
         analyzer = None
     if analyzer is None:
         try:
-            analyzer = get_schema_analyzer(str(Path(__file__).resolve().parents[1] / "metadata_jsonl"))
+            analyzer = get_schema_analyzer()
         except Exception:
             analyzer = None
     if analyzer is not None:
@@ -7499,7 +7499,7 @@ def _align_requested_joined_description_variant(sql: str, question: str, ctx: st
         analyzer = None
     if analyzer is None:
         try:
-            analyzer = get_schema_analyzer(str(Path(__file__).resolve().parents[1] / "metadata_jsonl"))
+            analyzer = get_schema_analyzer()
         except Exception:
             analyzer = None
 
@@ -12131,7 +12131,7 @@ def _enforce_all_other_group_avg_self_exclusion(sql: str, question: str) -> str:
         analyzer = None
     if analyzer is None:
         try:
-            analyzer = get_schema_analyzer(str(Path(__file__).resolve().parents[1] / "metadata_jsonl"))
+            analyzer = get_schema_analyzer()
         except Exception:
             analyzer = None
 

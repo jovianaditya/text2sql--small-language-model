@@ -152,6 +152,9 @@ def _collection_candidate_from_spec(spec: str | None) -> str | None:
 
 def _infer_default_collection_name() -> str:
     for spec in (
+        os.getenv("SCHEMA_METADATA_JSONL"),
+        os.getenv("DENSE_METADATA_JSONL"),
+        os.getenv("SPARSE_METADATA_JSONL"),
         os.getenv("JSON_INPUT"),
         os.getenv("EXPORT_JSONL_OUTPUT"),
         str(_DEFAULT_METADATA_DIR / "*_dense.jsonl"),
@@ -166,10 +169,14 @@ def _infer_default_collection_name() -> str:
 def _infer_default_export_jsonl_output(collection_name: str) -> str:
     name = str(collection_name or "").strip() or "default_collection"
     return str(_DEFAULT_METADATA_DIR / f"{name}_dense.jsonl")
+
+
+def _infer_default_sparse_jsonl_input(collection_name: str) -> str:
+    name = str(collection_name or "").strip() or "default_collection"
+    return str(_DEFAULT_METADATA_DIR / f"{name}_sparse.jsonl")
 # ======================================================================
 # ============================ APP/GENERAL =============================
 # ======================================================================
-JSON_INPUT        = os.getenv("JSON_INPUT", os.getenv("EXPORT_JSONL_OUTPUT", str(_DEFAULT_METADATA_DIR / "*.jsonl"))).strip()
 CHROMA_DIR        = os.getenv("CHROMA_DIR", "./chroma_db").strip()
 COLLECTION_NAME   = os.getenv("COLLECTION_NAME", _infer_default_collection_name()).strip()
 OLLAMA_URL        = os.getenv("OLLAMA_URL", "http://localhost:11434").strip()
@@ -237,10 +244,34 @@ RETRIEVAL_SINGLE_LOCK_MAX_NON_PRIMARY_SPARSE_HITS = int(
 RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK = int(
     os.getenv("RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK", "1")
 )
-# >>> Bisa dimatiin kalau mau lebih silent
+# Optional retrieval debug switches.
 SPARSE_DEBUG   = bool(int(os.getenv("SPARSE_DEBUG", "0")))
 RETRIEVE_DEBUG = bool(int(os.getenv("RETRIEVE_DEBUG", "1")))
-EXPORT_JSONL_OUTPUT = os.getenv("EXPORT_JSONL_OUTPUT", _infer_default_export_jsonl_output(COLLECTION_NAME)).strip()
+# Explicit metadata-source contract:
+# - dense metadata feeds vector ingestion / dense retrieval
+# - sparse metadata feeds BM25 / lexical retrieval
+# - schema metadata feeds schema analysis and defaults to the dense source
+DENSE_METADATA_JSONL = os.getenv(
+    "DENSE_METADATA_JSONL",
+    os.getenv("EXPORT_JSONL_OUTPUT", _infer_default_export_jsonl_output(COLLECTION_NAME)),
+).strip()
+SPARSE_METADATA_JSONL = os.getenv(
+    "SPARSE_METADATA_JSONL",
+    _infer_default_sparse_jsonl_input(COLLECTION_NAME),
+).strip()
+SCHEMA_METADATA_JSONL = os.getenv(
+    "SCHEMA_METADATA_JSONL",
+    DENSE_METADATA_JSONL,
+).strip()
+# Backward-compatible aliases for older code paths:
+# - JSON_INPUT now defaults to the sparse BM25 metadata input.
+# - EXPORT_JSONL_OUTPUT continues to point at the dense metadata export.
+JSON_INPUT = os.getenv("JSON_INPUT", SPARSE_METADATA_JSONL).strip()
+EXPORT_JSONL_OUTPUT = os.getenv("EXPORT_JSONL_OUTPUT", DENSE_METADATA_JSONL).strip()
+SCHEMA_ANALYZER_STRICT_JSONL = bool(int(os.getenv("SCHEMA_ANALYZER_STRICT_JSONL", "1")))
+SCHEMA_ANALYZER_INVALID_JSONL_PREVIEW = int(
+    os.getenv("SCHEMA_ANALYZER_INVALID_JSONL_PREVIEW", "3")
+)
 
 RETRIEVAL_STATS_MAX_SAMPLES = int(os.getenv("RETRIEVAL_STATS_MAX_SAMPLES", "5"))
 RETRIEVAL_DESC_KEYWORD_HEAD_WORDS = int(os.getenv("RETRIEVAL_DESC_KEYWORD_HEAD_WORDS", "5"))
