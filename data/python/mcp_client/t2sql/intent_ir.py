@@ -176,6 +176,7 @@ class IntentIR:
     confidence: float = 0.0
     planner_compatible: bool = True
     mentioned_tables: List[str] = field(default_factory=list)
+    ambiguity_signals: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -2682,6 +2683,35 @@ def _compute_confidence(
     return score, planner_compatible, notes
 
 
+def _detect_ambiguity_signals(
+    subject: str,
+    mentioned_tables: List[str],
+    notes: List[str],
+    column_mentions: List[Tuple[str, str, int]],
+) -> List[str]:
+    signals: List[str] = []
+    subject_l = str(subject or "").strip().lower()
+    table_mentions = [str(t or "").strip().lower() for t in (mentioned_tables or []) if str(t or "").strip()]
+    unique_tables = list(dict.fromkeys(table_mentions))
+
+    if not subject_l and len(unique_tables) >= 2:
+        signals.append("unresolved_subject_multi_table")
+    if len(unique_tables) >= 4:
+        signals.append("high_table_ambiguity")
+    if "disconnected_mentions" in {str(n or "").strip().lower() for n in (notes or [])}:
+        signals.append("disconnected_table_mentions")
+
+    column_tables = {
+        str(t or "").strip().lower()
+        for (t, _, _) in (column_mentions or [])
+        if str(t or "").strip()
+    }
+    if not subject_l and len(column_tables) >= 3:
+        signals.append("column_mentions_span_many_tables")
+
+    return list(dict.fromkeys(signals))
+
+
 def build_intent_ir(
     question: str,
     ctx: str,
@@ -2766,6 +2796,12 @@ def build_intent_ir(
         existence=existence,
         mentioned_tables=mentioned_tables,
     )
+    ambiguity_signals = _detect_ambiguity_signals(
+        subject=subject,
+        mentioned_tables=mentioned_tables,
+        notes=notes,
+        column_mentions=column_mentions,
+    )
 
     ir = IntentIR(
         subject_entity=subject,
@@ -2782,6 +2818,7 @@ def build_intent_ir(
         confidence=confidence,
         planner_compatible=planner_compatible,
         mentioned_tables=mentioned_tables,
+        ambiguity_signals=ambiguity_signals,
     )
     return ir.to_dict()
 

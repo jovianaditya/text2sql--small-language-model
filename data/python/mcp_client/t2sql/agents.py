@@ -34,6 +34,9 @@ from .config import (
     AGENT_IR_MAX_TABLES,
     AGENT_IR_ALLOW_SIMPLE_HAVING,
     AGENT_IR_SIMPLE_HAVING_MAX_FILTERS,
+    AGENT_B4_CANNOT_ANSWER_ENABLED,
+    AGENT_B4_AMBIGUITY_ABSTAIN_ENABLED,
+    AGENT_B4_AMBIGUITY_MIN_SIGNALS,
     AGENT_AST_GUARDS_ENABLED,
     AGENT_AST_GUARDS_DEBUG,
     AGENT_REGEN_PRECHECK_ENABLED,
@@ -4851,6 +4854,28 @@ def _should_expand_retrieval_context(gate_reasons: List[str]) -> bool:
     return False
 
 
+def _evaluate_cannot_answer_from_ir(intent_ir: Dict[str, Any]) -> Tuple[bool, str, List[str]]:
+    """
+    Decide whether to abstain before SQL drafting for ambiguous/unanswerable intents.
+    This gate is flag-driven and defaults to inactive.
+    """
+    signals = [str(s).strip() for s in (intent_ir.get("ambiguity_signals") or []) if str(s).strip()]
+    notes = {str(n or "").strip().lower() for n in (intent_ir.get("notes") or []) if str(n or "").strip()}
+    subject = str(intent_ir.get("subject_entity") or "").strip()
+    mention_count = len(intent_ir.get("mentioned_tables") or [])
+
+    if AGENT_B4_AMBIGUITY_ABSTAIN_ENABLED and len(signals) >= max(1, int(AGENT_B4_AMBIGUITY_MIN_SIGNALS)):
+        return True, f"Ambiguous question across schema context: {signals}", signals
+
+    if AGENT_B4_CANNOT_ANSWER_ENABLED:
+        if not subject and mention_count >= 2 and signals:
+            return True, f"Cannot resolve subject entity reliably: {signals}", signals
+        if "disconnected_mentions" in notes and not subject:
+            return True, "Cannot map disconnected table mentions to a safe join path", signals
+
+    return False, "", signals
+
+
 def _extract_explicit_row_limit_value(question: str) -> Optional[int]:
     """
     Extract a row-limit value only from phrases that constrain result rows.
@@ -7522,6 +7547,9 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     state["ir_gate_reasons"] = []
     state["ir_table_count"] = 0
     state["ir_context_table_count"] = 0
+    state["ambiguity_signals"] = []
+    state["cannot_answer"] = False
+    state["cannot_answer_reason"] = ""
 
     # ------------------------------------------------------------------
     # IR-FIRST deterministic planning (schema-agnostic)
@@ -7534,6 +7562,25 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             primary_table=state.get("primary_table", ""),
         )
         state["intent_ir"] = intent_ir
+        state["ambiguity_signals"] = list(intent_ir.get("ambiguity_signals") or [])
+
+        should_abstain, abstain_reason, ambiguity_signals = _evaluate_cannot_answer_from_ir(intent_ir)
+        if should_abstain:
+            print(f"[DRAFTER] Abstain: {abstain_reason}")
+            updated_decision = dict(decision or {})
+            updated_decision["is_valid_question"] = False
+            updated_decision["rejection_reason"] = abstain_reason
+            return {
+                **state,
+                "ambiguity_signals": ambiguity_signals,
+                "cannot_answer": True,
+                "cannot_answer_reason": abstain_reason,
+                "router_decision": updated_decision,
+                "draft_source": "cannot_answer_guard",
+                "draft_sql": "",
+                "final_sql": "",
+                "answer": abstain_reason,
+            }
 
         mentioned_tables = intent_ir.get("mentioned_tables") or []
         router_tables = state.get("router_tables") or []

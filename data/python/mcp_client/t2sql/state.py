@@ -24,6 +24,7 @@ class RAGState(TypedDict, total=False):
     retrieval_retry_used: bool
     retrieval_retry_reason: str
     retrieval_expanded_table_count: int
+    retrieval_snapshot: Dict[str, Any]
     # ROUTING
     router_decision: Dict[str, Any]  # Output JSON Router
     router_tables: List[str]
@@ -41,6 +42,9 @@ class RAGState(TypedDict, total=False):
     final_sql: str
     # Agnostic pipeline artifacts
     intent_ir: Dict[str, Any]
+    ambiguity_signals: List[str]
+    cannot_answer: bool
+    cannot_answer_reason: str
     join_plan: Dict[str, Any]
     # Route telemetry
     ir_used: bool
@@ -102,6 +106,7 @@ def make_state(
         "retrieval_retry_used": False,
         "retrieval_retry_reason": "",
         "retrieval_expanded_table_count": 0,
+        "retrieval_snapshot": {},
         "router_decision": {},
         "router_tables": [],
         "primary_table": "",
@@ -116,6 +121,9 @@ def make_state(
         "ranked_cols": [],
         "final_sql": "",
         "intent_ir": {},
+        "ambiguity_signals": [],
+        "cannot_answer": False,
+        "cannot_answer_reason": "",
         "join_plan": {},
         "ir_used": False,
         "ir_confidence": 0.0,

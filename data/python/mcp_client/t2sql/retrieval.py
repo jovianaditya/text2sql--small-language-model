@@ -126,6 +126,7 @@ from .config import (
     RETRIEVAL_SINGLE_LOCK_MAX_NON_PRIMARY_SPARSE_HITS,
     RETRIEVAL_SINGLE_LOCK_FALLBACK_TOPK,
     RETRIEVAL_EXPAND_MAX_TABLES,
+    RETRIEVAL_TELEMETRY_MAX_ITEMS,
     AGENT_ROUTER_QTYPE_LOOKUP,
     AGENT_ROUTER_QTYPE_AGGREGATE,
     AGENT_ROUTER_QTYPE_RANK,
@@ -483,6 +484,7 @@ def _build_cards(
     desc_max_len: int = RETRIEVAL_CARDS_DESC_MAX_LEN,
     question: str = "",  # Add question parameter
     qtype: str = "",     # Add qtype parameter
+    drop_counters: Optional[Dict[str, int]] = None,
 ) -> str:
     cards: List[str] = []
     present = set()
@@ -508,6 +510,10 @@ def _build_cards(
         if question and qtype:
             if not _is_column_relevant_to_query(column, table, question, qtype, md):
                 # Skip this column - not relevant to the query
+                if drop_counters is not None:
+                    drop_counters["cards_irrelevant_column"] = int(
+                        drop_counters.get("cards_irrelevant_column", 0)
+                    ) + 1
                 if RETRIEVE_DEBUG:
                     print(f"   [FILTER] Excluding {table}.{column} (not relevant to query)")
                 continue
@@ -1750,6 +1756,7 @@ def retrieve_node(state: RAGState) -> RAGState:
     # -----------------------------
     allowed = defaultdict(list)
     alias_map = defaultdict(dict)
+    retrieval_drop_reasons: Dict[str, int] = {}
 
     for item in reranked:
         md = item["meta"] or {}
@@ -1764,6 +1771,9 @@ def retrieve_node(state: RAGState) -> RAGState:
             is_relevant = _is_column_relevant_to_query(c, t, q, qtype, md)
             if not is_relevant:
                 # Skip this column - not relevant to the query
+                retrieval_drop_reasons["allowed_irrelevant_column"] = int(
+                    retrieval_drop_reasons.get("allowed_irrelevant_column", 0)
+                ) + 1
                 if RETRIEVE_DEBUG:
                     print(f"   [FILTER-ALLOWED] Excluding {t}.{c} from allowed identifiers")
                 continue
@@ -2061,6 +2071,7 @@ def retrieve_node(state: RAGState) -> RAGState:
         desc_max_len=RETRIEVAL_CARDS_DESC_MAX_LEN,
         question=q,      # Pass question for column filtering
         qtype=qtype,     # Pass qtype for column filtering
+        drop_counters=retrieval_drop_reasons,
     )
 
     context = (allowed_block + "\n\n### CARDS\n" + cards_text).strip()
@@ -2072,9 +2083,37 @@ def retrieve_node(state: RAGState) -> RAGState:
         for tbl, cols in filtered_allowed.items():
             print(f"[DEBUG] {tbl}: {len(cols)} columns")
 
+    telem_limit = max(1, int(RETRIEVAL_TELEMETRY_MAX_ITEMS))
+    sparse_preview = [str(s) for s in (sparse_docs_pretty or [])[:telem_limit]]
+    dense_preview = [
+        f"{(_meta_table(md) or '?')}.{(_meta_column(md) or '?')}"
+        for md in (dense_metas or [])[:telem_limit]
+    ]
+    rerank_preview = [
+        f"{(_meta_table((it.get('meta') or {})) or '?')}.{(_meta_column((it.get('meta') or {})) or '?')}"
+        for it in (reranked or [])[:telem_limit]
+    ]
+    filtered_allowed_col_count = sum(len(set(cols or [])) for cols in (filtered_allowed or {}).values())
+    allowed_col_count = sum(len(set(cols or [])) for cols in (allowed or {}).values())
+    retrieval_snapshot = {
+        "qtype": str(qtype or ""),
+        "sparse_candidates": int(len(sparse_field_urns or [])),
+        "dense_candidates": int(len(dense_metas or [])),
+        "reranked_candidates": int(len(reranked or [])),
+        "allowed_tables_before_filter": int(len(allowed or {})),
+        "allowed_tables_after_filter": int(len(filtered_allowed or {})),
+        "allowed_columns_before_filter": int(allowed_col_count),
+        "allowed_columns_after_filter": int(filtered_allowed_col_count),
+        "drop_reasons": {str(k): int(v) for k, v in sorted((retrieval_drop_reasons or {}).items())},
+        "sparse_preview": sparse_preview,
+        "dense_preview": dense_preview,
+        "rerank_preview": rerank_preview,
+    }
+
     state["context"] = context
     state["retrieval_context_mode"] = "primary"
     state["retrieval_retry_used"] = False
     state["retrieval_retry_reason"] = ""
     state["retrieval_expanded_table_count"] = 0
+    state["retrieval_snapshot"] = retrieval_snapshot
     return state

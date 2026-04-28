@@ -53,6 +53,7 @@ from .config import (
     SMALL_MODEL_P3,
     LARGE_MODEL_P3,
     OLLAMA_KEEP_ALIVE,
+    EXECUTION_EMPTY_RESULT_CLASSIFY,
     format_heuristic_observability,
 )
 from .state import make_state
@@ -768,9 +769,10 @@ def save_to_excel(
         "question": 50,
         "groundtruth_sql": 40, "predicted_sql": 40,
         "draft_source": 14, "ir_confidence": 12, "ir_gate_reasons": 28,
+        "ambiguity_signals": 24, "cannot_answer": 12, "cannot_answer_reason": 34,
         "final_model_used": 12,  # Model tracking
         "va_success": 12, "va_notes": 30,
-        "exec_success": 12, "exec_notes": 34,
+        "exec_success": 12, "exec_notes": 34, "pred_empty_result": 14, "gt_empty_result": 14,
         "ts_success": 12, "ts_failed_databases": 24,
         "pred_row_count": 28, "gt_row_count": 28,
         "latency_s": 12
@@ -918,6 +920,9 @@ async def run_single_case(
         "ir_confidence": 0.0,
         "ir_plannable": False,
         "ir_gate_reasons": "",
+        "ambiguity_signals": "",
+        "cannot_answer": False,
+        "cannot_answer_reason": "",
         "ir_hint_passed": False,
         "initial_model_used": "",  # Initial model chosen by router (3b/7b)
         "final_model_used": "",    # Standardized route label: ir_planner | llm_small | llm_large
@@ -933,6 +938,8 @@ async def run_single_case(
         "ts_match_count": 0,            # Number of DBs that match for this case
         "ts_total_databases": len(ts_db_targets),  # Configured TS DB count for this case
         "ts_failed_databases": "",      # Newline-separated DBs that mismatched/failed
+        "pred_empty_result": False,
+        "gt_empty_result": False,
         "latency_s": 0,            # Primary: warm prompt->final SQL latency (seconds)
         "error": None,
     }
@@ -975,6 +982,10 @@ async def run_single_case(
         result["ir_plannable"] = bool(state.get("ir_plannable", False))
         gate_reasons = state.get("ir_gate_reasons", []) or []
         result["ir_gate_reasons"] = "|".join(str(x) for x in gate_reasons if str(x).strip())
+        ambiguity_signals = state.get("ambiguity_signals", []) or []
+        result["ambiguity_signals"] = "|".join(str(x) for x in ambiguity_signals if str(x).strip())
+        result["cannot_answer"] = bool(state.get("cannot_answer", False))
+        result["cannot_answer_reason"] = str(state.get("cannot_answer_reason") or "").strip()
         result["ir_hint_passed"] = bool(state.get("ir_hint_passed", False))
         
         # Primary latency metric for thesis:
@@ -1058,10 +1069,25 @@ async def run_single_case(
         )
         
         print(f"[PREDICTED] {predicted_sql}")
-        
+
     except Exception as e:
         result["error"] = f"Pipeline error: {e}"
         print(f"[ERROR] Pipeline failed: {e}")
+        return result
+
+    if result["cannot_answer"]:
+        reason = result["cannot_answer_reason"] or "Cannot answer from available schema evidence"
+        result["va_success"] = False
+        result["va_notes"] = "cannot_answer"
+        result["exec_success"] = False
+        result["exec_notes"] = reason
+        result["result_match"] = False
+        result["ts_match_count"] = 0
+        result["ts_failed_databases"] = "\n".join(ts_db_targets)
+        result["match_reason"] = reason
+        result["error"] = reason
+        _refresh_row_count_fields()
+        print(f"[ABSTAIN] {reason}")
         return result
 
     # Fail-closed outputs must be treated as failed evaluation cases.
@@ -1111,6 +1137,10 @@ async def run_single_case(
     if pred_success:
         result["exec_notes"] = "Predicted SQL executed successfully"
         pred_base_rows_count = len(pred_rows or [])
+        if EXECUTION_EMPTY_RESULT_CLASSIFY:
+            result["pred_empty_result"] = pred_base_rows_count == 0
+            if result["pred_empty_result"]:
+                result["exec_notes"] = "Predicted SQL executed successfully (empty result)"
         pred_counts_by_db[primary_db] = f"{pred_base_rows_count} rows"
         _refresh_row_count_fields()
         print(f"[EX] Predicted SQL returned {pred_base_rows_count} rows")
@@ -1140,6 +1170,8 @@ async def run_single_case(
         gt_success, gt_rows, gt_error = await execute_sql(mcp, groundtruth_sql, database=primary_db)
         if gt_success:
             gt_base_rows_count = len(gt_rows or [])
+            if EXECUTION_EMPTY_RESULT_CLASSIFY:
+                result["gt_empty_result"] = gt_base_rows_count == 0
             gt_counts_by_db[primary_db] = f"{gt_base_rows_count} rows"
             _refresh_row_count_fields()
         else:
@@ -1653,8 +1685,9 @@ async def run_batch_eval(
             "question",
             "groundtruth_sql", "predicted_sql",
             "draft_source", "final_model_used", "ir_confidence", "ir_gate_reasons",
+            "ambiguity_signals", "cannot_answer", "cannot_answer_reason",
             "va_success", "va_notes",
-            "exec_success", "exec_notes",
+            "exec_success", "exec_notes", "pred_empty_result", "gt_empty_result",
             "ts_success", "ts_failed_databases",
             "pred_row_count", "gt_row_count",
             "latency_s"

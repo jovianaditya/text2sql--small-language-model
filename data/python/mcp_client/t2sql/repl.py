@@ -34,6 +34,7 @@ from .config import (
     HITL_LOG_PATH,
     HITL_SUCCESS_REVIEW_ENABLED,
     HITL_TEST_FORCE_FAILURE,
+    EXECUTION_EMPTY_RESULT_CLASSIFY,
 )
 from .state import make_state
 from .graph import build_app
@@ -140,10 +141,23 @@ async def _exec_via_mcp(
 
         if isinstance(payload, dict) and payload.get("success"):
             display_table_from_json(payload)
+            empty_result = False
+            if EXECUTION_EMPTY_RESULT_CLASSIFY:
+                try:
+                    total_rows = payload.get("total_rows")
+                    if isinstance(total_rows, int):
+                        empty_result = total_rows <= 0
+                    else:
+                        preview_rows = payload.get("preview_rows") or []
+                        empty_result = len(preview_rows) == 0
+                except Exception:
+                    empty_result = False
             return {
                 "success": True,
                 "sql": sql_clean,
                 "payload": payload,
+                "empty_result": bool(empty_result),
+                "result_state": "success_empty" if empty_result else "success_non_empty",
             }
 
         err = payload.get("error") if isinstance(payload, dict) else str(payload)
