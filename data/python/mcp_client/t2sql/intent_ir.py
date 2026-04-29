@@ -2684,15 +2684,27 @@ def _compute_confidence(
 
 
 def _detect_ambiguity_signals(
+    question: str,
     subject: str,
-    mentioned_tables: List[str],
+    table_mentions: List[Tuple[str, int]],
     notes: List[str],
     column_mentions: List[Tuple[str, str, int]],
 ) -> List[str]:
     signals: List[str] = []
+    q = str(question or "").strip().lower()
     subject_l = str(subject or "").strip().lower()
-    table_mentions = [str(t or "").strip().lower() for t in (mentioned_tables or []) if str(t or "").strip()]
-    unique_tables = list(dict.fromkeys(table_mentions))
+    table_mention_names = [
+        str(t or "").strip().lower()
+        for (t, _) in (table_mentions or [])
+        if str(t or "").strip()
+    ]
+    unique_tables = list(dict.fromkeys(table_mention_names))
+    table_positions: Dict[str, List[int]] = {}
+    for t, pos in (table_mentions or []):
+        tl = str(t or "").strip().lower()
+        if not tl:
+            continue
+        table_positions.setdefault(tl, []).append(int(pos))
 
     if not subject_l and len(unique_tables) >= 2:
         signals.append("unresolved_subject_multi_table")
@@ -2708,6 +2720,35 @@ def _detect_ambiguity_signals(
     }
     if not subject_l and len(column_tables) >= 3:
         signals.append("column_mentions_span_many_tables")
+
+    # Explicit column-link ambiguity:
+    # the same column token maps to multiple tables without clear table qualification.
+    # This is a schema-agnostic guard to avoid overconfident wrong links.
+    if q and len(unique_tables) >= 2:
+        col_to_mentions: Dict[str, List[Tuple[str, int]]] = {}
+        for table, col, pos in (column_mentions or []):
+            tl = str(table or "").strip().lower()
+            cl = str(col or "").strip().lower()
+            if not tl or not cl:
+                continue
+            col_to_mentions.setdefault(cl, []).append((tl, int(pos)))
+
+        proximity_chars = 40
+        for col_key, mentions in col_to_mentions.items():
+            candidate_tables = {t for t, _ in mentions}
+            if len(candidate_tables) < 2:
+                continue
+
+            has_explicit_qualifier = False
+            for t, col_pos in mentions:
+                near_positions = table_positions.get(t, [])
+                if any(abs(col_pos - tp) <= proximity_chars for tp in near_positions):
+                    has_explicit_qualifier = True
+                    break
+
+            if not has_explicit_qualifier:
+                signals.append("ambiguous_column_link")
+                break
 
     return list(dict.fromkeys(signals))
 
@@ -2797,8 +2838,9 @@ def build_intent_ir(
         mentioned_tables=mentioned_tables,
     )
     ambiguity_signals = _detect_ambiguity_signals(
+        question=question,
         subject=subject,
-        mentioned_tables=mentioned_tables,
+        table_mentions=table_mentions,
         notes=notes,
         column_mentions=column_mentions,
     )

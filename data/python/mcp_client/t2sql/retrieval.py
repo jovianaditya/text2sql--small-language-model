@@ -1446,6 +1446,36 @@ def _infer_bridge_tables(
     if len(selected_tables) < 2:
         return set()
 
+    def _merge_fk_graph(base: Dict[str, Dict[str, str]], extra: Dict[str, Dict[str, str]]) -> None:
+        for src, fk_map in (extra or {}).items():
+            src_l = str(src or "").strip().lower()
+            if not src_l:
+                continue
+            dst = base.setdefault(src_l, {})
+            for fk_col, target in (fk_map or {}).items():
+                fk_l = str(fk_col or "").strip().lower()
+                tgt_l = str(target or "").strip().lower()
+                if fk_l and tgt_l and fk_l not in dst:
+                    dst[fk_l] = tgt_l
+
+    def _build_schema_fk_graph() -> Dict[str, Dict[str, str]]:
+        graph: Dict[str, Dict[str, str]] = {}
+        try:
+            fk_rels = get_fk_relationships() or {}
+        except Exception:
+            fk_rels = {}
+        for src_table, fk_map in fk_rels.items():
+            st_lower = str(src_table or "").strip().lower()
+            if not st_lower:
+                continue
+            for fk_col, target_table in (fk_map or {}).items():
+                fc_lower = str(fk_col or "").strip().lower()
+                tt_lower = str(target_table or "").strip().lower()
+                if not fc_lower or not tt_lower:
+                    continue
+                graph.setdefault(st_lower, {})[fc_lower] = tt_lower
+        return graph
+
     # Build FK graph from metadata
     # Format: {source_table: {fk_column: target_table}}
     fk_graph: Dict[str, Dict[str, str]] = {}
@@ -1470,6 +1500,10 @@ def _infer_bridge_tables(
                 if st_lower not in fk_graph:
                     fk_graph[st_lower] = {}
                 fk_graph[st_lower][fc_lower] = tt_lower
+
+    # Merge with schema-level FK relationships as fallback so bridge inference
+    # still works when reranked metadata is sparse or misses FK descriptions.
+    _merge_fk_graph(fk_graph, _build_schema_fk_graph())
 
     # Find bridge tables using BFS
     bridge_tables = set()

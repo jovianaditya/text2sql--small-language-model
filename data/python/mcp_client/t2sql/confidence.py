@@ -210,6 +210,136 @@ def _check_entity_coverage(sql: str, question: str, ctx: str) -> Tuple[float, Li
     return score, warnings
 
 
+def _build_fk_adjacency_pairs(fk_rels: Dict[str, Dict[str, str]]) -> Set[Tuple[str, str]]:
+    adjacent: Set[Tuple[str, str]] = set()
+    for src_table, fk_map in (fk_rels or {}).items():
+        src_l = str(src_table or "").strip().lower()
+        if not src_l:
+            continue
+        for _, target_table in (fk_map or {}).items():
+            tgt_l = str(target_table or "").strip().lower()
+            if not tgt_l:
+                continue
+            adjacent.add((src_l, tgt_l))
+            adjacent.add((tgt_l, src_l))
+    return adjacent
+
+
+def _relation_alias_table_map(relation: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        from sqlglot import expressions as exp
+    except Exception:
+        return out
+
+    if isinstance(relation, exp.Table):
+        table_name = str(relation.name or "").strip().lower()
+        alias = str(relation.alias_or_name or "").strip().lower()
+        if table_name:
+            out[alias or table_name] = table_name
+        return out
+
+    if isinstance(relation, exp.Subquery):
+        alias = str(relation.alias_or_name or "").strip().lower()
+        if alias:
+            # Subquery does not map directly to base schema table.
+            out[alias] = alias
+        return out
+
+    return out
+
+
+def _analyze_join_predicates(sql: str, strict_adjacent: Set[Tuple[str, str]]) -> Tuple[int, int, List[str]]:
+    """
+    Analyze JOIN predicates using AST for stronger join validity checks.
+
+    Returns:
+        (critical_issues, strict_path_issues, warnings)
+    """
+    warnings: List[str] = []
+    critical_issues = 0
+    strict_path_issues = 0
+
+    try:
+        import sqlglot
+        from sqlglot import expressions as exp
+        tree = sqlglot.parse_one(sql.strip(), read=SQL_PARSE_DIALECT)
+    except Exception as e:
+        return 1, 0, [f"JOIN predicate analysis skipped (parse error): {str(e)[:80]}"]
+
+    joins = list(tree.args.get("joins") or [])
+    if not joins:
+        return 0, 0, []
+    known_tables = {str(t or "").strip().lower() for t in get_all_tables() if str(t or "").strip()}
+
+    seen_alias_to_table: Dict[str, str] = {}
+    from_expr = tree.args.get("from")
+    if from_expr is not None:
+        seen_alias_to_table.update(_relation_alias_table_map(from_expr.this))
+
+    for join in joins:
+        join_kind = str(join.args.get("kind") or "").strip().upper()
+        on_expr = join.args.get("on")
+        using_expr = join.args.get("using")
+        right_map = _relation_alias_table_map(join.this)
+
+        left_aliases = {a for a in seen_alias_to_table.keys() if a}
+        right_aliases = {a for a in right_map.keys() if a}
+
+        if join_kind != "CROSS" and on_expr is None and using_expr is None:
+            critical_issues += 1
+            warnings.append("JOIN missing ON/USING predicate")
+
+        if on_expr is not None:
+            on_tables = {
+                str(col.table or "").strip().lower()
+                for col in on_expr.find_all(exp.Column)
+                if str(col.table or "").strip()
+            }
+            if right_aliases and not on_tables.intersection(right_aliases):
+                critical_issues += 1
+                warnings.append("JOIN predicate does not reference right-side table alias")
+            if left_aliases and not on_tables.intersection(left_aliases):
+                critical_issues += 1
+                warnings.append("JOIN predicate does not reference left-side table alias")
+
+            has_column_equality = any(
+                isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Column)
+                for eq in on_expr.find_all(exp.EQ)
+            )
+            if join_kind != "CROSS" and not has_column_equality:
+                critical_issues += 1
+                warnings.append("JOIN predicate lacks explicit column equality condition")
+
+        # Tighten direct join plausibility when FK metadata exists.
+        left_tables = {
+            t for a, t in seen_alias_to_table.items()
+            if a in left_aliases and t and t in known_tables
+        }
+        right_tables = {
+            t for a, t in right_map.items()
+            if a in right_aliases and t and t in known_tables
+        }
+        if strict_adjacent and left_tables and right_tables:
+            has_direct_fk = any(
+                (lt, rt) in strict_adjacent or (rt, lt) in strict_adjacent
+                for lt in left_tables
+                for rt in right_tables
+            )
+            if not has_direct_fk:
+                strict_path_issues += 1
+                warnings.append(
+                    "JOIN pair has no direct FK relationship: "
+                    + ",".join(sorted(left_tables))
+                    + " -> "
+                    + ",".join(sorted(right_tables))
+                )
+
+        seen_alias_to_table.update(right_map)
+
+    return critical_issues, strict_path_issues, warnings
+
+
 def _check_join_path_valid(sql: str, ctx: str) -> Tuple[float, List[str]]:
     """
     Check if JOIN conditions use valid FK relationships from schema.
@@ -239,30 +369,8 @@ def _check_join_path_valid(sql: str, ctx: str) -> Tuple[float, List[str]]:
         # No FK metadata available, assume valid but warn
         return 0.8, ["FK relationships not available for validation"]
     
-    # Build adjacency graph from FK relationships
-    adjacent: Set[Tuple[str, str]] = set()
-    for src_table, fk_map in fk_rels.items():
-        for fk_col, target_table in fk_map.items():
-            adjacent.add((src_table.lower(), target_table.lower()))
-            adjacent.add((target_table.lower(), src_table.lower()))
-    
-    # Also add implicit relationships (shared ID columns)
-    # This is schema-agnostic - looks for columns ending in 'id', 'number', 'code'
-    try:
-        from .schema_analyzer import get_schema_analyzer
-        analyzer = get_schema_analyzer()
-        tables = list(sql_tables)
-        for i, t1 in enumerate(tables):
-            cols1 = set(analyzer._table_columns.get(t1, []))
-            id_cols1 = {c for c in cols1 if c.endswith(('id', 'number', 'code'))}
-            for t2 in tables[i+1:]:
-                cols2 = set(analyzer._table_columns.get(t2, []))
-                id_cols2 = {c for c in cols2 if c.endswith(('id', 'number', 'code'))}
-                if id_cols1.intersection(id_cols2):
-                    adjacent.add((t1, t2))
-                    adjacent.add((t2, t1))
-    except Exception:
-        pass
+    # Build strict adjacency graph from FK relationships.
+    adjacent = _build_fk_adjacency_pairs(fk_rels)
     
     # Check if all joined tables are connected
     tables_list = list(sql_tables)
@@ -275,8 +383,15 @@ def _check_join_path_valid(sql: str, ctx: str) -> Tuple[float, List[str]]:
                 if not path_exists:
                     warnings.append(f"No FK path between {t1} and {t2}")
                     all_connected = False
-    
-    return 1.0 if all_connected else 0.6, warnings
+
+    critical_issues, strict_path_issues, join_warnings = _analyze_join_predicates(sql, adjacent)
+    warnings.extend(join_warnings)
+
+    base_score = 1.0 if all_connected else 0.6
+    penalty = (0.15 * float(critical_issues)) + (0.10 * float(strict_path_issues))
+    score = max(0.2, base_score - penalty) if warnings else base_score
+    score = max(0.0, min(1.0, score))
+    return score, warnings
 
 
 def _bfs_path_exists(start: str, end: str, adjacent: Set[Tuple[str, str]]) -> bool:
