@@ -47,6 +47,7 @@ from .config import (
     AGENT_PROMPT_V2_ENABLED,
     AGENT_PROMPT_ABSTAIN_ENABLED,
     AGENT_PROMPT_ABSTAIN_NOTES_PREFIX,
+    SQL_PARSE_DIALECT,
 )
 from .schema_analyzer import (
     get_transaction_tables,
@@ -406,7 +407,7 @@ def validate_identifiers(sql: str, ctx: str) -> List[str]:
         import sqlglot
         from sqlglot import exp
 
-        ast = sqlglot.parse_one(sql, read="mysql")
+        ast = sqlglot.parse_one(sql, read=SQL_PARSE_DIALECT)
         for subq in ast.find_all(exp.Subquery):
             inner_sel = subq.this if isinstance(getattr(subq, "this", None), exp.Select) else None
             if not isinstance(inner_sel, exp.Select):
@@ -4858,7 +4859,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             ):
                 try:
                     import sqlglot
-                    sqlglot.parse_one(s_forced, read="mysql")
+                    sqlglot.parse_one(s_forced, read=SQL_PARSE_DIALECT)
                     forced_rewrite_ok = True
                 except Exception:
                     forced_rewrite_ok = False

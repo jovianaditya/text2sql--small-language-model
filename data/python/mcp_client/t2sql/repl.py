@@ -161,11 +161,14 @@ async def _exec_via_mcp(
             }
 
         err = payload.get("error") if isinstance(payload, dict) else str(payload)
+        payload_error_type = str(payload.get("error_type") or "").strip() if isinstance(payload, dict) else ""
+        if not payload_error_type:
+            payload_error_type = "execution_error"
         print(f"query_db failed: {err}")
         return {
             "success": False,
             "sql": sql_clean,
-            "error_type": "execution_error",
+            "error_type": payload_error_type,
             "error_message": str(err or "Unknown query_db failure"),
             "payload": payload,
         }

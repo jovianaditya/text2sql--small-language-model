@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .schema_analyzer import is_numeric_column, is_date_column, get_all_tables
 from .helpers_main import validate_identifiers
+from .config import SQL_PARSE_DIALECT
 
 # ======================================================================
 # ======================= SIGNAL WEIGHTS (TUNABLE) =====================
@@ -54,7 +55,7 @@ def _check_syntax_valid(sql: str) -> Tuple[float, List[str]]:
     
     try:
         import sqlglot
-        parsed = sqlglot.parse_one(sql.strip(), read="mysql")
+        parsed = sqlglot.parse_one(sql.strip(), read=SQL_PARSE_DIALECT)
         if parsed is None:
             return 0.5, ["SQL parsed but returned None"]
         return 1.0, []

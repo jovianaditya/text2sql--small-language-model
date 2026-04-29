@@ -323,6 +323,56 @@ RETRIEVAL_BRIDGE_MIN_TABLE_COUNT = int(os.getenv("RETRIEVAL_BRIDGE_MIN_TABLE_COU
 MCP_BASE    = os.getenv("MCP_BASE", "http://mcp_server:8000/mcp")
 MCP_TIMEOUT = int(os.getenv("MCP_CLIENT_TIMEOUT", "60"))
 # ======================================================================
+# ============================ SQL DIALECT ==============================
+# ======================================================================
+SQL_DIALECT = str(os.getenv("SQL_DIALECT", "mysql") or "mysql").strip().lower() or "mysql"
+SQL_PARSE_DIALECT = str(os.getenv("SQL_PARSE_DIALECT", SQL_DIALECT) or SQL_DIALECT).strip().lower() or SQL_DIALECT
+SQL_WRITE_DIALECT = str(os.getenv("SQL_WRITE_DIALECT", SQL_DIALECT) or SQL_DIALECT).strip().lower() or SQL_DIALECT
+
+_SQL_DIALECT_CAPABILITY_PRESETS: dict[str, dict[str, bool]] = {
+    # Conservative defaults; features can be overridden via env JSON.
+    "mysql": {
+        "supports_qualify": False,
+        "supports_ilike": False,
+        "supports_distinct_on": False,
+        "supports_boolean_type": False,
+        "supports_limit": True,
+    },
+    "postgres": {
+        "supports_qualify": False,
+        "supports_ilike": True,
+        "supports_distinct_on": True,
+        "supports_boolean_type": True,
+        "supports_limit": True,
+    },
+    "sqlite": {
+        "supports_qualify": False,
+        "supports_ilike": False,
+        "supports_distinct_on": False,
+        "supports_boolean_type": False,
+        "supports_limit": True,
+    },
+}
+_sql_caps = dict(_SQL_DIALECT_CAPABILITY_PRESETS.get(SQL_DIALECT, _SQL_DIALECT_CAPABILITY_PRESETS["mysql"]))
+_sql_caps_raw = str(os.getenv("SQL_DIALECT_CAPABILITIES_JSON", "") or "").strip()
+if _sql_caps_raw:
+    try:
+        _parsed_caps = json.loads(_sql_caps_raw)
+        if isinstance(_parsed_caps, dict):
+            for _k, _v in _parsed_caps.items():
+                key = str(_k or "").strip().lower()
+                if not key:
+                    continue
+                if isinstance(_v, bool):
+                    _sql_caps[key] = _v
+                elif isinstance(_v, str):
+                    _sql_caps[key] = _v.strip().lower() in {"1", "true", "yes", "on"}
+                else:
+                    _sql_caps[key] = bool(_v)
+    except Exception:
+        pass
+SQL_DIALECT_CAPABILITIES = _sql_caps
+# ======================================================================
 # ========================= DRAFT/RETRY ================================
 # ======================================================================
 OOM_WAIT_TIME = int(os.getenv("OOM_WAIT_TIME", "35"))

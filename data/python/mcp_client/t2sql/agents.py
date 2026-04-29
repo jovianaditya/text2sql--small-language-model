@@ -207,6 +207,8 @@ from .config import (
     AGENT_REFINE_TABLE_REF_TOKEN_PATTERN,
     AGENT_REFINE_GROUP_RISKY_COMPARE_PATTERN,
     AGENT_REFINE_GROUP_RISKY_PAREN_PATTERN,
+    SQL_PARSE_DIALECT,
+    SQL_WRITE_DIALECT,
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
@@ -586,7 +588,7 @@ def _has_top_level_order_by(sql: str) -> bool:
         return False
     try:
         import sqlglot
-        parsed = sqlglot.parse_one(s, read="mysql")
+        parsed = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT)
         order = parsed.args.get("order") if parsed is not None else None
         return order is not None
     except Exception:
@@ -947,7 +949,7 @@ def _rewrite_grouped_aggregate_to_window_partition(sql: str, partition_col: str,
         import sqlglot
         from sqlglot import exp
 
-        parsed = sqlglot.parse_one(s, read="mysql")
+        parsed = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT)
         sel = parsed.find(exp.Select)
         if sel is None or sel.find(exp.Window):
             return sql
@@ -992,7 +994,7 @@ def _rewrite_grouped_aggregate_to_window_partition(sql: str, partition_col: str,
             }
             if col_tables and col_tables != {base_alias}:
                 return sql
-            non_agg_exprs.append(item.sql(dialect="mysql"))
+            non_agg_exprs.append(item.sql(dialect=SQL_WRITE_DIALECT))
 
         if agg_count != 1 or not non_agg_exprs:
             return sql
@@ -1022,11 +1024,11 @@ def _rewrite_grouped_aggregate_to_window_partition(sql: str, partition_col: str,
         if agg_alias:
             window_item += f" AS {agg_alias}"
 
-        rebuilt = f"SELECT {', '.join(non_agg_exprs + [window_item])} FROM {base_src.sql(dialect='mysql')}"
+        rebuilt = f"SELECT {', '.join(non_agg_exprs + [window_item])} FROM {base_src.sql(dialect=SQL_WRITE_DIALECT)}"
         if where_expr is not None:
-            rebuilt += f" WHERE {where_expr.sql(dialect='mysql')}"
+            rebuilt += f" WHERE {where_expr.sql(dialect=SQL_WRITE_DIALECT)}"
         if order_expr is not None:
-            rebuilt += f" {order_expr.sql(dialect='mysql')}"
+            rebuilt += f" {order_expr.sql(dialect=SQL_WRITE_DIALECT)}"
         return rebuilt + ";"
     except Exception:
         return sql
@@ -5110,7 +5112,7 @@ def _evaluate_semantic_contract(
         if limit_arg is None:
             failures.append("missing_limit")
         else:
-            parsed_limit = _extract_limit_value_from_clause_sql(limit_arg.sql(dialect="mysql"))
+            parsed_limit = _extract_limit_value_from_clause_sql(limit_arg.sql(dialect=SQL_WRITE_DIALECT))
             if parsed_limit is None:
                 failures.append("unparsed_limit")
             elif int(parsed_limit) != int(required_limit):
@@ -5278,7 +5280,7 @@ def _deterministic_sql_acceptance_gate(
         import sqlglot
         from sqlglot import exp
 
-        parsed = sqlglot.parse_one(candidate_sql, read="mysql")
+        parsed = sqlglot.parse_one(candidate_sql, read=SQL_PARSE_DIALECT)
         sel = parsed.find(exp.Select)
         if sel is None:
             verdict["reasons"].append("no_select")
@@ -5294,7 +5296,7 @@ def _deterministic_sql_acceptance_gate(
             return False
 
         def _norm_expr(expr_in: "exp.Expression") -> str:
-            s = expr_in.sql(dialect="mysql")
+            s = expr_in.sql(dialect=SQL_WRITE_DIALECT)
             s = s.replace("`", "").strip().lower()
             return re.sub(r"\s+", " ", s)
 

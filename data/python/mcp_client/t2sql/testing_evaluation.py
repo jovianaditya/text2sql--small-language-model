@@ -765,7 +765,7 @@ def save_to_excel(
     
     # Adjust column widths
     col_widths = {
-        "id": 8, "scenario": 10, "difficulty": 10,
+        "id": 8, "scenario": 10, "difficulty": 10, "expected_behavior": 18,
         "question": 50,
         "groundtruth_sql": 40, "predicted_sql": 40,
         "draft_source": 14, "ir_confidence": 12, "ir_gate_reasons": 28,
@@ -886,6 +886,13 @@ async def run_single_case(
     question = case.get("question", "")
     groundtruth_sql = case.get("groundtruth_sql", "").strip()
     difficulty = case.get("difficulty", "unknown")
+    expected_behavior = str(case.get("expected_behavior", "answerable") or "answerable").strip().lower()
+    expects_cannot_answer = expected_behavior in {
+        "cannot_answer",
+        "abstain",
+        "unanswerable",
+        "out_of_schema",
+    }
     allow_null_zero_equivalent, explicit_null_to_zero_required, null_zero_reason = (
         _resolve_null_zero_equivalent(question, null_zero_mode)
     )
@@ -911,6 +918,7 @@ async def run_single_case(
         "id": case_id,
         "scenario": str(scenario or "P1").strip().upper(),
         "difficulty": difficulty,
+        "expected_behavior": expected_behavior,
         "question": question,
         "base_database": primary_db,
         "groundtruth_sql": groundtruth_sql,
@@ -1077,17 +1085,46 @@ async def run_single_case(
 
     if result["cannot_answer"]:
         reason = result["cannot_answer_reason"] or "Cannot answer from available schema evidence"
-        result["va_success"] = False
-        result["va_notes"] = "cannot_answer"
-        result["exec_success"] = False
-        result["exec_notes"] = reason
-        result["result_match"] = False
-        result["ts_match_count"] = 0
-        result["ts_failed_databases"] = "\n".join(ts_db_targets)
-        result["match_reason"] = reason
-        result["error"] = reason
+        if expects_cannot_answer:
+            result["va_success"] = True
+            result["va_notes"] = "cannot_answer_expected"
+            result["exec_success"] = True
+            result["exec_notes"] = reason
+            result["result_match"] = True
+            result["ts_success"] = True
+            result["ts_total_databases"] = 0
+            result["ts_match_count"] = 0
+            result["ts_failed_databases"] = ""
+            result["match_reason"] = reason
+            result["error"] = None
+        else:
+            result["va_success"] = False
+            result["va_notes"] = "cannot_answer"
+            result["exec_success"] = False
+            result["exec_notes"] = reason
+            result["result_match"] = False
+            result["ts_match_count"] = 0
+            result["ts_failed_databases"] = "\n".join(ts_db_targets)
+            result["match_reason"] = reason
+            result["error"] = reason
         _refresh_row_count_fields()
         print(f"[ABSTAIN] {reason}")
+        return result
+
+    if expects_cannot_answer:
+        result["va_success"] = False
+        result["va_notes"] = "expected_cannot_answer_but_sql_generated"
+        result["exec_success"] = False
+        result["exec_notes"] = "Expected cannot_answer for this benchmark case"
+        result["result_match"] = False
+        result["ts_success"] = False
+        result["ts_total_databases"] = 0
+        result["ts_match_count"] = 0
+        result["ts_failed_databases"] = ""
+        result["match_reason"] = "Expected cannot_answer but model generated SQL"
+        result["error"] = "Expected cannot_answer but model generated SQL"
+        _refresh_row_count_fields()
+        print("[ABSTAIN] Expected cannot_answer, but model generated SQL")
         return result
 
     # Fail-closed outputs must be treated as failed evaluation cases.
@@ -1681,7 +1718,7 @@ async def run_batch_eval(
     if output_path:
         fieldnames = [
             # Keep key identifiers first to reduce horizontal scrolling.
-            "id", "scenario", "difficulty",
+            "id", "scenario", "difficulty", "expected_behavior",
             "question",
             "groundtruth_sql", "predicted_sql",
             "draft_source", "final_model_used", "ir_confidence", "ir_gate_reasons",
