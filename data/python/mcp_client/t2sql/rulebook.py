@@ -9,6 +9,10 @@ def _default_rules_path() -> Path:
     return Path(__file__).with_name("t2sql_rules.yml")
 
 
+def _default_config_path() -> Path:
+    return Path(__file__).with_name("t2sql_config.yml")
+
+
 def _coerce_non_empty_list(val: Any) -> list[str]:
     if not isinstance(val, list):
         return []
@@ -48,6 +52,35 @@ def _load_rules() -> Dict[str, Any]:
 
 def reset_rulebook_cache() -> None:
     _load_rules.cache_clear()
+    _load_config.cache_clear()
+
+
+@lru_cache(maxsize=1)
+def _load_config() -> Dict[str, Any]:
+    path_raw = (
+        os.getenv("T2SQL_CONFIG_PATH", "").strip()
+        or os.getenv("T2SQL_CONFIG_DEFAULTS_PATH", "").strip()
+    )
+    path = Path(path_raw).expanduser() if path_raw else _default_config_path()
+    if not path.is_absolute() and not path_raw:
+        path = _default_config_path()
+
+    if not path.exists():
+        return {}
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return {}
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+    return data
 
 
 def rule_value(path: Sequence[str], default: Any = None) -> Any:
@@ -76,6 +109,62 @@ def rule_dict(path: Sequence[str], default: Optional[Dict[str, Any]] = None) -> 
     if isinstance(val, dict):
         return val
     return dict(default or {})
+
+
+def config_default_list(key: str, default: Optional[Iterable[str]] = None) -> list[str]:
+    """
+    Read config lexical defaults from rulebook path:
+      config.lists.<key>
+    """
+    k = str(key or "").strip()
+    if not k:
+        return [str(x).strip() for x in (default or []) if str(x).strip()]
+    from_overlay = rule_value(("config", "lists", k), None)
+    if from_overlay is None:
+        # Backward compatibility for older rulebook structure
+        from_overlay = rule_value(("config_defaults", "lists", k), None)
+    if isinstance(from_overlay, list):
+        return _coerce_non_empty_list(from_overlay)
+    if from_overlay is None:
+        overlay_root = _load_config()
+        for root_key in ("config", "config_defaults"):
+            cur = overlay_root
+            for part in (root_key, "lists", k):
+                if not isinstance(cur, dict) or part not in cur:
+                    cur = None
+                    break
+                cur = cur.get(part)
+            if isinstance(cur, list):
+                return _coerce_non_empty_list(cur)
+    return rule_list(("config", "lists", k), rule_list(("config_defaults", "lists", k), default))
+
+
+def config_default_dict(key: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Read config lexical dict defaults from rulebook path:
+      config.dicts.<key>
+    """
+    k = str(key or "").strip()
+    if not k:
+        return dict(default or {})
+    from_overlay = rule_value(("config", "dicts", k), None)
+    if from_overlay is None:
+        # Backward compatibility for older rulebook structure
+        from_overlay = rule_value(("config_defaults", "dicts", k), None)
+    if isinstance(from_overlay, dict):
+        return dict(from_overlay)
+    if from_overlay is None:
+        overlay_root = _load_config()
+        for root_key in ("config", "config_defaults"):
+            cur = overlay_root
+            for part in (root_key, "dicts", k):
+                if not isinstance(cur, dict) or part not in cur:
+                    cur = None
+                    break
+                cur = cur.get(part)
+            if isinstance(cur, dict):
+                return dict(cur)
+    return rule_dict(("config", "dicts", k), rule_dict(("config_defaults", "dicts", k), default))
 
 
 def normalized_text(text: str) -> str:

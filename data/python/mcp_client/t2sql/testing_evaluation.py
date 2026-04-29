@@ -614,6 +614,10 @@ def save_to_excel(
     latencies: list,
     ts_total_cases: int = 0,
     ts_success_cases: int = 0,
+    run_started_at: datetime | None = None,
+    run_finished_at: datetime | None = None,
+    run_elapsed_seconds: float | None = None,
+    run_status: str = "SUCCESS",
 ):
     """Save evaluation results to formatted Excel file."""
     
@@ -669,18 +673,45 @@ def save_to_excel(
         ("Average Latency (s)", f"{avg_latency_sec:.2f}" if latencies else "N/A", ""),
     ]
     
-    for row_idx, row_data in enumerate(summary_data, start=3):
+    summary_header_row = 3
+    for row_idx, row_data in enumerate(summary_data, start=summary_header_row):
         for col_idx, value in enumerate(row_data, start=1):
             cell = ws_summary.cell(row=row_idx, column=col_idx, value=value)
             cell.border = border
             cell.alignment = Alignment(vertical='center')
-            if row_idx == 3:
+            if row_idx == summary_header_row:
                 cell.font = header_font
                 cell.fill = header_fill
+
+    summary_end_row = summary_header_row + len(summary_data) - 1
+
+    # Execution metadata (already available in runtime logs) mirrored to XLSX summary.
+    exec_title_row = summary_end_row + 2
+    ws_summary.cell(row=exec_title_row, column=1, value="EXECUTION INFO").font = Font(bold=True, size=12)
+    exec_header_row = exec_title_row + 1
+    exec_value_row = exec_header_row + 1
+    exec_headers = ["Run Start (UTC+07)", "Run End (UTC+07)", "Duration", "Status"]
+    exec_values = [
+        _format_jakarta_timestamp(run_started_at) if run_started_at else "N/A",
+        _format_jakarta_timestamp(run_finished_at) if run_finished_at else "N/A",
+        _format_duration(float(run_elapsed_seconds)) if run_elapsed_seconds is not None else "N/A",
+        str(run_status or "N/A"),
+    ]
+    for col_idx, label in enumerate(exec_headers, start=1):
+        cell = ws_summary.cell(row=exec_header_row, column=col_idx, value=label)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    for col_idx, value in enumerate(exec_values, start=1):
+        cell = ws_summary.cell(row=exec_value_row, column=col_idx, value=value)
+        cell.border = border
+        cell.alignment = Alignment(vertical='center')
     
     # By difficulty
-    ws_summary["A10"] = "BY DIFFICULTY"
-    ws_summary["A10"].font = Font(bold=True, size=12)
+    diff_title_row = exec_value_row + 2
+    ws_summary.cell(row=diff_title_row, column=1, value="BY DIFFICULTY").font = Font(bold=True, size=12)
+    diff_header_row = diff_title_row + 1
     
     diff_header = [
         "Difficulty",
@@ -694,13 +725,13 @@ def save_to_excel(
         "Avg Latency (s)"
     ]
     for col_idx, h in enumerate(diff_header, start=1):
-        cell = ws_summary.cell(row=11, column=col_idx, value=h)
+        cell = ws_summary.cell(row=diff_header_row, column=col_idx, value=h)
         cell.font = header_font
         cell.fill = header_fill
         cell.border = border
         cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
-    for row_idx, (d, stats) in enumerate(sorted(by_difficulty.items()), start=12):
+    for row_idx, (d, stats) in enumerate(sorted(by_difficulty.items()), start=diff_header_row + 1):
         t = stats["total"]
         ex_match = stats["result_match"]
         va = stats.get("va_success", 0)
@@ -727,7 +758,7 @@ def save_to_excel(
     ws_summary.column_dimensions['G'].width = 12
     ws_summary.column_dimensions['H'].width = 18
     ws_summary.column_dimensions['I'].width = 15
-    ws_summary.freeze_panes = "A12"
+    ws_summary.freeze_panes = f"A{diff_header_row + 1}"
     
     # ============================================================
     # Sheet 2: Detail Results
@@ -1511,6 +1542,10 @@ async def run_batch_eval(
         ts_databases: Ordered list of DB names for TS evaluation.
         base_database: Database used for VA/EX only.
     """
+    run_started_at = _jakarta_now()
+    run_started_perf = time.perf_counter()
+    run_status = "SUCCESS"
+
     scenario_name, scenario_config = resolve_scenario_config(scenario)
     active_models = apply_scenario_models(scenario_config)
     scenario_config.update(active_models)
@@ -1713,6 +1748,9 @@ async def run_batch_eval(
     if latencies:
         print(f"Average Latency: {sum(latencies)/len(latencies):.2f}s\n")
     
+    run_finished_at = _jakarta_now()
+    run_elapsed_seconds = time.perf_counter() - run_started_perf
+
     # Save to Excel or CSV
 
     if output_path:
@@ -1743,6 +1781,10 @@ async def run_batch_eval(
                 latencies,
                 ts_total_cases=ts_total_cases,
                 ts_success_cases=ts_success_cases,
+                run_started_at=run_started_at,
+                run_finished_at=run_finished_at,
+                run_elapsed_seconds=run_elapsed_seconds,
+                run_status=run_status,
             )
         else:
             # Fallback to CSV

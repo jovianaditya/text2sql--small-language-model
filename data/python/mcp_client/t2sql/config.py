@@ -18,6 +18,8 @@ import re
 import ast
 from pathlib import Path
 from .rulebook import (
+    config_default_dict,
+    config_default_list,
     retrieval_extra_stopwords,
     retrieval_generic_mention_terms,
     retrieval_join_signals,
@@ -33,9 +35,11 @@ def _env_json_list(name: str, default: list[str]) -> list[str]:
     2) Comma-separated string
     3) default
     """
-    raw = os.getenv(name)
+    name_key = str(name or "").strip()
+    raw = os.getenv(name_key)
     if not raw:
-        return default
+        rule_default = config_default_list(name_key.lower(), default)
+        return rule_default
 
     try:
         parsed = json.loads(raw)
@@ -61,9 +65,17 @@ def _env_json_dict(name: str, default: dict[str, str]) -> dict[str, str]:
     """
     Read dict config from env as JSON object; fallback to default.
     """
-    raw = os.getenv(name)
+    name_key = str(name or "").strip()
+    raw = os.getenv(name_key)
     if not raw:
-        return default
+        rule_default = config_default_dict(name_key.lower(), default)
+        out_default: dict[str, str] = {}
+        for k, v in rule_default.items():
+            key = str(k).strip()
+            val = str(v).strip()
+            if key and val:
+                out_default[key] = val
+        return out_default or default
 
     try:
         parsed = json.loads(raw)
@@ -79,6 +91,54 @@ def _env_json_dict(name: str, default: dict[str, str]) -> dict[str, str]:
         pass
 
     return default
+
+
+_DEPRECATED_ENV_ALIASES_USED: list[dict[str, str]] = []
+
+
+def _env_get_with_alias(name: str, default: str, aliases: list[str] | None = None) -> str:
+    """
+    Read a primary env var with optional backward-compatible aliases.
+    Keeps behavior stable while making migration explicit.
+    """
+    primary = str(name or "").strip()
+    if not primary:
+        return str(default)
+
+    raw = os.getenv(primary)
+    if raw not in (None, ""):
+        return str(raw)
+
+    for alias in (aliases or []):
+        alias_key = str(alias or "").strip()
+        if not alias_key:
+            continue
+        alias_val = os.getenv(alias_key)
+        if alias_val not in (None, ""):
+            _DEPRECATED_ENV_ALIASES_USED.append(
+                {"alias": alias_key, "preferred": primary}
+            )
+            return str(alias_val)
+    return str(default)
+
+
+def deprecated_env_alias_notes() -> list[str]:
+    """
+    Return one-line deprecation notes for alias env vars seen at runtime.
+    """
+    out: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for item in _DEPRECATED_ENV_ALIASES_USED:
+        alias = str(item.get("alias") or "").strip()
+        preferred = str(item.get("preferred") or "").strip()
+        key = (alias, preferred)
+        if not alias or not preferred or key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            f"Deprecated env alias '{alias}' is active; migrate to '{preferred}'."
+        )
+    return out
 
 
 def _profiled_domain_defaults(
@@ -182,9 +242,17 @@ def _infer_default_sparse_jsonl_input(collection_name: str) -> str:
 # ======================================================================
 # ============================ APP/GENERAL =============================
 # ======================================================================
-CHROMA_DIR        = os.getenv("CHROMA_DIR", "./chroma_db").strip()
-COLLECTION_NAME   = os.getenv("COLLECTION_NAME", _infer_default_collection_name()).strip()
-OLLAMA_URL        = os.getenv("OLLAMA_URL", "http://localhost:11434").strip()
+CHROMA_DIR        = _env_get_with_alias("CHROMA_DIR", "./chroma_db", ["CHROMA_PATH"]).strip()
+COLLECTION_NAME   = _env_get_with_alias(
+    "COLLECTION_NAME",
+    _infer_default_collection_name(),
+    ["CHROMA_COLLECTION"],
+).strip()
+OLLAMA_URL        = _env_get_with_alias(
+    "OLLAMA_URL",
+    "http://localhost:11434",
+    ["OLLAMA_BASE_URL"],
+).strip()
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "180s")  # keep_alive 90s, model stays loaded for batch eval
 ROUTING_MODEL     = os.getenv("ROUTING_MODEL", "qwen2.5:1.5b-instruct").strip()
 SMALL_MODEL       = os.getenv("SMALL_MODEL", "qwen2.5:3b-instruct").strip()
@@ -269,17 +337,20 @@ RETRIEVE_DEBUG = bool(int(os.getenv("RETRIEVE_DEBUG", "1")))
 # - dense metadata feeds vector ingestion / dense retrieval
 # - sparse metadata feeds BM25 / lexical retrieval
 # - schema metadata feeds schema analysis and defaults to the dense source
-DENSE_METADATA_JSONL = os.getenv(
+DENSE_METADATA_JSONL = _env_get_with_alias(
     "DENSE_METADATA_JSONL",
     os.getenv("EXPORT_JSONL_OUTPUT", _infer_default_export_jsonl_output(COLLECTION_NAME)),
+    ["T2SQL_DENSE_METADATA_JSONL"],
 ).strip()
-SPARSE_METADATA_JSONL = os.getenv(
+SPARSE_METADATA_JSONL = _env_get_with_alias(
     "SPARSE_METADATA_JSONL",
     _infer_default_sparse_jsonl_input(COLLECTION_NAME),
+    ["T2SQL_SPARSE_METADATA_JSONL", "JSON_INPUT"],
 ).strip()
-SCHEMA_METADATA_JSONL = os.getenv(
+SCHEMA_METADATA_JSONL = _env_get_with_alias(
     "SCHEMA_METADATA_JSONL",
     DENSE_METADATA_JSONL,
+    ["T2SQL_SCHEMA_METADATA_JSONL"],
 ).strip()
 # Strict schema-path resolution:
 # - 0 (default): preserve legacy auto-discovery fallback behavior
@@ -320,12 +391,14 @@ RETRIEVAL_BRIDGE_MIN_TABLE_COUNT = int(os.getenv("RETRIEVAL_BRIDGE_MIN_TABLE_COU
 # ======================================================================
 # =============================== MCP ==================================
 # ======================================================================
-MCP_BASE    = os.getenv("MCP_BASE", "http://mcp_server:8000/mcp")
-MCP_TIMEOUT = int(os.getenv("MCP_CLIENT_TIMEOUT", "60"))
+MCP_BASE    = _env_get_with_alias("MCP_BASE", "http://mcp_server:8000/mcp", ["T2SQL_MCP_BASE"]).strip()
+MCP_TIMEOUT = int(_env_get_with_alias("MCP_CLIENT_TIMEOUT", "60", ["T2SQL_MCP_TIMEOUT"]).strip() or "60")
 # ======================================================================
 # ============================ SQL DIALECT ==============================
 # ======================================================================
-SQL_DIALECT = str(os.getenv("SQL_DIALECT", "mysql") or "mysql").strip().lower() or "mysql"
+SQL_DIALECT = str(
+    _env_get_with_alias("SQL_DIALECT", "mysql", ["T2SQL_SQL_DIALECT", "SQLGL0T_DIALECT"]) or "mysql"
+).strip().lower() or "mysql"
 SQL_PARSE_DIALECT = str(os.getenv("SQL_PARSE_DIALECT", SQL_DIALECT) or SQL_DIALECT).strip().lower() or SQL_DIALECT
 SQL_WRITE_DIALECT = str(os.getenv("SQL_WRITE_DIALECT", SQL_DIALECT) or SQL_DIALECT).strip().lower() or SQL_DIALECT
 
@@ -415,35 +488,44 @@ ALIAS_MAX_LEN = int(os.getenv("ALIAS_MAX_LEN", "36"))
 # ======================================================================
 AGENT_INSTANT_REJECT_PATTERNS = _env_json_list(
     "AGENT_INSTANT_REJECT_PATTERNS",
-    [
-        r"^\s*(hi|hello|hey|halo|hai|hallo)\s*[!.,]?\s*$",
-        r"^\s*(good\s*)?(morning|afternoon|evening|night)\s*[!.,]?\s*$",
-        r"^\s*(selamat\s+)?(pagi|siang|sore|malam)\s*[!.,]?\s*$",
-        r"^\s*(apa\s+kabar|how\s+are\s+you|what'?s\s+up)\s*[?!.,]?\s*$",
-        r"^\s*(thanks?|thank\s+you|terima\s*kasih|makasih)\s*[!.,]?\s*$",
-        r"^\s*(bye|goodbye|see\s+you|sampai\s+jumpa)\s*[!.,]?\s*$",
-        r"^\s*(yes|no|ya|tidak|ok|okay|oke|sip)\s*[!.,]?\s*$",
-        r"^\s*(test|testing|tes|coba)\s*[!.,]?\s*$",
-        r"^\s*[!?.,:;\-_=+*#@&]+\s*$",
-        r"^\s*\d+\s*$",
-        r"^\s*.{0,2}\s*$",
-    ],
+    config_default_list(
+        "agent_instant_reject_patterns",
+        [
+            r"^\s*(hi|hello|hey|halo|hai|hallo)\s*[!.,]?\s*$",
+            r"^\s*(good\s*)?(morning|afternoon|evening|night)\s*[!.,]?\s*$",
+            r"^\s*(selamat\s+)?(pagi|siang|sore|malam)\s*[!.,]?\s*$",
+            r"^\s*(apa\s+kabar|how\s+are\s+you|what'?s\s+up)\s*[?!.,]?\s*$",
+            r"^\s*(thanks?|thank\s+you|terima\s*kasih|makasih)\s*[!.,]?\s*$",
+            r"^\s*(bye|goodbye|see\s+you|sampai\s+jumpa)\s*[!.,]?\s*$",
+            r"^\s*(yes|no|ya|tidak|ok|okay|oke|sip)\s*[!.,]?\s*$",
+            r"^\s*(test|testing|tes|coba)\s*[!.,]?\s*$",
+            r"^\s*[!?.,:;\-_=+*#@&]+\s*$",
+            r"^\s*\d+\s*$",
+            r"^\s*.{0,2}\s*$",
+        ],
+    ),
 )
 
 AGENT_DEFINITE_SQL_PATTERNS = _env_json_list(
     "AGENT_DEFINITE_SQL_PATTERNS",
-    [
-        r"\b(show|list|display|get|find|retrieve|fetch|count|total|sum|average)\b",
-        r"\b(tampilkan|tunjukkan|lihat|ambil|cari|hitung|berapa)\b",
-        r"\b(select|from|where|join|group by|order by)\b",
-        r"\b(highest|lowest|top|most|least|largest|smallest|latest|earliest)\b",
-        r"\b(tertinggi|terendah|terbesar|terkecil|terbaru|terlama)\b",
-    ],
+    config_default_list(
+        "agent_definite_sql_patterns",
+        [
+            r"\b(show|list|display|get|find|retrieve|fetch|count|total|sum|average)\b",
+            r"\b(tampilkan|tunjukkan|lihat|ambil|cari|hitung|berapa)\b",
+            r"\b(select|from|where|join|group by|order by)\b",
+            r"\b(highest|lowest|top|most|least|largest|smallest|latest|earliest)\b",
+            r"\b(tertinggi|terendah|terbesar|terkecil|terbaru|terlama)\b",
+        ],
+    ),
 )
 
 AGENT_GIBBERISH_KEYBOARD_PATTERNS = _env_json_list(
     "AGENT_GIBBERISH_KEYBOARD_PATTERNS",
-    ["qwert", "asdfg", "zxcvb", "qazwsx", "yxcvbn", "hjkl", "yuiop"],
+    config_default_list(
+        "agent_gibberish_keyboard_patterns",
+        ["qwert", "asdfg", "zxcvb", "qazwsx", "yxcvbn", "hjkl", "yuiop"],
+    ),
 )
 
 AGENT_GUARD_EXAMPLE_MAX_ITEMS = int(os.getenv("AGENT_GUARD_EXAMPLE_MAX_ITEMS", "3"))
@@ -496,44 +578,56 @@ AGENT_COLUMN_ORDERED_BY_PATTERN = os.getenv(
 AGENT_MISSING_COL_SUFFIX_SYNONYMS = _env_json_dict(
     "AGENT_MISSING_COL_SUFFIX_SYNONYMS",
     {
-        "number": r"(number|no|id|code|kode|nomor)",
-        "code": r"(code|id|no|number|kode|nomor)",
-        "id": r"(id|no|code|number|kode|nomor)",
-        "date": r"(date|tanggal|tgl|waktu)",
-        "name": r"(name|nama)",
-        "amount": r"(amount|total|jumlah|nilai|harga)",
-        "extension": r"(extension|ext)",
+        str(k): str(v)
+        for k, v in config_default_dict(
+            "agent_missing_col_suffix_synonyms",
+            {
+                "number": r"(number|no|id|code|kode|nomor)",
+                "code": r"(code|id|no|number|kode|nomor)",
+                "id": r"(id|no|code|number|kode|nomor)",
+                "date": r"(date|tanggal|tgl|waktu)",
+                "name": r"(name|nama)",
+                "amount": r"(amount|total|jumlah|nilai|harga)",
+                "extension": r"(extension|ext)",
+            },
+        ).items()
     },
 )
 
 AGENT_REGEX_TRIGGERS = _env_json_list(
     "AGENT_REGEX_TRIGGERS",
-    [
-        r"exactly\s+\w+\s+digits",
-        r"followed\s+by\s+\w+\s+digits",
-        r"\d+\s+digits",
-        r"pattern",
-        r"format",
-    ],
+    config_default_list(
+        "agent_regex_triggers",
+        [
+            r"exactly\s+\w+\s+digits",
+            r"followed\s+by\s+\w+\s+digits",
+            r"\d+\s+digits",
+            r"pattern",
+            r"format",
+        ],
+    ),
 )
 
 AGENT_CONTRACT_BASE_METRIC_TERMS = set(
     _env_json_list(
         "AGENT_CONTRACT_BASE_METRIC_TERMS",
-        [
-            "amount",
-            "total",
-            "price",
-            "quantity",
-            "cost",
-            "rate",
-            "count",
-            "number",
-            "value",
-            "percent",
-            "ratio",
-            "limit",
-        ],
+        config_default_list(
+            "agent_contract_base_metric_terms",
+            [
+                "amount",
+                "total",
+                "price",
+                "quantity",
+                "cost",
+                "rate",
+                "count",
+                "number",
+                "value",
+                "percent",
+                "ratio",
+                "limit",
+            ],
+        ),
     )
 )
 
@@ -560,38 +654,44 @@ AGENT_CONTRACT_LEGACY_METRIC_FALLBACK_TERMS = set(
 AGENT_CONTRACT_GENERIC_COUNT_NOUNS = set(
     _env_json_list(
         "AGENT_CONTRACT_GENERIC_COUNT_NOUNS",
-        [
-            "row",
-            "rows",
-            "record",
-            "records",
-            "result",
-            "results",
-            "item",
-            "items",
-            "entry",
-            "entries",
-        ],
+        config_default_list(
+            "agent_contract_generic_count_nouns",
+            [
+                "row",
+                "rows",
+                "record",
+                "records",
+                "result",
+                "results",
+                "item",
+                "items",
+                "entry",
+                "entries",
+            ],
+        ),
     )
 )
 
 INTENT_IR_BASE_NUMERIC_HINTS = tuple(
     _env_json_list(
         "INTENT_IR_BASE_NUMERIC_HINTS",
-        [
-            "amount",
-            "total",
-            "price",
-            "quantity",
-            "cost",
-            "rate",
-            "count",
-            "number",
-            "value",
-            "percent",
-            "ratio",
-            "limit",
-        ],
+        config_default_list(
+            "intent_ir_base_numeric_hints",
+            [
+                "amount",
+                "total",
+                "price",
+                "quantity",
+                "cost",
+                "rate",
+                "count",
+                "number",
+                "value",
+                "percent",
+                "ratio",
+                "limit",
+            ],
+        ),
     )
 )
 
@@ -1301,25 +1401,31 @@ RETRIEVAL_DESC_CAMEL_SPLIT_PATTERN_2 = os.getenv(
 
 RETRIEVAL_NAME_QUERY_TERMS = _env_json_list(
     "RETRIEVAL_NAME_QUERY_TERMS",
-    ["name"],
+    config_default_list("retrieval_name_query_terms", ["name"]),
 )
 
 RETRIEVAL_ID_LIKE_QUERY_TERMS = _env_json_list(
     "RETRIEVAL_ID_LIKE_QUERY_TERMS",
-    [" id", "id ", " id,", "identifier", "code", "number"],
+    config_default_list(
+        "retrieval_id_like_query_terms",
+        [" id", "id ", " id,", "identifier", "code", "number"],
+    ),
 )
 
 RETRIEVAL_NAME_REQUEST_TERMS = _env_json_list(
     "RETRIEVAL_NAME_REQUEST_TERMS",
-    ["name", "names", "nama"],
+    config_default_list("retrieval_name_request_terms", ["name", "names", "nama"]),
 )
 
 RETRIEVAL_CONTACT_NAME_TERMS = _env_json_list(
     "RETRIEVAL_CONTACT_NAME_TERMS",
-    [
-        "contact name", "contact first", "contact last",
-        "first name", "last name", "person name",
-    ],
+    config_default_list(
+        "retrieval_contact_name_terms",
+        [
+            "contact name", "contact first", "contact last",
+            "first name", "last name", "person name",
+        ],
+    ),
 )
 
 RETRIEVAL_NAME_ROLE_HINT_TERMS = set(
@@ -2113,3 +2219,7 @@ AGENT_REFINE_LOWER_HAVING_PATTERN = os.getenv(
     "AGENT_REFINE_LOWER_HAVING_PATTERN",
     r"\bhaving\s+(.*?)(?:\border\b|\blimit\b|;|$)",
 ).strip()
+
+# Snapshot of legacy env aliases observed at import-time.
+# Useful for debugging migration without changing runtime behavior.
+DEPRECATED_ENV_ALIAS_NOTES = deprecated_env_alias_notes()

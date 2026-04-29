@@ -1,0 +1,776 @@
+schema_version: 1
+description: Auto-generated config lexical defaults extracted from config.py
+config:
+  lists:
+    agent_column_stop_tokens:
+    - id
+    - ids
+    - code
+    - codes
+    - number
+    - numbers
+    - name
+    - names
+    - date
+    - dates
+    - line
+    - lines
+    - type
+    - types
+    - status
+    - each
+    - table
+    - order
+    - quantity
+    - price
+    - amount
+    - total
+    - average
+    - value
+    agent_column_suffix_code_terms:
+    - code
+    - codes
+    - id
+    - ids
+    - number
+    - numbers
+    - nomor
+    - kode
+    - 'no'
+    agent_column_suffix_date_terms:
+    - date
+    - dates
+    - tanggal
+    - tgl
+    - time
+    - waktu
+    agent_column_suffix_description_terms:
+    - description
+    - descriptions
+    - detail
+    - details
+    - desc
+    - text
+    agent_column_suffix_detail_terms:
+    - detail
+    - details
+    - description
+    - descriptions
+    - desc
+    - text
+    agent_column_suffix_id_terms:
+    - id
+    - ids
+    - number
+    - numbers
+    - code
+    - codes
+    - nomor
+    - kode
+    - 'no'
+    agent_column_suffix_name_terms:
+    - name
+    - names
+    - nama
+    agent_column_suffix_number_terms:
+    - number
+    - numbers
+    - id
+    - ids
+    - code
+    - codes
+    - nomor
+    - kode
+    - 'no'
+    agent_column_suffix_text_terms:
+    - text
+    - description
+    - descriptions
+    - detail
+    - details
+    - desc
+    agent_draft_limit_intent_terms:
+    - top
+    - best
+    - highest
+    - lowest
+    - limit
+    agent_gibberish_repeat_pattern_lengths:
+    - '2'
+    - '3'
+    agent_half_open_upper_range_patterns:
+    - \bbetween\s+([-+]?\d+(?:\.\d+)?)\s+(?:and|-|to)\s+(?:less\s+than|below|under)\s+([-+]?\d+(?:\.\d+)?)\b
+    - \bfrom\s+([-+]?\d+(?:\.\d+)?)\s+(?:to|through)\s+(?:less\s+than|below|under)\s+([-+]?\d+(?:\.\d+)?)\b
+    agent_refine_primary_from_skip_tokens:
+    - select
+    - with
+    agent_refine_regex_tokens:
+    - REGEXP
+    - RLIKE
+    agent_refine_subquery_alias_reserved_tokens:
+    - where
+    - group
+    - order
+    - having
+    - limit
+    - 'on'
+    - and
+    - or
+    agent_refine_table_alias_reserved_tokens:
+    - where
+    - group
+    - order
+    - having
+    - limit
+    - 'on'
+    - and
+    - or
+    - select
+    agent_router_aggregate_context_patterns:
+    - \b(total|sum|count|average|avg)\s+(of\s+)?__ENTITY__\b
+    - \b(total|sum|count|average|avg)\s+(of\s+)?__ENTITY__\s+\w+
+    - \bnumber\s+of\s+__ENTITY__\b
+    - \b__ENTITY__\b\s+(total|sum|count|average)\b
+    agent_router_explicit_rank_patterns:
+    - \ba\s+rank\s+of\b
+    - \brank\s+\w+\s+by\b
+    - \branking\s+of\b
+    - \breturn.*\brank\b.*\bwithin\b
+    - \brank\s+.*\bbased\s+on\b
+    - \brank\s+the\s+\w+\b
+    - \branked\s+by\b
+    agent_router_explicit_sort_terms:
+    - sort by
+    - ordered by
+    - sorted by
+    - order by
+    - sorted from
+    - alphabetical
+    - alphabetically
+    - reverse alphabetical
+    - reversed alphabetical
+    - descending
+    - ascending
+    - a-z
+    - z-a
+    agent_router_explicit_subject_entity_patterns:
+    - ^\s*(?:show|list|display|return|get|find|fetch)\s+(?:only\s+|all\s+)?(?:\w+\s+){0,2}__ENTITY__\b
+    - ^\s*(?:which|what)\s+(?:\w+\s+){0,2}__ENTITY__\b
+    agent_router_fk_suffix_terms:
+    - number
+    - code
+    - id
+    agent_router_for_each_entity_patterns:
+    - \bfor\s+(?:each|every)\s+(?:(?:such|individual|respective)\s+)?(?:\w+\s+){0,2}__ENTITY__\b
+    - \bper\s+(?:(?:such|individual|respective)\s+)?(?:\w+\s+){0,2}__ENTITY__\b
+    - \b(?:each|every)\s+(?:(?:such|individual|respective)\s+)?(?:\w+\s+){0,2}__ENTITY__\b
+    agent_router_generic_cross_table_exclusion_terms:
+    - without any
+    - have no
+    - has no
+    - tidak pernah
+    - belum pernah
+    - tidak ada
+    - yang tidak punya
+    agent_router_group_indicators:
+    - each
+    - per
+    - every
+    - masing-masing
+    - setiap
+    - for each
+    - classify
+    agent_router_id_reference_terms:
+    - number
+    - id
+    - code
+    - kode
+    - nomor
+    agent_router_ignore_patterns_group:
+    - \bgroup\s+by\b
+    agent_router_ignore_patterns_order:
+    - \border(ed|s)?\s+by\b
+    - \bordered\s+in\s+(?:ascending|descending)\s+order\b
+    - \bordered\s+(?:ascending|descending)\b
+    - \b(descending|ascending)\s+order\b
+    - \bin\s+order\b
+    agent_router_ignore_patterns_rank:
+    - \brank\s+over\b
+    agent_router_ignore_patterns_sort:
+    - \bsort(ed)?\s+by\b
+    agent_router_math_keywords:
+    - sum
+    - count
+    - total
+    - avg
+    - average
+    - number of
+    - jumlah
+    - rata-rata
+    - percentage
+    - percent
+    - ratio
+    - proportion
+    - persentase
+    - rasio
+    agent_router_ordinal_target_terms:
+    - highest
+    - lowest
+    - largest
+    - smallest
+    - biggest
+    - top
+    - bottom
+    - best
+    - worst
+    - most
+    - least
+    - terbesar
+    - terkecil
+    - tertinggi
+    - terendah
+    agent_router_ordinal_words:
+    - second
+    - third
+    - fourth
+    - fifth
+    - 2nd
+    - 3rd
+    - 4th
+    - 5th
+    - kedua
+    - ketiga
+    - keempat
+    - kelima
+    agent_router_primary_from_in_patterns:
+    - \b\w+\s+(from|in)\s+__ENTITY__\b
+    - \b__ENTITY__\b\s+who\s+
+    - \b__ENTITY__\b\s+that\s+
+    agent_router_table_attribute_patterns:
+    - \b__ENTITY__\b\s+(name|number|id|code)\b
+    agent_router_time_rank_terms:
+    - latest
+    - earliest
+    - newest
+    - oldest
+    - terbaru
+    - terlama
+    agent_router_value_rank_terms:
+    - highest
+    - lowest
+    - top
+    - bottom
+    - most
+    - least
+    - largest
+    - smallest
+    - terbesar
+    - terkecil
+    - paling
+    - tertinggi
+    - terendah
+    agent_sql_reserved_extra_tokens:
+    - year
+    - month
+    - day
+    - date
+    - date_format
+    - now
+    - curdate
+    - concat
+    - group_concat
+    - coalesce
+    - ifnull
+    - sum
+    - count
+    - avg
+    - t
+    - limit
+    - offset
+    - as
+    - regexp_like
+    - str_to_date
+    - case
+    - when
+    - then
+    - else
+    - end
+    - union
+    - all
+    - distinct
+    - values
+    - exists
+    - having
+    - substr
+    - over
+    - partition
+    - range
+    - rows
+    - row
+    - between
+    - unbounded
+    - preceding
+    - following
+    - current
+    helpers_all_other_intent_patterns:
+    - \ball\s+other\b
+    helpers_average_intent_patterns:
+    - \b(?:average|avg|mean)\b
+    helpers_count_intent_terms:
+    - total number
+    - number of
+    - count of
+    - how many
+    - count
+    helpers_ctx_generic_metric_fallback_terms:
+    - amount
+    - total
+    - price
+    - quantity
+    - cost
+    - value
+    - rate
+    - count
+    - number
+    - percent
+    - ratio
+    - limit
+    - average
+    - avg
+    - mean
+    helpers_dual_fact_family_stopwords:
+    - a
+    - an
+    - the
+    - of
+    - for
+    - per
+    - each
+    - every
+    - such
+    - total
+    - number
+    - count
+    - sum
+    - combined
+    - aggregate
+    - aggregated
+    - and
+    - or
+    - with
+    - without
+    - show
+    - return
+    - list
+    - display
+    - give
+    - find
+    - who
+    - have
+    - has
+    - had
+    - at
+    - least
+    - one
+    - all
+    helpers_dual_fact_generic_metric_terms:
+    - amount
+    - value
+    - price
+    - prices
+    - quantity
+    - qty
+    - volume
+    - balance
+    - cost
+    - total
+    - spend
+    helpers_entity_generic_fallback_terms:
+    - entity
+    - entities
+    - record
+    - records
+    - row
+    - rows
+    - entry
+    - entries
+    - item
+    - items
+    - result
+    - results
+    helpers_existence_support_verbs_generic:
+    - have
+    - has
+    - had
+    - made
+    helpers_grouping_intent_patterns:
+    - \bfor\s+(?:each|every)\b
+    - \bper\b
+    - \beach\b
+    - \bevery\b
+    - \bin\s+each\b
+    - \bgrouped\s+by\b
+    helpers_hierarchical_collection_possessives:
+    - their
+    - its
+    - his
+    - her
+    helpers_hierarchical_collection_verb_stems:
+    - collect
+    - handle
+    - manage
+    - own
+    helpers_inner_join_generic_object_terms:
+    - record
+    - records
+    - row
+    - rows
+    - entry
+    - entries
+    helpers_metric_agg_idlike_tokens:
+    - id
+    - identifier
+    - code
+    - number
+    - name
+    - date
+    - time
+    - status
+    - email
+    - phone
+    - address
+    - city
+    - country
+    - zip
+    - postal
+    - check
+    helpers_metric_agg_intent_terms:
+    - total
+    - sum
+    - average
+    - avg
+    - mean
+    - combined
+    - aggregate
+    - aggregated
+    - jumlah
+    - rata
+    - rata-rata
+    helpers_ordering_alphabetic_terms:
+    - alphabetical
+    - alphabetically
+    - alphabetized
+    - alphabetize
+    - a to z
+    - z to a
+    - reverse alphabetical
+    - reversed alphabetical
+    - reverse
+    helpers_ordering_row_container_terms:
+    - row
+    - rows
+    - record
+    - records
+    - entry
+    - entries
+    - result
+    - results
+    - item
+    - items
+    - tuple
+    - tuples
+    helpers_ordering_sequence_terms:
+    - previous
+    - next
+    - prior
+    - following
+    - lag
+    - lead
+    helpers_probe_generic_metric_terms:
+    - amount
+    - price
+    - quantity
+    - total
+    - count
+    - cost
+    - rate
+    - ratio
+    - percent
+    helpers_probe_localized_metric_terms:
+    - omset
+    - harga
+    - jumlah
+    helpers_rollup_generic_metric_terms:
+    - amount
+    - value
+    - price
+    - quantity
+    - cost
+    - spend
+    helpers_same_group_intent_patterns:
+    - \bsame\b
+    helpers_semantic_alias_listprice_exclude_terms:
+    - buy price
+    - purchase price
+    - cost
+    - cogs
+    - unit price
+    - selling price
+    - deal price
+    helpers_semantic_alias_listprice_include_terms:
+    - msrp
+    - list price
+    helpers_semantic_alias_price_exclude_terms:
+    - buy price
+    - purchase price
+    - cost
+    - cogs
+    - msrp
+    - list price
+    - retail price
+    - catalog price
+    helpers_semantic_alias_price_include_terms:
+    - unit price
+    helpers_temporal_event_column_terms:
+    - created
+    - updated
+    - posted
+    - shipped
+    - ordered
+    helpers_temporal_fallback_meta_tokens:
+    - date
+    - time
+    - timestamp
+    - temporal
+    helpers_temporal_fallback_stop_tokens:
+    - the
+    - a
+    - an
+    - and
+    - or
+    - to
+    - of
+    - for
+    - with
+    - by
+    - from
+    - show
+    - list
+    - return
+    - display
+    - get
+    - find
+    - include
+    - including
+    - where
+    - which
+    - that
+    - whose
+    - is
+    - are
+    - was
+    - were
+    - be
+    - in
+    - 'on'
+    - at
+    - year
+    - years
+    helpers_top_n_per_group_patterns:
+    - \b(?:for\s+(?:each|every)|each|every|per|within\s+each|within\s+every)\b[\s\S]{0,160}\b(?:top|bottom)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b
+    - \b(?:top|bottom)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b[\s\S]{0,160}\b(?:for\s+(?:each|every)|per|within\s+each|within\s+every)\b
+    - \b(?:list|return|show|give)\s+(?:exactly\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b[\s\S]{0,80}\b(?:largest|smallest|highest|lowest|most|least|best|worst)\b[\s\S]{0,160}\b(?:for\s+(?:each|every)|per|within\s+each|within\s+every)\b
+    - \b(?:for\s+(?:each|every)|each|every|per|within\s+each|within\s+every)\b[\s\S]{0,160}\b(?:list|return|show|give)\s+(?:exactly\s+)?(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b[\s\S]{0,80}\b(?:largest|smallest|highest|lowest|most|least|best|worst)\b
+    helpers_winner_row_generic_object_terms:
+    - entity
+    - entities
+    - record
+    - records
+    - row
+    - rows
+    - entry
+    - entries
+    - item
+    - items
+    - result
+    - results
+    - tuple
+    - tuples
+    helpers_winner_row_partition_stop_tokens:
+    - for
+    - each
+    - per
+    - the
+    - a
+    - an
+    - of
+    - with
+    - and
+    - or
+    - id
+    - ids
+    - code
+    - codes
+    - number
+    - numbers
+    - name
+    - names
+    - date
+    - dates
+    - record
+    - row
+    - latest
+    - earliest
+    - largest
+    - highest
+    - lowest
+    - amount
+    - total
+    helpers_winner_row_ranking_signal_terms:
+    - date
+    - time
+    - timestamp
+    - amount
+    - quantity
+    - price
+    - value
+    - score
+    helpers_zero_fill_output_patterns:
+    - \btreat\s+(?:it|them|missing\s+values?|no\s+\w+|nulls?)\s+as\s+0\b
+    - \btreat\s+(?:it|them|missing\s+values?|no\s+\w+|nulls?)\s+as\s+zero\b
+    - \binclude\b[\s\S]{0,100}\b(?:never|no|without)\b[\s\S]{0,140}\b(?:treat(?:ing)?|show|return)\b[\s\S]{0,40}\b(?:0|zero)\b
+    - \b(?:never|no|without)\b[\s\S]{0,140}\b(?:treat(?:ing)?|show|return)\b[\s\S]{0,40}\b(?:0|zero)\b
+    - \bif\s+(?:a|an|the)?\s*\w+\s+has\s+no\b[\s\S]{0,80}\b(?:treat|show|return)\b[\s\S]{0,40}\b(?:0|zero)\b
+    - \b(?:missing|no)\s+\w+\s+(?:should\s+)?(?:be|count\s+as|treated\s+as)\s+(?:0|zero)\b
+    retrieval_aggregate_query_terms:
+    - sum
+    - avg
+    - average
+    - total
+    retrieval_bm25_stem_exceptions_base:
+    - status
+    - address
+    - business
+    retrieval_bm25_stopword_exceptions:
+    - name
+    - names
+    retrieval_contact_column_hint_terms:
+    - contact
+    retrieval_count_query_terms:
+    - count
+    retrieval_desc_generic_terms:
+    - number
+    - total
+    - each
+    - per
+    - for
+    - the
+    - a
+    - an
+    retrieval_dimension_like_table_types:
+    - dimension
+    - unknown
+    retrieval_expand_trigger_reasons:
+    - hard_identifier
+    - identifier
+    - ambiguous_unqualified
+    - invalid_join_path
+    - group_projection_mismatch
+    retrieval_id_boost_column_substring_terms:
+    - number
+    retrieval_id_boost_column_suffix_terms:
+    - id
+    retrieval_id_boost_query_terms:
+    - id
+    - id
+    - id,
+    - identifier
+    - code
+    retrieval_id_column_substring_terms:
+    - number
+    retrieval_id_column_suffix_terms:
+    - id
+    - code
+    - number
+    retrieval_id_role_hint_terms:
+    - id
+    retrieval_id_role_tags:
+    - id
+    - key
+    - primary
+    - identifier
+    retrieval_metric_role_tags:
+    - metric
+    - measure
+    - amount
+    - quantity
+    retrieval_name_column_hint_terms:
+    - name
+    retrieval_name_role_hint_terms:
+    - name
+    retrieval_numeric_exclude_column_keywords:
+    - id
+    - code
+    - key
+    retrieval_numeric_pattern_keywords:
+    - quantity
+    - stock
+    - amount
+    - price
+    - cost
+    - value
+    retrieval_numeric_signal_keywords:
+    - quantity
+    - price
+    - amount
+    - total
+    - cost
+    - value
+    - each
+    - rate
+    retrieval_numeric_sql_types:
+    - int
+    - integer
+    - tinyint
+    - smallint
+    - mediumint
+    - bigint
+    - decimal
+    - numeric
+    - float
+    - double
+    - double precision
+    - real
+    - money
+    - smallmoney
+    - bit
+    retrieval_numeric_type_hints:
+    - int
+    - decimal
+    - numeric
+    - float
+    - double
+    retrieval_table_scoring_math_keywords:
+    - sum
+    - count
+    - total
+    - avg
+    - average
+    - number of
+    - jumlah
+    - rata-rata
+    - percentage
+    - percent
+    - ratio
+    - proportion
+    - persentase
+    - rasio
+  dicts:
+    agent_keep_alive_unit_seconds:
+      s: '1'
+      m: '60'
+      h: '3600'
+    helpers_existence_irregular_base_forms:
+      paid: pay
+    retrieval_column_variant_replacements:
+      instock: in stock
