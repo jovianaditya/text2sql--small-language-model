@@ -81,6 +81,8 @@ def _is_executable_sql_candidate(sql_text: str) -> tuple[bool, str]:
     s = str(sql_text or "").strip().rstrip(";").strip()
     if not s:
         return False, "empty_sql_candidate"
+    if "FINAL_GATE_BLOCKED" in s.upper():
+        return False, "final_gate_blocked_candidate"
     if re.match(r"^\s*SELECT\b", s, flags=re.I):
         return True, ""
     if re.match(r"^\s*WITH\b", s, flags=re.I) and re.search(r"\bSELECT\b", s, flags=re.I):

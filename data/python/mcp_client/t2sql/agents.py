@@ -37,6 +37,11 @@ from .config import (
     AGENT_B4_CANNOT_ANSWER_ENABLED,
     AGENT_B4_AMBIGUITY_ABSTAIN_ENABLED,
     AGENT_B4_AMBIGUITY_MIN_SIGNALS,
+    AGENT_B4_EVIDENCE_ABSTAIN_ENABLED,
+    AGENT_B4_EVIDENCE_MIN_ALLOWED_TABLES,
+    AGENT_B4_EVIDENCE_MIN_ALLOWED_COLUMNS,
+    AGENT_B4_EVIDENCE_MIN_RERANKED,
+    AGENT_B4_EVIDENCE_TRIGGER_REASONS,
     AGENT_PROMPT_ABSTAIN_ENABLED,
     AGENT_PROMPT_ABSTAIN_NOTES_PREFIX,
     AGENT_AST_GUARDS_ENABLED,
@@ -4858,7 +4863,48 @@ def _should_expand_retrieval_context(gate_reasons: List[str]) -> bool:
     return False
 
 
-def _evaluate_cannot_answer_from_ir(intent_ir: Dict[str, Any]) -> Tuple[bool, str, List[str]]:
+def _is_low_retrieval_evidence(
+    retrieval_snapshot: Optional[Dict[str, Any]],
+) -> Tuple[bool, List[str]]:
+    snap = dict(retrieval_snapshot or {})
+    reasons: List[str] = []
+
+    def _to_int(v: Any, default: int = 0) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+    allowed_tables = _to_int(snap.get("allowed_tables_after_filter"))
+    allowed_cols = _to_int(snap.get("allowed_columns_after_filter"))
+    reranked = _to_int(snap.get("reranked_candidates"))
+    sparse = _to_int(snap.get("sparse_candidates"))
+    dense = _to_int(snap.get("dense_candidates"))
+
+    if allowed_tables < max(1, int(AGENT_B4_EVIDENCE_MIN_ALLOWED_TABLES)):
+        reasons.append(
+            f"allowed_tables_low:{allowed_tables}<{int(AGENT_B4_EVIDENCE_MIN_ALLOWED_TABLES)}"
+        )
+    if allowed_cols < max(1, int(AGENT_B4_EVIDENCE_MIN_ALLOWED_COLUMNS)):
+        reasons.append(
+            f"allowed_columns_low:{allowed_cols}<{int(AGENT_B4_EVIDENCE_MIN_ALLOWED_COLUMNS)}"
+        )
+    if reranked < max(1, int(AGENT_B4_EVIDENCE_MIN_RERANKED)):
+        reasons.append(
+            f"reranked_low:{reranked}<{int(AGENT_B4_EVIDENCE_MIN_RERANKED)}"
+        )
+    if sparse <= 0 and dense <= 0:
+        reasons.append("no_sparse_dense_candidates")
+
+    return bool(reasons), reasons
+
+
+def _evaluate_cannot_answer_from_ir(
+    intent_ir: Dict[str, Any],
+    *,
+    retrieval_snapshot: Optional[Dict[str, Any]] = None,
+    gate_reasons: Optional[List[str]] = None,
+) -> Tuple[bool, str, List[str]]:
     """
     Decide whether to abstain before SQL drafting for ambiguous/unanswerable intents.
     This gate is flag-driven and defaults to inactive.
@@ -4876,6 +4922,39 @@ def _evaluate_cannot_answer_from_ir(intent_ir: Dict[str, Any]) -> Tuple[bool, st
             return True, f"Cannot resolve subject entity reliably: {signals}", signals
         if "disconnected_mentions" in notes and not subject:
             return True, "Cannot map disconnected table mentions to a safe join path", signals
+
+    if AGENT_B4_EVIDENCE_ABSTAIN_ENABLED:
+        low_evidence, evidence_reasons = _is_low_retrieval_evidence(retrieval_snapshot)
+        gate_reason_set = {
+            str(r or "").strip().lower()
+            for r in (gate_reasons or [])
+            if str(r or "").strip()
+        }
+        trigger_reasons = {
+            str(r or "").strip().lower()
+            for r in (AGENT_B4_EVIDENCE_TRIGGER_REASONS or [])
+            if str(r or "").strip()
+        }
+        trigger_hit = False
+        for reason in gate_reason_set:
+            if reason in trigger_reasons:
+                trigger_hit = True
+                break
+            if any(
+                reason.startswith(f"{trig}:") or trig in reason
+                for trig in trigger_reasons
+            ):
+                trigger_hit = True
+                break
+
+        if low_evidence and (signals or trigger_hit):
+            reason_bits: List[str] = []
+            if trigger_hit:
+                reason_bits.append(f"gate_reasons={sorted(gate_reason_set)}")
+            if signals:
+                reason_bits.append(f"ambiguity={signals}")
+            reason_bits.append(f"evidence={evidence_reasons}")
+            return True, "Cannot answer safely from weak schema evidence (" + "; ".join(reason_bits) + ")", signals
 
     return False, "", signals
 
@@ -7592,7 +7671,10 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         state["intent_ir"] = intent_ir
         state["ambiguity_signals"] = list(intent_ir.get("ambiguity_signals") or [])
 
-        should_abstain, abstain_reason, ambiguity_signals = _evaluate_cannot_answer_from_ir(intent_ir)
+        should_abstain, abstain_reason, ambiguity_signals = _evaluate_cannot_answer_from_ir(
+            intent_ir,
+            retrieval_snapshot=state.get("retrieval_snapshot"),
+        )
         if should_abstain:
             print(f"[DRAFTER] Abstain: {abstain_reason}")
             updated_decision = dict(decision or {})
@@ -7932,6 +8014,28 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             print(
                 f"[IR] gated off -> LLM. reasons={ir_log_reasons or ['unknown_ir_gate_reason']}"
             )
+        if not ir_plannable:
+            should_abstain, abstain_reason, ambiguity_signals = _evaluate_cannot_answer_from_ir(
+                intent_ir,
+                retrieval_snapshot=state.get("retrieval_snapshot"),
+                gate_reasons=ir_log_reasons,
+            )
+            if should_abstain:
+                print(f"[DRAFTER] Abstain (evidence-aware): {abstain_reason}")
+                updated_decision = dict(decision or {})
+                updated_decision["is_valid_question"] = False
+                updated_decision["rejection_reason"] = abstain_reason
+                return {
+                    **state,
+                    "ambiguity_signals": ambiguity_signals,
+                    "cannot_answer": True,
+                    "cannot_answer_reason": abstain_reason,
+                    "router_decision": updated_decision,
+                    "draft_source": "cannot_answer_guard",
+                    "draft_sql": "",
+                    "final_sql": "",
+                    "answer": abstain_reason,
+                }
 
     fallback_model = forced_model or state.get("router_model_candidate")
     if not fallback_model:

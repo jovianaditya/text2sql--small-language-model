@@ -459,12 +459,28 @@ AGENT_IR_MULTI_TABLE_MIN_CONFIDENCE = float(os.getenv("AGENT_IR_MULTI_TABLE_MIN_
 AGENT_IR_MAX_TABLES = int(os.getenv("AGENT_IR_MAX_TABLES", "2"))
 AGENT_IR_ALLOW_SIMPLE_HAVING = bool(int(os.getenv("AGENT_IR_ALLOW_SIMPLE_HAVING", "1")))
 AGENT_IR_SIMPLE_HAVING_MAX_FILTERS = int(os.getenv("AGENT_IR_SIMPLE_HAVING_MAX_FILTERS", "1"))
-AGENT_B4_CANNOT_ANSWER_ENABLED = bool(int(os.getenv("AGENT_B4_CANNOT_ANSWER_ENABLED", "0")))
-AGENT_B4_AMBIGUITY_ABSTAIN_ENABLED = bool(int(os.getenv("AGENT_B4_AMBIGUITY_ABSTAIN_ENABLED", "0")))
+AGENT_B4_CANNOT_ANSWER_ENABLED = bool(int(os.getenv("AGENT_B4_CANNOT_ANSWER_ENABLED", "1")))
+AGENT_B4_AMBIGUITY_ABSTAIN_ENABLED = bool(int(os.getenv("AGENT_B4_AMBIGUITY_ABSTAIN_ENABLED", "1")))
 AGENT_B4_AMBIGUITY_MIN_SIGNALS = int(os.getenv("AGENT_B4_AMBIGUITY_MIN_SIGNALS", "2"))
+AGENT_B4_EVIDENCE_ABSTAIN_ENABLED = bool(int(os.getenv("AGENT_B4_EVIDENCE_ABSTAIN_ENABLED", "1")))
+AGENT_B4_EVIDENCE_MIN_ALLOWED_TABLES = int(os.getenv("AGENT_B4_EVIDENCE_MIN_ALLOWED_TABLES", "1"))
+AGENT_B4_EVIDENCE_MIN_ALLOWED_COLUMNS = int(os.getenv("AGENT_B4_EVIDENCE_MIN_ALLOWED_COLUMNS", "2"))
+AGENT_B4_EVIDENCE_MIN_RERANKED = int(os.getenv("AGENT_B4_EVIDENCE_MIN_RERANKED", "2"))
+AGENT_B4_EVIDENCE_TRIGGER_REASONS = _env_json_list(
+    "AGENT_B4_EVIDENCE_TRIGGER_REASONS",
+    [
+        "missing_subject_entity",
+        "empty_ir_payload",
+        "planner_incompatible",
+        "confidence_below_min",
+        "disconnected_mentions",
+        "high_table_ambiguity",
+        "unresolved_subject_multi_table",
+    ],
+)
 EXECUTION_EMPTY_RESULT_CLASSIFY = bool(int(os.getenv("EXECUTION_EMPTY_RESULT_CLASSIFY", "1")))
 AGENT_PROMPT_V2_ENABLED = bool(int(os.getenv("AGENT_PROMPT_V2_ENABLED", "0")))
-AGENT_PROMPT_ABSTAIN_ENABLED = bool(int(os.getenv("AGENT_PROMPT_ABSTAIN_ENABLED", "0")))
+AGENT_PROMPT_ABSTAIN_ENABLED = bool(int(os.getenv("AGENT_PROMPT_ABSTAIN_ENABLED", "1")))
 AGENT_PROMPT_ABSTAIN_NOTES_PREFIX = os.getenv("AGENT_PROMPT_ABSTAIN_NOTES_PREFIX", "CANNOT_ANSWER:").strip()
 
 # AST guardrails (sqlglot-based safety checks in refine phase)
