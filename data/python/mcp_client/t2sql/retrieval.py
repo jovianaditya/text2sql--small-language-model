@@ -14,7 +14,7 @@ import re
 import json
 import hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple, Set
 from collections import defaultdict
 from rank_bm25 import BM25Okapi
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
@@ -146,6 +146,7 @@ from .schema_analyzer import (
     get_column_synonyms,
     get_name_column,
     get_id_column,
+    get_fk_relationships,
 )
 # ======================================================================
 # ========================== CONTEXT BUILDER ===========================
@@ -213,6 +214,151 @@ def _extract_cards_and_hint(ctx: str) -> tuple[str, str]:
     return cards_text, hint_text
 
 
+def _compute_retrieval_evidence_strength(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute lightweight retrieval evidence strength from telemetry counters.
+    Higher score indicates stronger retrieval support for schema linking.
+    """
+    sparse = int(snapshot.get("sparse_candidates", 0) or 0)
+    dense = int(snapshot.get("dense_candidates", 0) or 0)
+    reranked = int(snapshot.get("reranked_candidates", 0) or 0)
+    allowed_tables = int(snapshot.get("allowed_tables_after_filter", 0) or 0)
+    allowed_cols = int(snapshot.get("allowed_columns_after_filter", 0) or 0)
+    cols_before = int(snapshot.get("allowed_columns_before_filter", 0) or 0)
+
+    sparse_signal = min(1.0, float(sparse) / 3.0)
+    dense_signal = min(1.0, float(dense) / 12.0)
+    rerank_signal = min(1.0, float(reranked) / 6.0)
+    table_signal = min(1.0, float(allowed_tables) / 2.0)
+    col_signal = min(1.0, float(allowed_cols) / 8.0)
+    retention_signal = (
+        min(1.0, float(allowed_cols) / float(cols_before))
+        if cols_before > 0
+        else 1.0
+    )
+    dual_channel_signal = 1.0 if sparse > 0 and dense > 0 else 0.0
+
+    score = (
+        0.20 * sparse_signal
+        + 0.15 * dense_signal
+        + 0.25 * rerank_signal
+        + 0.10 * table_signal
+        + 0.15 * col_signal
+        + 0.10 * retention_signal
+        + 0.05 * dual_channel_signal
+    )
+    score = max(0.0, min(1.0, float(score)))
+
+    if score >= 0.75:
+        tier = "strong"
+    elif score >= 0.45:
+        tier = "moderate"
+    else:
+        tier = "weak"
+
+    return {
+        "score": round(score, 3),
+        "tier": tier,
+        "signals": {
+            "sparse": round(sparse_signal, 3),
+            "dense": round(dense_signal, 3),
+            "reranked": round(rerank_signal, 3),
+            "allowed_tables": round(table_signal, 3),
+            "allowed_columns": round(col_signal, 3),
+            "column_retention": round(retention_signal, 3),
+            "dual_channel": round(dual_channel_signal, 3),
+        },
+    }
+
+
+def _build_expanded_cards_from_schema(
+    expanded_allowed: Dict[str, List[str]],
+    *,
+    state: RAGState,
+    analyzer: Any,
+    max_cards: int,
+    desc_max_len: int,
+) -> str:
+    """
+    Regenerate cards for expanded context from schema metadata + ranked column hints.
+    """
+    if not expanded_allowed:
+        return ""
+
+    ranked_cols = state.get("ranked_cols") or []
+    ranked_by_table: Dict[str, List[str]] = defaultdict(list)
+    for tbl, col in ranked_cols:
+        t = str(tbl or "").strip().lower()
+        c = str(col or "").strip()
+        if not t or not c:
+            continue
+        bucket = ranked_by_table[t]
+        if c not in bucket:
+            bucket.append(c)
+
+    cards: List[str] = []
+    for table in expanded_allowed.keys():
+        allowed_cols = [str(c).strip() for c in (expanded_allowed.get(table) or []) if str(c).strip()]
+        if not allowed_cols:
+            continue
+        ranked_first = [c for c in ranked_by_table.get(table, []) if c in allowed_cols]
+        candidate_cols = ranked_first + [c for c in allowed_cols if c not in set(ranked_first)]
+        for col in candidate_cols:
+            desc = ""
+            if analyzer is not None:
+                try:
+                    desc = str(analyzer.get_column_description(table, col) or "").strip()
+                except Exception:
+                    desc = ""
+            if desc and len(desc) > desc_max_len:
+                desc = desc[:desc_max_len].rstrip() + "..."
+            cards.append(f"- table: {table} | column: {col} | desc: {desc or '(no description)'}")
+            if len(cards) >= max_cards:
+                return "\n".join(cards)
+
+    return "\n".join(cards)
+
+
+def _build_expanded_fk_hints(selected_tables: List[str]) -> str:
+    """
+    Build compact FK connector hints for expanded context.
+    """
+    table_scope = {str(t or "").strip().lower() for t in (selected_tables or []) if str(t or "").strip()}
+    if len(table_scope) < 2:
+        return ""
+
+    try:
+        fk_map = get_fk_relationships() or {}
+    except Exception:
+        fk_map = {}
+
+    edges: List[str] = []
+    seen: Set[str] = set()
+    for src, rels in (fk_map or {}).items():
+        src_l = str(src or "").strip().lower()
+        if not src_l or src_l not in table_scope:
+            continue
+        for fk_col, tgt in (rels or {}).items():
+            tgt_l = str(tgt or "").strip().lower()
+            fk_l = str(fk_col or "").strip()
+            if not tgt_l or not fk_l or tgt_l not in table_scope:
+                continue
+            tgt_id = (get_id_column(tgt_l) or "").strip("`")
+            edge = f"- {src_l}.{fk_l} -> {tgt_l}.{tgt_id}" if tgt_id else f"- {src_l}.{fk_l} -> {tgt_l}"
+            if edge in seen:
+                continue
+            seen.add(edge)
+            edges.append(edge)
+            if len(edges) >= 12:
+                break
+        if len(edges) >= 12:
+            break
+
+    if not edges:
+        return ""
+    return "JOIN KEY HINTS:\n" + "\n".join(edges)
+
+
 def build_expanded_context_from_state(state: RAGState) -> Dict[str, Any]:
     """
     Build a broader ALLOWED IDENTIFIERS context from current retrieval state.
@@ -246,6 +392,42 @@ def build_expanded_context_from_state(state: RAGState) -> Dict[str, Any]:
     max_tables = max(1, int(RETRIEVAL_EXPAND_MAX_TABLES))
     selected_tables = table_order[:max_tables]
 
+    # Add FK connector tables so expanded context can preserve joinability.
+    if len(selected_tables) >= 2 and len(selected_tables) < max_tables:
+        fk_graph: Dict[str, Dict[str, str]] = {}
+        try:
+            fk_graph = get_fk_relationships() or {}
+        except Exception:
+            fk_graph = {}
+        try:
+            all_tables = get_all_tables() or []
+        except Exception:
+            all_tables = []
+        allowed_universe = {
+            str(t or "").strip().lower(): []
+            for t in all_tables
+            if str(t or "").strip()
+        }
+        if fk_graph and allowed_universe:
+            connector_tables: List[str] = []
+            for i, left in enumerate(selected_tables):
+                for right in selected_tables[i + 1:]:
+                    path = _find_fk_path(left, right, fk_graph, allowed_universe)
+                    if not path:
+                        continue
+                    for bridge in path[1:-1]:
+                        bridge_l = str(bridge or "").strip().lower()
+                        if bridge_l and bridge_l not in seen and bridge_l not in connector_tables:
+                            connector_tables.append(bridge_l)
+                if len(selected_tables) >= max_tables:
+                    break
+            for bridge in connector_tables:
+                if len(selected_tables) >= max_tables:
+                    break
+                if bridge not in seen:
+                    seen.add(bridge)
+                    selected_tables.append(bridge)
+
     analyzer = None
     try:
         analyzer = get_schema_analyzer()
@@ -273,9 +455,20 @@ def build_expanded_context_from_state(state: RAGState) -> Dict[str, Any]:
             "expanded_table_count": 0,
         }
 
-    cards_text, hint_text = _extract_cards_and_hint(current_ctx)
+    _, hint_text = _extract_cards_and_hint(current_ctx)
     allowed_block = _build_allowed_block(expanded_allowed)
-    cards_block = cards_text or "(cards retained from primary retrieval context)"
+    cards_block = _build_expanded_cards_from_schema(
+        expanded_allowed,
+        state=state,
+        analyzer=analyzer,
+        max_cards=RETRIEVAL_CARDS_MAX_DOCS,
+        desc_max_len=RETRIEVAL_CARDS_DESC_MAX_LEN,
+    )
+    fk_hints = _build_expanded_fk_hints(list(expanded_allowed.keys()))
+    if fk_hints:
+        cards_block = (cards_block + "\n\n" + fk_hints).strip() if cards_block else fk_hints
+    if not cards_block:
+        cards_block = "(expanded cards unavailable)"
     new_ctx = (allowed_block + "\n\n### CARDS\n" + cards_block).strip()
     if hint_text:
         new_ctx += f"\n\n### _INTERNAL_HINT\n{hint_text}"
@@ -1478,6 +1671,7 @@ def _single_table_lock_is_high_confidence(
     primary_table: str,
     table_scores: Dict[str, float],
     reranked: List[Dict[str, Any]],
+    evidence_strength: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Decide whether single-table lock should be strict.
@@ -1487,6 +1681,11 @@ def _single_table_lock_is_high_confidence(
     """
     primary = str(primary_table or "").strip().lower()
     if not primary:
+        return False
+
+    # Weak retrieval evidence should not force strict single-table lock.
+    evidence_tier = str((evidence_strength or {}).get("tier") or "").strip().lower()
+    if evidence_tier == "weak":
         return False
 
     # No score signal available: preserve previous behavior (strict lock).
@@ -1816,6 +2015,16 @@ def retrieve_node(state: RAGState) -> RAGState:
     # -----------------------------
     token_for_score = _tokenize_bm25_query(sparse_query_clean)
     table_scores = score_tables_from_reranked(reranked, token_for_score)
+    allowed_col_count_pre = sum(len(set(cols or [])) for cols in (allowed or {}).values())
+    lock_evidence_snapshot = {
+        "sparse_candidates": int(len(sparse_field_urns or [])),
+        "dense_candidates": int(len(dense_metas or [])),
+        "reranked_candidates": int(len(reranked or [])),
+        "allowed_tables_after_filter": int(len(allowed or {})),
+        "allowed_columns_after_filter": int(allowed_col_count_pre),
+        "allowed_columns_before_filter": int(allowed_col_count_pre),
+    }
+    lock_evidence_strength = _compute_retrieval_evidence_strength(lock_evidence_snapshot)
 
     # Aggregate override:
     # if join-intent heuristic is noisy but one primary table dominates strongly,
@@ -1829,6 +2038,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                 primary_table=primary_aggregate,
                 table_scores=table_scores,
                 reranked=reranked,
+                evidence_strength=lock_evidence_strength,
             )
             if lock_high_conf:
                 lock_single = True
@@ -1845,6 +2055,7 @@ def retrieve_node(state: RAGState) -> RAGState:
                 primary_table=primary,
                 table_scores=table_scores,
                 reranked=reranked,
+                evidence_strength=lock_evidence_strength,
             )
             if lock_high_conf:
                 only_primary = {t: cols for t, cols in allowed.items() if t.lower() == (primary or "")}
@@ -2094,7 +2305,7 @@ def retrieve_node(state: RAGState) -> RAGState:
         for it in (reranked or [])[:telem_limit]
     ]
     filtered_allowed_col_count = sum(len(set(cols or [])) for cols in (filtered_allowed or {}).values())
-    allowed_col_count = sum(len(set(cols or [])) for cols in (allowed or {}).values())
+    allowed_col_count = allowed_col_count_pre
     retrieval_snapshot = {
         "qtype": str(qtype or ""),
         "sparse_candidates": int(len(sparse_field_urns or [])),
@@ -2109,6 +2320,10 @@ def retrieve_node(state: RAGState) -> RAGState:
         "dense_preview": dense_preview,
         "rerank_preview": rerank_preview,
     }
+    evidence_strength = _compute_retrieval_evidence_strength(retrieval_snapshot)
+    retrieval_snapshot["evidence_strength"] = evidence_strength
+    retrieval_snapshot["evidence_score"] = float(evidence_strength.get("score", 0.0))
+    retrieval_snapshot["evidence_tier"] = str(evidence_strength.get("tier") or "weak")
 
     state["context"] = context
     state["retrieval_context_mode"] = "primary"
