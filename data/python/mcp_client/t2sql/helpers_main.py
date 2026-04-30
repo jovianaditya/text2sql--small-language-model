@@ -4671,7 +4671,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     
     if group_match:
         group_clause = group_match.group(1).strip()
-        group_items = [item.strip() for item in group_clause.split(',')]
+        # Split only on top-level commas so computed grouping expressions like
+        # CONCAT_WS(..., ..., ...) stay intact during key/label reordering.
+        group_items = [item.strip() for item in _split_top_level_commas(group_clause)]
         
         if len(group_items) > 1:
             key_patterns = [r'Number$', r'Code$', r'ID$', r'Id$', r'_id$']

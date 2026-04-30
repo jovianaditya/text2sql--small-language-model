@@ -1725,6 +1725,254 @@ def _repair_near_miss_output_alias_references(sql: str, ctx: str = "") -> str:
     return head + repaired_tail
 
 
+def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Repair explicit "group by first N characters of <column>" questions.
+
+    This is a schema-driven semantic rewrite for single-table grouped summaries:
+    - resolve the referenced text/code column from runtime schema metadata
+    - normalize the grouping expression to LEFT(column, N)
+    - drop redundant/invalid LENGTH(alias)=N filters introduced by drafts
+    """
+    s = (sql or "").strip()
+    q = str(question or "").strip()
+    if not s or not q:
+        return sql
+
+    m = re.search(
+        r"\b(?:group(?:ed|ing)?(?:\s+\w+){0,4}\s+by|by)\s+"
+        r"(?:the\s+)?(?:first|leading|leftmost)\s+"
+        r"(?P<count>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(?:characters?|chars?|letters?|digits?)\s+of\s+"
+        r"(?P<target>[a-z][a-z0-9_ ]{1,48}?)"
+        r"(?=(?:[.,;]|\b(?:return|show|list|display|give|keep|only|order|sort|having|where|with)\b|$))",
+        q,
+        flags=re.I,
+    )
+    if not m:
+        return sql
+
+    count_token = str(m.group("count") or "").strip().lower()
+    target_phrase = str(m.group("target") or "").strip()
+    if not count_token or not target_phrase:
+        return sql
+
+    word_to_int = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+        "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    }
+    try:
+        n_chars = int(count_token) if count_token.isdigit() else word_to_int.get(count_token)
+    except Exception:
+        n_chars = None
+    if n_chars is None or n_chars <= 0:
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(s, read="mysql")
+    except Exception:
+        return sql
+
+    sel = ast.find(exp.Select)
+    if sel is None or list(ast.find_all(exp.Join)):
+        return sql
+
+    tables = []
+    relation_alias = ""
+    for src in ast.find_all(exp.Table):
+        table_name = str(src.name or "").strip("`")
+        if not table_name:
+            continue
+        tables.append(table_name)
+        if not relation_alias:
+            alias_or_name = str(src.alias_or_name or "").strip("`")
+            relation_alias = alias_or_name if alias_or_name and alias_or_name.lower() != table_name.lower() else ""
+    table_names = {t.lower() for t in tables if t}
+    if len(table_names) != 1:
+        return sql
+    table_name = next(iter(table_names))
+
+    allowed_map = _parse_allowed_identifiers(ctx or "") or {}
+    allowed_cols = list(allowed_map.get(table_name) or [])
+    if not allowed_cols:
+        try:
+            allowed_cols = list(get_schema_analyzer().get_table_columns(table_name) or [])
+        except Exception:
+            allowed_cols = []
+    if not allowed_cols:
+        return sql
+
+    def _tokens(text: str) -> Set[str]:
+        raw = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or ""))
+        toks = {
+            tok for tok in re.findall(r"[a-z0-9]+", raw.lower())
+            if tok and tok not in {
+                "the", "a", "an", "of", "for", "to", "by", "in", "on", "at",
+                "with", "without", "and", "or", "first", "leading", "leftmost",
+                "character", "characters", "char", "chars", "letter", "letters",
+                "digit", "digits",
+            }
+        }
+        return toks
+
+    analyzer = get_schema_analyzer()
+    target_tokens = _tokens(target_phrase)
+    if not target_tokens:
+        return sql
+
+    best_col = ""
+    best_score = 0.0
+    for col in allowed_cols:
+        col_name = str(col or "").strip()
+        if not col_name:
+            continue
+        semantic_texts = {col_name, col_name.replace("_", " ")}
+        try:
+            for syn in analyzer.get_column_synonyms(table_name, col_name):
+                syn_s = str(syn or "").strip()
+                if syn_s:
+                    semantic_texts.add(syn_s)
+            desc = str(get_column_description(table_name, col_name) or "").strip()
+            if desc:
+                semantic_texts.add(desc)
+        except Exception:
+            pass
+        col_tokens: Set[str] = set()
+        for text in semantic_texts:
+            col_tokens.update(_tokens(text))
+        if not col_tokens:
+            continue
+        overlap = target_tokens.intersection(col_tokens)
+        if not overlap:
+            continue
+        score = float(len(overlap))
+        if target_tokens.issubset(col_tokens):
+            score += 2.0
+        role = str(get_column_role(table_name, col_name) or "").strip().lower()
+        if role in {"name", "text", "code"}:
+            score += 0.5
+        if role in {"metric", "date"}:
+            score -= 0.5
+        if score > best_score:
+            best_col = col_name
+            best_score = score
+
+    if not best_col:
+        return sql
+
+    grouped_items: List[Tuple[int, Any, Optional[str]]] = []
+    for idx, item in enumerate(sel.expressions):
+        base = item.this if isinstance(item, exp.Alias) else item
+        if base.find(exp.AggFunc) or base.find(exp.Window) or isinstance(base, (exp.Literal, exp.Star)):
+            continue
+        alias_name = item.alias if isinstance(item, exp.Alias) else None
+        grouped_items.append((idx, base, alias_name))
+    if len(grouped_items) != 1:
+        return sql
+
+    idx, old_dim_expr, old_alias = grouped_items[0]
+    qualified_col = f"{relation_alias}.{best_col}" if relation_alias else best_col
+    try:
+        replacement_expr = sqlglot.parse_one(
+            f"SELECT LEFT({qualified_col}, {int(n_chars)})",
+            read="mysql",
+        ).expressions[0]
+    except Exception:
+        return sql
+
+    current_dim_sql = old_dim_expr.sql(dialect="mysql")
+    replacement_sql = replacement_expr.sql(dialect="mysql")
+    if re.sub(r"[\s`]+", "", current_dim_sql).lower() == re.sub(r"[\s`]+", "", replacement_sql).lower():
+        return sql
+
+    new_item = exp.alias_(replacement_expr.copy(), old_alias, quoted=False) if old_alias else replacement_expr.copy()
+    new_select_exprs = list(sel.expressions)
+    new_select_exprs[idx] = new_item
+    sel.set("expressions", new_select_exprs)
+
+    grp = sel.args.get("group")
+    if grp is None or not getattr(grp, "expressions", None):
+        return sql
+    grp.set("expressions", [replacement_expr.copy()])
+
+    def _norm_expr(expr_in: Any) -> str:
+        if expr_in is None:
+            return ""
+        try:
+            text = expr_in.sql(dialect="mysql")
+        except Exception:
+            text = str(expr_in or "")
+        return re.sub(r"[\s`]+", "", text).lower()
+
+    def _flatten_and(expr_in: Any) -> List[Any]:
+        if expr_in is None:
+            return []
+        if isinstance(expr_in, exp.And):
+            return _flatten_and(expr_in.this) + _flatten_and(expr_in.expression)
+        return [expr_in]
+
+    def _build_and(exprs: List[Any]) -> Any:
+        cleaned = [e for e in exprs if e is not None]
+        if not cleaned:
+            return None
+        out = cleaned[0]
+        for nxt in cleaned[1:]:
+            out = exp.And(this=out, expression=nxt)
+        return out
+
+    def _is_matching_length_filter(cond: Any) -> bool:
+        if not isinstance(cond, exp.EQ):
+            return False
+        left = cond.this
+        right = cond.expression
+        literal = None
+        fn_side = None
+        for a, b in ((left, right), (right, left)):
+            if isinstance(b, exp.Literal) and not getattr(b, "is_string", False):
+                try:
+                    literal = int(str(b.this))
+                except Exception:
+                    literal = None
+                fn_side = a
+                break
+        if literal != int(n_chars) or fn_side is None:
+            return False
+        if not isinstance(fn_side, (exp.Length, exp.Anonymous)):
+            return False
+        fn_name = ""
+        if isinstance(fn_side, exp.Length):
+            fn_name = "length"
+        else:
+            fn_name = str(getattr(fn_side, "name", "") or getattr(fn_side, "this", "") or "").lower()
+        if fn_name not in {"length", "char_length", "character_length"}:
+            return False
+        inner = getattr(fn_side, "this", None)
+        if inner is None and getattr(fn_side, "expressions", None):
+            inner = fn_side.expressions[0]
+        inner_norm = _norm_expr(inner)
+        if old_alias and isinstance(inner, exp.Column) and not inner.table:
+            if str(inner.name or "").strip("`").lower() == str(old_alias).strip("`").lower():
+                return True
+        return inner_norm in {_norm_expr(old_dim_expr), _norm_expr(replacement_expr)}
+
+    where_arg = sel.args.get("where")
+    if isinstance(where_arg, exp.Where):
+        conds = _flatten_and(where_arg.this)
+        kept = [c.copy() for c in conds if not _is_matching_length_filter(c)]
+        if len(kept) != len(conds):
+            rebuilt_where = _build_and(kept)
+            sel.set("where", exp.Where(this=rebuilt_where) if rebuilt_where is not None else None)
+
+    out = ast.sql(dialect="mysql")
+    return out if out else sql
+
+
 def _normalize_order_term_tokens(text: str) -> Set[str]:
     raw = re.sub(AGENT_COLUMN_CAMEL_SPLIT_PATTERN, r"\1 \2", str(text or ""))
     tokens = re.findall(r"[a-z0-9]+", raw.lower())
@@ -2163,6 +2411,11 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
     if fixed != out_sql:
         out_sql = fixed
         corrections.append("Semantic contract: repaired near-miss output alias reference")
+
+    fixed = _rewrite_leading_character_grouping(out_sql, question, ctx)
+    if fixed != out_sql:
+        out_sql = fixed
+        corrections.append("Semantic contract: normalized leading-character grouping expression")
 
     has_set_operation = bool(
         re.search(r"\b(?:UNION(?:\s+ALL)?|INTERSECT|EXCEPT)\b", out_sql, flags=re.I)

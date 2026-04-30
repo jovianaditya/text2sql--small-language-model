@@ -9939,9 +9939,24 @@ def _question_wants_winner_row(question: str) -> bool:
     explicit_rank_sig = bool(
         re.search(r"\b(?:rank|ranking|ranked)\b", q_rank_scope, flags=re.I)
     )
+    # Keep single-pick detection narrow.
+    # Generic verbs like "keep" or "select" frequently appear in grouped
+    # aggregate/report questions ("keep only job titles with at least 2 employees")
+    # and should not by themselves force winner-row behavior.
     explicit_single_pick_sig = bool(
         re.search(
-            r"\b(?:pick|choose|select|keep|winner|top\s*1|bottom\s*1|single)\b",
+            r"\b(?:pick|choose|winner|top\s*1|bottom\s*1|single)\b",
+            q_rank_scope,
+            flags=re.I,
+        )
+        or re.search(
+            r"\bselect\s+(?:the\s+)?(?:one|single|winner|top\s*1|bottom\s*1)\b",
+            q_rank_scope,
+            flags=re.I,
+        )
+        or re.search(
+            r"\bkeep\s+(?:only\s+)?(?:the\s+)?"
+            r"(?:one|single|winner|top\s*1|bottom\s*1|latest|newest|earliest|oldest|highest|lowest|largest|smallest|best|worst)\b",
             q_rank_scope,
             flags=re.I,
         )
