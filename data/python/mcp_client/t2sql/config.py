@@ -490,6 +490,9 @@ AGENT_AST_SEMANTIC_FIRST = bool(int(os.getenv("AGENT_AST_SEMANTIC_FIRST", "1")))
 AGENT_NORMALIZE_REWRITE_BUDGET = int(os.getenv("AGENT_NORMALIZE_REWRITE_BUDGET", "1"))
 AGENT_NORMALIZE_EARLY_STOP = bool(int(os.getenv("AGENT_NORMALIZE_EARLY_STOP", "1")))
 AGENT_REGEN_PRECHECK_ENABLED = bool(int(os.getenv("AGENT_REGEN_PRECHECK_ENABLED", "1")))
+AGENT_CONFIDENCE_RETRY_MIN_IMPROVEMENT = float(
+    os.getenv("AGENT_CONFIDENCE_RETRY_MIN_IMPROVEMENT", "0.03")
+)
 # ======================================================================
 # ============================= DEBUG ==================================
 # ======================================================================

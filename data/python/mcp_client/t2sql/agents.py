@@ -47,6 +47,7 @@ from .config import (
     AGENT_AST_GUARDS_ENABLED,
     AGENT_AST_GUARDS_DEBUG,
     AGENT_REGEN_PRECHECK_ENABLED,
+    AGENT_CONFIDENCE_RETRY_MIN_IMPROVEMENT,
     AGENT_INSTANT_REJECT_PATTERNS,
     AGENT_DEFINITE_SQL_PATTERNS,
     AGENT_GIBBERISH_KEYBOARD_PATTERNS,
@@ -289,6 +290,7 @@ def _attempt_confidence_retry(
     confidence_result: dict,
     make_prompt_fn,
     prompt_kwargs: Optional[Dict[str, Any]] = None,
+    decision: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """
     Attempt one retry with 7B model when confidence is below threshold.
@@ -324,19 +326,108 @@ def _attempt_confidence_retry(
     new_confidence = compute_sql_confidence(candidate_sql, question, ctx)
     new_score = new_confidence.get("confidence", 0.0)
     old_score = confidence_result.get("confidence", 0.0)
+    min_improvement = max(0.0, float(AGENT_CONFIDENCE_RETRY_MIN_IMPROVEMENT))
+    improvement = float(new_score - old_score)
     
     _dbg_print_two(
         "[REFINER - CONFIDENCE]",
-        f"Retry result: {old_score:.1%} → {new_score:.1%}"
+        (
+            f"Retry result: {old_score:.1%} → {new_score:.1%} "
+            f"(delta={improvement:.1%}, min={min_improvement:.1%})"
+        )
     )
-    
-    # Accept new SQL if confidence improved
-    if new_score > old_score:
-        _dbg_print_two("[REFINER - CONFIDENCE]", "Retry accepted (improved)")
-        return {"used": True, "sql": candidate_sql, "confidence": new_confidence, "accepted": True}
-    else:
-        _dbg_print_two("[REFINER - CONFIDENCE]", "Retry rejected (no improvement)")
-        return {"used": True, "sql": current_sql, "confidence": confidence_result, "accepted": False}
+
+    # Minimum confidence improvement guard (avoid noisy tiny swaps).
+    if improvement < min_improvement:
+        _dbg_print_two(
+            "[REFINER - CONFIDENCE]",
+            "Retry rejected (below minimum improvement threshold)"
+        )
+        return {
+            "used": True,
+            "sql": current_sql,
+            "confidence": confidence_result,
+            "accepted": False,
+            "reason": "below_min_improvement",
+        }
+
+    # Deterministic acceptance gate must pass before accepting confidence retry SQL.
+    retry_gate = _deterministic_sql_acceptance_gate(
+        candidate_sql,
+        ctx=ctx,
+        question=question,
+        strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+    )
+    candidate_sql = str(retry_gate.get("sql") or candidate_sql).strip()
+
+    retry_parse_only_reasons = {
+        str(r) for r in (retry_gate.get("reasons") or []) if str(r).strip()
+    }
+    if (
+        not retry_gate.get("accepted", False)
+        and retry_parse_only_reasons == {"parse_error"}
+        and _can_bypass_parse_only_gate(sql=candidate_sql, ctx=ctx, decision=decision or {})
+    ):
+        retry_gate = {
+            **dict(retry_gate or {}),
+            "accepted": True,
+            "reasons": [],
+            "parse_error": "",
+        }
+
+    if not retry_gate.get("accepted", False):
+        _dbg_print_two(
+            "[REFINER - CONFIDENCE]",
+            f"Retry rejected by acceptance gate: {retry_gate.get('reasons')}"
+        )
+        return {
+            "used": True,
+            "sql": current_sql,
+            "confidence": confidence_result,
+            "accepted": False,
+            "reason": "gate_rejected",
+            "gate": retry_gate,
+        }
+
+    if not candidate_sql.endswith(";"):
+        candidate_sql += ";"
+
+    # Recompute confidence on gated SQL in case AST/gate rewrites changed semantics.
+    accepted_confidence = compute_sql_confidence(candidate_sql, question, ctx)
+    accepted_score = accepted_confidence.get("confidence", 0.0)
+    accepted_improvement = float(accepted_score - old_score)
+    if accepted_improvement < min_improvement:
+        _dbg_print_two(
+            "[REFINER - CONFIDENCE]",
+            "Retry rejected after gate (improvement dropped below threshold)"
+        )
+        return {
+            "used": True,
+            "sql": current_sql,
+            "confidence": confidence_result,
+            "accepted": False,
+            "reason": "below_min_improvement_after_gate",
+            "gate": retry_gate,
+        }
+
+    retry_validation_errors = list(
+        retry_gate.get("identifier_errors") or validate_identifiers(candidate_sql, ctx)
+    )
+    retry_gate_reasons = list(retry_gate.get("reasons") or [])
+
+    _dbg_print_two("[REFINER - CONFIDENCE]", "Retry accepted (improved + gate-passed)")
+    return {
+        "used": True,
+        "sql": candidate_sql,
+        "confidence": accepted_confidence,
+        "accepted": True,
+        "reason": "accepted",
+        "gate": retry_gate,
+        "validation_errors": retry_validation_errors,
+        "gate_pass": bool(retry_gate.get("accepted", False)),
+        "gate_reasons": retry_gate_reasons,
+        "gate_reason_tags": _categorize_gate_reasons(retry_gate_reasons),
+    }
 
 
 from .schema_analyzer import (
@@ -10045,15 +10136,21 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "router_decision": decision,
                 "state": state,
             },
+            decision=decision,
         )
         confidence_retry_used = retry_result.get("used", False)
         if retry_result.get("accepted", False):
             final_sql = retry_result["sql"]
             confidence_result = retry_result["confidence"]
+            final_validation_errors = list(retry_result.get("validation_errors") or final_validation_errors)
+            final_gate_pass = bool(retry_result.get("gate_pass", final_gate_pass))
+            final_gate_reasons = list(retry_result.get("gate_reasons") or final_gate_reasons)
+            final_gate_reason_tags = list(retry_result.get("gate_reason_tags") or _categorize_gate_reasons(final_gate_reasons))
             corrections.append("Confidence retry succeeded (7B)")
             final_model = LARGE_MODEL
         else:
-            corrections.append("Confidence retry attempted (no improvement)")
+            retry_reason = str(retry_result.get("reason") or "not_accepted").strip()
+            corrections.append(f"Confidence retry attempted ({retry_reason})")
 
     return {
         **state,
