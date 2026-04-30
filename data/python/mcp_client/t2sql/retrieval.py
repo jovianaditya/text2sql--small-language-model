@@ -1454,6 +1454,163 @@ def _check_needs_numeric_data_from_retrieved(reranked: List[Dict[str, Any]]) -> 
 # ==============================================================================
 # BRIDGE TABLE INFERENCE
 # ==============================================================================
+def _merge_fk_graph(base: Dict[str, Dict[str, str]], extra: Dict[str, Dict[str, str]]) -> None:
+    for src, fk_map in (extra or {}).items():
+        src_l = str(src or "").strip().lower()
+        if not src_l:
+            continue
+        dst = base.setdefault(src_l, {})
+        for fk_col, target in (fk_map or {}).items():
+            fk_l = str(fk_col or "").strip().lower()
+            tgt_l = str(target or "").strip().lower()
+            if fk_l and tgt_l and fk_l not in dst:
+                dst[fk_l] = tgt_l
+
+
+def _build_schema_fk_graph() -> Dict[str, Dict[str, str]]:
+    graph: Dict[str, Dict[str, str]] = {}
+    try:
+        fk_rels = get_fk_relationships() or {}
+    except Exception:
+        fk_rels = {}
+    for src_table, fk_map in fk_rels.items():
+        st_lower = str(src_table or "").strip().lower()
+        if not st_lower:
+            continue
+        for fk_col, target_table in (fk_map or {}).items():
+            fc_lower = str(fk_col or "").strip().lower()
+            tt_lower = str(target_table or "").strip().lower()
+            if not fc_lower or not tt_lower:
+                continue
+            graph.setdefault(st_lower, {})[fc_lower] = tt_lower
+    return graph
+
+
+def _build_effective_fk_graph(reranked: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    """
+    Build FK graph from reranked metadata, then backfill from schema metadata so
+    connector discovery can still traverse unseen bridge tables.
+    """
+    fk_graph: Dict[str, Dict[str, str]] = {}
+    for item in reranked:
+        md = item.get("meta") or {}
+        desc = str(md.get(RETRIEVAL_META_DESCRIPTION_KEY) or "")
+
+        fk_match = re.search(RETRIEVAL_FK_REFERENCE_PATTERN, desc, re.IGNORECASE)
+        if not fk_match:
+            continue
+        source_table = _meta_table(md)
+        fk_column = _meta_column(md)
+        target_table = fk_match.group(1)
+        if not (source_table and fk_column and target_table):
+            continue
+
+        st_lower = str(source_table).strip().lower()
+        fc_lower = str(fk_column).strip().lower()
+        tt_lower = str(target_table).strip().lower()
+        if st_lower and fc_lower and tt_lower:
+            fk_graph.setdefault(st_lower, {})[fc_lower] = tt_lower
+
+    _merge_fk_graph(fk_graph, _build_schema_fk_graph())
+    return fk_graph
+
+
+def _canonicalize_table_column(table: str, column: str) -> str:
+    t = str(table or "").strip().lower()
+    c = str(column or "").strip()
+    if not t or not c:
+        return c
+    try:
+        analyzer = get_schema_analyzer()
+        for candidate in analyzer.get_table_columns(t) or []:
+            cand_s = str(candidate or "").strip()
+            if cand_s and cand_s.lower() == c.lower():
+                return cand_s
+    except Exception:
+        pass
+    return c
+
+
+def _infer_bridge_paths(
+    selected_tables: set,
+    allowed: Dict[str, List[str]],
+    reranked: List[Dict[str, Any]],
+) -> Tuple[List[List[str]], Dict[str, Dict[str, str]]]:
+    """
+    Discover FK connector paths between selected tables using the full schema
+    graph as the traversal universe, while keeping endpoints anchored to the
+    currently selected table set.
+    """
+    if len(selected_tables) < 2:
+        return [], _build_effective_fk_graph(reranked)
+
+    fk_graph = _build_effective_fk_graph(reranked)
+
+    try:
+        table_universe = {
+            str(t or "").strip().lower()
+            for t in (get_all_tables() or [])
+            if str(t or "").strip()
+        }
+    except Exception:
+        table_universe = set()
+    if not table_universe:
+        table_universe = {str(t).strip().lower() for t in allowed.keys() if str(t).strip()}
+
+    selected_lower = {str(t).strip().lower() for t in selected_tables if str(t).strip()}
+    paths: List[List[str]] = []
+    seen_paths: Set[Tuple[str, ...]] = set()
+    table_list = sorted(selected_lower)
+    for i, tbl_a in enumerate(table_list):
+        for tbl_b in table_list[i + 1:]:
+            path = _find_fk_path(tbl_a, tbl_b, fk_graph, allowed, table_universe=table_universe)
+            if not path or len(path) < 2:
+                continue
+            path_key = tuple(path)
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            paths.append(path)
+    return paths, fk_graph
+
+
+def _augment_allowed_with_fk_path_columns(
+    allowed: Dict[str, List[str]],
+    paths: List[List[str]],
+    fk_graph: Dict[str, Dict[str, str]],
+) -> None:
+    """
+    Seed connector-path tables with the join-key columns needed for downstream
+    SQL generation: FK columns on traversed edges plus each path table's ID key.
+    """
+    for path in paths or []:
+        normalized_path = [str(t or "").strip().lower() for t in path if str(t or "").strip()]
+        if not normalized_path:
+            continue
+
+        for table_name in normalized_path:
+            allowed.setdefault(table_name, [])
+            id_col = str(get_id_column(table_name) or "").strip()
+            if id_col:
+                id_col = _canonicalize_table_column(table_name, id_col)
+                if id_col and id_col not in allowed[table_name]:
+                    allowed[table_name].append(id_col)
+
+        for left, right in zip(normalized_path, normalized_path[1:]):
+            for fk_col, target in (fk_graph.get(left) or {}).items():
+                if str(target or "").strip().lower() != right:
+                    continue
+                fk_name = _canonicalize_table_column(left, fk_col)
+                if fk_name and fk_name not in allowed[left]:
+                    allowed[left].append(fk_name)
+            for fk_col, target in (fk_graph.get(right) or {}).items():
+                if str(target or "").strip().lower() != left:
+                    continue
+                fk_name = _canonicalize_table_column(right, fk_col)
+                if fk_name and fk_name not in allowed[right]:
+                    allowed[right].append(fk_name)
+
+
 def _infer_bridge_tables(
     selected_tables: set,
     allowed: Dict[str, List[str]],
@@ -1477,92 +1634,13 @@ def _infer_bridge_tables(
     """
     if len(selected_tables) < 2:
         return set()
-
-    def _merge_fk_graph(base: Dict[str, Dict[str, str]], extra: Dict[str, Dict[str, str]]) -> None:
-        for src, fk_map in (extra or {}).items():
-            src_l = str(src or "").strip().lower()
-            if not src_l:
-                continue
-            dst = base.setdefault(src_l, {})
-            for fk_col, target in (fk_map or {}).items():
-                fk_l = str(fk_col or "").strip().lower()
-                tgt_l = str(target or "").strip().lower()
-                if fk_l and tgt_l and fk_l not in dst:
-                    dst[fk_l] = tgt_l
-
-    def _build_schema_fk_graph() -> Dict[str, Dict[str, str]]:
-        graph: Dict[str, Dict[str, str]] = {}
-        try:
-            fk_rels = get_fk_relationships() or {}
-        except Exception:
-            fk_rels = {}
-        for src_table, fk_map in fk_rels.items():
-            st_lower = str(src_table or "").strip().lower()
-            if not st_lower:
-                continue
-            for fk_col, target_table in (fk_map or {}).items():
-                fc_lower = str(fk_col or "").strip().lower()
-                tt_lower = str(target_table or "").strip().lower()
-                if not fc_lower or not tt_lower:
-                    continue
-                graph.setdefault(st_lower, {})[fc_lower] = tt_lower
-        return graph
-
-    # Build FK graph from metadata
-    # Format: {source_table: {fk_column: target_table}}
-    fk_graph: Dict[str, Dict[str, str]] = {}
-
-    for item in reranked:
-        md = item.get("meta") or {}
-        desc = str(md.get(RETRIEVAL_META_DESCRIPTION_KEY) or "")
-
-        # Parse FK references from description
-        # Pattern: "FK to targetTable.targetColumn"
-        fk_match = re.search(RETRIEVAL_FK_REFERENCE_PATTERN, desc, re.IGNORECASE)
-        if fk_match:
-            source_table = _meta_table(md)
-            fk_column = _meta_column(md)
-            target_table = fk_match.group(1)
-
-            if source_table and fk_column:
-                st_lower = source_table.lower()
-                fc_lower = fk_column.lower()
-                tt_lower = target_table.lower()
-
-                if st_lower not in fk_graph:
-                    fk_graph[st_lower] = {}
-                fk_graph[st_lower][fc_lower] = tt_lower
-
-    # Merge with schema-level FK relationships as fallback so bridge inference
-    # still works when reranked metadata is sparse or misses FK descriptions.
-    _merge_fk_graph(fk_graph, _build_schema_fk_graph())
-
-    # Find bridge tables using BFS
     bridge_tables = set()
-
-    # Convert selected_tables to lowercase for comparison
     selected_lower = {t.lower() for t in selected_tables}
-
-    # Keep bridge inference anchored to currently selected tables.
-    # This prevents low-score "numeric" tails in reranked docs from
-    # inflating table fanout and blocking IR on otherwise simple joins.
-    expanded_tables = set(selected_lower)
-
-    # For each pair of expanded tables, check if we need a bridge
-    table_list = list(expanded_tables)
-    for i, tbl_a in enumerate(table_list):
-        for tbl_b in table_list[i+1:]:
-            # Check if tbl_a can reach tbl_b via FK path
-            path = _find_fk_path(tbl_a, tbl_b, fk_graph, allowed)
-            if path:
-                # Add intermediate tables (excluding endpoints)
-                for bridge in path[1:-1]:
-                    if bridge not in selected_lower:
-                        bridge_tables.add(bridge)
-
-    # Also check for common FK relationships
-    # If table A has FK to table B, and both have columns in results, no bridge needed
-    # But if we need columns from A and C where A→B→C, we need B as bridge
+    paths, _fk_graph = _infer_bridge_paths(selected_tables, allowed, reranked)
+    for path in paths:
+        for bridge in path[1:-1]:
+            if bridge not in selected_lower:
+                bridge_tables.add(bridge)
 
     return bridge_tables
 
@@ -1571,6 +1649,7 @@ def _find_fk_path(
     end: str,
     fk_graph: Dict[str, Dict[str, str]],
     allowed: Dict[str, List[str]],
+    table_universe: Optional[Set[str]] = None,
     max_depth: int = RETRIEVAL_FK_PATH_MAX_DEPTH,
 ) -> Optional[List[str]]:
     """
@@ -1599,6 +1678,14 @@ def _find_fk_path(
                 reverse_graph[target] = set()
             reverse_graph[target].add(source)
 
+    allowed_tables = {
+        str(t or "").strip().lower()
+        for t in (table_universe or set(allowed.keys()))
+        if str(t or "").strip()
+    }
+    if start not in allowed_tables or end not in allowed_tables:
+        return None
+
     # BFS from start to end
     queue = deque([(start, [start])])
     visited = {start}
@@ -1611,7 +1698,7 @@ def _find_fk_path(
             for target in fk_graph[current].values():
                 if target == end:
                     return path + [target]
-                if target not in visited and target in [t.lower() for t in allowed.keys()]:
+                if target not in visited and target in allowed_tables:
                     visited.add(target)
                     queue.append((target, path + [target]))
 
@@ -1620,7 +1707,7 @@ def _find_fk_path(
             for source in reverse_graph[current]:
                 if source == end:
                     return path + [source]
-                if source not in visited and source in [t.lower() for t in allowed.keys()]:
+                if source not in visited and source in allowed_tables:
                     visited.add(source)
                     queue.append((source, path + [source]))
 
@@ -2320,7 +2407,28 @@ def retrieve_node(state: RAGState) -> RAGState:
                 # Addition: Bridge table inference
                 # If we have multiple tables, check if we need bridge tables
                 if len(top_tables) >= RETRIEVAL_BRIDGE_MIN_TABLE_COUNT:
-                    bridge_tables = _infer_bridge_tables(top_tables, allowed, reranked)
+                    connector_paths, fk_graph = _infer_bridge_paths(top_tables, allowed, reranked)
+                    top_tables_lower = {
+                        str(t).strip().lower()
+                        for t in top_tables
+                        if str(t).strip()
+                    }
+                    bridge_paths = [
+                        path
+                        for path in connector_paths
+                        if any(
+                            bridge not in top_tables_lower
+                            for bridge in path[1:-1]
+                        )
+                    ]
+                    if bridge_paths:
+                        _augment_allowed_with_fk_path_columns(allowed, bridge_paths, fk_graph)
+                    bridge_tables = {
+                        bridge
+                        for path in bridge_paths
+                        for bridge in path[1:-1]
+                        if bridge not in top_tables_lower
+                    }
                     top_tables.update(bridge_tables)
 
                 if top_tables:
