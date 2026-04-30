@@ -963,6 +963,23 @@ async def run_single_case(
         "cannot_answer": False,
         "cannot_answer_reason": "",
         "ir_hint_passed": False,
+        "retrieval_context_mode": "",
+        "retrieval_retry_used": False,
+        "retrieval_retry_reason": "",
+        "retrieval_expanded_table_count": 0,
+        "retrieval_evidence_tier": "",
+        "retrieval_evidence_score": 0.0,
+        "retrieval_sparse_candidates": 0,
+        "retrieval_dense_candidates": 0,
+        "retrieval_reranked_candidates": 0,
+        "retrieval_allowed_tables_after_filter": 0,
+        "retrieval_allowed_columns_after_filter": 0,
+        "final_gate_pass": False,
+        "final_gate_reason_tags": "",
+        "validation_errors": "",
+        "sql_confidence": 0.0,
+        "confidence_low": False,
+        "confidence_retry_used": False,
         "initial_model_used": "",  # Initial model chosen by router (3b/7b)
         "final_model_used": "",    # Standardized route label: ir_planner | llm_small | llm_large
         "va_success": False,       # Valid SQL (EXPLAIN)
@@ -1026,6 +1043,38 @@ async def run_single_case(
         result["cannot_answer"] = bool(state.get("cannot_answer", False))
         result["cannot_answer_reason"] = str(state.get("cannot_answer_reason") or "").strip()
         result["ir_hint_passed"] = bool(state.get("ir_hint_passed", False))
+        result["retrieval_context_mode"] = str(state.get("retrieval_context_mode") or "").strip()
+        result["retrieval_retry_used"] = bool(state.get("retrieval_retry_used", False))
+        result["retrieval_retry_reason"] = str(state.get("retrieval_retry_reason") or "").strip()
+        result["retrieval_expanded_table_count"] = int(state.get("retrieval_expanded_table_count", 0) or 0)
+
+        retrieval_snapshot = state.get("retrieval_snapshot", {}) or {}
+        if isinstance(retrieval_snapshot, dict):
+            evidence_blob = retrieval_snapshot.get("evidence_strength", {}) or {}
+            if isinstance(evidence_blob, dict):
+                result["retrieval_evidence_tier"] = str(evidence_blob.get("tier") or "").strip()
+                result["retrieval_evidence_score"] = round(float(evidence_blob.get("score", 0.0) or 0.0), 3)
+            else:
+                result["retrieval_evidence_tier"] = str(retrieval_snapshot.get("evidence_tier") or "").strip()
+                result["retrieval_evidence_score"] = round(float(retrieval_snapshot.get("evidence_score", 0.0) or 0.0), 3)
+            result["retrieval_sparse_candidates"] = int(retrieval_snapshot.get("sparse_candidates", 0) or 0)
+            result["retrieval_dense_candidates"] = int(retrieval_snapshot.get("dense_candidates", 0) or 0)
+            result["retrieval_reranked_candidates"] = int(retrieval_snapshot.get("reranked_candidates", 0) or 0)
+            result["retrieval_allowed_tables_after_filter"] = int(
+                retrieval_snapshot.get("allowed_tables_after_filter", 0) or 0
+            )
+            result["retrieval_allowed_columns_after_filter"] = int(
+                retrieval_snapshot.get("allowed_columns_after_filter", 0) or 0
+            )
+
+        result["final_gate_pass"] = bool(state.get("final_gate_pass", False))
+        gate_reason_tags = state.get("final_gate_reason_tags", []) or []
+        result["final_gate_reason_tags"] = "|".join(str(x) for x in gate_reason_tags if str(x).strip())
+        validation_errors = state.get("validation_errors", []) or []
+        result["validation_errors"] = "|".join(str(x) for x in validation_errors if str(x).strip())
+        result["sql_confidence"] = round(float(state.get("sql_confidence", 0.0) or 0.0), 4)
+        result["confidence_low"] = bool(state.get("confidence_low", False))
+        result["confidence_retry_used"] = bool(state.get("confidence_retry_used", False))
         
         # Primary latency metric for thesis:
         # Warm prompt->final SQL (model receives prompt -> final SQL ready).
@@ -1761,6 +1810,12 @@ async def run_batch_eval(
             "groundtruth_sql", "predicted_sql",
             "draft_source", "final_model_used", "ir_confidence", "ir_gate_reasons",
             "ambiguity_signals", "cannot_answer", "cannot_answer_reason",
+            "retrieval_context_mode", "retrieval_retry_used", "retrieval_retry_reason",
+            "retrieval_expanded_table_count", "retrieval_evidence_tier", "retrieval_evidence_score",
+            "retrieval_sparse_candidates", "retrieval_dense_candidates", "retrieval_reranked_candidates",
+            "retrieval_allowed_tables_after_filter", "retrieval_allowed_columns_after_filter",
+            "final_gate_pass", "final_gate_reason_tags", "validation_errors",
+            "sql_confidence", "confidence_low", "confidence_retry_used",
             "va_success", "va_notes",
             "exec_success", "exec_notes", "pred_empty_result", "gt_empty_result",
             "ts_success", "ts_failed_databases",
