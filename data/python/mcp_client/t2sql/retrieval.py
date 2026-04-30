@@ -144,6 +144,7 @@ from .schema_analyzer import (
     get_table_type,
     is_transaction_table,
     get_column_synonyms,
+    get_column_entity_variants,
     get_name_column,
     get_id_column,
     get_fk_relationships,
@@ -574,7 +575,56 @@ def _is_column_relevant_to_query(
     """
     col_lower = column.lower()
     q_l = question.lower()
+    q_norm = _normalize_text(question)
+    q_words = set(q_norm.split())
     table_lower = table.lower()
+
+    def _normalized_phrase(text: str) -> str:
+        return " ".join(_normalize_text(text).split())
+
+    def _question_mentions_variant(variant: str) -> bool:
+        norm = _normalized_phrase(variant)
+        if not norm:
+            return False
+        parts = norm.split()
+        if not parts:
+            return False
+        if len(parts) == 1:
+            return parts[0] in q_words
+        pattern = re.escape(norm).replace(r"\ ", r"\s+")
+        return bool(re.search(rf"\b{pattern}\b", q_norm))
+
+    def _column_variants() -> Set[str]:
+        variants: Set[str] = set()
+        try:
+            variants.update(get_column_entity_variants(table, column))
+        except Exception:
+            pass
+
+        nested_meta = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
+        alias_variants = _parse_str_or_list_lower(
+            metadata.get("tags_alias")
+            or metadata.get("aliases")
+            or nested_meta.get("tags_alias")
+            or nested_meta.get("aliases")
+            or []
+        )
+        for alias in alias_variants:
+            alias_s = str(alias or "").strip()
+            if alias_s:
+                variants.add(alias_s)
+
+        normalized_variants: Set[str] = set()
+        for variant in variants:
+            norm = _normalized_phrase(variant)
+            if not norm:
+                continue
+            toks = norm.split()
+            if len(toks) > 1 or (toks and toks[0] not in _GENERIC_MENTION_TERMS):
+                normalized_variants.add(norm)
+        return normalized_variants
+
+    explicit_column_match = any(_question_mentions_variant(v) for v in _column_variants())
 
     # === RULE 1: Always include primary keys and identifying columns ===
     roles = _parse_str_or_list_lower(metadata.get("tags_role") or metadata.get("roles") or [])
@@ -582,15 +632,9 @@ def _is_column_relevant_to_query(
         return True
 
     # === RULE 2: Always include if explicitly mentioned in question ===
-    # Check column name (exact word match, not substring)
-    # Use word boundary to avoid false positives like "products" matching "quantityInStock"
-    q_words = set(q_l.split())
-    if col_lower in q_words:
-        return True
-
-    # Also check with underscores removed (quantity_in_stock -> quantityinstock)
-    col_no_underscore = col_lower.replace("_", "")
-    if col_no_underscore in q_words:
+    # This now uses schema-driven column variants + metadata aliases so unseen
+    # paraphrases can survive the late relevance filter too.
+    if explicit_column_match:
         return True
 
     # Check column description (with word boundary matching)
@@ -623,21 +667,9 @@ def _is_column_relevant_to_query(
         has_numeric_pattern = any(p in col_lower for p in numeric_patterns)
 
         if is_metric or (is_numeric and has_numeric_pattern):
-            # Only include if COLUMN NAME is explicitly mentioned in question
-            # (not just generic numeric keywords like "total")
-            # Check column name variants
-            normalized_compound = col_lower
-            for src, dst in RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS.items():
-                normalized_compound = normalized_compound.replace(src, dst)
-
-            col_variants = [
-                col_lower,                    # quantityinstock
-                col_no_underscore,             # same for no underscore
-                normalized_compound,           # configurable compound normalization
-            ]
-            mentioned_in_question = any(v in q_l for v in col_variants if v)
-
-            if not mentioned_in_question:
+            # Only include if the metric column itself is explicitly referenced
+            # via schema-driven name/synonym variants, not just generic words.
+            if not explicit_column_match:
                 # DEBUG: Show why column is being excluded
                 if RETRIEVE_DEBUG and col_lower in RETRIEVAL_DEBUG_FOCUS_COLUMNS:
                     print(f"   [FILTER-RULE3] Excluding {table}.{column}: is_metric={is_metric}, is_numeric={is_numeric}, has_pattern={has_numeric_pattern}")
