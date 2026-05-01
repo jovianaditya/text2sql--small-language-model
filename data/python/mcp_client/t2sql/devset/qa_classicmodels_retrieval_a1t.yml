@@ -1,0 +1,112 @@
+cases:
+  - id: A1T1
+    difficulty: manual
+    type: mixed_count_metric
+    question: "Group payments by customer. Return customer number, payment count, and average payment amount."
+    expected_retrieval:
+      should_include_table: ["payments"]
+      should_keep_metric_columns: ["amount"]
+
+  - id: A1T2
+    difficulty: manual
+    type: mixed_count_metric
+    question: "For each customer, show number of payments and total payment amount."
+    expected_retrieval:
+      should_include_table: ["payments"]
+      should_keep_metric_columns: ["amount"]
+
+  - id: A1T3
+    difficulty: manual
+    type: mixed_count_metric
+    question: "By payment year, return count of payments and maximum payment amount."
+    expected_retrieval:
+      should_include_table: ["payments"]
+      should_keep_metric_columns: ["amount"]
+
+  - id: A1T4
+    difficulty: manual
+    type: mixed_count_metric
+    question: "Group order details by product code. Return line count and average price each."
+    expected_retrieval:
+      should_include_table: ["orderdetails"]
+      should_keep_metric_columns: ["priceEach"]
+
+  - id: A1T5
+    difficulty: manual
+    type: mixed_count_metric
+    question: "For each product line, show number of products and average buy price."
+    expected_retrieval:
+      should_include_table: ["products"]
+      should_keep_metric_columns: ["buyPrice"]
+
+  - id: A1T6
+    difficulty: manual
+    type: mixed_count_metric
+    question: "Group products by vendor. Return product count and maximum MSRP."
+    expected_retrieval:
+      should_include_table: ["products"]
+      should_keep_metric_columns: ["MSRP"]
+
+  - id: A1T7
+    difficulty: manual
+    type: mixed_count_metric
+    question: "For each order, return number of lines and total quantity ordered."
+    expected_retrieval:
+      should_include_table: ["orderdetails"]
+      should_keep_metric_columns: ["quantityOrdered"]
+
+  - id: A1T11
+    difficulty: manual
+    type: mixed_count_metric
+    question: "By payment year, return count of payments and minimum payment amount."
+    expected_retrieval:
+      should_include_table: ["payments"]
+      should_keep_metric_columns: ["amount"]
+
+  - id: A1T12
+    difficulty: manual
+    type: mixed_count_metric
+    question: "For each customer, show payment count and mean payment amount."
+    expected_retrieval:
+      should_include_table: ["payments"]
+      should_keep_metric_columns: ["amount"]
+
+  - id: A1T13
+    difficulty: manual
+    type: mixed_count_metric
+    question: "For each product line, return product count and maximum buy price."
+    expected_retrieval:
+      should_include_table: ["products"]
+      should_keep_metric_columns: ["buyPrice"]
+
+  - id: A1T14
+    difficulty: manual
+    type: mixed_count_metric
+    question: "For each order, show line count and total ordered quantity."
+    expected_retrieval:
+      should_include_table: ["orderdetails"]
+      should_keep_metric_columns: ["quantityOrdered"]
+
+  - id: A1T8
+    difficulty: manual
+    type: count_only
+    question: "Group customers by country. Return customer count only."
+    expected_retrieval:
+      should_include_table: ["customers"]
+      count_only_note: "Unrelated metric columns may be filtered"
+
+  - id: A1T9
+    difficulty: manual
+    type: count_only
+    question: "For each office, return number of employees only."
+    expected_retrieval:
+      should_include_table: ["employees", "offices"]
+      count_only_note: "Unrelated metric columns may be filtered"
+
+  - id: A1T10
+    difficulty: manual
+    type: count_only
+    question: "Group payments by check number length. Return count only."
+    expected_retrieval:
+      should_include_table: ["payments"]
+      count_only_note: "Unrelated metric columns may be filtered"

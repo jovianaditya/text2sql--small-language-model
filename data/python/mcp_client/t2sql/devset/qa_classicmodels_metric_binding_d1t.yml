@@ -1,0 +1,48 @@
+cases:
+  - id: D1T1
+    difficulty: manual
+    type: metric_slot_binding
+    question: "Group order details by product code. Return line count and average price each."
+    expected_semantic:
+      required_metric_column: ["priceEach"]
+      avoid_metric_column: ["quantityOrdered"]
+
+  - id: D1T2
+    difficulty: manual
+    type: metric_slot_binding
+    question: "Group order details by product code. Return line count and average quantity ordered."
+    expected_semantic:
+      required_metric_column: ["quantityOrdered"]
+      avoid_metric_column: ["priceEach"]
+
+  - id: D1T3
+    difficulty: manual
+    type: metric_slot_binding
+    question: "For each product line, return product count and maximum buy price."
+    expected_semantic:
+      required_metric_column: ["buyPrice"]
+      avoid_metric_column: ["MSRP"]
+
+  - id: D1T4
+    difficulty: manual
+    type: metric_slot_binding
+    question: "For each vendor, return product count and average MSRP."
+    expected_semantic:
+      required_metric_column: ["MSRP"]
+      avoid_metric_column: ["buyPrice"]
+
+  - id: D1T5
+    difficulty: manual
+    type: metric_slot_binding
+    question: "For each customer, return payment count and average payment amount."
+    expected_semantic:
+      required_metric_column: ["amount"]
+      avoid_metric_column: ["customerNumber", "checkNumber"]
+
+  - id: D1T6
+    difficulty: manual
+    type: metric_slot_binding
+    question: "By payment year, return count of payments and minimum payment amount."
+    expected_semantic:
+      required_metric_column: ["amount"]
+      avoid_metric_column: ["checkNumber", "customerNumber"]

@@ -1,0 +1,48 @@
+cases:
+  - id: C1T1
+    difficulty: manual
+    type: fk_adjacent_metric_allowed
+    question: "For each order, return line count and total quantity ordered."
+    expected_retrieval:
+      should_include_table: ["orders", "orderdetails"]
+      should_keep_metric_columns: ["quantityOrdered"]
+
+  - id: C1T2
+    difficulty: manual
+    type: fk_adjacent_metric_allowed
+    question: "For each order, return line count and average price each."
+    expected_retrieval:
+      should_include_table: ["orders", "orderdetails"]
+      should_keep_metric_columns: ["priceEach"]
+
+  - id: C1T3
+    difficulty: manual
+    type: fk_adjacent_metric_allowed
+    question: "By order status, return number of line items and total quantity ordered."
+    expected_retrieval:
+      should_include_table: ["orders", "orderdetails"]
+      should_keep_metric_columns: ["quantityOrdered"]
+
+  - id: C1T4
+    difficulty: manual
+    type: fk_adjacent_metric_allowed
+    question: "For each customer, return number of orders and total quantity ordered across all order lines."
+    expected_retrieval:
+      should_include_table: ["customers", "orders", "orderdetails"]
+      should_keep_metric_columns: ["quantityOrdered"]
+
+  - id: C1T5
+    difficulty: manual
+    type: fk_adjacent_metric_allowed
+    question: "For each order, return number of lines and total line value."
+    expected_retrieval:
+      should_include_table: ["orders", "orderdetails"]
+      should_keep_metric_columns: ["quantityOrdered", "priceEach"]
+
+  - id: C1T6
+    difficulty: manual
+    type: fk_adjacent_metric_allowed
+    question: "For each customer, return number of orders and average line price each."
+    expected_retrieval:
+      should_include_table: ["customers", "orders", "orderdetails"]
+      should_keep_metric_columns: ["priceEach"]

@@ -543,6 +543,75 @@ def _format_stats_for_llm(stats_raw: Any) -> str:
 # ==============================================================================
 # 2. CORE LOGIC: COLUMN RELEVANCE FILTERING (Metadata-Driven)
 # ==============================================================================
+def _is_likely_filtered_requested_metric(
+    column: str,
+    table: str,
+    question: str,
+    qtype: str,
+    metadata: Dict[str, Any],
+) -> bool:
+    """
+    Log-only diagnostic helper.
+    Returns True when a filtered column looks like a requested metric in a mixed
+    count + metric aggregate question.
+    """
+    if qtype != AGENT_ROUTER_QTYPE_AGGREGATE:
+        return False
+
+    q_l = str(question or "").lower()
+    q_words = set(_normalize_text(question).split())
+    if not q_l or not q_words:
+        return False
+
+    has_count_intent = any(k in q_l for k in RETRIEVAL_COUNT_QUERY_TERMS)
+    has_non_count_agg_intent = bool(
+        re.search(r"\b(sum|avg|average|mean|min|max|minimum|maximum)\b", q_l, flags=re.I)
+    )
+    has_total_metric_intent = "total" in q_words and bool(q_words.intersection(RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS))
+    if not (has_count_intent and (has_non_count_agg_intent or has_total_metric_intent)):
+        return False
+
+    roles = _parse_str_or_list_lower(metadata.get("tags_role") or metadata.get("roles") or [])
+    is_metric_role = any(r in RETRIEVAL_METRIC_ROLE_TAGS for r in roles)
+    datatype = str(metadata.get("datatype") or "").lower()
+    is_numeric = any(t in datatype for t in RETRIEVAL_NUMERIC_TYPE_HINTS)
+    col_lower = str(column or "").strip().lower()
+    has_numeric_pattern = any(p in col_lower for p in RETRIEVAL_NUMERIC_PATTERN_KEYWORDS)
+    if not (is_metric_role or (is_numeric and has_numeric_pattern)):
+        return False
+
+    mention_tokens: Set[str] = set()
+    mention_tokens.update(tok for tok in re.findall(RETRIEVAL_TOKENIZE_ALNUM_PATTERN, col_lower) if tok)
+
+    try:
+        for v in get_column_entity_variants(table, column):
+            mention_tokens.update(tok for tok in re.findall(RETRIEVAL_TOKENIZE_ALNUM_PATTERN, str(v).lower()) if tok)
+    except Exception:
+        pass
+    try:
+        for syn in get_column_synonyms(table, column) or []:
+            mention_tokens.update(tok for tok in re.findall(RETRIEVAL_TOKENIZE_ALNUM_PATTERN, str(syn).lower()) if tok)
+    except Exception:
+        pass
+
+    nested_meta = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
+    alias_variants = _parse_str_or_list_lower(
+        metadata.get("tags_alias")
+        or metadata.get("aliases")
+        or nested_meta.get("tags_alias")
+        or nested_meta.get("aliases")
+        or []
+    )
+    for alias in alias_variants:
+        mention_tokens.update(tok for tok in re.findall(RETRIEVAL_TOKENIZE_ALNUM_PATTERN, str(alias).lower()) if tok)
+
+    cleaned_tokens = {
+        t for t in mention_tokens
+        if t and t not in _GENERIC_MENTION_TERMS and t not in RETRIEVAL_DESC_GENERIC_TERMS
+    }
+    return bool(cleaned_tokens.intersection(q_words))
+
+
 def _is_column_relevant_to_query(
     column: str,
     table: str,
@@ -578,6 +647,13 @@ def _is_column_relevant_to_query(
     q_norm = _normalize_text(question)
     q_words = set(q_norm.split())
     table_lower = table.lower()
+    has_count_intent = any(k in q_l for k in RETRIEVAL_COUNT_QUERY_TERMS)
+    # Mixed aggregate intent should keep metric columns (e.g., "count and average amount").
+    has_non_count_agg_intent = bool(
+        re.search(r"\b(sum|avg|average|mean|min|max|minimum|maximum)\b", q_l, flags=re.I)
+    )
+    has_total_metric_intent = "total" in q_words and bool(q_words.intersection(RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS))
+    mixed_count_metric_intent = has_count_intent and (has_non_count_agg_intent or has_total_metric_intent)
 
     def _normalized_phrase(text: str) -> str:
         return " ".join(_normalize_text(text).split())
@@ -651,7 +727,7 @@ def _is_column_relevant_to_query(
             return True
 
     # === RULE 3: For COUNT queries, exclude metric columns not mentioned ===
-    if qtype == AGENT_ROUTER_QTYPE_AGGREGATE and any(k in q_l for k in RETRIEVAL_COUNT_QUERY_TERMS):
+    if qtype == AGENT_ROUTER_QTYPE_AGGREGATE and has_count_intent and not mixed_count_metric_intent:
         # Count queries only need: PK, name columns, and explicitly mentioned columns
         # Exclude: quantityInStock, buyPrice, etc. unless mentioned
         is_metric = any(r in RETRIEVAL_METRIC_ROLE_TAGS for r in roles)
@@ -741,6 +817,11 @@ def _build_cards(
                     ) + 1
                 if RETRIEVE_DEBUG:
                     print(f"   [FILTER] Excluding {table}.{column} (not relevant to query)")
+                    if _is_likely_filtered_requested_metric(column, table, question, qtype, md):
+                        print(
+                            f"   [FILTER-ALERT] {table}.{column} filtered despite mixed count+metric intent; "
+                            "check metric mention coverage."
+                        )
                 continue
 
         # --- LOGIKA DESKRIPSI (WATERFALL PRIORITY) ---
@@ -2128,6 +2209,11 @@ def retrieve_node(state: RAGState) -> RAGState:
                 ) + 1
                 if RETRIEVE_DEBUG:
                     print(f"   [FILTER-ALLOWED] Excluding {t}.{c} from allowed identifiers")
+                    if _is_likely_filtered_requested_metric(c, t, q, qtype, md):
+                        print(
+                            f"   [FILTER-ALERT] {t}.{c} removed from allowed identifiers despite mixed count+metric intent; "
+                            "check metric mention coverage."
+                        )
                 continue
             elif RETRIEVE_DEBUG and c.lower() in RETRIEVAL_DEBUG_FOCUS_COLUMNS:
                 # Debug: show why numeric columns passed the filter

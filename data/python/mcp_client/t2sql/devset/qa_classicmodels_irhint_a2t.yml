@@ -1,0 +1,48 @@
+cases:
+  - id: A2T1
+    difficulty: manual
+    type: ir_hint_threshold_having
+    question: "For each customer, return payment count, but only keep customers with more than 2 payments."
+    expected_semantic:
+      should_use_having: true
+      threshold_intent: "count > 2"
+
+  - id: A2T2
+    difficulty: manual
+    type: ir_hint_threshold_having
+    question: "By payment year, show total payment amount for years where the total is above 500000."
+    expected_semantic:
+      should_use_having: true
+      threshold_intent: "sum(amount) > 500000"
+
+  - id: A2T3
+    difficulty: manual
+    type: ir_hint_threshold_having
+    question: "For each office, show employee count and keep only offices with at least 3 employees."
+    expected_semantic:
+      should_use_having: true
+      threshold_intent: "count >= 3"
+
+  - id: A2T4
+    difficulty: manual
+    type: ir_hint_threshold_having
+    question: "By product line, return average buy price for product lines with average buy price at least 60."
+    expected_semantic:
+      should_use_having: true
+      threshold_intent: "avg(buyPrice) >= 60"
+
+  - id: A2T5
+    difficulty: manual
+    type: ir_hint_threshold_having
+    question: "By vendor, show product count and keep only vendors with fewer than 5 products."
+    expected_semantic:
+      should_use_having: true
+      threshold_intent: "count < 5"
+
+  - id: A2T6
+    difficulty: manual
+    type: ir_hint_threshold_having
+    question: "For each customer, count orders and keep only customers whose order count is between 2 and 5."
+    expected_semantic:
+      should_use_having: true
+      threshold_intent: "count between 2 and 5"
