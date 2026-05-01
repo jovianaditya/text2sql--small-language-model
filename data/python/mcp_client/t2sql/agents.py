@@ -1997,6 +1997,32 @@ def _normalize_order_term_tokens(text: str) -> Set[str]:
     return set(normalized)
 
 
+def _normalize_order_reference(expr: str) -> str:
+    text = str(expr or "").strip()
+    if not text:
+        return ""
+    text = text.replace("`", "")
+    text = re.sub(r"\s+", "", text)
+    return text.lower()
+
+
+def _quote_order_identifier_if_reserved(expr: str) -> str:
+    token = str(expr or "").strip()
+    if not token:
+        return token
+    if token.startswith("`") and token.endswith("`"):
+        return token
+    if "." in token or re.search(r"[()\s]", token):
+        return token
+    bare = token.strip("`")
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", bare):
+        return token
+    reserved_tokens = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS))
+    if bare.lower() in reserved_tokens:
+        return f"`{bare}`"
+    return bare
+
+
 def _extract_requested_final_order_terms(question: str) -> List[Tuple[str, str]]:
     q = str(question or "").strip()
     if not q:
@@ -2083,6 +2109,201 @@ def _extract_requested_final_order_terms(question: str) -> List[Tuple[str, str]]
     return out
 
 
+def _build_requested_final_order_mapping(
+    sql: str,
+    question: str,
+) -> Optional[List[Dict[str, Any]]]:
+    requested = _extract_requested_final_order_terms(question)
+    if not requested:
+        return []
+
+    s = (sql or "").strip()
+    if not s:
+        return None
+    if not re.match(r"^\s*SELECT\b", s, flags=re.I):
+        return None
+
+    from_pos = _find_top_level_kw(s, "from")
+    if from_pos < 0:
+        return None
+
+    select_segment = re.sub(r"^\s*select\s+", "", s[:from_pos], flags=re.I | re.S).strip()
+    select_items = _split_top_level_csv(select_segment)
+    if not select_items:
+        return None
+
+    candidates: List[Dict[str, Any]] = []
+    for item in select_items:
+        item_clean = re.sub(r"(?is)^(?:DISTINCT|ALL)\s+", "", item.strip()).strip()
+        if not item_clean:
+            continue
+
+        alias_match = re.search(r"\bAS\s+(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", item_clean, flags=re.I)
+        alias_sql = alias_match.group(1).strip() if alias_match else ""
+        alias = alias_sql.strip("`")
+        expr = item_clean[:alias_match.start()].strip() if alias_match else item_clean
+        simple_col_match = re.search(r"(?:^|\.)(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", expr)
+        expr_name = simple_col_match.group(1).strip("`") if simple_col_match else expr
+        preferred_expr = _quote_order_identifier_if_reserved(alias_sql or expr_name)
+        token_text = " ".join(x for x in [alias, expr_name, expr] if x)
+        tokens = _normalize_order_term_tokens(token_text)
+        if not preferred_expr or not tokens:
+            continue
+
+        acceptable_refs: Set[str] = set()
+        for ref in {preferred_expr, alias_sql, alias, expr_name, expr}:
+            norm = _normalize_order_reference(ref)
+            if norm:
+                acceptable_refs.add(norm)
+                if "." in norm:
+                    acceptable_refs.add(norm.split(".")[-1])
+
+        candidates.append(
+            {
+                "preferred_expr": preferred_expr,
+                "tokens": tokens,
+                "acceptable_refs": acceptable_refs,
+            }
+        )
+
+    if not candidates:
+        return None
+
+    mapped: List[Dict[str, Any]] = []
+    for phrase, direction in requested:
+        phrase_tokens = _normalize_order_term_tokens(phrase)
+        if not phrase_tokens:
+            return None
+
+        scored: List[Tuple[int, Dict[str, Any]]] = []
+        for candidate in candidates:
+            candidate_tokens = set(candidate.get("tokens") or set())
+            overlap = len(phrase_tokens.intersection(candidate_tokens))
+            if phrase_tokens.issubset(candidate_tokens):
+                exact_bonus = 30 if candidate_tokens == phrase_tokens else 0
+                scored.append((100 + exact_bonus + overlap, candidate))
+            elif overlap and overlap == len(phrase_tokens):
+                exact_bonus = 30 if candidate_tokens == phrase_tokens else 0
+                scored.append((50 + exact_bonus + overlap, candidate))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        if not scored:
+            return None
+
+        best_score = scored[0][0]
+        best_candidates = [cand for score, cand in scored if score == best_score]
+        best_exprs = {
+            str(cand.get("preferred_expr") or "").strip()
+            for cand in best_candidates
+            if str(cand.get("preferred_expr") or "").strip()
+        }
+        if len(best_exprs) != 1:
+            return None
+
+        chosen = best_candidates[0]
+        mapped.append(
+            {
+                "phrase": phrase,
+                "direction": direction,
+                "preferred_expr": str(chosen.get("preferred_expr") or "").strip(),
+                "acceptable_refs": set(chosen.get("acceptable_refs") or set()),
+            }
+        )
+
+    return mapped if len(mapped) == len(requested) else None
+
+
+def _extract_top_level_order_specs_from_ast(
+    parsed: Any,
+    sel: Any,
+    exp_mod: Any,
+) -> List[Dict[str, Any]]:
+    def _semantic_clause_arg(name: str) -> Any:
+        root_arg = getattr(parsed, "args", {}).get(name)
+        if root_arg is not None:
+            return root_arg
+        return getattr(sel, "args", {}).get(name)
+
+    order_arg = _semantic_clause_arg("order")
+    if order_arg is None:
+        return []
+
+    items: List[Dict[str, Any]] = []
+    for ordered in getattr(order_arg, "expressions", None) or []:
+        expr_node = getattr(ordered, "this", None)
+        if expr_node is None:
+            continue
+        try:
+            expr_sql = expr_node.sql(dialect=SQL_WRITE_DIALECT)
+        except Exception:
+            expr_sql = str(expr_node or "")
+
+        acceptable_refs: Set[str] = set()
+        expr_norm = _normalize_order_reference(expr_sql)
+        if expr_norm:
+            acceptable_refs.add(expr_norm)
+            if "." in expr_norm:
+                acceptable_refs.add(expr_norm.split(".")[-1])
+        if isinstance(expr_node, exp_mod.Column):
+            col_name = str(expr_node.name or "").strip("`")
+            table_name = str(expr_node.table or "").strip("`")
+            if col_name:
+                acceptable_refs.add(_normalize_order_reference(col_name))
+                if table_name:
+                    acceptable_refs.add(_normalize_order_reference(f"{table_name}.{col_name}"))
+
+        items.append(
+            {
+                "direction": "DESC" if bool(getattr(ordered, "args", {}).get("desc")) else "ASC",
+                "acceptable_refs": acceptable_refs,
+            }
+        )
+    return items
+
+
+def _evaluate_requested_final_order_sequence(
+    *,
+    sql: str,
+    question: str,
+    parsed: Any,
+    sel: Any,
+    exp_mod: Any,
+) -> List[str]:
+    mapped = _build_requested_final_order_mapping(sql, question)
+    if mapped is None or not mapped:
+        return []
+
+    actual_items = _extract_top_level_order_specs_from_ast(parsed, sel, exp_mod)
+    if not actual_items:
+        return []
+
+    failures: List[str] = []
+    if len(actual_items) < len(mapped):
+        failures.append(f"missing_order_keys:{len(actual_items)}<{len(mapped)}")
+
+    for idx, spec in enumerate(mapped):
+        if idx >= len(actual_items):
+            break
+        expected_refs = {
+            str(ref or "").strip().lower()
+            for ref in (spec.get("acceptable_refs") or set())
+            if str(ref or "").strip()
+        }
+        actual_refs = {
+            str(ref or "").strip().lower()
+            for ref in (actual_items[idx].get("acceptable_refs") or set())
+            if str(ref or "").strip()
+        }
+        if expected_refs and actual_refs.isdisjoint(expected_refs):
+            failures.append(f"order_key_mismatch:{idx + 1}")
+        expected_dir = str(spec.get("direction") or "").upper()
+        actual_dir = str(actual_items[idx].get("direction") or "").upper()
+        if expected_dir and actual_dir and expected_dir != actual_dir:
+            failures.append(f"order_dir_mismatch:{idx + 1}:{actual_dir}!={expected_dir}")
+
+    return failures
+
+
 def _complete_requested_final_order(sql: str, question: str) -> str:
     """
     Rebuild a simple top-level ORDER BY when the question gives an explicit
@@ -2092,8 +2313,8 @@ def _complete_requested_final_order(sql: str, question: str) -> str:
     s = (sql or "").strip()
     if not s or not _has_top_level_order_by(s):
         return sql
-    requested = _extract_requested_final_order_terms(question)
-    if not requested:
+    mapped_specs = _build_requested_final_order_mapping(s, question)
+    if not mapped_specs:
         return sql
     # Ranking window ORDER BY is often part of row-number semantics.  Still
     # allow a top-level final ORDER BY repair when the question explicitly names
@@ -2124,69 +2345,12 @@ def _complete_requested_final_order(sql: str, question: str) -> str:
     limit_pos = _find_top_level_kw(s, "limit", order_pos + len("order by"))
     order_end = limit_pos if limit_pos >= 0 else len(s)
     suffix = s[order_end:].strip()
-
-    reserved_tokens = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS))
-
-    def _quote_order_identifier_if_reserved(expr: str) -> str:
-        token = str(expr or "").strip()
-        if not token:
-            return token
-        if token.startswith("`") and token.endswith("`"):
-            return token
-        if "." in token or re.search(r"[()\s]", token):
-            return token
-        bare = token.strip("`")
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", bare):
-            return token
-        if bare.lower() in reserved_tokens:
-            return f"`{bare}`"
-        return bare
-
-    candidates: List[Tuple[str, Set[str]]] = []
-    for item in select_items:
-        item_clean = item.strip()
-        # SELECT modifiers are not part of the projected expression name.  When
-        # a DISTINCT query needs final ORDER BY repair, treating "DISTINCT col"
-        # as the sortable expression would generate invalid SQL.
-        item_clean = re.sub(r"(?is)^(?:DISTINCT|ALL)\s+", "", item_clean).strip()
-        if not item_clean:
-            continue
-        alias_match = re.search(r"\bAS\s+(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", item_clean, flags=re.I)
-        alias_sql = alias_match.group(1).strip() if alias_match else ""
-        alias = alias_sql.strip("`")
-        expr = item_clean[:alias_match.start()].strip() if alias_match else item_clean
-        simple_col_match = re.search(r"(?:^|\.)(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", expr)
-        expr_name = simple_col_match.group(1).strip("`") if simple_col_match else expr
-        order_expr = _quote_order_identifier_if_reserved(alias_sql or expr_name)
-        token_text = " ".join(x for x in [alias, expr_name, expr] if x)
-        tokens = _normalize_order_term_tokens(token_text)
-        if order_expr and tokens:
-            candidates.append((order_expr, tokens))
-
-    mapped: List[str] = []
-    for phrase, direction in requested:
-        phrase_tokens = _normalize_order_term_tokens(phrase)
-        if not phrase_tokens:
-            return s + trailing_semicolon
-        scored: List[Tuple[int, str]] = []
-        for expr, tokens in candidates:
-            overlap = len(phrase_tokens.intersection(tokens))
-            if phrase_tokens.issubset(tokens):
-                exact_bonus = 30 if tokens == phrase_tokens else 0
-                scored.append((100 + exact_bonus + overlap, expr))
-            elif overlap and overlap == len(phrase_tokens):
-                exact_bonus = 30 if tokens == phrase_tokens else 0
-                scored.append((50 + exact_bonus + overlap, expr))
-        scored.sort(reverse=True)
-        if not scored:
-            return s + trailing_semicolon
-        best_score = scored[0][0]
-        best_exprs = [expr for score, expr in scored if score == best_score]
-        if len(set(best_exprs)) != 1:
-            return s + trailing_semicolon
-        mapped.append(f"{_quote_order_identifier_if_reserved(best_exprs[0])} {direction}")
-
-    if len(mapped) != len(requested):
+    mapped = [
+        f"{_quote_order_identifier_if_reserved(str(spec.get('preferred_expr') or '').strip())} {str(spec.get('direction') or 'ASC').upper()}"
+        for spec in mapped_specs
+        if str(spec.get("preferred_expr") or "").strip()
+    ]
+    if len(mapped) != len(mapped_specs):
         return s + trailing_semicolon
 
     prefix = s[:order_pos].rstrip()
@@ -2499,6 +2663,25 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
             corrections.append("Semantic contract: normalized chronological month ordering")
         if not _has_top_level_order_by(out_sql):
             violations.append("missing_final_order")
+        elif _build_requested_final_order_mapping(out_sql, question):
+            try:
+                import sqlglot
+                from sqlglot import exp
+
+                parsed_order = sqlglot.parse_one(out_sql, read=SQL_PARSE_DIALECT)
+                sel_order = parsed_order.find(exp.Select)
+                if sel_order is not None:
+                    order_failures = _evaluate_requested_final_order_sequence(
+                        sql=out_sql,
+                        question=question,
+                        parsed=parsed_order,
+                        sel=sel_order,
+                        exp_mod=exp,
+                    )
+                    if order_failures:
+                        violations.append("incomplete_final_order")
+            except Exception:
+                pass
 
     if bool(contract.get("requires_offset_window")):
         fixed = _strip_unrequested_offset_window_default(out_sql, question)
@@ -5371,6 +5554,7 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
         "requires_order_by": False,
         "required_limit": None,
         "required_aggs": [],
+        "requested_order_terms": [],
     }
     if not q:
         return contract
@@ -5381,6 +5565,8 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     # not as a top-level ORDER BY requirement.
     explicit_sort_phrase = _question_requests_ordering(question)
     contract["requires_order_by"] = explicit_sort_phrase
+    if explicit_sort_phrase:
+        contract["requested_order_terms"] = _extract_requested_final_order_terms(question)
 
     # Ordinal per-group winner pattern (e.g. "second highest per customer")
     # naturally relies on window ranking + rn filter, and does not require
@@ -5502,6 +5688,8 @@ def _extract_limit_value_from_clause_sql(limit_sql: str) -> Optional[int]:
 
 
 def _evaluate_semantic_contract(
+    sql: str,
+    question: str,
     parsed: Any,
     sel: Any,
     exp_mod: Any,
@@ -5529,6 +5717,16 @@ def _evaluate_semantic_contract(
         has_order = bool(order_arg is not None and (getattr(order_arg, "expressions", None) or []))
         if not has_order:
             failures.append("missing_order_by")
+        else:
+            failures.extend(
+                _evaluate_requested_final_order_sequence(
+                    sql=sql,
+                    question=question,
+                    parsed=parsed,
+                    sel=sel,
+                    exp_mod=exp_mod,
+                )
+            )
 
     if required_limit is not None:
         limit_arg = _semantic_clause_arg("limit")
@@ -6262,6 +6460,8 @@ def _deterministic_sql_acceptance_gate(
                 verdict["reasons"].append("group_projection_mismatch")
 
         semantic_failures = _evaluate_semantic_contract(
+            sql=candidate_sql,
+            question=question,
             parsed=parsed,
             sel=sel,
             exp_mod=exp,
@@ -6345,6 +6545,15 @@ def _build_gate_retry_instruction(base_instruction: str, gate: Dict[str, Any]) -
         semantic_parts: List[str] = []
         if semantic_contract.get("requires_order_by"):
             semantic_parts.append("ORDER BY is required")
+        requested_order_terms = semantic_contract.get("requested_order_terms") or []
+        if requested_order_terms:
+            order_text = ", ".join(
+                f"{phrase} {direction}".strip()
+                for phrase, direction in requested_order_terms
+                if str(phrase or "").strip()
+            )
+            if order_text:
+                semantic_parts.append(f"Requested final order sequence: {order_text}")
         if semantic_contract.get("required_limit") is not None:
             semantic_parts.append(f"LIMIT {semantic_contract.get('required_limit')} is required")
         req_aggs = semantic_contract.get("required_aggs") or []
@@ -6577,7 +6786,12 @@ def _attempt_last_chance_rescue_7b(
     return result
 
 
-_LLM_SEMANTIC_RETRY_FAILURE_PREFIXES = ("limit_mismatch:",)
+_LLM_SEMANTIC_RETRY_FAILURE_PREFIXES = (
+    "limit_mismatch:",
+    "missing_order_keys:",
+    "order_key_mismatch:",
+    "order_dir_mismatch:",
+)
 _LLM_SEMANTIC_RETRY_FAILURES = {
     "missing_order_by",
     "missing_limit",
@@ -8914,7 +9128,22 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         elif "missing_final_order" in contract_violations:
             extra_instruction = (
                 "STRICT REQUIREMENT: The question explicitly requests final result ordering. "
-                "You MUST include a top-level ORDER BY in the final query with the requested sort direction."
+                "You MUST include a top-level ORDER BY in the final query with the requested sort direction. "
+                "Preserve FROM/JOIN/WHERE/GROUP BY/HAVING and selected columns; fix only the final ORDER BY."
+            )
+        elif "incomplete_final_order" in contract_violations:
+            requested_order_terms = _extract_requested_final_order_terms(question)
+            requested_order_text = ", ".join(
+                f"{phrase} {direction}".strip()
+                for phrase, direction in requested_order_terms
+                if str(phrase or "").strip()
+            )
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question explicitly requests a multi-key final ordering and the current SQL "
+                "does not preserve the full ORDER BY sequence. "
+                "Preserve FROM/JOIN/WHERE/GROUP BY/HAVING, selected columns, metrics, and aliases exactly as they are. "
+                "Rewrite ONLY the top-level ORDER BY clause so it matches the requested order sequence"
+                + (f": {requested_order_text}." if requested_order_text else ".")
             )
         elif "missing_scalar_extrema_date_filter" in contract_violations:
             extra_instruction = (
