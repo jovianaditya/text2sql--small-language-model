@@ -20,6 +20,9 @@ PAGE_SIZE = int(os.getenv("DATAHUB_PAGE_SIZE", "100"))
 TIMEOUT = 60
 ACTOR = os.getenv("DATAHUB_ACTOR")
 OUTPUT_DIR = os.getenv("EXPORT_JSONL_OUTPUT", "./exports_dense_final")
+TABLE_CONTEXT_MAX_CHARS = int(os.getenv("DATAHUB_TABLE_CONTEXT_MAX_CHARS", "280"))
+SAMPLE_TEXT_MAX_CHARS = int(os.getenv("DATAHUB_SAMPLE_TEXT_MAX_CHARS", "64"))
+SAMPLE_DISTINCT_MAX = int(os.getenv("DATAHUB_SAMPLE_DISTINCT_MAX", "10"))
 
 if not TOKEN:
     raise RuntimeError("DATAHUB_TOKEN is not set.")
@@ -116,9 +119,14 @@ def _graphql(query: str, variables: dict) -> dict:
         resp = requests.post(GRAPHQL_URL, json={"query": query, "variables": variables}, headers=_headers_json(), timeout=TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        if data.get("errors"): return {}
+        if data.get("errors"):
+            msg = data.get("errors", [{}])[0].get("message", "unknown GraphQL error")
+            print(f"[WARN] GraphQL returned errors: {msg}")
+            return {}
         return data.get("data", {})
-    except: return {}
+    except Exception as e:
+        print(f"[WARN] GraphQL request failed: {e}")
+        return {}
 
 def iter_dataset_urns():
     scroll_id = None
@@ -232,11 +240,7 @@ def split_alias_and_role(raw_tags: List[str]) -> Tuple[List[str], List[str]]:
             val = re.sub(r"^alias[:.]", "", clean_urn, flags=re.IGNORECASE).strip()
             if val: alias_out.append(val)
             
-        # FALLBACK PENTING:
-        # Jika tag tidak punya prefix (misal tag bernama "Cost" atau "KPI"), 
-        # jangan dibuang! Anggap sebagai Alias/Synonym.
-        else:
-            alias_out.append(clean_urn)
+        # Ignore non alias/role tags to avoid noisy synonym injection.
             
     return alias_out, role_out
 # ==============================================================================
@@ -257,10 +261,35 @@ def translate_role_to_sentence(roles: List[str]) -> str:
         "binary": "Binary data (Image/File)."
     }
     sentences = []
+    seen = set()
     for r in roles:
         base = r.lower().split(':')[0]
-        sentences.append(role_map.get(base, f"Role: {r}."))
-    return " ".join(list(set(sentences)))
+        sentence = role_map.get(base, f"Role: {r}.")
+        if sentence not in seen:
+            seen.add(sentence)
+            sentences.append(sentence)
+    return " ".join(sentences)
+
+
+def _extract_fk_target(text: str) -> Optional[str]:
+    """
+    Extract FK target in normalized form 'table.column' from free-form text.
+    Supports variants such as:
+    - 'FK to table.column'
+    - 'foreign key to table.column'
+    - 'references table.column'
+    """
+    src = str(text or "")
+    patterns = [
+        r"\bfk\s+to\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+        r"\bforeign\s+key\s+to\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+        r"\breferences\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, src, flags=re.IGNORECASE)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}"
+    return None
 
 def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> Dict[str, Any]:
     """
@@ -277,13 +306,20 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     desc = raw_row.get("description") or ""
     aliases = raw_row.get("tags_alias", [])
     roles = raw_row.get("tags_role", [])
+    fk_target = _extract_fk_target(desc)
     
     # 3. Sample Value Logic (For Text Embedding)
     # Only inject sample into text if it's categorical (distinct < 20)
     distinct_raw = raw_row.get("distinct_count")
     sample_raw = str(raw_row.get("sample_value", ""))
     sample_sentence = ""
-    if isinstance(distinct_raw, int) and distinct_raw < 20 and sample_raw.lower() not in ["", "unknown", "none", "null"]:
+    if (
+        isinstance(distinct_raw, int)
+        and 0 < distinct_raw <= SAMPLE_DISTINCT_MAX
+        and len(sample_raw) <= SAMPLE_TEXT_MAX_CHARS
+        and "\n" not in sample_raw
+        and sample_raw.lower() not in ["", "unknown", "none", "null"]
+    ):
         sample_sentence = f"Example value: {sample_raw}."
 
     # 4. Context Injection (Table Description)
@@ -292,6 +328,8 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     if table_desc:
         clean_tbl_desc = table_desc.replace("\n", " ").strip()
         if len(clean_tbl_desc) > 3: # Validasi panjang minimal
+            if len(clean_tbl_desc) > TABLE_CONTEXT_MAX_CHARS:
+                clean_tbl_desc = clean_tbl_desc[:TABLE_CONTEXT_MAX_CHARS].rstrip() + "..."
             table_part = f"Table: {tbl} (Context: {clean_tbl_desc})."
 
     # 5. Build Embedding Sentence
@@ -299,6 +337,7 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
         table_part,
         f"Column: {col}.",
         f"Description: {desc}." if desc else "",
+        f"FK to {fk_target}." if fk_target else "",
         translate_role_to_sentence(roles),
         f"Synonyms: {', '.join(aliases)}." if aliases else "",
         sample_sentence

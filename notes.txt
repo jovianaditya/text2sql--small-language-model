@@ -3,10 +3,13 @@ docker run --rm confluentinc/cp-kafka:8.0.0 /bin/kafka-storage random-uuid
 # copy the UUID it prints, then:
 echo "KAFKA_CLUSTER_ID=<PASTE_UUID_HERE>" >> .env
 
+sudo chown -R 1000:1000 data/kafka data/elasticsearch
+sudo chmod -R 775 data/kafka data/elasticsearch
+
 
 #recreate container after add datahub token or change .env
 docker compose -f datahub.yml up -d --force-recreate
-
+docker logs mcp_client | grep -i token
 create domain dulu yang di script domain_tags_datahub.ipynb baru cli setelah itu create tags
 
 

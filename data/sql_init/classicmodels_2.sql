@@ -21,7 +21,7 @@ SET FOREIGN_KEY_CHECKS = 1;
 
 /* ===== productlines ===== */
 CREATE TABLE productlines (
-  productLine        varchar(50)   COMMENT 'Product line or category name (primary key).',
+  productLine        varchar(50)   COMMENT 'Product line or category name. Primary Key.',
   textDescription    varchar(4000) DEFAULT NULL COMMENT 'Plain text description (optional).',
   htmlDescription    mediumtext     COMMENT 'HTML description for web display (optional).',
   image              mediumblob     COMMENT 'Image or logo (BLOB; optional).',
@@ -30,9 +30,9 @@ CREATE TABLE productlines (
 
 /* ===== products ===== */
 CREATE TABLE products (
-  productCode        varchar(15)   COMMENT 'Unique product code (primary key).',
+  productCode        varchar(15)   COMMENT 'Unique product code. Primary Key.',
   productName        varchar(70)  NOT NULL COMMENT 'Human-readable product name.',
-  productLine        varchar(50)  NOT NULL COMMENT 'Owning product line; FK to productlines.productLine.',
+  productLine        varchar(50)  NOT NULL COMMENT 'Owning product line. FK to productlines.productLine.',
   productScale       varchar(10)  NOT NULL COMMENT 'Model scale ratio text (e.g., 1:10, 1:18).',
   productVendor      varchar(50)  NOT NULL COMMENT 'Manufacturer or vendor name.',
   productDescription text         NOT NULL COMMENT 'Plain-text description of features and details.',
@@ -45,7 +45,7 @@ CREATE TABLE products (
 
 /* ===== offices ===== */
 CREATE TABLE offices (
-  officeCode   varchar(10)  COMMENT 'Unique office code (primary key).',
+  officeCode   varchar(10)  COMMENT 'Unique office code. Primary Key.',
   city         varchar(50) NOT NULL COMMENT 'City where the office is located.',
   phone        varchar(50) NOT NULL COMMENT 'Main office phone (stored as text).',
   addressLine1 varchar(50) NOT NULL COMMENT 'Street address line 1.',
@@ -59,13 +59,13 @@ CREATE TABLE offices (
 
 /* ===== employees ===== */
 CREATE TABLE employees (
-  employeeNumber int           COMMENT 'Unique employee ID (primary key).',
+  employeeNumber int           COMMENT 'Unique employee ID. Primary Key.',
   lastName       varchar(50) NOT NULL COMMENT 'Employee surname/family name.',
   firstName      varchar(50) NOT NULL COMMENT 'Employee given/first name.',
   extension      varchar(10) NOT NULL COMMENT 'Internal phone extension.',
   email          varchar(100) NOT NULL COMMENT 'Work email address.',
-  officeCode     varchar(10)  NOT NULL COMMENT 'Assigned office; FK to offices.officeCode.',
-  reportsTo      int DEFAULT NULL COMMENT "Direct manager's employeeNumber; NULL if top-level.",
+  officeCode     varchar(10)  NOT NULL COMMENT 'Assigned office. FK to offices.officeCode.',
+  reportsTo      int DEFAULT NULL COMMENT "Direct manager employeeNumber; FK to employees.employeeNumber. NULL if top-level.",
   jobTitle       varchar(50) NOT NULL COMMENT 'Official job title or role.',
   PRIMARY KEY (employeeNumber),
   FOREIGN KEY (reportsTo) REFERENCES employees (employeeNumber),
@@ -74,7 +74,7 @@ CREATE TABLE employees (
 
 /* ===== customers ===== */
 CREATE TABLE customers (
-  customerNumber int            COMMENT 'Unique customer ID (primary key).',
+  customerNumber int            COMMENT 'Unique customer ID. Primary Key.',
   customerName   varchar(50)  NOT NULL COMMENT 'Customer/company legal or trading name.',
   contactLastName varchar(50) NOT NULL COMMENT 'Last name of the primary contact.',
   contactFirstName varchar(50) NOT NULL COMMENT 'First name of the primary contact.',
@@ -85,7 +85,7 @@ CREATE TABLE customers (
   state          varchar(50)           DEFAULT NULL COMMENT 'State/province/region (optional).',
   postalCode     varchar(15)           DEFAULT NULL COMMENT 'Postal/ZIP code (may include leading zeros).',
   country        varchar(50)  NOT NULL COMMENT 'Customer country.',
-  salesRepEmployeeNumber int  DEFAULT NULL COMMENT 'Account manager; FK to employees.employeeNumber.',
+  salesRepEmployeeNumber int  DEFAULT NULL COMMENT 'Account manager employee number. FK to employees.employeeNumber.',
   creditLimit    decimal(10,2)         DEFAULT NULL COMMENT 'Approved credit limit for this customer.',
   PRIMARY KEY (customerNumber),
   FOREIGN KEY (salesRepEmployeeNumber) REFERENCES employees (employeeNumber)
@@ -93,8 +93,8 @@ CREATE TABLE customers (
 
 /* ===== payments ===== */
 CREATE TABLE payments (
-  customerNumber int            COMMENT 'Paying customer; FK to customers.customerNumber.',
-  checkNumber    varchar(50)  NOT NULL COMMENT 'Payment reference; composite PK with customerNumber.',
+  customerNumber int            COMMENT 'Paying customer. FK to customers.customerNumber.',
+  checkNumber    varchar(50)  NOT NULL COMMENT 'Payment reference. Part of composite PK with customerNumber.',
   paymentDate    date         NOT NULL COMMENT 'Date the payment was recorded.',
   amount         decimal(10,2) NOT NULL COMMENT 'Payment amount in billing currency.',
   PRIMARY KEY (customerNumber, checkNumber),
@@ -103,21 +103,21 @@ CREATE TABLE payments (
 
 /* ===== orders ===== */
 CREATE TABLE orders (
-  orderNumber   int            COMMENT 'Unique order ID (primary key).',
+  orderNumber   int            COMMENT 'Unique order ID. Primary Key.',
   orderDate     date         NOT NULL COMMENT 'Date the order was created.',
   requiredDate  date         NOT NULL COMMENT 'Requested ship-by/fulfillment deadline.',
   shippedDate   date                  DEFAULT NULL COMMENT 'Actual ship date; NULL if not yet shipped.',
   status        varchar(15) NOT NULL COMMENT 'Order status (e.g., Shipped, In Process, On Hold, Cancelled, Disputed, Resolved).',
   comments      text                          COMMENT 'Free-form order notes (optional).',
-  customerNumber int        NOT NULL COMMENT 'Ordering customer; FK to customers.customerNumber.',
+  customerNumber int        NOT NULL COMMENT 'Ordering customer. FK to customers.customerNumber.',
   PRIMARY KEY (orderNumber),
   FOREIGN KEY (customerNumber) REFERENCES customers (customerNumber)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 /* ===== orderdetails ===== */
 CREATE TABLE orderdetails (
-  orderNumber      int            COMMENT 'Order ID; FK to orders.orderNumber. Part of composite PK.',
-  productCode      varchar(15)  NOT NULL COMMENT 'Product code; FK to products.productCode. Part of composite PK.',
+  orderNumber      int            COMMENT 'Order ID. FK to orders.orderNumber. Part of composite PK.',
+  productCode      varchar(15)  NOT NULL COMMENT 'Product code. FK to products.productCode. Part of composite PK.',
   quantityOrdered  int          NOT NULL COMMENT 'Units ordered on this line item.',
   priceEach        decimal(10,2) NOT NULL COMMENT 'Unit selling price at order time.',
   orderLineNumber  smallint(6)  NOT NULL COMMENT 'Line sequence number within the order (1..n).',
