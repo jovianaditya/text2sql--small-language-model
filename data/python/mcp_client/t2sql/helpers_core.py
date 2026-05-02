@@ -12,7 +12,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Pattern, Set, Tuple
+from typing import Any, Dict, List, Optional, Pattern, Sequence, Set, Tuple
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
@@ -7690,208 +7690,6 @@ def _rewrite_in_list_null_literal_as_is_null(sql: str) -> str:
 
     return pat.sub(_repl, sql)
 
-
-def _inject_not_shipped_null_predicate(sql: str, question: str, ctx: str = "") -> str:
-    """
-    For explicit "not shipped yet" intent in simple single-table lookups,
-    ensure shipped-date NULL predicate exists.
-    """
-    if not sql or not question:
-        return sql
-
-    q = str(question or "").strip().lower()
-    if not q:
-        return sql
-    not_shipped_sig = bool(
-        re.search(
-            r"\b(?:not\s+shipped\s+yet|not\s+yet\s+shipped|unshipped|"
-            r"haven'?t\s+been\s+shipped|hasn'?t\s+been\s+shipped|"
-            r"have\s+not\s+been\s+shipped|has\s+not\s+been\s+shipped|"
-            r"pending\s+shipment)\b",
-            q,
-            flags=re.I,
-        )
-    )
-    if not not_shipped_sig:
-        return sql
-
-    s = str(sql or "").strip().rstrip(";").strip()
-    if not s:
-        return sql
-    if re.search(r"\b(?:join|group\s+by|having|union|intersect|except|with)\b", s, flags=re.I):
-        return sql
-    if re.search(r"\bOVER\s*\(", s, flags=re.I):
-        return sql
-
-    m_sel = re.match(
-        r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<from>.+?)"
-        r"(?:\s+WHERE\s+(?P<where>.+?))?"
-        r"(?:\s+ORDER\s+BY\s+(?P<order>.+?))?"
-        r"(?:\s+LIMIT\s+(?P<limit>.+?))?\s*$",
-        s,
-    )
-    if not m_sel:
-        return sql
-
-    select_part = (m_sel.group("select") or "").strip()
-    from_core = (m_sel.group("from") or "").strip()
-    where_part = (m_sel.group("where") or "").strip()
-    order_part = (m_sel.group("order") or "").strip()
-    limit_part = (m_sel.group("limit") or "").strip()
-    if not select_part or not from_core:
-        return sql
-
-    alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}")
-    unique_tables = sorted(
-        {
-            str(t or "").strip().lower()
-            for a, t in alias_to_table.items()
-            if a and a.lower() == a and t
-        }
-    )
-    if not unique_tables:
-        m_base = re.match(
-            r"(?is)^\s*`?([A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?\s*$",
-            from_core,
-        )
-        if not m_base:
-            return sql
-        base_table = str(m_base.group(1) or "").strip().lower()
-        base_alias = str(m_base.group(2) or "").strip() or base_table
-    else:
-        if len(unique_tables) != 1:
-            return sql
-        base_table = unique_tables[0]
-        base_alias = next(
-            (
-                a for a, t in alias_to_table.items()
-                if a and a.lower() == a and str(t or "").strip().lower() == base_table
-            ),
-            base_table,
-        )
-
-    analyzer = None
-    cols: List[str] = []
-    try:
-        analyzer = get_schema_analyzer()
-    except Exception:
-        analyzer = None
-    if analyzer is not None:
-        try:
-            cols = [str(c).strip("`") for c in analyzer.get_table_columns(base_table) if str(c).strip()]
-        except Exception:
-            cols = []
-    if not cols and ctx:
-        allowed = _parse_allowed_identifiers(ctx)
-        cols = [str(c).strip("`") for c in (allowed.get(base_table, set()) or set()) if str(c).strip()]
-    if not cols:
-        return sql
-
-    shipped_col = next(
-        (c for c in cols if "ship" in c.lower() and "date" in c.lower()),
-        None,
-    )
-    if not shipped_col:
-        return sql
-
-    use_qualified = bool(
-        base_alias
-        and base_alias.lower() != base_table
-        and re.search(rf"\b{re.escape(base_alias)}\s*\.", s, flags=re.I)
-    )
-    shipped_ref = f"{base_alias}.{shipped_col}" if use_qualified else shipped_col
-
-    status_col = next((c for c in cols if str(c or "").strip().lower() == "status"), None)
-    if not status_col:
-        status_col = next((c for c in cols if "status" in str(c or "").lower()), None)
-    status_ref = f"{base_alias}.{status_col}" if (status_col and use_qualified) else (status_col or "status")
-
-    def _extract_status_literals_from_ctx() -> List[str]:
-        text = str(ctx or "")
-        if not text:
-            return []
-        status_name = re.escape(str(status_col or "status"))
-        patterns = [
-            rf"\bcolumn:\s*{status_name}\b[^\n]*?\((?:e\.g\.|eg|such\s+as)\s*([^)]+)\)",
-            rf"\b{status_name}\b[^\n]*?\((?:e\.g\.|eg|such\s+as)\s*([^)]+)\)",
-        ]
-        values: List[str] = []
-        for pat in patterns:
-            m = re.search(pat, text, flags=re.I)
-            if not m:
-                continue
-            raw = str(m.group(1) or "").strip()
-            if not raw:
-                continue
-            chunks = [x.strip() for x in re.split(r",|\bor\b", raw, flags=re.I) if x.strip()]
-            for ch in chunks:
-                v = ch.strip().strip("`'\"")
-                if v:
-                    values.append(v)
-            if values:
-                break
-        dedup: List[str] = []
-        seen: Set[str] = set()
-        for v in values:
-            key = v.lower().strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            dedup.append(v)
-        return dedup
-
-    def _is_final_status_label(label: str) -> bool:
-        l = str(label or "").strip().lower()
-        if not l:
-            return False
-        final_kw = {
-            "shipped", "resolved", "complete", "completed",
-            "deliver", "delivered", "fulfilled", "closed", "done",
-        }
-        return any(k in l for k in final_kw)
-
-    status_literals = _extract_status_literals_from_ctx()
-    non_final_statuses = [v for v in status_literals if not _is_final_status_label(v)]
-    canonical_status_where = ""
-    if status_col and non_final_statuses and where_part:
-        status_ref_re = re.escape(status_ref)
-        status_simple_pred = (
-            rf"(?is)^\s*\(*\s*{status_ref_re}\s*(?:IN\s*\([^)]*\)|=\s*(?:'[^']*'|\"[^\"]*\"|`[^`]*`))\s*\)*\s*$"
-        )
-        status_null_proxy = (
-            rf"(?is)^\s*\(*\s*{status_ref_re}\s+IN\s*\([^)]*\)\s+OR\s+{status_ref_re}\s+IS\s+NULL\s*\)*\s*$"
-        )
-        if re.match(status_simple_pred, where_part) or re.match(status_null_proxy, where_part):
-            quoted = ", ".join("'" + v.replace("'", "''") + "'" for v in non_final_statuses)
-            canonical_status_where = f"{status_ref} IN ({quoted})"
-
-    if re.search(
-        rf"(?is)\b(?:{re.escape(shipped_ref)}|{re.escape(shipped_col)})\s+IS\s+NULL\b",
-        where_part or s,
-        flags=re.I,
-    ):
-        if not canonical_status_where:
-            return sql
-
-    # Conservative: when WHERE already exists, only inject if it appears to use
-    # status as proxy for shipping state.
-    if where_part and not re.search(r"\bstatus\b", where_part, flags=re.I):
-        return sql
-
-    if canonical_status_where:
-        new_where = f"{canonical_status_where} OR {shipped_ref} IS NULL"
-    else:
-        new_where = f"({where_part}) OR {shipped_ref} IS NULL" if where_part else f"{shipped_ref} IS NULL"
-    out_lines = [f"SELECT {select_part}", f"FROM {from_core}", f"WHERE {new_where}"]
-    if order_part:
-        out_lines.append(f"ORDER BY {order_part}")
-    if limit_part:
-        out_lines.append(f"LIMIT {limit_part}")
-
-    fixed = "\n".join(out_lines).strip()
-    if not fixed.endswith(";"):
-        fixed += ";"
-    return fixed
 
 def _prune_non_primary_dimensions_for_primary_aggregate(sql: str, question: str, ctx: str = "") -> str:
     """
@@ -36308,6 +36106,263 @@ def _strip_empty_string_comparison_on_non_text(sql: str) -> str:
     # Clean up double spaces
     s = re.sub(r"\s{2,}", " ", s)
     return s
+
+
+def _repair_explicit_iso_date_filter_from_question(sql: str, question: str) -> str:
+    """
+    Conservative safety net:
+    if the question asks for a direct ISO-date boundary (before/after/on or before/on or after)
+    but the SQL expands it into YEAR/MONTH/DAY logic on a single date column,
+    collapse it back to a direct date comparison.
+    """
+    if not sql or not question:
+        return sql
+    if has_join(sql):
+        return sql
+
+    q = str(question or "").strip().lower()
+    m_date = re.search(r"\b((?:19|20)\d{2}-\d{2}-\d{2})\b", q)
+    if not m_date:
+        return sql
+
+    op = None
+    prefix = q[:m_date.start()]
+    if re.search(r"\bon\s+or\s+after\b", prefix):
+        op = ">="
+    elif re.search(r"\bon\s+or\s+before\b", prefix):
+        op = "<="
+    elif re.search(r"\b(?:after|later\s+than)\b", prefix):
+        op = ">"
+    elif re.search(r"\b(?:before|earlier\s+than)\b", prefix):
+        op = "<"
+    if not op:
+        return sql
+
+    m_where = re.search(
+        r"(?is)\bWHERE\b\s+(?P<body>.*?)(?=\bGROUP\s+BY\b|\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|;|$)",
+        sql,
+    )
+    if not m_where:
+        return sql
+
+    where_body = str(m_where.group("body") or "").strip()
+    func_cols = re.findall(
+        r"\b(?:YEAR|MONTH|DAY|DAYOFMONTH)\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        where_body,
+        flags=re.I,
+    )
+    func_cols = list(dict.fromkeys(c.lower() for c in func_cols if c))
+    if len(func_cols) != 1:
+        return sql
+
+    date_col = func_cols[0]
+    remainder = re.sub(
+        r"\b(?:YEAR|MONTH|DAY|DAYOFMONTH)\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s*\)\s*"
+        r"(?:=|<|<=|>|>=)\s*\d+\b",
+        "",
+        where_body,
+        flags=re.I,
+    )
+    remainder = re.sub(r"[\s()]+", " ", remainder)
+    remainder = re.sub(r"\b(?:and|or)\b", " ", remainder, flags=re.I)
+    if re.sub(r"\s+", "", remainder):
+        return sql
+
+    rebuilt = f"{date_col} {op} '{m_date.group(1)}'"
+    suffix = sql[m_where.end("body"):]
+    if suffix and not suffix[:1].isspace():
+        suffix = " " + suffix
+    return sql[:m_where.start("body")] + rebuilt + suffix
+
+
+def _repair_enum_process_proxy_filter_from_question(sql: str, question: str) -> str:
+    """
+    Conservative safety net for negated process-state phrasing.
+    Uses schema descriptions to find:
+    - a proxy column described like "NULL if not yet <process>"
+    - an enum-like descriptive column with enumerated values
+    Then canonicalizes narrow or inconsistent filters into:
+      enum_col IN (<non-final values>) OR proxy_col IS NULL
+    """
+    if not sql or not question:
+        return sql
+
+    q = str(question or "").strip().lower()
+    process_terms: Set[str] = set()
+    for pat in (
+        r"\b(?:haven['’]t|have\s+not|hasn['’]t|has\s+not|not)\s+been\s+([a-z][a-z\s-]{1,24}?)(?:\s+yet)?\b",
+        r"\bnot\s+([a-z][a-z\s-]{1,24}?)\s+yet\b",
+        r"\bpending\s+([a-z][a-z\s-]{1,24})\b",
+    ):
+        m_proc = re.search(pat, q, flags=re.I)
+        if not m_proc:
+            continue
+        for tok in re.findall(r"[a-z]+", str(m_proc.group(1) or "").lower()):
+            if len(tok) <= 2:
+                continue
+            base = tok
+            for suffix in ("ing", "ed", "ment", "tion", "s"):
+                if base.endswith(suffix) and len(base) > len(suffix) + 2:
+                    base = base[: -len(suffix)]
+                    break
+            process_terms.add(base)
+        if process_terms:
+            break
+    if not process_terms:
+        return sql
+
+    m_table = re.search(r"\bFROM\s+`?([A-Za-z_][A-Za-z0-9_]*)`?", sql, flags=re.I)
+    if not m_table:
+        return sql
+    table = m_table.group(1).strip().lower()
+
+    analyzer = get_schema_analyzer()
+    table_cols = [str(c or "").strip() for c in analyzer.get_table_columns(table) if str(c or "").strip()]
+    if not table_cols:
+        return sql
+
+    def _normalize_terms(text: str) -> Set[str]:
+        out: Set[str] = set()
+        for tok in re.findall(r"[a-z]+", str(text or "").lower()):
+            if len(tok) <= 2:
+                continue
+            base = tok
+            for suffix in ("ing", "ed", "ment", "tion", "s"):
+                if base.endswith(suffix) and len(base) > len(suffix) + 2:
+                    base = base[: -len(suffix)]
+                    break
+            out.add(base)
+        return out
+
+    def _extract_enum_values(desc_text: str) -> List[str]:
+        desc_text = str(desc_text or "").strip()
+        if not desc_text:
+            return []
+        for pat in (
+            r"\(\s*e\.g\.,?\s*([^)]+?)\s*\)",
+            r"\be\.g\.,?\s*([^.;]+)",
+            r"\bi\.e\.,?\s*([^.;]+)",
+        ):
+            m = re.search(pat, desc_text, flags=re.I)
+            if not m:
+                continue
+            parts = [p.strip(" '\"") for p in str(m.group(1) or "").split(",")]
+            vals = [re.sub(r"\s+", " ", p).strip() for p in parts if re.sub(r"\s+", " ", p).strip()]
+            if vals:
+                return vals
+        return []
+
+    def _question_mentions_enum_values(values: Sequence[str]) -> bool:
+        q_text = str(question or "").strip()
+        if not q_text:
+            return False
+        for value in values or []:
+            clean = re.sub(r"\s+", " ", str(value or "").strip())
+            if not clean:
+                continue
+            pat = r"\b" + r"\s+".join(re.escape(part) for part in clean.split()) + r"\b"
+            if re.search(pat, q_text, flags=re.I):
+                return True
+        return False
+
+    proxy_col = ""
+    proxy_score = 0
+    enum_col = ""
+    enum_values: List[str] = []
+    enum_score = 0
+
+    for col in table_cols:
+        desc = str(get_column_description(table, col) or "").strip()
+        if not desc:
+            continue
+        desc_l = desc.lower()
+        if re.search(r"\bnull\s+if\s+not\s+yet\b", desc_l):
+            m_proxy = re.search(r"\bnull\s+if\s+not\s+yet\s+([^.;]+)", desc, flags=re.I)
+            proxy_terms = _normalize_terms(m_proxy.group(1) if m_proxy else desc)
+            score = len(process_terms.intersection(proxy_terms))
+            if score > proxy_score:
+                proxy_score = score
+                proxy_col = col
+        vals = _extract_enum_values(desc)
+        if len(vals) >= 2:
+            score = len(vals)
+            if any(term in desc_l for term in ("status", "state", "phase", "condition")):
+                score += 5
+            if score > enum_score:
+                enum_score = score
+                enum_col = col
+                enum_values = vals
+
+    if not proxy_col or proxy_score <= 0 or not enum_col or len(enum_values) < 2:
+        return sql
+
+    excluded_terms = {
+        "shipped",
+        "resolved",
+        "complete",
+        "completed",
+        "delivered",
+        "closed",
+        "fulfilled",
+        "finalized",
+        "finalised",
+    }
+    candidate_values = [v for v in enum_values if not any(term in v.lower() for term in excluded_terms)]
+    if len(candidate_values) < 2:
+        return sql
+    explicit_enum_mention = _question_mentions_enum_values(candidate_values)
+
+    alias_to_table = _parse_from_join_aliases(sql)
+    use_qualified = False
+    base_alias = table
+    for alias, alias_table in (alias_to_table or {}).items():
+        if str(alias_table or "").strip().lower() == table and alias and alias.lower() != table:
+            if re.search(rf"\b{re.escape(alias)}\s*\.", sql, flags=re.I):
+                use_qualified = True
+                base_alias = alias
+                break
+    enum_ref = f"{base_alias}.{enum_col}" if use_qualified else enum_col
+    proxy_ref = f"{base_alias}.{proxy_col}" if use_qualified else proxy_col
+
+    in_list = ", ".join("'" + v.replace("'", "''") + "'" for v in candidate_values)
+    col_pat = rf"((?:[A-Za-z_][A-Za-z0-9_]*\.)?`?{re.escape(enum_col)}`?)\s*(?:=|LIKE)\s*'[^']+'"
+
+    m_where = re.search(
+        r"(?is)\bWHERE\b\s+(?P<body>.*?)(?=\bGROUP\s+BY\b|\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|;|$)",
+        sql,
+    )
+    if m_where:
+        where_body = str(m_where.group("body") or "").strip()
+        enum_pred_pat = (
+            rf"(?is)\(*\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?{re.escape(enum_col)}`?\s*"
+            rf"(?:IN\s*\([^)]*\)|=\s*'[^']+'|LIKE\s*'[^']+')\s*\)*"
+        )
+        proxy_null_pat = (
+            rf"(?is)\(*\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?{re.escape(proxy_col)}`?\s+IS\s+NULL\s*\)*"
+        )
+        reduced = re.sub(enum_pred_pat, " ", where_body, flags=re.I)
+        reduced = re.sub(proxy_null_pat, " ", reduced, flags=re.I)
+        reduced = re.sub(r"\b(?:and|or)\b", " ", reduced, flags=re.I)
+        reduced = re.sub(r"[\s()]+", " ", reduced).strip()
+        has_enum_pred = bool(re.search(enum_pred_pat, where_body, flags=re.I))
+        has_proxy_null = bool(re.search(proxy_null_pat, where_body, flags=re.I))
+        if (
+            not reduced
+            and (has_enum_pred or has_proxy_null)
+            and (has_enum_pred or explicit_enum_mention)
+        ):
+            canonical = f"{enum_ref} IN ({in_list})"
+            canonical = f"({canonical}) OR {proxy_ref} IS NULL"
+            suffix = sql[m_where.end('body'):]
+            if suffix and not suffix[:1].isspace():
+                suffix = " " + suffix
+            return sql[:m_where.start('body')] + canonical + suffix
+
+    if not explicit_enum_mention and not re.search(col_pat, sql, flags=re.I):
+        return sql
+    if not re.search(col_pat, sql, flags=re.I):
+        return sql
+    return re.sub(col_pat, rf"\1 IN ({in_list})", sql, count=1, flags=re.I)
 
 
 def _explicit_limit_from_question(question: str) -> Optional[int]:

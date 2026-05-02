@@ -160,11 +160,53 @@ class SchemaAnalyzer:
 
     def _next_field_after(self, text: str, field: str) -> Optional[str]:
         """Extract the value of a field after a given marker."""
-        pattern = rf'{re.escape(field)}\s+([^.]+?)(?:\.|$)'
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1).strip()
-        return None
+        src = str(text or "")
+        if not src or not field:
+            return None
+
+        lowered = src.lower()
+        marker = field.lower()
+        start = lowered.find(marker)
+        if start < 0:
+            return None
+
+        value_start = start + len(field)
+        tail = src[value_start:].lstrip()
+        if not tail:
+            return None
+
+        # Dense metadata uses labeled sections such as:
+        # Table: ... Column: ... Description: ... Synonyms: ... Example value: ...
+        # Stop at the next known field marker instead of the first period so
+        # abbreviations like "e.g." do not truncate the description.
+        next_markers = [
+            "Table:",
+            "Column:",
+            "Description:",
+            "Role:",
+            "Synonyms:",
+            "Example value:",
+            "Context:",
+        ]
+        end = len(tail)
+        tail_lower = tail.lower()
+        for candidate in next_markers:
+            candidate_lower = candidate.lower()
+            if candidate_lower == marker:
+                continue
+            idx = tail_lower.find(candidate_lower)
+            if idx >= 0 and idx < end:
+                end = idx
+
+        value = tail[:end].strip()
+        if not value:
+            return None
+
+        if field.strip().lower() == "role:":
+            value = re.split(r"\.(?:\s|$)", value, maxsplit=1)[0].strip()
+
+        return value.strip(" .")
+        
 
     def _infer_table_types(self):
         """

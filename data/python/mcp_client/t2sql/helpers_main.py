@@ -154,10 +154,11 @@ from .helpers_core import (
     _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _canonicalize_structural_regex, _canonicalize_boundary_regex, _guardrail_fix_mysql_regexp_literals,
     _rewrite_regex_filter_to_case_bucket, _rewrite_half_open_between_bounds,
     # phase 6
-    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _inject_not_shipped_null_predicate, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _strip_redundant_distinct_in_in_not_in_subqueries, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
+    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _strip_redundant_distinct_in_in_not_in_subqueries, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
     _ast_guardrails,
     # phase 7
-    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes, _strip_empty_string_comparison_on_non_text, _drop_raw_column_covered_by_function
+    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes, _strip_empty_string_comparison_on_non_text, _drop_raw_column_covered_by_function,
+    _repair_explicit_iso_date_filter_from_question, _repair_enum_process_proxy_filter_from_question,
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -5153,7 +5154,6 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _expand_missing_null_to_null_or_empty(s, question)
     s = _expand_present_not_null_to_not_empty(s, question, ctx)
     s = _rewrite_in_list_null_literal_as_is_null(s)
-    s = _inject_not_shipped_null_predicate(s, question, ctx)
     s = _enforce_set_operation_operator_from_question(s, question)
     s = _ensure_reasonable_distinct(s, question)
     s = _ensure_reasonable_count_distinct(s, question)
@@ -5644,6 +5644,11 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
             _dbg_print_two("[REFINER - AST] warnings", f"{ast_meta.get('warnings')}")
         return sql_in, ast_meta
 
+    def _apply_final_question_repairs(sql_in: str) -> str:
+        sql_in = _repair_explicit_iso_date_filter_from_question(sql_in, question)
+        sql_in = _repair_enum_process_proxy_filter_from_question(sql_in, question)
+        return sql_in
+
     s = _apply_postprocess(raw_sql)
 
     if ranked_cols:
@@ -5665,6 +5670,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
     )
 
     if should_early_stop:
+        s = _apply_final_question_repairs(s)
         s = _collapse_spaces_outside_quotes(s)
         _dbg_print_two("[REFINER - NORMALIZE] output sql:", s)
         return s
@@ -5677,6 +5683,8 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
     if needs_second_pass:
         s = _apply_postprocess(s)
         s, _ = _ast_stabilize(s)
+
+    s = _apply_final_question_repairs(s)
 
     _dbg_print_two("[REFINER - NORMALIZE] output sql:", s)
     return s

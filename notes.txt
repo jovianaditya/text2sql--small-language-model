@@ -1,0 +1,86 @@
+docker pull confluentinc/cp-kafka:8.0.0
+docker run --rm confluentinc/cp-kafka:8.0.0 /bin/kafka-storage random-uuid
+# copy the UUID it prints, then:
+echo "KAFKA_CLUSTER_ID=<PASTE_UUID_HERE>" >> .env
+
+sudo chown -R 1000:1000 data/kafka data/elasticsearch
+sudo chmod -R 775 data/kafka data/elasticsearch
+
+
+#recreate container after add datahub token or change .env
+docker compose -f datahub.yml up -d --force-recreate
+docker logs mcp_client | grep -i token
+create domain dulu yang di script domain_tags_datahub.ipynb baru cli setelah itu create tags
+
+
+#delete datahub datasets
+for d in customers employees products productlines orders orderdetails payments offices; do
+  URN="urn:li:dataset:(urn:li:dataPlatform:mysql,classicmodels.${d},PROD)"
+  echo "Deleting $URN ..."
+  curl -sS -X POST 'http://datahub-gms:8080/entities?action=delete' \
+    -H 'Content-Type: application/json' \
+    -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6ImRhdGFodWIiLCJ0eXBlIjoiUEVSU09OQUwiLCJ2ZXJzaW9uIjoiMiIsImp0aSI6ImQzYzE2YzUzLTAxOWItNDFmNy1iYWY0LTY3ZmI5MzZjNjlhYyIsInN1YiI6ImRhdGFodWIiLCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.PujEmc6gqD3TEY-olAIEjf5xBlzebQlthc999BuHf2M' \
+    -H 'X-DataHub-Actor: urn:li:corpuser:datahub' \
+    -d "{\"urn\":\"$URN\",\"hardDelete\":true}"
+  echo
+done
+
+# delete database schema
+export DATAHUB_GMS_URL="http://datahub-gms:8080"
+export DATAHUB_TOKEN="eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6ImRhdGFodWIiLCJ0eXBlIjoiUEVSU09OQUwiLCJ2ZXJzaW9uIjoiMiIsImp0aSI6ImQzYzE2YzUzLTAxOWItNDFmNy1iYWY0LTY3ZmI5MzZjNjlhYyIsInN1YiI6ImRhdGFodWIiLCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.PujEmc6gqD3TEY-olAIEjf5xBlzebQlthc999BuHf2M" 
+# 1 Ambil semua URN CONTAINER yg match "classicmodels"
+CONTAINER_URNS=$(curl -sS "$DATAHUB_GMS_URL/api/graphql" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $DATAHUB_TOKEN" \
+  -d '{"query":"query($q: String!){ search(input:{ type: CONTAINER, query: $q, start:0, count:50 }) { searchResults { entity { urn } } } }","variables":{"q":"classicmodels"}}' \
+| python3 -c 'import sys,json; d=json.load(sys.stdin); print("\n".join(r["entity"]["urn"] for r in d["data"]["search"]["searchResults"]))')
+
+# 2 Hapus masing-masing container (database/schema)
+for urn in $CONTAINER_URNS; do
+  echo "Hard-deleting container $urn ..."
+  curl -sS -X POST "$DATAHUB_GMS_URL/entities?action=delete" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $DATAHUB_TOKEN" \
+    -H "X-DataHub-Actor: urn:li:corpuser:datahub" \
+    -d '{"urn":"'"$urn"'","hardDelete":true}'
+  echo
+done
+
+# DEVELOPMENT FULL
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset t2sql/devset/qa_classicmodels_devset_mix.yml --output results.xlsx" 2>&1 | tee run_full.log
+
+## hard
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset t2sql/devset/qa_classicmodels_devset_mix.yml --output results_hard_mix.xlsx --hard --warmup-models small" 2>&1 | tee run_hard_mix.log
+
+## medium
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset t2sql/devset/qa_classicmodels_devset_mix.yml --output results_medium_mix.xlsx --medium --warmup-models small" 2>&1 | tee run_medium_mix.log
+
+## easy
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset t2sql/devset/qa_classicmodels_devset_mix.yml --output results_easy_mix.xlsx --easy --warmup-models small" 2>&1 | tee run_easy_mix.log
+
+# PRIMARY EVALUATION SCENARIO P1
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/evaluation/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p1.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p1.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/evaluation/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p1.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p1.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/evaluation/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p1.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p1.log
+
+# PRIMARY EVALUATION SCENARIO P2
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/evaluation/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p2.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p2.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/evaluation/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p2.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p2.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/evaluation/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p2.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p2.log
+
+# PRIMARY EVALUATION SCENARIO P3
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/evaluation/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p3.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p3.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/evaluation/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p3.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p3.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/evaluation/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p3.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p3.log
+
+# tmux
+# new session
+tmux new -s thesis
+# kalau mau out dari tampilan tmux ctrl+b lalu d
+# check available session
+tmux ls
+# continue session
+tmux attach -d -t thesis
+tmux new-window -t thesis
+tmux select-window -t thesis:1
+tmux kill-session -t thesis

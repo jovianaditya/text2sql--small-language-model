@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from .schema_analyzer import (
     get_all_tables,
     get_column_synonyms,
+    get_column_description,
     get_fk_relationships,
     get_id_column,
     get_name_column,
@@ -1616,6 +1617,157 @@ def _detect_filters(
                 return
         filters.append(f)
 
+    def _pick_date_target_column() -> Tuple[str, Optional[str]]:
+        date_col = None
+        date_table = subject
+        for t, c, _ in column_mentions:
+            if _is_date_column(c):
+                date_table, date_col = t, c
+                break
+        if not date_col:
+            date_col = _find_best_date_column(subject, allowed)
+        if not date_col:
+            metric_tables: List[str] = []
+            for m in metrics or []:
+                t = str(getattr(m, "table", "") or "").strip().lower()
+                if t and t not in metric_tables:
+                    metric_tables.append(t)
+            for mt in metric_tables:
+                mt_date_col = _find_best_date_column(mt, allowed)
+                if mt_date_col:
+                    date_table = mt
+                    date_col = mt_date_col
+                    break
+        return date_table, date_col
+
+    def _normalize_process_tokens(text: str) -> Set[str]:
+        out: Set[str] = set()
+        for tok in re.findall(r"[a-z]+", str(text or "").lower()):
+            if len(tok) <= 2:
+                continue
+            base = tok
+            for suffix in ("ing", "ed", "ment", "tion", "s"):
+                if base.endswith(suffix) and len(base) > len(suffix) + 2:
+                    base = base[: -len(suffix)]
+                    break
+            out.add(base)
+        return out
+
+    def _extract_negated_process_terms() -> Set[str]:
+        patterns = [
+            r"\b(?:haven['’]t|have\s+not|hasn['’]t|has\s+not|not)\s+been\s+([a-z][a-z\s-]{1,24}?)(?:\s+yet)?\b",
+            r"\bnot\s+([a-z][a-z\s-]{1,24}?)\s+yet\b",
+            r"\bpending\s+([a-z][a-z\s-]{1,24})\b",
+        ]
+        for pat in patterns:
+            m = re.search(pat, q, flags=re.I)
+            if m:
+                terms = _normalize_process_tokens(m.group(1) or "")
+                if terms:
+                    return terms
+        return set()
+
+    def _extract_enum_values_from_description(table: str, column: str) -> List[str]:
+        desc = str(get_column_description(table, column) or "").strip()
+        if not desc:
+            return []
+
+        candidates: List[str] = []
+        patterns = [
+            r"\(\s*e\.g\.,?\s*([^)]+?)\s*\)",
+            r"\be\.g\.,?\s*([^.;]+)",
+            r"\bi\.e\.,?\s*([^.;]+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, desc, flags=re.I)
+            if not m:
+                continue
+            raw = str(m.group(1) or "").strip()
+            if not raw:
+                continue
+            parts = [p.strip(" '\"") for p in raw.split(",")]
+            for part in parts:
+                clean = re.sub(r"\s+", " ", part).strip()
+                if clean and clean not in candidates:
+                    candidates.append(clean)
+            if candidates:
+                break
+        return candidates
+
+    def _derive_nonfinal_enum_values(table: str, column: str) -> List[str]:
+        enum_values = _extract_enum_values_from_description(table, column)
+        if not enum_values:
+            return []
+
+        excluded_terms = {
+            "shipped",
+            "resolved",
+            "complete",
+            "completed",
+            "delivered",
+            "closed",
+            "fulfilled",
+            "finalized",
+            "finalised",
+        }
+        out: List[str] = []
+        for value in enum_values:
+            value_l = value.lower()
+            if any(term in value_l for term in excluded_terms):
+                continue
+            if value not in out:
+                out.append(value)
+        return out
+
+    def _question_mentions_enum_values(values: Sequence[str]) -> bool:
+        q_text = str(q_raw or q or "").strip()
+        if not q_text:
+            return False
+        for value in values or []:
+            clean = re.sub(r"\s+", " ", str(value or "").strip())
+            if not clean:
+                continue
+            pat = r"\b" + r"\s+".join(re.escape(part) for part in clean.split()) + r"\b"
+            if re.search(pat, q_text, flags=re.I):
+                return True
+        return False
+
+    def _find_best_process_proxy_column(table: str, process_terms: Set[str]) -> Optional[str]:
+        if not process_terms:
+            return None
+        best_col = None
+        best_score = 0
+        for col in allowed.get(table, set()):
+            desc = str(get_column_description(table, col) or "").strip()
+            if not desc or not re.search(r"\bnull\s+if\s+not\s+yet\b", desc, flags=re.I):
+                continue
+            proxy_phrase = re.search(r"\bnull\s+if\s+not\s+yet\s+([^.;]+)", desc, flags=re.I)
+            proxy_terms = _normalize_process_tokens((proxy_phrase.group(1) if proxy_phrase else desc))
+            score = len(process_terms.intersection(proxy_terms))
+            if score > best_score:
+                best_score = score
+                best_col = col
+        return best_col if best_score > 0 else None
+
+    def _find_best_enum_descriptor_column(table: str) -> Optional[str]:
+        best_col = None
+        best_score = 0
+        for col in allowed.get(table, set()):
+            desc = str(get_column_description(table, col) or "").strip()
+            if not desc:
+                continue
+            enum_values = _extract_enum_values_from_description(table, col)
+            if len(enum_values) < 2:
+                continue
+            desc_l = desc.lower()
+            score = len(enum_values)
+            if any(term in desc_l for term in ("status", "state", "phase", "condition")):
+                score += 5
+            if score > best_score:
+                best_score = score
+                best_col = col
+        return best_col
+
     def _pick_text_target_column(anchor_pos: Optional[int] = None) -> Optional[Tuple[str, str]]:
         # Prefer explicit "check number" mention when present.
         if re.search(r"\bcheck\s+number\b", q):
@@ -1776,31 +1928,26 @@ def _detect_filters(
         if v is not None:
             add_filter(IRFilter(table=t, column=c, op="lt", value=v))
 
+    # Explicit full-date filters take priority over generic year-only fallback.
+    full_date_match = re.search(r"\b((?:19|20)\d{2}-\d{2}-\d{2})\b", q)
+    if full_date_match:
+        date_literal = full_date_match.group(1)
+        date_table, date_col = _pick_date_target_column()
+        if date_col:
+            date_prefix = q[:full_date_match.start()]
+            if re.search(r"\bon\s+or\s+after\b", date_prefix):
+                add_filter(IRFilter(table=date_table, column=date_col, op="gte", value=date_literal))
+            elif re.search(r"\bon\s+or\s+before\b", date_prefix):
+                add_filter(IRFilter(table=date_table, column=date_col, op="lte", value=date_literal))
+            elif re.search(r"\b(?:after|later\s+than)\b", date_prefix):
+                add_filter(IRFilter(table=date_table, column=date_col, op="gt", value=date_literal))
+            elif re.search(r"\b(?:before|earlier\s+than)\b", date_prefix):
+                add_filter(IRFilter(table=date_table, column=date_col, op="lt", value=date_literal))
+
     # Year filters.
     years = re.findall(r"\b((?:19|20)\d{2})\b", q)
-    if years:
-        date_col = None
-        date_table = subject
-        for t, c, _ in column_mentions:
-            if _is_date_column(c):
-                date_table, date_col = t, c
-                break
-        if not date_col:
-            date_col = _find_best_date_column(subject, allowed)
-        if not date_col:
-            # Fallback: use metric table date when subject table has no date column
-            # (e.g., subject customers, metric from payments, filter year 2004).
-            metric_tables: List[str] = []
-            for m in metrics or []:
-                t = str(getattr(m, "table", "") or "").strip().lower()
-                if t and t not in metric_tables:
-                    metric_tables.append(t)
-            for mt in metric_tables:
-                mt_date_col = _find_best_date_column(mt, allowed)
-                if mt_date_col:
-                    date_table = mt
-                    date_col = mt_date_col
-                    break
+    if years and not full_date_match:
+        date_table, date_col = _pick_date_target_column()
         if date_col:
             add_filter(IRFilter(table=date_table, column=date_col, op="year_eq", value=int(years[0])))
 
@@ -1924,6 +2071,18 @@ def _detect_filters(
                 add_filter(IRFilter(table=status_table, column=status_col, op="in", value=[v.strip() for v in quoted_values]))
             else:
                 add_filter(IRFilter(table=status_table, column=status_col, op="eq", value=quoted_values[0].strip()))
+
+    negated_process_terms = _extract_negated_process_terms()
+    if negated_process_terms:
+        proxy_col = _find_best_process_proxy_column(subject, negated_process_terms)
+        enum_col = _find_best_enum_descriptor_column(subject)
+        if proxy_col and enum_col:
+            candidate_values = _derive_nonfinal_enum_values(subject, enum_col)
+            if candidate_values and _question_mentions_enum_values(candidate_values):
+                if len(candidate_values) >= 2:
+                    add_filter(IRFilter(table=subject, column=enum_col, op="in", value=candidate_values))
+                else:
+                    add_filter(IRFilter(table=subject, column=enum_col, op="eq", value=candidate_values[0]))
 
     # Missing/empty (skip when intent is explicit non-null/not-null).
     if (
