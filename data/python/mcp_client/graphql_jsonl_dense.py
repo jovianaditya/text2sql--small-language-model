@@ -19,7 +19,8 @@ TOKEN = os.getenv("DATAHUB_TOKEN")
 PAGE_SIZE = int(os.getenv("DATAHUB_PAGE_SIZE", "100"))
 TIMEOUT = 60
 ACTOR = os.getenv("DATAHUB_ACTOR")
-OUTPUT_DIR = os.getenv("EXPORT_JSONL_OUTPUT", "./exports_dense_final")
+# Prefer dedicated dense output env var, then fallback to generic export env.
+OUTPUT_DIR = os.getenv("EXPORT_DENSE_JSONL_OUTPUT", os.getenv("EXPORT_JSONL_OUTPUT", "./exports_dense_final"))
 TABLE_CONTEXT_MAX_CHARS = int(os.getenv("DATAHUB_TABLE_CONTEXT_MAX_CHARS", "280"))
 SAMPLE_TEXT_MAX_CHARS = int(os.getenv("DATAHUB_SAMPLE_TEXT_MAX_CHARS", "64"))
 SAMPLE_DISTINCT_MAX = int(os.getenv("DATAHUB_SAMPLE_DISTINCT_MAX", "10"))
@@ -291,6 +292,14 @@ def _extract_fk_target(text: str) -> Optional[str]:
             return f"{m.group(1)}.{m.group(2)}"
     return None
 
+
+def _has_fk_literal(text: str, fk_target: str) -> bool:
+    """Check whether text already contains an explicit 'FK to table.column' literal."""
+    if not text or not fk_target:
+        return False
+    escaped = re.escape(fk_target)
+    return bool(re.search(rf"\bfk\s+to\s+{escaped}\b", text, flags=re.IGNORECASE))
+
 def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> Dict[str, Any]:
     """
     Gold Standard: Context Injection + Metadata Separation
@@ -303,10 +312,11 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     # 2. Prepare Text Components
     tbl = raw_row.get("table")
     col = raw_row.get("column")
-    desc = raw_row.get("description") or ""
+    desc = str(raw_row.get("description") or "")
+    desc_clean = re.sub(r"\s+", " ", desc).strip().rstrip(" .")
     aliases = raw_row.get("tags_alias", [])
     roles = raw_row.get("tags_role", [])
-    fk_target = _extract_fk_target(desc)
+    fk_target = _extract_fk_target(desc_clean)
     
     # 3. Sample Value Logic (For Text Embedding)
     # Only inject sample into text if it's categorical (distinct < 20)
@@ -336,8 +346,8 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     text_parts = [
         table_part,
         f"Column: {col}.",
-        f"Description: {desc}." if desc else "",
-        f"FK to {fk_target}." if fk_target else "",
+        f"Description: {desc_clean}." if desc_clean else "",
+        f"FK to {fk_target}." if (fk_target and not _has_fk_literal(desc_clean, fk_target)) else "",
         translate_role_to_sentence(roles),
         f"Synonyms: {', '.join(aliases)}." if aliases else "",
         sample_sentence
@@ -439,9 +449,19 @@ def _sanitize_filename(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_dir = OUTPUT_DIR
+    # If env points to a file path (e.g., /app/metadata_jsonl/classicmodels_dense.jsonl),
+    # write dense output next to that file instead of creating a directory with that name.
+    if output_dir.lower().endswith(".jsonl"):
+        output_dir = os.path.dirname(output_dir) or "."
+        print(f"[WARN] OUTPUT path looks like a file. Using parent directory for dense export: {output_dir}")
+    elif os.path.exists(output_dir) and os.path.isfile(output_dir):
+        output_dir = os.path.dirname(output_dir) or "."
+        print(f"[WARN] OUTPUT path is a file. Using parent directory for dense export: {output_dir}")
+
+    os.makedirs(output_dir, exist_ok=True)
     writers = {}
-    print(f"[INFO] Exporting Gold Standard Dense JSONL to: {os.path.abspath(OUTPUT_DIR)}")
+    print(f"[INFO] Exporting Gold Standard Dense JSONL to: {os.path.abspath(output_dir)}")
     
     count = 0
     for urn in iter_dataset_urns():
@@ -455,7 +475,7 @@ def main():
                 fname = f"{_sanitize_filename(db_name)}_dense.jsonl"
                 
                 if fname not in writers:
-                    writers[fname] = open(os.path.join(OUTPUT_DIR, fname), "w", encoding="utf-8")
+                    writers[fname] = open(os.path.join(output_dir, fname), "w", encoding="utf-8")
                 
                 writers[fname].write(json.dumps(row, ensure_ascii=False) + "\n")
                 count += 1

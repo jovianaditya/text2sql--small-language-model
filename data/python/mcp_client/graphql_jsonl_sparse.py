@@ -21,7 +21,14 @@ TIMEOUT = 60
 ACTOR = os.getenv("DATAHUB_ACTOR")
 
 # OUTPUT KHUSUS SPARSE
-OUTPUT_DIR = os.getenv("EXPORT_JSONL_OUTPUT", "./exports_sparse_final")
+# Prefer dedicated sparse output env var, then fallback to generic export env.
+OUTPUT_DIR = os.getenv("EXPORT_SPARSE_JSONL_OUTPUT", os.getenv("EXPORT_JSONL_OUTPUT", "./exports_sparse_final"))
+SPARSE_STRING_SAMPLE_LIMIT = int(os.getenv("SPARSE_STRING_SAMPLE_LIMIT", "8"))
+SPARSE_NUMERIC_SAMPLE_LIMIT = int(os.getenv("SPARSE_NUMERIC_SAMPLE_LIMIT", "3"))
+SPARSE_SAMPLE_VALUE_MAX_CHARS = int(os.getenv("SPARSE_SAMPLE_VALUE_MAX_CHARS", "64"))
+SPARSE_STRING_SAMPLE_DISTINCT_MAX = int(os.getenv("SPARSE_STRING_SAMPLE_DISTINCT_MAX", "200"))
+SPARSE_METADATA_SAMPLE_MAX_CHARS = int(os.getenv("SPARSE_METADATA_SAMPLE_MAX_CHARS", "220"))
+SPARSE_INCLUDE_SAMPLES_IN_KEYWORDS = os.getenv("SPARSE_INCLUDE_SAMPLES_IN_KEYWORDS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 if not TOKEN:
     raise RuntimeError("DATAHUB_TOKEN is not set.")
@@ -117,9 +124,14 @@ def _graphql(query: str, variables: dict) -> dict:
         resp = requests.post(GRAPHQL_URL, json={"query": query, "variables": variables}, headers=_headers_json(), timeout=TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        if data.get("errors"): return {}
+        if data.get("errors"):
+            msg = data.get("errors", [{}])[0].get("message", "unknown GraphQL error")
+            print(f"[WARN] GraphQL returned errors: {msg}")
+            return {}
         return data.get("data", {})
-    except: return {}
+    except Exception as e:
+        print(f"[WARN] GraphQL request failed: {e}")
+        return {}
 
 def iter_dataset_urns():
     scroll_id = None
@@ -224,15 +236,59 @@ def split_alias_and_role(raw_tags: List[str]) -> Tuple[List[str], List[str]]:
     for t in raw_tags:
         clean_urn = t.replace("urn:li:tag:", "")
         lowered = clean_urn.lower()
-        if lowered.startswith("role") or lowered.startswith("role."):
+        if lowered.startswith("role:") or lowered.startswith("role."):
             clean = re.sub(r"^role[:.]", "", clean_urn, flags=re.IGNORECASE).strip()
             if clean: role_out.append(clean)
-        elif lowered.startswith("alias") or lowered.startswith("alias."):
+        elif lowered.startswith("alias:") or lowered.startswith("alias."):
             clean = re.sub(r"^alias[:.]", "", clean_urn, flags=re.IGNORECASE).strip()
             if clean: alias_out.append(clean)
-        else:
-            alias_out.append(clean_urn)
+        # ignore non alias/role tags for sparse keyword hygiene
     return alias_out, role_out
+
+
+ROLE_CANONICAL = {
+    "pk": "pk",
+    "fk": "fk",
+    "id": "id",
+    "measure": "measure",
+    "metric": "measure",
+    "dimension": "dimension",
+    "date": "date",
+    "geo": "geo",
+    "contact": "contact",
+    "address": "address",
+    "text": "text",
+    "binary": "binary",
+}
+
+
+def normalize_role(role: str) -> str:
+    key = str(role or "").strip().lower()
+    return ROLE_CANONICAL.get(key, key)
+
+
+def _sanitize_fragment(x: Any) -> str:
+    return re.sub(r"\s+", " ", str(x or "")).strip().strip(".")
+
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for it in items:
+        norm = it.lower()
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(it)
+    return out
+
+
+def _truncate_metadata_sample(value: Any, is_string: bool) -> str:
+    sample = str(value or "")
+    if not is_string:
+        return sample
+    if len(sample) <= SPARSE_METADATA_SAMPLE_MAX_CHARS:
+        return sample
+    return sample[:SPARSE_METADATA_SAMPLE_MAX_CHARS].rstrip() + "..."
 
 # ==============================================================================
 # 4. TRANSFORMATION LOGIC (SPARSE RETRIEVAL - STRICT LIMIT)
@@ -249,16 +305,16 @@ def transform_to_sparse_schema(raw_row: Dict[str, Any], table_desc: str = "") ->
 
     tbl = raw_row.get("table") or ""
     col = raw_row.get("column") or ""
-    desc = raw_row.get("description") or ""
+    desc = _sanitize_fragment(raw_row.get("description"))
     aliases = raw_row.get("tags_alias", [])
-    roles = raw_row.get("tags_role", [])
+    roles = [normalize_role(r) for r in raw_row.get("tags_role", []) if str(r or "").strip()]
     
     # --- KEYWORD CONSTRUCTION (Untuk Search BM25) ---
-    keywords_list = []
+    keywords_list: List[str] = []
     
     # 1. Core Metadata
-    keywords_list.append(tbl)
-    keywords_list.append(col)
+    keywords_list.append(_sanitize_fragment(tbl))
+    keywords_list.append(_sanitize_fragment(col))
     if aliases: keywords_list.extend(aliases)
     if desc: keywords_list.append(desc) # Desc tetap masuk keyword agar bisa disearch
     if roles: keywords_list.extend(roles)
@@ -266,25 +322,41 @@ def transform_to_sparse_schema(raw_row: Dict[str, Any], table_desc: str = "") ->
     # 2. Sample Values Logic (STRICT LIMIT)
     all_samples = raw_row.get("all_sample_values", [])
     
-    if all_samples:
-        limit = 3  # Default limit (Numeric/Date)
-        
+    if SPARSE_INCLUDE_SAMPLES_IN_KEYWORDS and all_samples:
+        limit = SPARSE_NUMERIC_SAMPLE_LIMIT  # Default limit (Numeric/Date)
+
         if is_string:
-            limit = 10
+            limit = SPARSE_STRING_SAMPLE_LIMIT
+            distinct_raw = raw_row.get("distinct_count")
+            if isinstance(distinct_raw, int) and distinct_raw > SPARSE_STRING_SAMPLE_DISTINCT_MAX:
+                limit = min(limit, 3)
         elif is_numeric:
-            limit = 3
-            
+            limit = SPARSE_NUMERIC_SAMPLE_LIMIT
+
+        filtered_samples: List[str] = []
+        for sv in all_samples:
+            s = _sanitize_fragment(sv)
+            if not s:
+                continue
+            if len(s) > SPARSE_SAMPLE_VALUE_MAX_CHARS:
+                continue
+            if "\n" in s:
+                continue
+            filtered_samples.append(s)
+
         # Ambil Top-N samples
-        limited_samples = all_samples[:limit]
+        limited_samples = filtered_samples[:limit]
         keywords_list.extend(limited_samples)
 
     # Gabungkan & Bersihkan
+    keywords_list = [k for k in (_sanitize_fragment(k) for k in keywords_list) if k]
+    keywords_list = _dedupe_keep_order(keywords_list)
     keywords_string = " ".join(keywords_list)
     keywords_string = re.sub(r'\s+', ' ', keywords_string).strip()
 
     # --- METADATA (PAYLOAD UNTUK LLM/RETRIEVAL) ---
     stats = {}
-    stats["sample_value"] = raw_row.get("sample_value") 
+    stats["sample_value"] = _truncate_metadata_sample(raw_row.get("sample_value"), is_string)
     
     if is_numeric:
         stats["min"] = raw_row.get("min")
@@ -301,7 +373,7 @@ def transform_to_sparse_schema(raw_row: Dict[str, Any], table_desc: str = "") ->
         "column": col,
         "datatype": raw_row.get("datatype"),
         # >>> INI PERUBAHANNYA: Masukkan description eksplisit <<<
-        "description": desc, 
+        "description": desc,
         "stats": stats
     }
 
@@ -377,10 +449,21 @@ def _sanitize_filename(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_dir = OUTPUT_DIR
+    # If env points to a file path (e.g., /app/metadata_jsonl/classicmodels_dense.jsonl),
+    # write sparse output next to that file instead of failing on makedirs.
+    if output_dir.lower().endswith(".jsonl"):
+        output_dir = os.path.dirname(output_dir) or "."
+        print(f"[WARN] OUTPUT path looks like a file. Using parent directory for sparse export: {output_dir}")
+    elif os.path.exists(output_dir) and os.path.isfile(output_dir):
+        output_dir = os.path.dirname(output_dir) or "."
+        print(f"[WARN] OUTPUT path is a file. Using parent directory for sparse export: {output_dir}")
+
+    os.makedirs(output_dir, exist_ok=True)
     writers = {}
-    print(f"[INFO] Exporting SPARSE JSONL (Keywords) to: {os.path.abspath(OUTPUT_DIR)}")
-    print("[INFO] Config: Max 10 samples for String, Max 3 for Numeric.")
+    print(f"[INFO] Exporting SPARSE JSONL (Keywords) to: {os.path.abspath(output_dir)}")
+    print(f"[INFO] Config: include samples in keywords = {SPARSE_INCLUDE_SAMPLES_IN_KEYWORDS}")
+    print(f"[INFO] Config: sample limits (string={SPARSE_STRING_SAMPLE_LIMIT}, numeric={SPARSE_NUMERIC_SAMPLE_LIMIT}).")
     print("[INFO] Metadata includes explicit 'description'.")
     
     count = 0
@@ -395,7 +478,7 @@ def main():
                 fname = f"{_sanitize_filename(db_name)}_sparse.jsonl"
                 
                 if fname not in writers:
-                    writers[fname] = open(os.path.join(OUTPUT_DIR, fname), "w", encoding="utf-8")
+                    writers[fname] = open(os.path.join(output_dir, fname), "w", encoding="utf-8")
                 
                 writers[fname].write(json.dumps(row, ensure_ascii=False) + "\n")
                 count += 1
