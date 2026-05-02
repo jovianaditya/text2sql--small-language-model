@@ -317,6 +317,20 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     aliases = raw_row.get("tags_alias", [])
     roles = raw_row.get("tags_role", [])
     fk_target = _extract_fk_target(desc_clean)
+    desc_lower = desc_clean.lower()
+
+    # Avoid duplicate semantics in text when description already contains it.
+    filtered_roles: List[str] = []
+    for r in roles:
+        base = str(r or "").strip().lower().split(":")[0]
+        if base == "pk" and re.search(r"\bprimary\s+key\b", desc_lower):
+            continue
+        if base == "fk" and (
+            re.search(r"\bforeign\s+key\b", desc_lower)
+            or (fk_target and _has_fk_literal(desc_clean, fk_target))
+        ):
+            continue
+        filtered_roles.append(r)
     
     # 3. Sample Value Logic (For Text Embedding)
     # Only inject sample into text if it's categorical (distinct < 20)
@@ -348,7 +362,7 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
         f"Column: {col}.",
         f"Description: {desc_clean}." if desc_clean else "",
         f"FK to {fk_target}." if (fk_target and not _has_fk_literal(desc_clean, fk_target)) else "",
-        translate_role_to_sentence(roles),
+        translate_role_to_sentence(filtered_roles),
         f"Synonyms: {', '.join(aliases)}." if aliases else "",
         sample_sentence
     ]
