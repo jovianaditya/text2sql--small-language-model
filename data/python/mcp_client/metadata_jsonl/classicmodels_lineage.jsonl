@@ -1,0 +1,8 @@
+{"id": "customers.salesRepEmployeeNumber->employees.employeeNumber", "from_table": "customers", "from_column": "salesRepEmployeeNumber", "to_table": "employees", "to_column": "employeeNumber"}
+{"id": "employees.officeCode->offices.officeCode", "from_table": "employees", "from_column": "officeCode", "to_table": "offices", "to_column": "officeCode"}
+{"id": "employees.reportsTo->employees.employeeNumber", "from_table": "employees", "from_column": "reportsTo", "to_table": "employees", "to_column": "employeeNumber"}
+{"id": "orderdetails.orderNumber->orders.orderNumber", "from_table": "orderdetails", "from_column": "orderNumber", "to_table": "orders", "to_column": "orderNumber"}
+{"id": "orderdetails.productCode->products.productCode", "from_table": "orderdetails", "from_column": "productCode", "to_table": "products", "to_column": "productCode"}
+{"id": "orders.customerNumber->customers.customerNumber", "from_table": "orders", "from_column": "customerNumber", "to_table": "customers", "to_column": "customerNumber"}
+{"id": "payments.customerNumber->customers.customerNumber", "from_table": "payments", "from_column": "customerNumber", "to_table": "customers", "to_column": "customerNumber"}
+{"id": "products.productLine->productlines.productLine", "from_table": "products", "from_column": "productLine", "to_table": "productlines", "to_column": "productLine"}
