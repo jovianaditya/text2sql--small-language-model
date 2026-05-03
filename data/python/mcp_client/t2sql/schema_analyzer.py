@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple, Any, Optional
 from collections import defaultdict
 from .config import (
+    LINEAGE_METADATA_JSONL,
     SCHEMA_PATH_STRICT,
     SCHEMA_ANALYZER_INVALID_JSONL_PREVIEW,
     SCHEMA_ANALYZER_STRICT_JSONL,
@@ -33,7 +34,7 @@ class SchemaAnalyzer:
     Replaces hardcoded table names, synonyms, and patterns with schema-driven inference.
     """
 
-    def __init__(self, jsonl_path: str):
+    def __init__(self, jsonl_path: str, lineage_jsonl_path: Optional[str] = None):
         """
         Initialize with path to JSONL metadata file.
 
@@ -41,12 +42,18 @@ class SchemaAnalyzer:
             jsonl_path: Path to dense JSONL file (e.g., dataset_dense.jsonl)
         """
         self.jsonl_path = jsonl_path
+        self.lineage_jsonl_path = lineage_jsonl_path
         self._tables: Set[str] = set()
         self._table_columns: Dict[str, List[str]] = defaultdict(list)
         self._table_synonyms: Dict[str, List[str]] = defaultdict(list)
         self._column_synonyms: Dict[str, List[str]] = defaultdict(list)
         self._table_types: Dict[str, str] = {}  # table -> type
         self._fk_relationships: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {fk_col: target_table}}
+        self._fk_target_columns: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {fk_col: target_col}}
+        self._text_fk_relationships: Dict[str, Dict[str, str]] = defaultdict(dict)
+        self._text_fk_target_columns: Dict[str, Dict[str, str]] = defaultdict(dict)
+        self._lineage_fk_relationships: Dict[str, Dict[str, str]] = defaultdict(dict)
+        self._lineage_fk_target_columns: Dict[str, Dict[str, str]] = defaultdict(dict)
         self._column_roles: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: role}}
         self._column_datatypes: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: datatype}}
         self._column_descriptions: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: description}}
@@ -92,6 +99,7 @@ class SchemaAnalyzer:
                 raise ValueError(message)
             warnings.warn(message, RuntimeWarning)
 
+        self._merge_fk_relationships()
         # Post-processing: infer table types
         self._infer_table_types()
 
@@ -136,8 +144,14 @@ class SchemaAnalyzer:
         fk_source = f"{description} {text}"
         fk_match = re.search(r'FK to\s+(\w+)\.(\w+)', fk_source, re.IGNORECASE)
         if fk_match:
-            target_table = fk_match.group(1).lower()
-            self._fk_relationships[table.lower()][column.lower()] = target_table
+            self._record_fk_edge(
+                self._text_fk_relationships,
+                self._text_fk_target_columns,
+                source_table=table,
+                source_column=column,
+                target_table=fk_match.group(1),
+                target_column=fk_match.group(2),
+            )
 
         combined_key_text = f"{description} {text}".lower()
         col_key = f"{table.lower()}.{column.lower()}"
@@ -157,6 +171,177 @@ class SchemaAnalyzer:
         # Extract datatype
         datatype = metadata.get("datatype", "")
         self._column_datatypes[table.lower()][column.lower()] = datatype
+
+    def _record_fk_edge(
+        self,
+        table_map: Dict[str, Dict[str, str]],
+        target_col_map: Dict[str, Dict[str, str]],
+        *,
+        source_table: str,
+        source_column: str,
+        target_table: str,
+        target_column: str = "",
+    ) -> None:
+        src_table = str(source_table or "").strip().lower()
+        src_col = str(source_column or "").strip().lower()
+        tgt_table = str(target_table or "").strip().lower()
+        tgt_col = str(target_column or "").strip()
+        if not src_table or not src_col or not tgt_table:
+            return
+        table_map[src_table][src_col] = tgt_table
+        target_col_map[src_table][src_col] = tgt_col
+
+    def _known_schema_column(self, table: str, column: str) -> bool:
+        table_l = str(table or "").strip().lower()
+        col_l = str(column or "").strip().lower()
+        if not table_l or not col_l:
+            return False
+        return col_l in set(self._table_columns.get(table_l, []))
+
+    def _known_schema_table(self, table: str) -> bool:
+        return str(table or "").strip().lower() in self._tables
+
+    def _parse_optional_jsonl(
+        self,
+        path: Optional[str],
+        *,
+        label: str,
+    ) -> List[Dict[str, Any]]:
+        resolved_path = self._resolve_optional_jsonl_path(path)
+        if resolved_path is None:
+            return []
+
+        invalid_lines: List[Tuple[int, str]] = []
+        rows: List[Dict[str, Any]] = []
+        with open(resolved_path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    invalid_lines.append((line_no, str(e)))
+
+        if invalid_lines:
+            preview_count = max(0, int(SCHEMA_ANALYZER_INVALID_JSONL_PREVIEW))
+            preview_items = invalid_lines[:preview_count]
+            preview_text = "; ".join(
+                f"line {line_no}: {err}"
+                for line_no, err in preview_items
+            )
+            more_count = max(0, len(invalid_lines) - len(preview_items))
+            if more_count:
+                preview_text = f"{preview_text}; ... and {more_count} more" if preview_text else f"... and {more_count} more"
+
+            message = (
+                f"Invalid JSONL entries found in {label} metadata '{resolved_path}': "
+                f"{len(invalid_lines)} invalid line(s)"
+            )
+            if preview_text:
+                message = f"{message}. {preview_text}"
+
+            if SCHEMA_ANALYZER_STRICT_JSONL:
+                raise ValueError(message)
+            warnings.warn(message, RuntimeWarning)
+
+        return rows
+
+    def _resolve_optional_jsonl_path(self, path: Optional[str]) -> Optional[Path]:
+        raw = str(path or "").strip()
+        if not raw:
+            return None
+
+        path_obj = Path(raw)
+        if (
+            "*" not in raw
+            and "?" not in raw
+            and "[" not in raw
+            and path_obj.exists()
+            and path_obj.is_file()
+        ):
+            return path_obj.resolve()
+
+        candidates: List[Path] = []
+        if path_obj.is_dir():
+            candidates = sorted(path_obj.glob("*_lineage.jsonl"))
+            if not candidates:
+                candidates = sorted(path_obj.glob("*.jsonl"))
+        elif "*" in raw or "?" in raw or "[" in raw:
+            candidates = sorted(path_obj.parent.glob(path_obj.name))
+        elif raw.lower().endswith(".jsonl") and path_obj.exists() and path_obj.is_file():
+            candidates = [path_obj]
+
+        if not candidates:
+            return None
+        return candidates[0].resolve()
+
+    def _load_lineage_fk_relationships(self) -> None:
+        rows = self._parse_optional_jsonl(self.lineage_jsonl_path, label="lineage")
+        for row in rows:
+            source_table = row.get("from_table")
+            source_column = row.get("from_column")
+            target_table = row.get("to_table")
+            target_column = row.get("to_column")
+
+            src_table_l = str(source_table or "").strip().lower()
+            src_col_l = str(source_column or "").strip().lower()
+            tgt_table_l = str(target_table or "").strip().lower()
+            if not src_table_l or not src_col_l or not tgt_table_l:
+                continue
+
+            if not self._known_schema_column(src_table_l, src_col_l):
+                continue
+            if not self._known_schema_table(tgt_table_l):
+                continue
+
+            self._record_fk_edge(
+                self._lineage_fk_relationships,
+                self._lineage_fk_target_columns,
+                source_table=src_table_l,
+                source_column=src_col_l,
+                target_table=tgt_table_l,
+                target_column=str(target_column or "").strip(),
+            )
+            self._column_foreign_key_hints[f"{src_table_l}.{src_col_l}"] = True
+
+    def _merge_fk_relationships(self) -> None:
+        self._load_lineage_fk_relationships()
+
+        conflicts: List[str] = []
+
+        for src_table, fk_map in self._lineage_fk_relationships.items():
+            for src_col, tgt_table in (fk_map or {}).items():
+                self._fk_relationships[src_table][src_col] = tgt_table
+                tgt_col = self._lineage_fk_target_columns.get(src_table, {}).get(src_col, "")
+                if tgt_col:
+                    self._fk_target_columns[src_table][src_col] = tgt_col
+
+        for src_table, fk_map in self._text_fk_relationships.items():
+            for src_col, tgt_table in (fk_map or {}).items():
+                existing_target = self._fk_relationships.get(src_table, {}).get(src_col)
+                if existing_target:
+                    if existing_target != tgt_table:
+                        conflicts.append(
+                            f"{src_table}.{src_col}: lineage -> {existing_target}, text -> {tgt_table}"
+                        )
+                    continue
+                self._fk_relationships[src_table][src_col] = tgt_table
+                tgt_col = self._text_fk_target_columns.get(src_table, {}).get(src_col, "")
+                if tgt_col:
+                    self._fk_target_columns[src_table][src_col] = tgt_col
+
+        if conflicts:
+            preview_count = max(0, int(SCHEMA_ANALYZER_INVALID_JSONL_PREVIEW))
+            preview_items = conflicts[:preview_count]
+            preview_text = "; ".join(preview_items)
+            more_count = max(0, len(conflicts) - len(preview_items))
+            if more_count:
+                preview_text = f"{preview_text}; ... and {more_count} more" if preview_text else f"... and {more_count} more"
+            warnings.warn(
+                "Schema metadata FK conflict detected; using lineage edge and retaining text FK as fallback only. "
+                + preview_text,
+                RuntimeWarning,
+            )
 
     def _next_field_after(self, text: str, field: str) -> Optional[str]:
         """Extract the value of a field after a given marker."""
@@ -427,6 +612,36 @@ class SchemaAnalyzer:
 # ============================ GLOBAL INSTANCE ============================
 _analyzer_instances: Dict[str, SchemaAnalyzer] = {}
 
+
+def _resolve_lineage_metadata_path(spec: Optional[str]) -> Optional[str]:
+    raw = str(spec or "").strip()
+    if not raw:
+        return None
+
+    path_obj = Path(raw)
+    if (
+        "*" not in raw
+        and "?" not in raw
+        and "[" not in raw
+        and path_obj.exists()
+        and path_obj.is_file()
+    ):
+        return str(path_obj.resolve())
+
+    candidates: List[Path] = []
+    if path_obj.is_dir():
+        candidates = sorted(path_obj.glob("*_lineage.jsonl"))
+        if not candidates:
+            candidates = sorted(path_obj.glob("*.jsonl"))
+    elif "*" in raw or "?" in raw or "[" in raw:
+        candidates = sorted(path_obj.parent.glob(path_obj.name))
+    elif raw.lower().endswith(".jsonl") and path_obj.exists() and path_obj.is_file():
+        candidates = [path_obj]
+
+    if not candidates:
+        return None
+    return str(candidates[0].resolve())
+
 def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
     """
     Get or create singleton SchemaAnalyzer instance.
@@ -462,8 +677,14 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
     ):
         final_path = jsonl_path_obj
         cache_key = str(final_path.resolve())
+        lineage_path = _resolve_lineage_metadata_path(LINEAGE_METADATA_JSONL)
+        if lineage_path:
+            cache_key = f"{cache_key}::lineage={lineage_path}"
         if cache_key not in _analyzer_instances:
-            _analyzer_instances[cache_key] = SchemaAnalyzer(cache_key)
+            _analyzer_instances[cache_key] = SchemaAnalyzer(
+                str(final_path.resolve()),
+                lineage_jsonl_path=lineage_path,
+            )
         return _analyzer_instances[cache_key]
 
     # Handle case where path is a directory (not a file)
@@ -522,8 +743,14 @@ def get_schema_analyzer(jsonl_path: str = None) -> SchemaAnalyzer:
         )
 
     cache_key = str(final_path.resolve())
+    lineage_path = _resolve_lineage_metadata_path(LINEAGE_METADATA_JSONL)
+    if lineage_path:
+        cache_key = f"{cache_key}::lineage={lineage_path}"
     if cache_key not in _analyzer_instances:
-        _analyzer_instances[cache_key] = SchemaAnalyzer(cache_key)
+        _analyzer_instances[cache_key] = SchemaAnalyzer(
+            str(final_path.resolve()),
+            lineage_jsonl_path=lineage_path,
+        )
 
     return _analyzer_instances[cache_key]
 

@@ -239,6 +239,11 @@ def _infer_default_export_jsonl_output(collection_name: str) -> str:
 def _infer_default_sparse_jsonl_input(collection_name: str) -> str:
     name = str(collection_name or "").strip() or "default_collection"
     return str(_DEFAULT_METADATA_DIR / f"{name}_sparse.jsonl")
+
+
+def _infer_default_lineage_jsonl_input(collection_name: str) -> str:
+    name = str(collection_name or "").strip() or "default_collection"
+    return str(_DEFAULT_METADATA_DIR / f"{name}_lineage.jsonl")
 # ======================================================================
 # ============================ APP/GENERAL =============================
 # ======================================================================
@@ -351,6 +356,11 @@ SCHEMA_METADATA_JSONL = _env_get_with_alias(
     "SCHEMA_METADATA_JSONL",
     DENSE_METADATA_JSONL,
     ["T2SQL_SCHEMA_METADATA_JSONL"],
+).strip()
+LINEAGE_METADATA_JSONL = _env_get_with_alias(
+    "LINEAGE_METADATA_JSONL",
+    _infer_default_lineage_jsonl_input(COLLECTION_NAME),
+    ["T2SQL_LINEAGE_METADATA_JSONL"],
 ).strip()
 # Strict schema-path resolution:
 # - 0 (default): preserve legacy auto-discovery fallback behavior
