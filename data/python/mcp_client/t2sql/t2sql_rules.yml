@@ -301,6 +301,20 @@ heuristic_repairs:
       - asc
     direction_noise_terms:
       - first
+    metric_desc_cues:
+      - more
+      - greater
+      - higher
+      - larger
+      - most
+      - greater number
+      - higher number
+      - larger number
+    first_position_terms:
+      - first
+      - appear first
+      - come first
+      - show first
     token_stopwords:
       - by
       - sort
@@ -334,6 +348,13 @@ heuristic_repairs:
       - number
       - of
     fallback_alias: row_count
+  grouped_self_fk_existence:
+    independence_cues:
+      - not necessarily
+      - not required to be
+      - regardless of whether
+      - independent of
+      - may or may not be
   threshold_count_object:
     local_stop_terms:
       - and
@@ -601,6 +622,10 @@ temporal_intent:
     - most recent year
     - tahun terbaru
     - tahun terakhir
+  year_column_terms:
+    - year
+    - yr
+    - tahun
 
 ranking_intent:
   ranking_keywords:

@@ -406,6 +406,39 @@ def ordering_temporal_intent_terms() -> list[str]:
 
 
 @lru_cache(maxsize=1)
+def temporal_year_column_terms() -> list[str]:
+    defaults = ["year", "yr", "tahun"]
+    return rule_list(("temporal_intent", "year_column_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def final_order_metric_desc_cues() -> list[str]:
+    defaults = [
+        "more", "greater", "higher", "larger", "most",
+        "greater number", "higher number", "larger number",
+    ]
+    return rule_list(("heuristic_repairs", "final_order", "metric_desc_cues"), defaults)
+
+
+@lru_cache(maxsize=1)
+def final_order_first_position_terms() -> list[str]:
+    defaults = ["first", "appear first", "come first", "show first"]
+    return rule_list(("heuristic_repairs", "final_order", "first_position_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def grouped_self_fk_independence_cues() -> list[str]:
+    defaults = [
+        "not necessarily",
+        "not required to be",
+        "regardless of whether",
+        "independent of",
+        "may or may not be",
+    ]
+    return rule_list(("heuristic_repairs", "grouped_self_fk_existence", "independence_cues"), defaults)
+
+
+@lru_cache(maxsize=1)
 def ordering_superlative_keywords() -> list[str]:
     defaults = [
         "top", "bottom", "most", "least", "most expensive", "least expensive",

@@ -1026,6 +1026,103 @@ def _rewrite_grouped_aggregate_to_window_partition(sql: str, partition_col: str,
     if re.search(r"\b(?:HAVING|UNION|INTERSECT|EXCEPT)\b", s, flags=re.I):
         return sql
 
+    def _split_expr_alias(item: str) -> Tuple[str, str]:
+        m_alias = re.match(
+            r"""(?is)^\s*(?P<expr>.*?)\s+AS\s+(?P<alias>`?[A-Za-z_][A-Za-z0-9_]*`?|'[^']+'|"[^"]+")\s*$""",
+            str(item or "").strip(),
+        )
+        if not m_alias:
+            return str(item or "").strip(), ""
+        return (m_alias.group("expr") or "").strip(), (m_alias.group("alias") or "").strip()
+
+    def _norm_col_ref(expr: str) -> str:
+        text = str(expr or "").strip().strip("`")
+        if "." in text:
+            text = text.split(".")[-1].strip("`")
+        return re.sub(r"\s+", "", text).lower()
+
+    def _find_partition_expr(group_clause: str) -> str:
+        for group_item in _split_top_level_csv(group_clause or ""):
+            group_expr = str(group_item or "").strip()
+            if _norm_col_ref(group_expr) == str(partition_col or "").strip().lower():
+                return group_expr
+        return str(partition_col or "").strip()
+
+    # Join-aware grouped aggregate fallback:
+    # convert a grouped per-row metric plus same-arg MAX/MIN companion into a
+    # windowed per-group extrema on the grouped metric itself.
+    flat_match = re.match(
+        r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<from>.+?)"
+        r"(?:\s+WHERE\s+(?P<where>.*?))?"
+        r"\s+GROUP\s+BY\s+(?P<group>.*?)(?:\s+ORDER\s+BY\s+(?P<order>.*?))?\s*$",
+        s,
+    )
+    if flat_match:
+        select_clause = (flat_match.group("select") or "").strip()
+        from_clause = (flat_match.group("from") or "").strip()
+        where_clause = (flat_match.group("where") or "").strip()
+        group_clause = (flat_match.group("group") or "").strip()
+        order_clause = (flat_match.group("order") or "").strip()
+        partition_expr = _find_partition_expr(group_clause)
+        if select_clause and from_clause and group_clause and partition_expr:
+            aggregate_items: List[Dict[str, str]] = []
+            select_items = _split_top_level_csv(select_clause)
+            for idx, raw_item in enumerate(select_items):
+                expr_sql, alias_sql = _split_expr_alias(raw_item)
+                m_agg = re.match(
+                    r"""(?is)^\s*(?P<expr>(?P<func>AVG|COUNT|SUM|MIN|MAX)\s*\(\s*(?P<arg>.+?)\s*\))\s*$""",
+                    expr_sql,
+                )
+                if not m_agg:
+                    continue
+                aggregate_items.append(
+                    {
+                        "index": str(idx),
+                        "func": (m_agg.group("func") or "").upper(),
+                        "arg": (m_agg.group("arg") or "").strip(),
+                        "expr": (m_agg.group("expr") or "").strip(),
+                        "alias": alias_sql,
+                    }
+                )
+
+            candidate_pair: Tuple[Dict[str, str], Dict[str, str]] | None = None
+            for target in aggregate_items:
+                if target.get("func") not in {"MAX", "MIN"}:
+                    continue
+                target_arg = _norm_col_ref(target.get("arg") or "")
+                if not target_arg:
+                    continue
+                matches = [
+                    src for src in aggregate_items
+                    if src is not target
+                    and src.get("func") in {"SUM", "COUNT", "AVG"}
+                    and _norm_col_ref(src.get("arg") or "") == target_arg
+                ]
+                if len(matches) == 1:
+                    candidate_pair = (target, matches[0])
+                    break
+
+            if candidate_pair is not None:
+                target_item, source_item = candidate_pair
+                target_idx = int(target_item["index"])
+                window_expr = (
+                    f"{target_item['func']}({source_item['expr']}) "
+                    f"OVER (PARTITION BY {partition_expr})"
+                )
+                if target_item.get("alias"):
+                    window_expr += f" AS {target_item['alias']}"
+                rebuilt_items = list(select_items)
+                rebuilt_items[target_idx] = window_expr
+                out = f"SELECT {', '.join(rebuilt_items)} FROM {from_clause}"
+                if where_clause:
+                    out += f" WHERE {where_clause}"
+                out += f" GROUP BY {group_clause}"
+                if order_clause:
+                    out += f" ORDER BY {order_clause}"
+                simple_out = out + ";"
+                if simple_out != sql:
+                    return simple_out
+
     match = re.match(
         r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)"
         r"(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?"
@@ -2274,12 +2371,18 @@ def _build_requested_final_order_mapping(
         for candidate in candidates:
             candidate_tokens = set(candidate.get("tokens") or set())
             overlap = len(phrase_tokens.intersection(candidate_tokens))
+            extra_tokens = candidate_tokens - phrase_tokens
             if phrase_tokens.issubset(candidate_tokens):
                 exact_bonus = 30 if candidate_tokens == phrase_tokens else 0
-                scored.append((100 + exact_bonus + overlap, candidate))
+                # Prefer the closest projection match when multiple projected
+                # columns share the requested tokens, e.g. "total quantity"
+                # should map to total_quantity before highest_total_quantity.
+                closeness_penalty = 4 * len(extra_tokens)
+                scored.append((100 + exact_bonus + overlap - closeness_penalty, candidate))
             elif overlap and overlap == len(phrase_tokens):
                 exact_bonus = 30 if candidate_tokens == phrase_tokens else 0
-                scored.append((50 + exact_bonus + overlap, candidate))
+                closeness_penalty = 4 * len(extra_tokens)
+                scored.append((50 + exact_bonus + overlap - closeness_penalty, candidate))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         if not scored:
@@ -2739,45 +2842,6 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         if not _has_include_zero_shape(out_sql):
             violations.append("missing_include_zero")
 
-    if contract["requires_final_order"]:
-        fixed = _add_missing_final_order(out_sql, question)
-        if fixed != out_sql:
-            out_sql = fixed
-            corrections.append("Semantic contract: added missing final ORDER BY")
-        fixed = _enforce_requested_order_direction(out_sql, question)
-        if fixed != out_sql:
-            out_sql = fixed
-            corrections.append("Semantic contract: enforced final ORDER BY direction")
-        fixed = _complete_requested_final_order(out_sql, question)
-        if fixed != out_sql:
-            out_sql = fixed
-            corrections.append("Semantic contract: completed requested final ORDER BY keys")
-        fixed = _repair_chronological_month_order(out_sql, question)
-        if fixed != out_sql:
-            out_sql = fixed
-            corrections.append("Semantic contract: normalized chronological month ordering")
-        if not _has_top_level_order_by(out_sql):
-            violations.append("missing_final_order")
-        elif _build_requested_final_order_mapping(out_sql, question):
-            try:
-                import sqlglot
-                from sqlglot import exp
-
-                parsed_order = sqlglot.parse_one(out_sql, read=SQL_PARSE_DIALECT)
-                sel_order = parsed_order.find(exp.Select)
-                if sel_order is not None:
-                    order_failures = _evaluate_requested_final_order_sequence(
-                        sql=out_sql,
-                        question=question,
-                        parsed=parsed_order,
-                        sel=sel_order,
-                        exp_mod=exp,
-                    )
-                    if order_failures:
-                        violations.append("incomplete_final_order")
-            except Exception:
-                pass
-
     if bool(contract.get("requires_offset_window")):
         fixed = _strip_unrequested_offset_window_default(out_sql, question)
         if fixed != out_sql:
@@ -2823,6 +2887,48 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
             )
         if not _has_required_window_partition(out_sql, required_window_partition_col):
             violations.append("missing_required_window_partition")
+
+    # Apply top-level final ordering late, after structural rewrites such as
+    # window-partition normalization, so later repairs do not invalidate a
+    # freshly repaired ORDER BY and trigger unnecessary regeneration.
+    if contract["requires_final_order"]:
+        fixed = _add_missing_final_order(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: added missing final ORDER BY")
+        fixed = _enforce_requested_order_direction(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: enforced final ORDER BY direction")
+        fixed = _complete_requested_final_order(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: completed requested final ORDER BY keys")
+        fixed = _repair_chronological_month_order(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: normalized chronological month ordering")
+        if not _has_top_level_order_by(out_sql):
+            violations.append("missing_final_order")
+        elif _build_requested_final_order_mapping(out_sql, question):
+            try:
+                import sqlglot
+                from sqlglot import exp
+
+                parsed_order = sqlglot.parse_one(out_sql, read=SQL_PARSE_DIALECT)
+                sel_order = parsed_order.find(exp.Select)
+                if sel_order is not None:
+                    order_failures = _evaluate_requested_final_order_sequence(
+                        sql=out_sql,
+                        question=question,
+                        parsed=parsed_order,
+                        sel=sel_order,
+                        exp_mod=exp,
+                    )
+                    if order_failures:
+                        violations.append("incomplete_final_order")
+            except Exception:
+                pass
 
     requires_boundary_regex = bool(contract.get("requires_boundary_regex"))
     requires_regex = bool(contract.get("requires_regex"))

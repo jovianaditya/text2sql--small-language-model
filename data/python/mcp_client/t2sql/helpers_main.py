@@ -103,6 +103,7 @@ from .helpers_core import (
     _wrap_same_level_window_rank_filter,
     _rewrite_existence_sum_to_distinct_entity_count,
     _prefer_conditional_count_final_order,
+    _prefer_requested_count_desc_final_order,
     _normalize_alias_lengths,
     # phase 4
     _winner_row_sanity_date_in_groupby, _strip_having_max_self_subquery, _fix_mixed_max_groupby_rownumber, _fix_redundant_groupby_with_rn_filter, _fix_inconsistent_subquery_alias, _fix_inner_rn_filter_scope, _looks_like_max_date_tiebreaker,
@@ -133,6 +134,7 @@ from .helpers_core import (
     _drop_tuple_in_filter_from_include_zero_ranked_winner,
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
+    _rewrite_grouped_self_fk_exists_to_group_having,
     _rewrite_role_label_count_semantics,
     _fix_misplaced_entity_count_threshold,
     _drop_unrequested_exists_filters,
@@ -2163,6 +2165,12 @@ def _repair_backticked_identifier_phrases(sql: str, ctx: str) -> str:
     if not allowed_cols_case:
         return sql
 
+    protected_quoted_aliases = {
+        str(alias or "").strip().lower()
+        for alias in re.findall(r"\bAS\s+`([^`]+)`", sql, flags=re.I)
+        if str(alias or "").strip()
+    }
+
     stop_tokens = {
         "the", "a", "an", "of", "for", "to", "with", "any", "all", "each",
         "every", "single", "exactly", "display", "show",
@@ -2334,6 +2342,8 @@ def _repair_backticked_identifier_phrases(sql: str, ctx: str) -> str:
         # Preserve explicit output aliases.
         prefix = sql[max(0, m.start() - 16):m.start()]
         if re.search(r"\bAS\s+$", prefix, flags=re.I):
+            return m.group(0)
+        if raw.lower() in protected_quoted_aliases:
             return m.group(0)
 
         low = raw.lower()
@@ -5069,6 +5079,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_row_level_nonnull_to_group_existence(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after nonnull row-filter->group existence fix: {s}")
 
+        s = _rewrite_grouped_self_fk_exists_to_group_having(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after grouped self-FK existence fix: {s}")
+
         s = _rewrite_role_label_count_semantics(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after role-label count fix: {s}")
 
@@ -5095,6 +5108,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _prefer_conditional_count_final_order(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after conditional-count order fix: {s}")
+
+        s = _prefer_requested_count_desc_final_order(s, question)
+        if DEBUG_WR: print(f"[REFINER - PH4] after requested count-desc order fix: {s}")
 
         s = _append_requested_secondary_order_key(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after secondary final-order fix: {s}")
@@ -5203,6 +5219,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
             s = _rewrite_existence_sum_to_distinct_entity_count(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after existence distinct-count fix: {s}")
+            s = _prefer_requested_count_desc_final_order(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after requested count-desc order fix: {s}")
             s = _append_requested_secondary_order_key(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after secondary final-order fix: {s}")
 
@@ -5368,6 +5386,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _preserve_requested_base_columns_in_running_self_join(s, question)
     s = _enforce_requested_order_direction(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
+    s = _prefer_requested_count_desc_final_order(s, question)
     s = _drop_unrequested_grouped_limit(s, question)
     s = _maybe_add_limit(question, s)
     s = _drop_raw_column_covered_by_function(s, question)
