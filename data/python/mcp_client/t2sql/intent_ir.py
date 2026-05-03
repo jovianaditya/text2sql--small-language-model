@@ -29,6 +29,11 @@ from .config import (
     INTENT_IR_BASE_NUMERIC_HINTS,
     INTENT_IR_DOMAIN_NUMERIC_FALLBACK_HINTS,
 )
+from .rulebook import (
+    aggregation_count_distinct_keywords,
+    aggregation_count_distinct_phrases,
+    any_phrase_in_text,
+)
 _DATE_HINTS = ("date", "time", "timestamp", "year", "month", "day")
 _NUMBER_TOKEN_PATTERN = r"-?\d[\d,]*(?:\.\d+)?"
 _NUMBER_WORDS = {
@@ -849,7 +854,9 @@ def _wants_count_distinct(question: str) -> bool:
         return False
     if not re.search(r"\b(how\s+many|number\s+of|count|total\s+number)\b", q):
         return False
-    return bool(re.search(r"\b(distinct|unique|different)\b", q))
+    if any_phrase_in_text(q, aggregation_count_distinct_phrases()):
+        return True
+    return any_phrase_in_text(q, aggregation_count_distinct_keywords())
 
 
 def _detect_metrics(
@@ -1357,8 +1364,12 @@ def _detect_metrics(
 
     # MAX / MIN in aggregate context only.
     if (qtype or "").lower().startswith("aggregate"):
+        prefer_temporal_extrema = bool(
+            re.search(r"\b(?:latest|newest|most\s+recent|earliest|oldest)\b", q, flags=re.I)
+            or has_temporal_metric_phrase
+        )
         if wants_max:
-            if mentioned_date_cols:
+            if prefer_temporal_extrema and mentioned_date_cols:
                 t, c, _ = mentioned_date_cols[0]
             else:
                 t, c = _metric_target_for_numeric()
@@ -1366,7 +1377,7 @@ def _detect_metrics(
             add_metric(IRMetric(agg="max", table=t, column=c, alias=alias))
 
         if wants_min:
-            if mentioned_date_cols:
+            if prefer_temporal_extrema and mentioned_date_cols:
                 t, c, _ = mentioned_date_cols[0]
             else:
                 t, c = _metric_target_for_numeric()
@@ -1902,10 +1913,31 @@ def _detect_filters(
 
     m_gte = re.search(rf"\b(?:at\s+least|minimum\s+of)\s+({_NUMBER_TOKEN_PATTERN})\b", q)
     if m_gte and numeric_col:
-        v = _to_float_token(m_gte.group(1))
-        t, c = numeric_col
-        if v is not None:
-            add_filter(IRFilter(table=t, column=c, op="gte", value=v))
+        threshold_tail = q[m_gte.end():m_gte.end() + 96]
+        row_count_threshold = bool(
+            re.search(
+                r"^\s+(?:\w+\s+){0,4}?(?:rows?|records?|lines?|entries|items?|groups?)\b",
+                threshold_tail,
+                flags=re.I,
+            )
+            or any(
+                re.search(
+                    rf"^\s+(?:\w+\s+){{0,4}}?{re.escape(str(term or '').strip().lower())}\b",
+                    threshold_tail,
+                    flags=re.I,
+                )
+                for term in (
+                    list(allowed.keys())
+                    + [_safe_get_singular_form(t) for t in allowed.keys()]
+                )
+                if str(term or "").strip()
+            )
+        )
+        if not row_count_threshold:
+            v = _to_float_token(m_gte.group(1))
+            t, c = numeric_col
+            if v is not None:
+                add_filter(IRFilter(table=t, column=c, op="gte", value=v))
 
     m_lte = re.search(rf"\b(?:at\s+most|maximum\s+of)\s+({_NUMBER_TOKEN_PATTERN})\b", q)
     if m_lte and numeric_col:

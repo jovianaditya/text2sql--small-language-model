@@ -232,6 +232,120 @@ retrieval_intent:
     - "per "
     - setiap
 
+heuristic_repairs:
+  count_metric_alias:
+    generic_total_terms:
+      - total
+      - sum
+      - combined
+      - aggregate
+      - aggregated
+    count_like_alias_terms:
+      - count
+      - number
+      - rows
+      - row
+  friendly_single_table:
+    reserved_alias_terms:
+      - where
+      - group
+      - order
+      - having
+      - limit
+  explicit_single_table_scope:
+    scope_prepositions:
+      - in
+      - from
+      - using
+      - within
+    table_noun_terms:
+      - table
+    reserved_alias_terms:
+      - on
+      - where
+      - join
+      - left
+      - right
+      - inner
+      - outer
+      - group
+      - order
+      - having
+      - limit
+  final_order:
+    verbs:
+      - sort
+      - sorted
+      - order
+      - ordered
+      - arrange
+      - arranged
+    final_output_terms:
+      - final result
+      - final results
+      - final output
+      - final rows
+      - result
+      - results
+      - output
+      - rows
+    direction_desc_terms:
+      - descending
+      - desc
+      - highest
+      - largest
+      - latest
+      - newest
+    direction_asc_terms:
+      - ascending
+      - asc
+    direction_noise_terms:
+      - first
+    token_stopwords:
+      - by
+      - sort
+      - order
+      - the
+    sequence_terms:
+      - then
+  grouped_count_output:
+    stop_clause_terms:
+      - keep only
+      - where
+      - having
+      - filter
+      - only include
+      - sort
+      - sorted
+      - order
+      - ordered
+    alias_stop_terms:
+      - show
+      - return
+      - include
+      - list
+      - the
+      - and
+      - or
+      - each
+      - for
+      - by
+      - total
+      - number
+      - of
+    fallback_alias: row_count
+  threshold_count_object:
+    local_stop_terms:
+      - and
+      - or
+      - but
+      - where
+      - with
+      - having
+      - filter
+      - sort
+      - order
+
 ordering_intent:
   explicit_sort_keywords:
     - order by
@@ -251,9 +365,60 @@ ordering_intent:
       - desc
       - descending
       - menurun
+  direction_terms:
+    asc:
+      - ascending
+      - asc
+      - a-z
+      - alphabetical
+      - chronological
+      - chronologically
+      - earliest
+      - oldest
+      - smallest
+      - lowest
+    desc:
+      - descending
+      - desc
+      - highest
+      - largest
+      - latest
+      - newest
+      - most
+      - reverse alphabetical
+      - reversed alphabetical
+      - reverse
+  temporal_terms:
+    asc:
+      - earliest
+      - oldest
+      - ascending
+      - asc
+      - chronological
+      - chronologically
+    desc:
+      - latest
+      - newest
+      - most recent
+      - descending
+      - desc
+  temporal_intent_terms:
+    - most recent
+    - least recent
+    - latest
+    - earliest
+    - newest
+    - oldest
+    - chronological
+    - chronologically
   superlative_keywords:
     - top
     - bottom
+    - most
+    - least
+    - most expensive
+    - least expensive
+    - cheapest
     - highest
     - lowest
     - largest
@@ -300,6 +465,96 @@ grouping_intent:
     - max
     - jumlah
     - rata-rata
+
+agent_semantics:
+  phrase_token_stopwords:
+    - a
+    - an
+    - the
+    - that
+    - this
+    - those
+    - these
+    - same
+    - within
+    - in
+    - of
+    - for
+    - to
+    - by
+    - on
+    - from
+    - including
+    - include
+    - includes
+    - excluded
+    - excluding
+    - except
+    - counting
+    - count
+    - itself
+    - themselves
+  order_term_stopwords:
+    - the
+    - a
+    - an
+    - by
+    - from
+    - to
+    - then
+    - and
+    - with
+    - first
+    - final
+    - result
+    - results
+    - output
+    - rows
+    - row
+    - sort
+    - sorted
+    - ordered
+    - arrange
+    - arranged
+    - ascending
+    - descending
+    - asc
+    - desc
+    - highest
+    - lowest
+    - largest
+    - smallest
+    - latest
+    - earliest
+    - newest
+    - oldest
+
+prompt_intent:
+  sort_direction:
+    desc_terms:
+      - latest
+      - newest
+      - most recent
+      - descending
+      - highest
+      - greatest
+      - largest
+      - biggest
+      - reverse alphabetical
+      - reversed alphabetical
+      - reverse
+    asc_terms:
+      - ascending
+      - alphabetical
+      - alphabetically
+      - smallest
+      - lowest
+      - oldest first
+      - earliest first
+    sort_request_terms:
+      - sort
+      - sorted
+      - order by
 
 set_operation_intent:
   set_op_keywords:
@@ -390,6 +645,8 @@ aggregation_intent:
     - unik
     - berbeda
   count_distinct_phrases:
+    - count distinct
+    - distinct count
     - how many distinct
     - number of unique
     - jumlah unik

@@ -301,6 +301,7 @@ def transform_to_sparse_schema(raw_row: Dict[str, Any], table_desc: str = "") ->
     """
     dt = str(raw_row.get("datatype", "")).lower()
     is_numeric = any(k in dt for k in ('int', 'double', 'float', 'decimal', 'numeric', 'real', 'number', 'money', 'bit'))
+    is_temporal = any(k in dt for k in ('date', 'time', 'datetime', 'timestamp', 'year'))
     is_string = any(k in dt for k in ('char', 'text', 'string', 'clob'))
 
     tbl = raw_row.get("table") or ""
@@ -358,11 +359,9 @@ def transform_to_sparse_schema(raw_row: Dict[str, Any], table_desc: str = "") ->
     stats = {}
     stats["sample_value"] = _truncate_metadata_sample(raw_row.get("sample_value"), is_string)
     
-    if is_numeric:
+    if is_numeric or is_temporal:
         stats["min"] = raw_row.get("min")
         stats["max"] = raw_row.get("max")
-        stats["mean"] = raw_row.get("mean")
-        stats["stddev"] = raw_row.get("stddev")
     
     if is_string:
         stats["distinct_count"] = raw_row.get("distinct_count")

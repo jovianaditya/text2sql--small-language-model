@@ -248,28 +248,102 @@ def split_alias_and_role(raw_tags: List[str]) -> Tuple[List[str], List[str]]:
 # 4. TRANSFORMATION LOGIC (GOLD STANDARD FOR DENSE RETRIEVAL)
 # ==============================================================================
 
-def translate_role_to_sentence(roles: List[str]) -> str:
-    if not roles: return ""
-    role_map = {
-        "pk": "Primary Key, identifies unique records.",
-        "fk": "Foreign Key, links to another table.",
-        "id": "Unique Identifier.",
-        "measure": "Metric, used for numerical calculations.",
-        "dimension": "Dimension, used for grouping or filtering.",
-        "date": "Temporal data.",
-        "geo": "Geographical location.",
-        "contact": "Contact info (Phone/Email).",
-        "binary": "Binary data (Image/File)."
-    }
-    sentences = []
+ROLE_CANONICAL = {
+    "pk": "pk",
+    "primary_key": "pk",
+    "primary key": "pk",
+    "fk": "fk",
+    "foreign_key": "fk",
+    "foreign key": "fk",
+    "id": "id",
+    "identifier": "id",
+    "measure": "measure",
+    "metric": "measure",
+    "amount": "measure",
+    "quantity": "measure",
+    "dimension": "dimension",
+    "date": "date",
+    "time": "date",
+    "datetime": "date",
+    "temporal": "date",
+    "geo": "geo",
+    "location": "geo",
+    "contact": "contact",
+    "address": "address",
+    "text": "text",
+    "binary": "binary",
+}
+
+ROLE_PRIORITY = [
+    "pk",
+    "fk",
+    "id",
+    "measure",
+    "date",
+    "geo",
+    "contact",
+    "address",
+    "text",
+    "dimension",
+    "binary",
+]
+
+
+def _normalize_role_label(role: str) -> str:
+    raw = str(role or "").strip().lower()
+    if not raw:
+        return ""
+    base = raw.split(":", 1)[0].replace(".", "_").replace("-", "_").strip()
+    return ROLE_CANONICAL.get(base, ROLE_CANONICAL.get(raw, raw))
+
+
+def _infer_fallback_role(raw_row: Dict[str, Any], fk_target: Optional[str]) -> str:
+    col = str(raw_row.get("column") or "").strip().lower()
+    desc = str(raw_row.get("description") or "").strip().lower()
+    dt = str(raw_row.get("datatype") or "").strip().lower()
+    joined = f"{col} {desc}"
+
+    if re.search(r"\bprimary\s+key\b", desc):
+        return "pk"
+    if fk_target or re.search(r"\bforeign\s+key\b|\breferences\b", desc):
+        return "fk"
+    if re.search(r"(date|time|year|month|day)", dt) or re.search(r"\b(date|time|year|month|day)\b", col):
+        return "date"
+    if re.search(r"\b(email|phone|fax|contact)\b", joined):
+        return "contact"
+    if re.search(r"\b(address|city|state|postal|zip|country)\b", joined):
+        return "address"
+    if re.search(r"\b(id|code|number)\b", col):
+        return "id"
+    if re.search(r"\b(char|text|clob|json|xml)\b", dt):
+        return "text"
+
+    is_numeric = any(k in dt for k in ("int", "double", "float", "decimal", "numeric", "real", "number", "money"))
+    if is_numeric and re.search(
+        r"\b(amount|price|cost|total|quantity|qty|stock|sales|revenue|profit|credit|debit|payment|msrp)\b",
+        joined,
+    ):
+        return "measure"
+
+    return "dimension"
+
+
+def _select_primary_role(raw_row: Dict[str, Any], roles: List[str], fk_target: Optional[str]) -> str:
+    normalized = []
     seen = set()
-    for r in roles:
-        base = r.lower().split(':')[0]
-        sentence = role_map.get(base, f"Role: {r}.")
-        if sentence not in seen:
-            seen.add(sentence)
-            sentences.append(sentence)
-    return " ".join(sentences)
+    for role in roles or []:
+        norm = _normalize_role_label(role)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        normalized.append(norm)
+
+    for preferred in ROLE_PRIORITY:
+        if preferred in normalized:
+            return preferred
+    if normalized:
+        return normalized[0]
+    return _infer_fallback_role(raw_row, fk_target)
 
 
 def _extract_fk_target(text: str) -> Optional[str]:
@@ -317,20 +391,7 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     aliases = raw_row.get("tags_alias", [])
     roles = raw_row.get("tags_role", [])
     fk_target = _extract_fk_target(desc_clean)
-    desc_lower = desc_clean.lower()
-
-    # Avoid duplicate semantics in text when description already contains it.
-    filtered_roles: List[str] = []
-    for r in roles:
-        base = str(r or "").strip().lower().split(":")[0]
-        if base == "pk" and re.search(r"\bprimary\s+key\b", desc_lower):
-            continue
-        if base == "fk" and (
-            re.search(r"\bforeign\s+key\b", desc_lower)
-            or (fk_target and _has_fk_literal(desc_clean, fk_target))
-        ):
-            continue
-        filtered_roles.append(r)
+    primary_role = _select_primary_role(raw_row, roles, fk_target)
     
     # 3. Sample Value Logic (For Text Embedding)
     # Only inject sample into text if it's categorical (distinct < 20)
@@ -361,8 +422,8 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
         table_part,
         f"Column: {col}.",
         f"Description: {desc_clean}." if desc_clean else "",
+        f"Role: {primary_role}." if primary_role else "",
         f"FK to {fk_target}." if (fk_target and not _has_fk_literal(desc_clean, fk_target)) else "",
-        translate_role_to_sentence(filtered_roles),
         f"Synonyms: {', '.join(aliases)}." if aliases else "",
         sample_sentence
     ]

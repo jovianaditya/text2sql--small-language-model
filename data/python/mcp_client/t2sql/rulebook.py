@@ -354,6 +354,98 @@ def retrieval_join_signals() -> list[str]:
     return rule_list(("retrieval_intent", "join_signals"), defaults)
 
 
+@lru_cache(maxsize=1)
+def aggregation_count_distinct_keywords() -> list[str]:
+    defaults = ["distinct", "unique", "different", "unik", "berbeda"]
+    return rule_list(("aggregation_intent", "count_distinct_keywords"), defaults)
+
+
+@lru_cache(maxsize=1)
+def aggregation_count_distinct_phrases() -> list[str]:
+    defaults = ["count distinct", "distinct count", "how many distinct", "number of unique", "jumlah unik"]
+    return rule_list(("aggregation_intent", "count_distinct_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_direction_desc_terms() -> list[str]:
+    defaults = [
+        "descending", "desc", "highest", "largest", "latest", "newest",
+        "most", "reverse alphabetical", "reversed alphabetical", "reverse",
+    ]
+    return rule_list(("ordering_intent", "direction_terms", "desc"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_direction_asc_terms() -> list[str]:
+    defaults = [
+        "ascending", "asc", "a-z", "alphabetical", "chronological",
+        "chronologically", "earliest", "oldest", "smallest", "lowest",
+    ]
+    return rule_list(("ordering_intent", "direction_terms", "asc"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_temporal_desc_terms() -> list[str]:
+    defaults = ["latest", "newest", "most recent", "descending", "desc"]
+    return rule_list(("ordering_intent", "temporal_terms", "desc"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_temporal_asc_terms() -> list[str]:
+    defaults = ["earliest", "oldest", "ascending", "asc", "chronological", "chronologically"]
+    return rule_list(("ordering_intent", "temporal_terms", "asc"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_temporal_intent_terms() -> list[str]:
+    defaults = [
+        "most recent", "least recent", "latest", "earliest",
+        "newest", "oldest", "chronological", "chronologically",
+    ]
+    return rule_list(("ordering_intent", "temporal_intent_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_superlative_keywords() -> list[str]:
+    defaults = [
+        "top", "bottom", "most", "least", "most expensive", "least expensive",
+        "cheapest", "highest", "lowest", "largest", "smallest", "newest",
+        "latest", "earliest", "oldest",
+    ]
+    return rule_list(("ordering_intent", "superlative_keywords"), defaults)
+
+
+@lru_cache(maxsize=1)
+def threshold_count_object_stop_terms() -> list[str]:
+    defaults = ["and", "or", "but", "where", "with", "having", "filter", "sort", "order"]
+    return rule_list(("heuristic_repairs", "threshold_count_object", "local_stop_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_phrase_token_stopwords() -> Set[str]:
+    defaults = [
+        "a", "an", "the", "that", "this", "those", "these", "same",
+        "within", "in", "of", "for", "to", "by", "on", "from",
+        "including", "include", "includes", "excluded", "excluding",
+        "except", "counting", "count", "itself", "themselves",
+    ]
+    vals = rule_list(("agent_semantics", "phrase_token_stopwords"), defaults)
+    return {normalized_text(v) for v in vals if normalized_text(v)}
+
+
+@lru_cache(maxsize=1)
+def order_term_token_stopwords() -> Set[str]:
+    defaults = [
+        "the", "a", "an", "by", "from", "to", "then", "and", "with",
+        "first", "final", "result", "results", "output", "rows", "row",
+        "sort", "sorted", "ordered", "arrange", "arranged",
+        "ascending", "descending", "asc", "desc", "highest", "lowest",
+        "largest", "smallest", "latest", "earliest", "newest", "oldest",
+    ]
+    vals = rule_list(("agent_semantics", "order_term_stopwords"), defaults)
+    return {normalized_text(v) for v in vals if normalized_text(v)}
+
+
 def question_wants_split_name_components(question: str) -> bool:
     q = normalized_text(question)
     if not q:
@@ -440,4 +532,8 @@ def rulebook_debug_snapshot() -> Dict[str, Any]:
         "retrieval_extra_stopwords_count": len(retrieval_extra_stopwords()),
         "retrieval_generic_mention_terms_count": len(retrieval_generic_mention_terms()),
         "retrieval_join_signals_count": len(retrieval_join_signals()),
+        "ordering_desc_terms_count": len(ordering_direction_desc_terms()),
+        "ordering_asc_terms_count": len(ordering_direction_asc_terms()),
+        "semantic_phrase_stopwords_count": len(semantic_phrase_token_stopwords()),
+        "order_term_stopwords_count": len(order_term_token_stopwords()),
     }

@@ -109,7 +109,7 @@ from .helpers_core import (
     _question_wants_winner_row, _rewrite_winner_row_guardrail, _rewrite_having_alias_to_expr,
     _force_restore_groupby_if_aggregate_without_groupby,
     _preexecute_sql_safety_pass,
-    _rewrite_winner_row_aggregate_misuse, _rewrite_single_table_tuple_in_winner_row, _rewrite_explicit_rank_aggregate_window, _rewrite_no_skip_rank_to_dense_rank, _repair_rank_window_partition_from_question, _add_rank_value_nonnull_filter_from_question, _rewrite_malformed_window_winner_clause, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_subquery_latest_year_tuple_filter, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
+    _rewrite_winner_row_aggregate_misuse, _rewrite_single_table_tuple_in_winner_row, _rewrite_explicit_rank_aggregate_window, _rewrite_grouped_count_rank_to_window_rank, _rewrite_no_skip_rank_to_dense_rank, _repair_rank_window_partition_from_question, _add_rank_value_nonnull_filter_from_question, _rewrite_malformed_window_winner_clause, _fix_winner_row_window_order_priority, _fix_winner_row_metric_order_priority, _rewrite_latest_year_same_year_aggregate, _rewrite_latest_year_correlated_maxdate_misuse, _rewrite_latest_year_derived_subquery_misuse, _rewrite_bridge_subquery_latest_year_tuple_filter, _rewrite_bridge_latest_year_tuple_filter, _rewrite_latest_year_tuple_in_filter, _move_latest_year_filter_where_to_inner_on, _winner_row_final_sanity,
     _fix_grouped_aggregate_rank_direction,
     _canonicalize_latest_year_same_year_pattern,
     _rewrite_latest_year_projection_to_year,
@@ -123,6 +123,12 @@ from .helpers_core import (
     _rewrite_missing_joined_agg_threshold_filter,
     _rewrite_average_ratio_to_sum_over_distinct_count,
     _rewrite_missing_overall_avg_having,
+    _rewrite_scalar_window_subquery_to_correlated_aggregate,
+    _repair_misnested_offset_window_function,
+    _repair_unbalanced_select_item_parentheses,
+    _repair_single_table_friendly_column_names,
+    _rewrite_explicit_single_table_scope,
+    _append_requested_secondary_order_key,
     _rewrite_employee_latest_payment_customer_identity,
     _drop_tuple_in_filter_from_include_zero_ranked_winner,
     _rewrite_metric_aggregate_column_mismatch,
@@ -131,8 +137,11 @@ from .helpers_core import (
     _fix_misplaced_entity_count_threshold,
     _drop_unrequested_exists_filters,
     _drop_unrequested_group_key_filters,
+    _drop_unrequested_positive_row_filters,
+    _drop_unrequested_metric_operand_group_keys,
     _drop_tautological_positive_count_having,
     _drop_unrequested_temporal_filters,
+    _drop_unrequested_fixed_year_filter_for_yearly_rollup,
     _repair_unbalanced_not_exists_order_by,
     _rewrite_two_table_grouped_temporal_exclusion,
     _rewrite_missing_temporal_bridge_exclusion,
@@ -160,6 +169,7 @@ from .helpers_core import (
     _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes, _strip_empty_string_comparison_on_non_text, _drop_raw_column_covered_by_function,
     _repair_explicit_iso_date_filter_from_question, _repair_enum_process_proxy_filter_from_question,
 )
+from .rulebook import any_phrase_in_text, rule_list
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
@@ -508,7 +518,17 @@ def _question_asks_for_winner_row_object(q_text: str) -> bool:
     if generic_object_alt and re.search(rf"\b(?:{generic_object_alt})\b", q, flags=re.I):
         return True
 
-    superlative_pattern = re.compile(r"\b(?:largest|highest|latest|best|most|max|min|top)\b", flags=re.I)
+    superlative_terms = rule_list(
+        ("ordering_intent", "superlative_keywords"),
+        ["largest", "highest", "latest", "best", "most", "max", "min", "top"],
+    )
+    superlative_alt = "|".join(
+        sorted((re.escape(t) for t in superlative_terms if t), key=len, reverse=True)
+    )
+    superlative_pattern = re.compile(
+        rf"\b(?:{superlative_alt})\b" if superlative_alt else r"$^",
+        flags=re.I,
+    )
     windows = [
         q[m.end(): m.end() + 96]
         for m in superlative_pattern.finditer(q)
@@ -555,7 +575,13 @@ def classify_query(question: str) -> str:
     # Pattern: [Group Context] + [Superlative] + [Object, not count]
     # ---------------------------------------------------------------------------
     has_group = re.search(r"\b(per|each|every|within|partition)\b", q)
-    has_superlative = re.search(r"\b(largest|highest|latest|best|most|max|min|top)\b", q)
+    has_superlative = any_phrase_in_text(
+        q,
+        rule_list(
+            ("ordering_intent", "superlative_keywords"),
+            ["largest", "highest", "latest", "best", "most", "max", "min", "top"],
+        ),
+    )
     # Mencari objek row/entity secara generic, atau entity mention yang
     # muncul dekat superlative, bukan noun bisnis yang di-hardcode.
     asks_for_object = _question_asks_for_winner_row_object(q)
@@ -4190,27 +4216,35 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         )
 
     # 6. Sorting Direction
-    desc_triggers = [
-    "latest", "newest", "most recent", "descending",
-    "highest", "greatest", "largest", "biggest",
-    "reverse alphabetical", "reversed alphabetical", "reverse"
-    ]
-
-    asc_triggers = [
-        "ascending", "alphabetical", "alphabetically",
-        "smallest", "lowest", "oldest first", "earliest first"
-    ]
+    desc_triggers = rule_list(
+        ("prompt_intent", "sort_direction", "desc_terms"),
+        [
+            "latest", "newest", "most recent", "descending",
+            "highest", "greatest", "largest", "biggest",
+            "reverse alphabetical", "reversed alphabetical", "reverse",
+        ],
+    )
+    asc_triggers = rule_list(
+        ("prompt_intent", "sort_direction", "asc_terms"),
+        [
+            "ascending", "alphabetical", "alphabetically",
+            "smallest", "lowest", "oldest first", "earliest first",
+        ],
+    )
 
     # Default untuk "sorted" tanpa qualifier
-    sort_requested = any(k in question.lower() for k in ["sort", "sorted", "order by"])
+    sort_requested = any_phrase_in_text(
+        question,
+        rule_list(("prompt_intent", "sort_direction", "sort_request_terms"), ["sort", "sorted", "order by"]),
+    )
 
     question_lower = question.lower()
 
-    if any(t in question_lower for t in desc_triggers):
+    if any_phrase_in_text(question_lower, desc_triggers):
         constraints.append(
             "SORT DIRECTION: The user implies a descending order. You MUST append `DESC` to the ORDER BY clause."
         )
-    elif any(t in question_lower for t in asc_triggers):
+    elif any_phrase_in_text(question_lower, asc_triggers):
         constraints.append(
             "SORT DIRECTION: The user requests ascending order. You MUST append `ASC` to the ORDER BY clause."
         )
@@ -4401,18 +4435,28 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         return "".join(out)
 
     def _fix_date_format_quarter(sql: str) -> str:
-        """Replace DATE_FORMAT(col, '%Q') with QUARTER(col).
+        """Replace DATE_FORMAT quarter near-misses with QUARTER(col).
 
         MySQL has no %Q format specifier.  The correct way to extract a
         calendar quarter is QUARTER(date).  Small LLMs (e.g. qwen 3B)
-        frequently hallucinate DATE_FORMAT(.., '%Q').
+        frequently hallucinate DATE_FORMAT(.., '%Q') or group by a
+        year-month format while aliasing the result as a quarter.
         """
-        if not sql or "%Q" not in sql:
+        if not sql:
             return sql
-        return re.sub(
+        out = re.sub(
             r"DATE_FORMAT\s*\(\s*([\w.]+)\s*,\s*['\"]%Q['\"]\s*\)",
             r"QUARTER(\1)",
             sql,
+            flags=re.I,
+        )
+        q_low = (question or "").lower()
+        if "quarter" not in q_low or "month" in q_low:
+            return out
+        return re.sub(
+            r"DATE_FORMAT\s*\(\s*([\w.]+)\s*,\s*['\"]%Y-%m['\"]\s*\)",
+            r"QUARTER(\1)",
+            out,
             flags=re.I,
         )
 
@@ -4635,6 +4679,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _ensure_unique_output_column_labels(s)
     s = _expand_group_by_aliases_regex(s)
     s = _canonicalize_single_computed_group_by_expression(s)
+    s = _drop_unrequested_metric_operand_group_keys(s, question, ctx)
     s = _simplify_same_expression_group_threshold_subquery(s)
     latest_year_sum_intent = _question_wants_latest_year_scope_with_aggregate(question)
     has_correlated_max_subquery = bool(
@@ -4897,6 +4942,18 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _repair_unbalanced_not_exists_order_by(s)
         if DEBUG_WR: print("[REFINER - PH4] after unbalanced NOT EXISTS fix:", s)
 
+        s = _repair_misnested_offset_window_function(s)
+        if DEBUG_WR: print("[REFINER - PH4] after offset window nesting fix:", s)
+
+        s = _repair_unbalanced_select_item_parentheses(s)
+        if DEBUG_WR: print("[REFINER - PH4] after select-item parenthesis fix:", s)
+
+        s = _rewrite_explicit_single_table_scope(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after explicit single-table scope fix:", s)
+
+        s = _repair_single_table_friendly_column_names(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after friendly column-name fix:", s)
+
         s = _rewrite_winner_row_aggregate_misuse(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after agg-misuse:", s)
 
@@ -4911,6 +4968,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _rewrite_explicit_rank_aggregate_window(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after explicit-rank aggregate fix:", s)
+
+        s = _rewrite_grouped_count_rank_to_window_rank(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after grouped count-rank fix:", s)
 
         s = _fix_grouped_aggregate_rank_direction(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after grouped aggregate rank direction fix:", s)
@@ -4935,6 +4995,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _rewrite_missing_overall_avg_having(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after overall-avg baseline fix:", s)
+
+        s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
+        if DEBUG_WR: print("[REFINER - PH4] after scalar-window subquery fix:", s)
 
         s = _rewrite_average_ratio_to_sum_over_distinct_count(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after avg-ratio rollup fix:", s)
@@ -4985,6 +5048,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
         s = _rewrite_latest_year_projection_to_year(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year projection->year fix:", s)
+
+        s = _drop_unrequested_fixed_year_filter_for_yearly_rollup(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after unrequested fixed-year drop:", s)
         
         if not AGENT_AST_SEMANTIC_FIRST:
             s = _fix_aggregate_in_where(s)
@@ -5030,6 +5096,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _prefer_conditional_count_final_order(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after conditional-count order fix: {s}")
 
+        s = _append_requested_secondary_order_key(s, question)
+        if DEBUG_WR: print(f"[REFINER - PH4] after secondary final-order fix: {s}")
+
         s = _drop_unrequested_current_date_filters(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested current-date filter drop: {s}")
 
@@ -5063,6 +5132,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         if DEBUG_WR: print("[REFINER - PH4] after post-repair ornamental-join cleanup:", s)
         s = _drop_unrequested_group_key_filters(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after post-repair group-key filter drop:", s)
+        s = _drop_unrequested_positive_row_filters(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after unrequested positive row-filter drop:", s)
         s = _drop_tautological_positive_count_having(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after post-repair tautological HAVING drop:", s)
 
@@ -5092,6 +5163,14 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
                 print("[PH4-FORCE] AST semantic-first enabled: skip regex agg/having surgery")
             s = _repair_unbalanced_not_exists_order_by(s)
             if DEBUG_WR: print(f"[PH4-FORCE] after unbalanced NOT EXISTS fix: {s}")
+            s = _repair_misnested_offset_window_function(s)
+            if DEBUG_WR: print(f"[PH4-FORCE] after offset window nesting fix: {s}")
+            s = _repair_unbalanced_select_item_parentheses(s)
+            if DEBUG_WR: print(f"[PH4-FORCE] after select-item parenthesis fix: {s}")
+            s = _rewrite_explicit_single_table_scope(s, question, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after explicit single-table scope fix: {s}")
+            s = _repair_single_table_friendly_column_names(s, question, ctx)
+            if DEBUG_WR: print(f"[PH4-FORCE] after friendly column-name fix: {s}")
             s = _add_missing_count_for_group_by(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after add-count fix: {s}")
 
@@ -5113,6 +5192,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             s = _rewrite_missing_overall_avg_having(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after overall-avg baseline fix: {s}")
 
+            s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
+            if DEBUG_WR: print(f"[PH4-FORCE] after scalar-window subquery fix: {s}")
+
             s = _rewrite_average_ratio_to_sum_over_distinct_count(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after avg-ratio rollup fix: {s}")
 
@@ -5121,6 +5203,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
             s = _rewrite_existence_sum_to_distinct_entity_count(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after existence distinct-count fix: {s}")
+            s = _append_requested_secondary_order_key(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after secondary final-order fix: {s}")
 
             s = _repair_invalid_year_filter_via_fk_bridge(s, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after invalid YEAR alias repair: {s}")
@@ -5168,6 +5252,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _strip_unneeded_count_distinct(s, question)
     s = _drop_unrequested_group_key_filters(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested group-key filter drop fix: {s}")
+    s = _drop_unrequested_positive_row_filters(s, question, ctx)
+    if DEBUG_WR: print(f"[REFINER - PH6] after unrequested positive row-filter drop fix: {s}")
     s = _drop_tautological_positive_count_having(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after tautological count HAVING drop fix: {s}")
     # ---------------------------------------------------------------------------

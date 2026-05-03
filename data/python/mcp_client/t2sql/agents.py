@@ -376,6 +376,32 @@ def _attempt_confidence_retry(
         }
 
     if not retry_gate.get("accepted", False):
+        retry_reasons = {str(r) for r in (retry_gate.get("reasons") or []) if str(r).strip()}
+        old_syntax = float((confidence_result.get("signals") or {}).get("syntax_valid", 1.0) or 0.0)
+        new_syntax = float((new_confidence.get("signals") or {}).get("syntax_valid", 1.0) or 0.0)
+        # Safety fallback: when the current SQL is syntactically invalid but the
+        # retry is syntactically valid and only fails soft semantic-contract checks,
+        # keep the valid retry to avoid execution hard-fail.
+        if retry_reasons and retry_reasons.issubset({"semantic_contract_mismatch"}) and old_syntax < 0.5 and new_syntax >= 0.99:
+            if not candidate_sql.endswith(";"):
+                candidate_sql += ";"
+            _dbg_print_two(
+                "[REFINER - CONFIDENCE]",
+                "Retry accepted with soft semantic warning (replaced syntactically invalid SQL)"
+            )
+            return {
+                "used": True,
+                "sql": candidate_sql,
+                "confidence": new_confidence,
+                "accepted": True,
+                "reason": "accepted_soft_semantic_after_invalid_syntax",
+                "gate": retry_gate,
+                "validation_errors": list(retry_gate.get("identifier_errors") or validate_identifiers(candidate_sql, ctx)),
+                "gate_pass": bool(retry_gate.get("accepted", False)),
+                "gate_reasons": list(retry_gate.get("reasons") or []),
+                "gate_reason_tags": _categorize_gate_reasons(list(retry_gate.get("reasons") or [])),
+            }
+
         _dbg_print_two(
             "[REFINER - CONFIDENCE]",
             f"Retry rejected by acceptance gate: {retry_gate.get('reasons')}"
@@ -480,6 +506,18 @@ from .helpers_core import (
     _remove_top_level_order_by_if_not_requested,
     _SQL_KEYWORDS,
 )
+from .rulebook import (
+    any_phrase_in_text,
+    order_term_token_stopwords,
+    ordering_direction_asc_terms,
+    ordering_direction_desc_terms,
+    ordering_superlative_keywords,
+    ordering_temporal_asc_terms,
+    ordering_temporal_desc_terms,
+    ordering_temporal_intent_terms,
+    rule_list,
+    semantic_phrase_token_stopwords,
+)
 
 
 def _dbg_agent3_retry(check_name: str, detail: str) -> None:
@@ -489,6 +527,38 @@ def _dbg_agent3_retry(check_name: str, detail: str) -> None:
 def _dbg_safety_block(scope: str, detail: str) -> None:
     label = "REFINER" if str(scope).strip().lower() == "agent3" else str(scope)
     _dbg_print_two(f"[{label}] Safety Block", detail)
+
+
+def _has_any_phrase(text: str, phrases: List[str]) -> bool:
+    return bool(phrases) and any_phrase_in_text(text or "", phrases)
+
+
+def _phrase_alt_pattern(phrases: List[str]) -> str:
+    out: List[str] = []
+    for phrase in phrases:
+        p = str(phrase or "").strip()
+        if not p:
+            continue
+        out.append(re.escape(p).replace(r"\ ", r"\s+"))
+    return "|".join(sorted(out, key=len, reverse=True))
+
+
+def _temporal_extrema_terms() -> List[str]:
+    latest_terms = rule_list(("temporal_intent", "latest_keywords"), ["latest", "newest", "most recent"])
+    earliest_terms = rule_list(("temporal_intent", "earliest_keywords"), ["earliest", "oldest"])
+    seen: Set[str] = set()
+    out: List[str] = []
+    for term in latest_terms + earliest_terms:
+        norm = str(term or "").strip().lower()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(str(term).strip())
+    return out
+
+
+def _temporal_extrema_alt() -> str:
+    return _phrase_alt_pattern(_temporal_extrema_terms())
 
 
 def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
@@ -698,10 +768,11 @@ def _question_requires_scalar_extrema_date_filter(question: str) -> bool:
 
     if _question_wants_winner_row(question):
         return False
+    temporal_alt = _temporal_extrema_alt()
 
-    if re.search(
+    if temporal_alt and re.search(
         r"\b(?:starting|beginning|going)\s+from\s+the\s+"
-        r"(?:most\s+recent|latest|newest|earliest|oldest)\b",
+        rf"(?:{temporal_alt})\b",
         q,
         flags=re.I,
     ):
@@ -711,17 +782,17 @@ def _question_requires_scalar_extrema_date_filter(question: str) -> bool:
         r"\bif\s+(?:there\s+is\s+a\s+tie|there\s+are\s+ties|multiple|same)\b",
         q,
         flags=re.I,
-    ) and re.search(
-        r"\b(?:latest|most\s+recent|newest|earliest|oldest)\b[^.]{0,24}\bdate\b",
+    ) and temporal_alt and re.search(
+        rf"\b(?:{temporal_alt})\b[^.]{{0,24}}\bdate\b",
         q,
         flags=re.I,
     ):
         return False
 
     return bool(
-        re.search(
+        temporal_alt and re.search(
             r"\b(?:on|for|with|from)\s+the\s+"
-            r"(?:most\s+recent|latest|newest|earliest|oldest)\s+"
+            rf"(?:{temporal_alt})\s+"
             r"(?:[a-z][a-z0-9_]*\s+){0,3}date\b",
             q,
             flags=re.I,
@@ -733,23 +804,24 @@ def _extract_same_group_phrase(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
         return ""
+    temporal_alt = _temporal_extrema_alt()
 
     # Tie-scoped temporal phrases like "that same most recent date" are
     # winner-row tie-break cues, not PARTITION BY hints.
-    if re.search(
+    if temporal_alt and re.search(
         r"\b(?:if\s+(?:there\s+are\s+)?multiple|if\s+there\s+is\s+a\s+tie|"
         r"if\s+there\s+are\s+ties|tie|tied|pick|choose)\b",
         q,
         flags=re.I,
     ) and re.search(
-        r"\bsame\s+(?:(?:most\s+recent|latest|newest|earliest|oldest)\s+)?"
+        rf"\bsame\s+(?:(?:{temporal_alt})\s+)?"
         r"(?:date|payment\s+date|order\s+date|time)\b",
         q,
         flags=re.I,
     ):
         return ""
-    if re.search(r"\bsame\s+year\b", q, flags=re.I) and re.search(
-        r"\b(?:latest|most\s+recent|newest|earliest|oldest)\b[^.]{0,40}\byear\b",
+    if re.search(r"\bsame\s+year\b", q, flags=re.I) and temporal_alt and re.search(
+        rf"\b(?:{temporal_alt})\b[^.]{{0,40}}\byear\b",
         q,
         flags=re.I | re.S,
     ):
@@ -774,12 +846,7 @@ def _extract_same_group_phrase(question: str) -> str:
 def _semantic_phrase_tokens(text: str) -> List[str]:
     raw = re.sub(AGENT_COLUMN_CAMEL_SPLIT_PATTERN, r"\1 \2", str(text or ""))
     tokens = re.findall(r"[a-z0-9]+", raw.lower())
-    stop_words = {
-        "a", "an", "the", "that", "this", "those", "these", "same",
-        "within", "in", "of", "for", "to", "by", "on", "from",
-        "including", "include", "includes", "excluded", "excluding",
-        "except", "counting", "count", "itself", "themselves",
-    }
+    stop_words = semantic_phrase_token_stopwords()
     return [tok for tok in tokens if tok and tok not in stop_words]
 
 
@@ -1176,7 +1243,8 @@ def _rewrite_scalar_extrema_date_filter(sql: str, question: str) -> str:
         return sql
 
     agg_func = "MAX"
-    if re.search(r"\b(?:earliest|oldest)\b", (question or "").lower(), flags=re.I):
+    earliest_terms = rule_list(("temporal_intent", "earliest_keywords"), ["earliest", "oldest"])
+    if _has_any_phrase(question or "", earliest_terms):
         agg_func = "MIN"
 
     date_candidates = re.findall(
@@ -1217,7 +1285,7 @@ def _rewrite_scalar_extrema_date_filter(sql: str, question: str) -> str:
         for ident in unique_identifiers:
             words = _to_words(ident)
             if words and words in sort_clause.lower():
-                direction = "DESC" if re.search(r"\b(?:descending|desc)\b", sort_clause, flags=re.I) else "ASC"
+                direction = "DESC" if _has_any_phrase(sort_clause, ordering_direction_desc_terms()) else "ASC"
                 requested_order = f"{ident} {direction}"
                 break
 
@@ -1405,11 +1473,28 @@ def _repair_chronological_month_order(sql: str, question: str) -> str:
             return str(monthname_match.group("date") or "").strip()
         return ""
 
+    def _extract_date_format_args(expr: str) -> Tuple[str, str]:
+        match = re.match(r"""(?is)^DATE_FORMAT\s*\(\s*(?P<args>.*)\s*\)$""", str(expr or "").strip())
+        if not match:
+            return "", ""
+        args = _split_top_level_csv(match.group("args"))
+        if len(args) != 2:
+            return "", ""
+        fmt = args[1].strip()
+        quote_match = re.match(r"""(?s)^(?P<quote>['"])(?P<fmt>.*)(?P=quote)$""", fmt)
+        if not quote_match:
+            return "", ""
+        return args[0].strip(), str(quote_match.group("fmt") or "")
+
     def _extract_month_numeric_source(expr: str) -> str:
         item_s = str(expr or "").strip()
         month_match = re.match(r"""(?is)^MONTH\s*\(\s*(?P<date>.+?)\s*\)$""", item_s)
         if month_match:
-            return str(month_match.group("date") or "").strip()
+            month_arg = str(month_match.group("date") or "").strip()
+            date_format_source, date_format_fmt = _extract_date_format_args(month_arg)
+            if date_format_source and re.search(r"%(?:m|c)\b", date_format_fmt):
+                return date_format_source
+            return month_arg
         date_format_match = re.match(
             r"""(?is)^DATE_FORMAT\s*\(\s*(?P<date>.+?)\s*,\s*(?P<quote>['"])(?P<fmt>%[A-Za-z])(?P=quote)\s*\)$""",
             item_s,
@@ -1468,12 +1553,10 @@ def _repair_chronological_month_order(sql: str, question: str) -> str:
         limit_pos = _find_top_level_kw(s, "limit", group_pos + len("group by"))
 
     direction = ""
-    if re.search(r"\b(?:latest|newest|most\s+recent|descending|desc)\b", q, flags=re.I):
+    if _has_any_phrase(q, ordering_temporal_desc_terms()):
         direction = "DESC"
-    elif re.search(r"\b(?:earliest|oldest|ascending|asc|chronological)\b", q, flags=re.I):
+    elif _has_any_phrase(q, ordering_temporal_asc_terms()):
         direction = "ASC"
-    if not direction:
-        return s + trailing_semicolon
 
     select_match = re.search(r"^\s*select\s+(.*?)\s+from\s", s, flags=re.I | re.S)
     month_label_aliases: Set[str] = set()
@@ -1486,6 +1569,8 @@ def _repair_chronological_month_order(sql: str, question: str) -> str:
                 month_label_aliases.add(alias_match.group(1).strip().lower())
 
     if order_pos < 0:
+        if not direction:
+            return s + trailing_semicolon
         if not _question_requests_ordering(question):
             return s + trailing_semicolon
         insert_pos = limit_pos if limit_pos >= 0 else len(s)
@@ -1502,6 +1587,12 @@ def _repair_chronological_month_order(sql: str, question: str) -> str:
         return s + trailing_semicolon
 
     first_item = order_items[0].strip()
+    if not direction:
+        existing_direction = re.search(r"\s+\b(ASC|DESC)\b\s*$", first_item, flags=re.I)
+        if existing_direction:
+            direction = existing_direction.group(1).upper()
+    if not direction:
+        direction = "ASC"
     first_base = re.sub(r"\s+\b(?:ASC|DESC)\b\s*$", "", first_item, flags=re.I).strip()
     first_base_l = first_base.lower()
     first_numeric_source = _extract_month_numeric_source(first_base)
@@ -1547,18 +1638,8 @@ def _add_missing_final_order(sql: str, question: str) -> str:
         return s + trailing_semicolon
 
     q = (question or "").lower()
-    direction = "DESC" if re.search(
-        r"\b(descending|desc|highest|lowest|most|least|largest|smallest|newest|oldest|reverse\s+alphabetical|reversed\s+alphabetical|reverse)\b",
-        q,
-        flags=re.I,
-    ) else "ASC"
-    temporal_order_intent = bool(
-        re.search(
-            r"\b(?:most\s+recent|least\s+recent|latest|earliest|newest|oldest|chronological)\b",
-            q,
-            flags=re.I,
-        )
-    )
+    direction = "DESC" if _has_any_phrase(q, ordering_direction_desc_terms()) else "ASC"
+    temporal_order_intent = _has_any_phrase(q, ordering_temporal_intent_terms())
 
     reserved_tokens = _SQL_KEYWORDS.union(set(AGENT_SQL_RESERVED_EXTRA_TOKENS))
 
@@ -1976,13 +2057,7 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
 def _normalize_order_term_tokens(text: str) -> Set[str]:
     raw = re.sub(AGENT_COLUMN_CAMEL_SPLIT_PATTERN, r"\1 \2", str(text or ""))
     tokens = re.findall(r"[a-z0-9]+", raw.lower())
-    stop = {
-        "the", "a", "an", "by", "from", "to", "then", "and", "with",
-        "first", "final", "result", "results", "output", "rows", "row",
-        "sort", "sorted", "ordered", "arrange", "arranged",
-        "ascending", "descending", "asc", "desc", "highest", "lowest",
-        "largest", "smallest", "latest", "earliest", "newest", "oldest",
-    }
+    stop = order_term_token_stopwords()
     normalized = []
     for tok in tokens:
         if len(tok) == 1:
@@ -2079,23 +2154,39 @@ def _extract_requested_final_order_terms(question: str) -> List[Tuple[str, str]]
         for p in re.split(r"\s*[;,]?\s+then\s+|\s*[;,]\s*", body, flags=re.I)
         if p.strip(" ,;")
     ]
+    desc_terms = ordering_direction_desc_terms()
+    asc_terms = ordering_direction_asc_terms()
+    direction_noise_terms = rule_list(
+        ("heuristic_repairs", "final_order", "direction_noise_terms"),
+        ["first"],
+    )
+    desc_alt = _phrase_alt_pattern(desc_terms)
+    asc_alt = _phrase_alt_pattern(asc_terms)
     out: List[Tuple[str, str]] = []
     for part in raw_parts:
         direction = "ASC"
-        if re.search(r"\b(?:descending|desc|highest|largest|latest|newest|most|reverse\s+alphabetical|reversed\s+alphabetical|reverse)\b", part, flags=re.I):
+        if _has_any_phrase(part, desc_terms):
             direction = "DESC"
         elif re.search(r"\bmore\b.*\bfirst\b", part, flags=re.I):
             direction = "DESC"
-        elif re.search(r"\b(?:ascending|asc|a-z|alphabetical|chronological|earliest|oldest|smallest|lowest)\b", part, flags=re.I):
+        elif _has_any_phrase(part, asc_terms):
             direction = "ASC"
         elif re.search(r"\b(?:less|fewer|lower|smaller)\b.*\bfirst\b", part, flags=re.I):
             direction = "ASC"
-        clean = re.sub(
-            r"\b(?:ascending|descending|asc|desc|first|from\s+(?:highest|lowest|latest|earliest)\s+to\s+(?:lowest|highest|earliest|latest)|reverse\s+alphabetical|reversed\s+alphabetical|reverse)\b",
-            " ",
-            part,
-            flags=re.I,
-        )
+        clean = part
+        if desc_alt and asc_alt:
+            clean = re.sub(
+                rf"\bfrom\s+(?:{desc_alt}|{asc_alt})\s+to\s+(?:{desc_alt}|{asc_alt})\b",
+                " ",
+                clean,
+                flags=re.I,
+            )
+        for phrase in desc_terms + asc_terms + direction_noise_terms:
+            phrase_clean = str(phrase or "").strip()
+            if not phrase_clean:
+                continue
+            pat = re.escape(phrase_clean).replace(r"\ ", r"\s+")
+            clean = re.sub(rf"\b{pat}\b", " ", clean, flags=re.I)
         clean = re.sub(
             r"^\s*(?:sort|sorted|order|ordered|arrange|arranged)\s+by\s+",
             "",
@@ -2138,7 +2229,11 @@ def _build_requested_final_order_mapping(
         if not item_clean:
             continue
 
-        alias_match = re.search(r"\bAS\s+(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", item_clean, flags=re.I)
+        alias_match = re.search(
+            r"""\bAS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            item_clean,
+            flags=re.I,
+        )
         alias_sql = alias_match.group(1).strip() if alias_match else ""
         alias = alias_sql.strip("`")
         expr = item_clean[:alias_match.start()].strip() if alias_match else item_clean
@@ -2479,11 +2574,11 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
 
     pattern = re.compile(
         r"""(?is)^\s*SELECT\s+(?P<select>.+?)\s+
-            FROM\s+`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<outer_alias>[A-Za-z_][A-Za-z0-9_]*))?\s+
+            FROM\s+\(?\s*`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)?(?:\s+(?:AS\s+)?(?P<outer_alias>[A-Za-z_][A-Za-z0-9_]*))?\s+
             WHERE\s+(?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
             (?P<op>>=|<=|<>|!=|=|>|<)\s*
             \(\s*SELECT\s+(?P<agg>AVG|MIN|MAX|SUM)\s*\(\s*(?P<inner_metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)
-            \s+FROM\s+`?(?P=table)`?(?:\s+(?:AS\s+)?(?P<inner_alias>[A-Za-z_][A-Za-z0-9_]*))?
+            \s+FROM\s+\(?\s*`?(?P=table)`?\s*\)?(?:\s+(?:AS\s+)?(?P<inner_alias>[A-Za-z_][A-Za-z0-9_]*))?
             (?:\s+WHERE\s+(?P<inner_where>.*?))?
             \s*\)\s*(?P<tail>.*)$""",
         re.X,
@@ -5059,11 +5154,13 @@ def router_agent(state: RAGState) -> RAGState:
     has_dual_fact_rollup = bool(
         is_multi_table and _router_has_dual_fact_rollup(question_raw, relevant_tables)
     )
+    temporal_alt = _temporal_extrema_alt()
     has_latest_year_same_year_aggregate_intent = bool(
         is_multi_table
         and _question_wants_latest_year_scope_with_aggregate(question)
+        and temporal_alt
         and re.search(
-            r"\b(?:latest|most\s+recent|newest|earliest|oldest)\b[^.]{0,64}\bdate\b",
+            rf"\b(?:{temporal_alt})\b[^.]{{0,64}}\bdate\b",
             question_lower,
             flags=re.I | re.S,
         )
@@ -5520,13 +5617,16 @@ def _extract_explicit_row_limit_value(question: str) -> Optional[int]:
         return None
 
     non_row_unit = r"(?!\s+(?:characters?|chars?|letters?|digits?|bytes?|positions?|tokens?|words?)\b)"
+    superlative_alt = _phrase_alt_pattern(
+        ordering_superlative_keywords()
+    )
     patterns = [
         r"\blimit\s+(\d{1,4})\b",
         r"\btop\s+(\d{1,4})\b",
         r"\bbottom\s+(\d{1,4})\b",
         rf"\b(?:first|last)\s+(\d{{1,4}})\b{non_row_unit}",
         rf"\b(?:show|return|list|display|give\s+me)\s+(\d{{1,4}})\b{non_row_unit}",
-        r"\b(\d{1,4})\s+(?:highest|lowest|largest|smallest|most|least|newest|latest|earliest|oldest)\b",
+        rf"\b(\d{{1,4}})\s+(?:{superlative_alt})\b" if superlative_alt else r"$^",
     ]
     for pat in patterns:
         m = re.search(pat, q, flags=re.I)
@@ -5568,13 +5668,16 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     if explicit_sort_phrase:
         contract["requested_order_terms"] = _extract_requested_final_order_terms(question)
 
+    superlative_alt = _phrase_alt_pattern(
+        ordering_superlative_keywords()
+    )
     # Ordinal per-group winner pattern (e.g. "second highest per customer")
     # naturally relies on window ranking + rn filter, and does not require
     # top-level ORDER BY unless user explicitly asks sorting.
     ordinal_per_group_pattern = bool(
         re.search(
-            r"\b(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+"
-            r"(?:highest|lowest|largest|smallest|newest|oldest|earliest|latest)\b",
+            rf"\b(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+"
+            rf"(?:{superlative_alt})\b" if superlative_alt else r"$^",
             q,
         )
         and re.search(r"\b(for\s+each|per|within\s+each|for\s+every)\b", q)
@@ -8437,25 +8540,26 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         ):
             ir_gate_reasons.append("column_to_column_compare_ir_unsupported")
 
+        temporal_alt = _temporal_extrema_alt()
         has_temporal_display_order_cue = bool(
-            re.search(
+            temporal_alt and re.search(
                 r"\b(?:starting|beginning|going)\s+from\s+the\s+"
-                r"(?:most\s+recent|latest|newest|earliest|oldest)\b",
+                rf"(?:{temporal_alt})\b",
                 q_low,
                 flags=re.I,
             )
-            or re.search(
+            or (temporal_alt and re.search(
                 r"\b(?:sorted|ordered)\s+from\s+the\s+"
-                r"(?:most\s+recent|latest|newest|earliest|oldest)\b",
+                rf"(?:{temporal_alt})\b",
                 q_low,
                 flags=re.I,
-            )
-            or re.search(
+            ))
+            or (temporal_alt and re.search(
                 r"\b(?:ordered|sorted)\s+by\b[^.;]{0,96}\bfrom\s+the\s+"
-                r"(?:most\s+recent|latest|newest|earliest|oldest)\b",
+                rf"(?:{temporal_alt})\b",
                 q_low,
                 flags=re.I,
-            )
+            ))
         )
 
         if (
@@ -8465,20 +8569,20 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             and len(mentioned_tables) <= 1
             and not has_temporal_display_order_cue
             and bool(
-                re.search(
+                temporal_alt and re.search(
                     r"\b(?:on|for|with|from)\s+the\s+"
-                    r"(?:most\s+recent|latest|newest|earliest|oldest)\s+"
+                    rf"(?:{temporal_alt})\s+"
                     r"(?:[a-z][a-z0-9_]*\s+){0,3}date\b",
                     q_low,
                     flags=re.I,
                 )
-                or re.search(
+                or (temporal_alt and re.search(
                     r"\b(?:equal\s+to|same\s+as)\s+the\s+"
-                    r"(?:most\s+recent|latest|newest|earliest|oldest)\s+"
+                    rf"(?:{temporal_alt})\s+"
                     r"(?:[a-z][a-z0-9_]*\s+){0,3}date\b",
                     q_low,
                     flags=re.I,
-                )
+                ))
             )
         ):
             ir_gate_reasons.append("scalar_extrema_date_subquery_ir_unsupported")
@@ -8963,6 +9067,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     sql_for_tokenizing = final_sql
     sql_for_tokenizing = re.sub(AGENT_REFINE_SINGLE_QUOTED_STRING_PATTERN, " ", sql_for_tokenizing)
     sql_for_tokenizing = re.sub(AGENT_REFINE_DOUBLE_QUOTED_STRING_PATTERN, " ", sql_for_tokenizing)
+    # Quoted aliases are display labels, not schema identifiers.  Leave the
+    # expression before AS intact, but remove the alias body so labels like
+    # `largest payment` are not treated as hallucinated columns.
+    sql_for_tokenizing = re.sub(
+        r"""\bAS\s+(?:`[^`]*`|'(?:''|[^'])*'|"(?:""|[^"])*")""",
+        " AS ",
+        sql_for_tokenizing,
+        flags=re.IGNORECASE,
+    )
     # FIX 1: Remove function calls (word followed by parenthesis)
     sql_for_tokenizing = re.sub(
         AGENT_REFINE_FUNCTION_CALL_PATTERN,
