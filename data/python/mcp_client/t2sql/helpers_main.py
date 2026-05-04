@@ -54,8 +54,10 @@ from .schema_analyzer import (
     get_anchor_columns,
     get_all_tables,
     get_aggregatable_columns,
+    get_column_description,
     get_filterable_date_columns,
     get_fk_relationships,
+    get_fk_target_column,
     get_id_column,
     get_name_column,
     get_table_synonyms,
@@ -168,10 +170,10 @@ from .helpers_core import (
     _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _strip_redundant_distinct_in_in_not_in_subqueries, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
     _ast_guardrails,
     # phase 7
-    _simplify_default_window_frame, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes, _strip_empty_string_comparison_on_non_text, _drop_raw_column_covered_by_function,
+    _simplify_default_window_frame, _rewrite_same_group_avg_gap_window_to_partition_only, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes, _strip_empty_string_comparison_on_non_text, _drop_raw_column_covered_by_function,
     _repair_explicit_iso_date_filter_from_question, _repair_enum_process_proxy_filter_from_question,
 )
-from .rulebook import any_phrase_in_text, rule_list
+from .rulebook import any_phrase_in_text, guidance_fact_support_phrases, phrase_in_text, rule_list
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
@@ -1358,6 +1360,16 @@ def _question_targets_table_exclusion(question: str, table: str) -> bool:
         sorted((re.escape(c).replace(r"\ ", r"\s+") for c in candidates), key=len, reverse=True)
     )
 
+    boundary_pattern = re.compile(
+        r"(?:,\s*|\.\s*|;\s*|\)\s*|\]\s*|\}\s*)"
+        r"(?:return|show|list|give|display|find|sort|order(?:ed)?\s+by)\b",
+        flags=re.I,
+    )
+
+    def _is_clause_local(match: re.Match) -> bool:
+        frag = match.group(0) or ""
+        return not boundary_pattern.search(frag)
+
     # Offset-window NULL fallback phrasing (e.g., "if there is no next payment")
     # should not be treated as exclusion of the table entity itself.
     if re.search(
@@ -1369,21 +1381,23 @@ def _question_targets_table_exclusion(question: str, table: str) -> bool:
         return False
 
     # Negation followed by entity mention.
-    if re.search(
+    for m in re.finditer(
         rf"\b(?:no|without(?:\s+any)?|never|not)\b(?:[\s,;:()'\"-]+\w+){{0,10}}[\s,;:()'\"-]+(?:{entity_alt})\b",
         q,
         flags=re.I,
     ):
-        return True
+        if _is_clause_local(m):
+            return True
 
     # Narrow reverse form to avoid cross-entity false positives like:
     # "payment ... never ... orders" (where "never" targets orders, not payments).
-    if re.search(
+    for m in re.finditer(
         rf"\b(?:{entity_alt})\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+\b(?:with\s+no|without(?:\s+any)?)\b",
         q,
         flags=re.I,
     ):
-        return True
+        if _is_clause_local(m):
+            return True
 
     # Verb-like negated mention: "never ordered", "not paid", etc.
     for _, is_negated in _iter_inflected_entity_mentions(q, table):
@@ -2531,10 +2545,14 @@ def _build_fk_join_chain(
             if primary_lower in fk_map:
                 for fk_col, target in fk_map[primary_lower].items():
                     if target.lower() == other_tbl:
+                        target_col = (
+                            get_fk_target_column(primary_lower, fk_col)
+                            or _infer_target_column(fk_col, other_tbl, ranked_cols)
+                        )
                         join_chain.append({
                             "from": primary_lower,
                             "join": other_tbl,
-                            "on": f"{primary_lower}.{fk_col} = {other_tbl}.{_infer_target_column(fk_col, other_tbl, ranked_cols)}"
+                            "on": f"{primary_lower}.{fk_col} = {other_tbl}.{target_col}"
                         })
                         break
 
@@ -2542,10 +2560,14 @@ def _build_fk_join_chain(
             if other_tbl in fk_map:
                 for fk_col, target in fk_map[other_tbl].items():
                     if target.lower() == primary_lower:
+                        target_col = (
+                            get_fk_target_column(other_tbl, fk_col)
+                            or _infer_target_column(fk_col, primary_lower, ranked_cols)
+                        )
                         join_chain.append({
                             "from": primary_lower,
                             "join": other_tbl,
-                            "on": f"{other_tbl}.{fk_col} = {primary_lower}.{_infer_target_column(fk_col, primary_lower, ranked_cols)}"
+                            "on": f"{other_tbl}.{fk_col} = {primary_lower}.{target_col}"
                         })
                         break
     else:
@@ -2558,10 +2580,14 @@ def _build_fk_join_chain(
 
             for fk_col, target_tbl in fk_map[source_tbl].items():
                 if target_tbl in router_tables_lower:
+                    target_col = (
+                        get_fk_target_column(source_tbl, fk_col)
+                        or _infer_target_column(fk_col, target_tbl, ranked_cols)
+                    )
                     join_chain.append({
                         "from": source_tbl,
                         "join": target_tbl,
-                        "on": f"{source_tbl}.{fk_col} = {target_tbl}.{_infer_target_column(fk_col, target_tbl, ranked_cols)}"
+                        "on": f"{source_tbl}.{fk_col} = {target_tbl}.{target_col}"
                     })
 
     return join_chain
@@ -2578,6 +2604,16 @@ def _infer_target_column(
     Example: If fk_col is an identifier-like reference for the target entity,
     the target column is often the same identifier on the referenced table.
     """
+    source_table = ""
+    for tbl, col in ranked_cols:
+        if str(col or "").strip().lower() == str(fk_col or "").strip().lower():
+            source_table = str(tbl or "").strip().lower()
+            break
+    if source_table:
+        exact_target_col = get_fk_target_column(source_table, fk_col)
+        if exact_target_col:
+            return exact_target_col
+
     # Check if we have this column in ranked_cols
     for tbl, col in ranked_cols:
         if tbl.lower() == target_table.lower():
@@ -2665,6 +2701,556 @@ def _build_dynamic_join_context(
     return "\n".join(lines)
 
 
+def _guidance_semantic_tokens(text: str) -> Set[str]:
+    raw = str(text or "").lower()
+    if not raw:
+        return set()
+
+    stop_tokens = {
+        "the", "a", "an", "of", "for", "to", "by", "in", "on", "at",
+        "with", "without", "and", "or", "show", "list", "find", "give",
+        "return", "display", "each", "every", "per", "all", "from",
+        "that", "this", "these", "those", "into", "within", "where",
+        "whose", "include", "including", "using", "based", "exactly",
+    }
+    return {
+        tok
+        for tok in re.findall(r"[a-z0-9]+", raw)
+        if len(tok) >= 3 and tok not in stop_tokens
+    }
+
+
+def _guidance_informative_terms(terms: Set[str]) -> Set[str]:
+    weak_terms = {
+        "count", "counts", "date", "dates", "latest", "earliest", "name",
+        "names", "number", "numbers", "recent", "total", "totals",
+        "value", "values",
+    }
+    informative = {str(term or "").strip().lower() for term in (terms or set()) if str(term or "").strip()}
+    filtered = {term for term in informative if term not in weak_terms}
+    return filtered or informative
+
+
+def _guidance_column_semantic_terms(table: str, column: str) -> Set[str]:
+    terms: Set[str] = set()
+    table_l = str(table or "").strip().lower()
+    col = str(column or "").strip()
+    if not table_l or not col:
+        return terms
+
+    variants = {col, col.replace("_", " ")}
+    try:
+        variants.update(get_column_entity_variants(table_l, col) or set())
+    except Exception:
+        pass
+    try:
+        variants.update(get_column_synonyms(table_l, col) or [])
+    except Exception:
+        pass
+    for variant in variants:
+        terms.update(_guidance_semantic_tokens(variant))
+    return terms
+
+
+def _guidance_column_cover_terms(table: str, column: str) -> Set[str]:
+    return _guidance_informative_terms(_guidance_column_semantic_terms(table, column))
+
+
+def _guidance_grouping_anchor_table(question: str, tables: List[str]) -> str:
+    """
+    Prefer explicit group-grain entities for hint-only table guidance.
+    Examples:
+    - "for each product line" -> productlines
+    - "for every product" -> products
+    """
+    q = str(question or "").lower()
+    if not q or not tables:
+        return ""
+
+    best_table = ""
+    best_pos: Optional[int] = None
+    best_span_len = -1
+
+    for table in tables:
+        table_l = str(table or "").strip().lower()
+        if not table_l:
+            continue
+        for cand in sorted(_table_mention_candidates(table_l, include_synonyms=True), key=len, reverse=True):
+            cand_text = str(cand or "").strip().lower()
+            if not cand_text:
+                continue
+            pattern = re.escape(cand_text).replace(r"\ ", r"\s+")
+            match = re.search(
+                rf"\b(?:for\s+each|for\s+every|each|every|per)\s+(?:such\s+|the\s+|those\s+|these\s+)?{pattern}\b",
+                q,
+                flags=re.I,
+            )
+            if not match:
+                continue
+            pos = match.start()
+            span_len = len(cand_text)
+            if best_pos is None or pos < best_pos or (pos == best_pos and span_len > best_span_len):
+                best_table = table_l
+                best_pos = pos
+                best_span_len = span_len
+
+    return best_table
+
+
+def _guidance_has_direct_table_mention(question: str, table: str) -> bool:
+    q = str(question or "").lower()
+    table_l = str(table or "").strip().lower()
+    if not q or not table_l:
+        return False
+    for cand in _table_mention_candidates(table_l, include_synonyms=True):
+        cand_text = str(cand or "").strip().lower()
+        if not cand_text:
+            continue
+        pattern = re.escape(cand_text).replace(r"\ ", r"\s+")
+        if re.search(rf"\b{pattern}\b", q, flags=re.I):
+            return True
+    return False
+
+
+def _should_emit_parent_entity_grain_guidance(
+    question: str,
+    primary_table: str,
+    guidance_anchor_table: str,
+    ctx: str,
+) -> bool:
+    primary = str(primary_table or "").strip().lower()
+    anchor = str(guidance_anchor_table or "").strip().lower()
+    if not primary or not anchor or anchor == primary:
+        return False
+    if _question_wants_winner_row(question):
+        return False
+    if not _question_wants_include_zero(question, ctx):
+        return False
+    if not _guidance_has_direct_table_mention(question, anchor):
+        return False
+    return _classify_guidance_hop_role(primary, anchor) == "parent"
+
+
+def _guidance_tables_question_matches(question: str, ranked_cols: list, tables: List[str]) -> Dict[str, Set[str]]:
+    raw_matches = _infer_tables_from_question_columns(question, ranked_cols or [], tables or [])
+    return {
+        str(tbl or "").strip().lower(): {
+            str(col or "").strip()
+            for col in (cols or [])
+            if str(col or "").strip()
+        }
+        for tbl, cols in (raw_matches or {}).items()
+        if str(tbl or "").strip()
+    }
+
+
+def _guidance_table_columns(
+    table: str,
+    allowed_identifiers: Dict[str, Set[str]],
+    ranked_cols: list,
+) -> List[str]:
+    table_l = str(table or "").strip().lower()
+    if not table_l:
+        return []
+
+    cols: List[str] = []
+    for original_tbl, table_cols in (allowed_identifiers or {}).items():
+        if str(original_tbl or "").strip().lower() == table_l:
+            cols.extend(str(col or "").strip() for col in (table_cols or set()) if str(col or "").strip())
+            break
+    if cols:
+        return cols
+
+    seen: Set[str] = set()
+    for tbl, col in (ranked_cols or []):
+        tbl_l = str(tbl or "").strip().lower()
+        col_name = str(col or "").strip()
+        if tbl_l != table_l or not col_name:
+            continue
+        if col_name.lower() in seen:
+            continue
+        seen.add(col_name.lower())
+        cols.append(col_name)
+    return cols
+
+
+def _guidance_column_is_covered_by_tables(
+    source_table: str,
+    column: str,
+    cover_tables: Set[str],
+    allowed_identifiers: Dict[str, Set[str]],
+    ranked_cols: list,
+) -> bool:
+    src_l = str(source_table or "").strip().lower()
+    col_name = str(column or "").strip()
+    if not src_l or not col_name or not cover_tables:
+        return False
+
+    col_lower = col_name.lower()
+    candidate_terms = _guidance_column_cover_terms(src_l, col_name)
+    col_words = set(re.findall(r"[a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", col_name).replace("_", " ").lower()))
+
+    for cover_table in cover_tables:
+        table_l = str(cover_table or "").strip().lower()
+        if not table_l:
+            continue
+        for avail_col in _guidance_table_columns(table_l, allowed_identifiers, ranked_cols):
+            avail_lower = str(avail_col or "").strip().lower()
+            if not avail_lower:
+                continue
+            if avail_lower == col_lower or col_lower in avail_lower or avail_lower in col_lower:
+                return True
+
+            avail_terms = _guidance_column_cover_terms(table_l, avail_col)
+            if candidate_terms and avail_terms:
+                overlap = candidate_terms.intersection(avail_terms)
+                if overlap:
+                    if overlap == candidate_terms:
+                        return True
+                    if len(overlap) / max(1, len(candidate_terms)) >= 0.60:
+                        return True
+
+            avail_words = set(
+                re.findall(
+                    r"[a-z0-9]+",
+                    re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(avail_col or "")).replace("_", " ").lower(),
+                )
+            )
+            if col_words and avail_words and col_words.intersection(avail_words):
+                return True
+
+    return False
+
+
+def _guidance_support_candidate_columns(table: str) -> List[str]:
+    """
+    Candidate columns for support-table inference should be true metric/temporal
+    carriers, not generic identifiers that happen to be numeric.
+    """
+    table_l = str(table or "").strip().lower()
+    if not table_l:
+        return []
+
+    seen: Set[str] = set()
+    candidates: List[str] = []
+    id_col = str(get_id_column(table_l) or "").strip().lower()
+    date_cols = {
+        str(c or "").strip().lower()
+        for c in (get_filterable_date_columns(table_l) or [])
+        if str(c or "").strip()
+    }
+    agg_cols = [
+        str(c or "").strip()
+        for c in (get_aggregatable_columns(table_l) or [])
+        if str(c or "").strip()
+    ]
+
+    for col in agg_cols + [c for c in date_cols if c not in {a.lower() for a in agg_cols}]:
+        col_name = str(col or "").strip()
+        col_l = col_name.lower()
+        if not col_l or col_l in seen:
+            continue
+        seen.add(col_l)
+
+        role = str(get_column_role(table_l, col_name) or "").strip().lower()
+        is_date_col = col_l in date_cols
+        tokenized_col = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", col_name).replace("_", " ").lower()
+        col_tokens = [tok for tok in re.findall(r"[a-z0-9]+", tokenized_col) if tok]
+        last_token = col_tokens[-1] if col_tokens else ""
+        is_id_like = bool(
+            col_l == id_col
+            or role in {"pk", "fk", "id", "identifier"}
+            or last_token in {"id", "code", "number"}
+            or re.search(r"(?:^|_)(?:id|code|number)$", col_l, flags=re.I)
+        )
+        if is_id_like and not is_date_col:
+            continue
+
+        candidates.append(col_name)
+
+    return candidates
+
+
+def _question_has_guidance_support_intent(question: str, qtype: str) -> bool:
+    qtype_l = str(qtype or "").strip().lower()
+    if qtype_l in {"aggregate", "rank", "aggregate_by", "aggregate_all"}:
+        return True
+
+    q = str(question or "").lower()
+    if not q:
+        return False
+
+    return bool(
+        re.search(
+            r"\b(sum|total|avg|average|mean|min|max|count|rank|top|bottom|latest|earliest|recent|quantity|amount|price|revenue|sales|ordered)\b",
+            q,
+            flags=re.I,
+        )
+    )
+
+
+def _find_schema_support_tables_for_guidance(
+    question: str,
+    ranked_cols: list,
+    relevant_tables: list,
+    primary_table: str,
+    ctx: str,
+    qtype: str = "",
+) -> List[str]:
+    """
+    Find FK-connected support tables whose metric/date columns are semantically
+    implicated by the question, even when retrieval/routing did not explicitly
+    surface the table for prompt guidance.
+    """
+    primary = str(primary_table or "").strip().lower()
+    base_tables = [
+        str(t or "").strip().lower()
+        for t in (relevant_tables or [])
+        if str(t or "").strip()
+    ]
+    if not primary or not base_tables:
+        return []
+    if not _question_has_guidance_support_intent(question, qtype):
+        return []
+
+    question_terms = _guidance_semantic_tokens(question)
+    if not question_terms:
+        return []
+    support_question_terms = _guidance_informative_terms(question_terms)
+    matched_fact_support_phrases = [
+        phrase
+        for phrase in guidance_fact_support_phrases()
+        if phrase_in_text(question, phrase)
+    ]
+    fact_support_cue_terms: Set[str] = set()
+    generic_fact_support_terms = {"order", "orders", "product", "products", "payment", "payments", "total"}
+    for phrase in matched_fact_support_phrases:
+        fact_support_cue_terms.update(
+            term
+            for term in _guidance_informative_terms(_guidance_semantic_tokens(phrase))
+            if term not in generic_fact_support_terms
+        )
+
+    explicit_metric_terms = {
+        tok
+        for tok in support_question_terms
+        if tok in (HELPERS_PROBE_GENERIC_METRIC_TERMS | HELPERS_PROBE_LOCALIZED_METRIC_TERMS)
+    }
+    ranked_pairs = {
+        (str(tbl or "").strip().lower(), str(col or "").strip().lower())
+        for tbl, col in (ranked_cols or [])
+        if str(tbl or "").strip() and str(col or "").strip()
+    }
+    allowed_identifiers = _parse_allowed_identifiers(ctx)
+    allowed_tables = {
+        str(t or "").strip().lower()
+        for t in (allowed_identifiers or {}).keys()
+        if str(t or "").strip()
+    }
+    covered_terms: Set[str] = set()
+    for table in base_tables:
+        table_l = str(table or "").strip().lower()
+        if not table_l:
+            continue
+        for col in _guidance_support_candidate_columns(table_l):
+            covered_terms.update(
+                _guidance_column_cover_terms(table_l, col).intersection(support_question_terms)
+            )
+
+    support_scores: List[Tuple[int, int, str]] = []
+    seen_tables = set(base_tables)
+    for table in sorted(get_all_tables()):
+        table_l = str(table or "").strip().lower()
+        if not table_l or table_l in seen_tables:
+            continue
+        if allowed_tables and table_l not in allowed_tables:
+            continue
+
+        path = _shortest_fk_table_path(primary, table_l)
+        if len(path) < 2:
+            continue
+
+        candidate_cols = _guidance_support_candidate_columns(table_l)
+        if not candidate_cols:
+            continue
+
+        col_scores: List[int] = []
+        matched_cols = 0
+        novel_overlap_seen = False
+        fact_support_seen = False
+        non_temporal_support_seen = False
+        for col in candidate_cols:
+            role = get_column_role(table_l, col)
+            col_terms = _guidance_column_cover_terms(table_l, col)
+            if matched_fact_support_phrases:
+                try:
+                    desc_terms = _guidance_informative_terms(
+                        _guidance_semantic_tokens(get_column_description(table_l, col))
+                    )
+                except Exception:
+                    desc_terms = set()
+            else:
+                desc_terms = set()
+            semantic_terms = col_terms.union(desc_terms)
+            overlap = semantic_terms.intersection(support_question_terms)
+            cue_overlap = semantic_terms.intersection(fact_support_cue_terms)
+            if not overlap and cue_overlap:
+                overlap = cue_overlap
+            if overlap:
+                matched_cols += 1
+                novel_overlap = overlap.difference(covered_terms)
+                if novel_overlap:
+                    novel_overlap_seen = True
+                col_score = min(len(overlap), 3) * 3
+                fact_phrase_overlap = cue_overlap
+                if fact_phrase_overlap:
+                    fact_support_seen = True
+                    col_score += 3
+                    if role in {"metric", "measure", "amount", "quantity"}:
+                        col_score += 2
+                if role in {"metric", "measure", "amount", "quantity"} or fact_phrase_overlap:
+                    non_temporal_support_seen = True
+                if role in {"metric", "measure", "amount", "quantity", "date"}:
+                    col_score += 2
+                if explicit_metric_terms and overlap.intersection(explicit_metric_terms):
+                    col_score += 2
+                if novel_overlap:
+                    col_score += 2
+                if _guidance_has_direct_table_mention(question, table_l):
+                    col_score += 1
+                col_scores.append(col_score)
+            if (table_l, col.lower()) in ranked_pairs:
+                if col_scores:
+                    col_scores[-1] += 1
+
+        if matched_cols <= 0:
+            continue
+        if not col_scores:
+            continue
+        if matched_fact_support_phrases and not non_temporal_support_seen:
+            continue
+        if (
+            not novel_overlap_seen
+            and not fact_support_seen
+            and not _guidance_has_direct_table_mention(question, table_l)
+        ):
+            continue
+
+        col_scores.sort(reverse=True)
+        score = sum(col_scores[:2])
+
+        distance_penalty = max(0, len(path) - 2)
+        support_scores.append((score - distance_penalty, len(path), table_l))
+
+    support_scores.sort(key=lambda item: (-item[0], item[1], item[2]))
+    max_support_tables = 2 if _question_wants_dual_fact_rollup(question) else 1
+    return [table for score, _, table in support_scores if score > 0][:max_support_tables]
+
+
+def _prune_guidance_tables_for_prompt(
+    question: str,
+    ranked_cols: list,
+    candidate_tables: List[str],
+    primary_table: str,
+    ctx: str,
+    support_tables: Optional[Set[str]] = None,
+) -> List[str]:
+    """
+    Prune hint-only table scope so the recommendation stays narrow:
+    - keep primary
+    - keep explicit support/existence/exclusion tables
+    - drop duplicate-dimension tables whose matched columns are already covered
+    """
+    tables = [str(t or "").strip().lower() for t in (candidate_tables or []) if str(t or "").strip()]
+    primary = str(primary_table or "").strip().lower()
+    if not tables:
+        return []
+    if not primary:
+        return tables
+
+    allowed_identifiers = _parse_allowed_identifiers(ctx)
+    matched_cols_by_table = _guidance_tables_question_matches(question, ranked_cols, tables)
+    support_set = {str(t or "").strip().lower() for t in (support_tables or set()) if str(t or "").strip()}
+    explicit_group_anchor = _guidance_grouping_anchor_table(question, tables)
+    keep_explicit_group_anchor = bool(explicit_group_anchor) and not _question_wants_winner_row(question)
+
+    pruned: List[str] = []
+    kept: Set[str] = set()
+
+    def _keep(table_name: str) -> None:
+        t = str(table_name or "").strip().lower()
+        if not t or t in kept:
+            return
+        kept.add(t)
+        pruned.append(t)
+
+    def _explicit_group_anchor_is_redundant_with_primary(anchor_table: str) -> bool:
+        anchor_l = str(anchor_table or "").strip().lower()
+        if not anchor_l or anchor_l == primary:
+            return False
+        if not _guidance_has_direct_table_mention(question, primary):
+            return False
+        if (
+            _question_wants_include_zero(question, ctx)
+            and _classify_guidance_hop_role(primary, anchor_l) == "parent"
+        ):
+            return False
+
+        anchor_matches = matched_cols_by_table.get(anchor_l, set())
+        if not anchor_matches:
+            return False
+
+        return all(
+            _guidance_column_is_covered_by_tables(
+                anchor_l,
+                col,
+                {primary},
+                allowed_identifiers,
+                ranked_cols,
+            )
+            for col in anchor_matches
+        )
+
+    _keep(primary)
+
+    for table in tables:
+        table_l = str(table or "").strip().lower()
+        if not table_l or table_l == primary:
+            continue
+
+        if keep_explicit_group_anchor and table_l == explicit_group_anchor:
+            if _explicit_group_anchor_is_redundant_with_primary(table_l):
+                continue
+            _keep(table_l)
+            continue
+        if table_l in support_set:
+            _keep(table_l)
+            continue
+        if _question_targets_table_exclusion(question, table_l) or _question_targets_table_existence(question, table_l):
+            _keep(table_l)
+            continue
+
+        matched_cols = matched_cols_by_table.get(table_l, set())
+        if not matched_cols:
+            if _guidance_has_direct_table_mention(question, table_l):
+                _keep(table_l)
+            continue
+
+        if any(
+            not _guidance_column_is_covered_by_tables(
+                table_l,
+                col,
+                kept,
+                allowed_identifiers,
+                ranked_cols,
+            )
+            for col in matched_cols
+        ):
+            _keep(table_l)
+
+    return pruned
+
+
 def _build_join_key_hints_for_prompt(
     state: "RAGState",
     *,
@@ -2686,6 +3272,7 @@ def _build_join_key_hints_for_prompt(
     ranked_cols = state.get("ranked_cols", []) or []
     router_tables_raw = [str(t).strip().lower() for t in (state.get("router_tables", []) or []) if str(t).strip()]
     primary_table = str(state.get("primary_table", "") or "").strip().lower()
+    qtype = str((state.get("router_decision", {}) or {}).get("qtype") or "").strip().lower()
 
     if not router_tables_raw:
         return []
@@ -2696,6 +3283,7 @@ def _build_join_key_hints_for_prompt(
         router_tables=router_tables_raw,
         ctx=ctx,
         primary_table=primary_table,
+        qtype=qtype,
     )
     if not router_tables:
         return []
@@ -2741,7 +3329,9 @@ def _build_join_key_hints_for_prompt(
     ordered_scope.extend([t for t in router_tables if t in table_scope and t not in ordered_scope])
 
     def _append_edge(src: str, fk_col: str, tgt: str) -> None:
-        tgt_id = (get_id_column(tgt) or "").strip("`")
+        tgt_id = str(get_fk_target_column(src, fk_col) or "").strip("`")
+        if not tgt_id:
+            tgt_id = (get_id_column(tgt) or "").strip("`")
         edge = f"{src}.{fk_col} = {tgt}.{tgt_id}" if tgt_id else f"{src}.{fk_col} = {tgt}.{fk_col}"
         if edge not in seen:
             seen.add(edge)
@@ -2782,6 +3372,7 @@ def _expand_router_tables_for_join_hints(
     router_tables: list,
     ctx: str,
     primary_table: str = "",
+    qtype: str = "",
 ) -> List[str]:
     """
     Expand hint table scope conservatively for prompt guidance:
@@ -2806,6 +3397,28 @@ def _expand_router_tables_for_join_hints(
     for t in base_tables:
         _add_table(t)
 
+    primary = str(primary_table or "").strip().lower()
+    allowed_identifiers = _parse_allowed_identifiers(ctx)
+    allowed_tables = [
+        str(t or "").strip().lower()
+        for t in (allowed_identifiers or {}).keys()
+        if str(t or "").strip()
+    ]
+
+    explicit_group_anchor = _guidance_grouping_anchor_table(
+        question,
+        allowed_tables or list(base_tables),
+    )
+    if (
+        primary
+        and explicit_group_anchor
+        and explicit_group_anchor != primary
+        and not _question_wants_winner_row(question)
+        and _question_wants_include_zero(question, ctx)
+        and _classify_guidance_hop_role(primary, explicit_group_anchor) == "parent"
+    ):
+        _add_table(explicit_group_anchor)
+
     try:
         implicit_tables = sorted(
             _find_tables_with_implicit_columns(
@@ -2820,6 +3433,31 @@ def _expand_router_tables_for_join_hints(
 
     for t in implicit_tables:
         _add_table(t)
+
+    try:
+        support_tables = _find_schema_support_tables_for_guidance(
+            question=question,
+            ranked_cols=ranked_cols or [],
+            relevant_tables=expanded,
+            primary_table=primary,
+            ctx=ctx,
+            qtype=qtype,
+        )
+    except Exception:
+        support_tables = []
+
+    for t in support_tables:
+        _add_table(t)
+
+    expanded = _prune_guidance_tables_for_prompt(
+        question=question,
+        ranked_cols=ranked_cols or [],
+        candidate_tables=expanded,
+        primary_table=primary,
+        ctx=ctx,
+        support_tables=set(support_tables or []),
+    )
+    seen = {str(t or "").strip().lower() for t in expanded if str(t or "").strip()}
 
     try:
         fk_map_raw = get_fk_relationships() or {}
@@ -2837,7 +3475,6 @@ def _expand_router_tables_for_join_hints(
             fk_map[src_l].add(tgt_l)
             fk_map[tgt_l].add(src_l)
 
-    primary = str(primary_table or "").strip().lower()
     if not primary:
         return expanded
 
@@ -3070,6 +3707,29 @@ def _build_connector_path_rules(primary_table: str, ordered_tables: List[str]) -
     return rules
 
 
+def _required_connector_tables_for_guidance(
+    primary_table: str,
+    required_targets: List[str],
+) -> Set[str]:
+    primary = str(primary_table or "").strip().lower()
+    if not primary:
+        return set()
+
+    connectors: Set[str] = set()
+    for target in required_targets:
+        target_l = str(target or "").strip().lower()
+        if not target_l or target_l == primary:
+            continue
+        path = _shortest_fk_table_path(primary, target_l)
+        if len(path) <= 2:
+            continue
+        for connector in path[1:-1]:
+            connector_l = str(connector or "").strip().lower()
+            if connector_l and connector_l != target_l:
+                connectors.add(connector_l)
+    return connectors
+
+
 def _classify_guidance_hop_role(primary_table: str, target_table: str) -> str:
     """
     Classify the final FK hop used to reach target_table from primary_table.
@@ -3131,6 +3791,26 @@ def _prefer_inner_join_for_reference_guidance(primary_table: str, target_table: 
     prefer INNER JOIN for schema-reference hops, e.g. fact -> dimension.
     """
     return _classify_guidance_hop_role(primary_table, target_table) == "parent"
+
+
+def _prefer_inner_join_for_parent_entity_membership(
+    primary_table: str,
+    target_table: str,
+) -> bool:
+    """
+    Prompt-hint heuristic only (non-binding):
+    when a preserved parent entity is the guidance anchor, use INNER JOIN for
+    its direct child membership table. This keeps the parent domain explicit
+    while treating deeper optional fact tables separately.
+    """
+    primary = str(primary_table or "").strip().lower()
+    target = str(target_table or "").strip().lower()
+    if not primary or not target or primary == target:
+        return False
+    if _classify_guidance_hop_role(primary, target) != "child":
+        return False
+    path = _shortest_fk_table_path(primary, target)
+    return len(path) == 2
 
 
 def _find_tables_with_implicit_columns(
@@ -3270,53 +3950,20 @@ def _find_tables_with_implicit_columns(
     # [FIX] Filter out tables whose columns are already available in existing relevant tables
     # Example: If payments.customerNumber exists, don't add customers just for customerNumber
     # This prevents single-table queries from being detected as multi-table
-    available_cols_in_existing = set()
     allowed_identifiers = _parse_allowed_identifiers(ctx)
-
-    # Prefer full schema columns from ALLOWED IDENTIFIERS for selected tables
-    # (ranked_cols can be sparse and miss shared columns like productLine).
-    for tbl_lower in relevant_lower:
-        matched_table = None
-        for original_tbl in allowed_identifiers.keys():
-            if original_tbl.lower() == tbl_lower:
-                matched_table = original_tbl
-                break
-
-        if matched_table:
-            for col in allowed_identifiers.get(matched_table, set()):
-                available_cols_in_existing.add(str(col).lower())
-        else:
-            # Fallback when ALLOWED block is incomplete
-            for rel_tbl, col in ranked_cols:
-                if rel_tbl.lower() == tbl_lower:
-                    available_cols_in_existing.add(col.lower())
 
     # Filter out tables whose columns are already covered
     filtered_mentioned_tables = {}
     for tbl, cols in mentioned_tables.items():
         cols_not_available = set()
         for col in cols:
-            col_lower = col.lower()
-            # Check if this column or its word components are already available
-            already_covered = False
-
-            # Direct match
-            if col_lower in available_cols_in_existing:
-                already_covered = True
-            else:
-                # Check word component overlap (e.g., "customerNumber" covers "customer")
-                for avail_col in available_cols_in_existing:
-                    if col_lower in avail_col or avail_col in col_lower:
-                        already_covered = True
-                        break
-                    # Check word component overlap
-                    col_words = set(col_lower.split('_'))
-                    avail_words = set(avail_col.split('_'))
-                    if col_words & avail_words:  # intersection non-empty
-                        already_covered = True
-                        break
-
-            if not already_covered:
+            if not _guidance_column_is_covered_by_tables(
+                tbl,
+                col,
+                set(relevant_lower),
+                allowed_identifiers,
+                ranked_cols,
+            ):
                 cols_not_available.add(col)
 
         if cols_not_available:
@@ -3555,6 +4202,16 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         router_decision.get("simple_multi_table_candidate", False)
     )
     router_tables = state.get("router_tables", []) if state else []
+    ranked_tables_for_prompt = {
+        str(tbl or "").strip().lower()
+        for tbl, _ in ((state or {}).get("ranked_cols", []) or [])
+        if str(tbl or "").strip()
+    }
+    has_fact_support_prompt_candidate = bool(
+        state
+        and any_phrase_in_text(question, guidance_fact_support_phrases())
+        and len(ranked_tables_for_prompt) > 1
+    )
     
     # Detect tiebreaker pattern: "if multiple...choose the one with latest/earliest"
     has_tiebreaker = bool(re.search(
@@ -3873,7 +4530,11 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     # [D] PRIMARY TABLE GUIDANCE (CRITICAL FOR ALL MULTI-TABLE QUERIES)
     # Apply to ALL non-simple queries (lookup, aggregate, ranking) to prevent wrong FROM clause order
     # This ensures the LLM uses the correct primary table as the first table in FROM clause
-    if (complexity != "simple" or is_simple_multi_table_candidate) and state:
+    if (
+        complexity != "simple"
+        or is_simple_multi_table_candidate
+        or has_fact_support_prompt_candidate
+    ) and state:
         primary_table = state.get("primary_table")
         primary_reason = state.get("primary_table_reason")
         join_key_hints = _build_join_key_hints_for_prompt(state, max_edges=8)
@@ -3890,11 +4551,39 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 router_tables=state.get("router_tables", []) or [],
                 ctx=ctx,
                 primary_table=primary_table_l,
+                qtype=qtype,
             )
-            other_tables = [t for t in router_tables_hint if str(t).strip() and t != primary_table_l]
-            other_tables = _order_tables_by_fk_distance(primary_table_l, other_tables)
+            if _question_wants_winner_row(question):
+                guidance_primary_table = primary_table_l
+            else:
+                guidance_primary_table = (
+                    _guidance_grouping_anchor_table(question, router_tables_hint) or primary_table_l
+                )
+            if guidance_primary_table not in router_tables_hint:
+                guidance_primary_table = primary_table_l
+            other_tables = [t for t in router_tables_hint if str(t).strip() and t != guidance_primary_table]
+            other_tables = _order_tables_by_fk_distance(guidance_primary_table, other_tables)
             requires_inner_join = _question_requires_inner_join(question, ctx)
             wants_include_zero = _question_wants_include_zero(question, ctx)
+            parent_entity_grain_guidance = _should_emit_parent_entity_grain_guidance(
+                question=question,
+                primary_table=primary_table_l,
+                guidance_anchor_table=guidance_primary_table,
+                ctx=ctx,
+            )
+            membership_tables = [
+                str(t).strip()
+                for t in other_tables
+                if _prefer_inner_join_for_parent_entity_membership(
+                    guidance_primary_table,
+                    str(t).strip(),
+                )
+            ]
+            optional_support_tables = [
+                str(t).strip()
+                for t in other_tables
+                if str(t).strip() and str(t).strip() not in membership_tables
+            ]
             exclusion_tables = {t for t in other_tables if _question_targets_table_exclusion(question, t)}
             existence_tables = {t for t in other_tables if _question_targets_table_existence(question, t)}
             if _question_wants_dual_fact_rollup(question) and len(other_tables) >= 2:
@@ -3910,13 +4599,27 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 router_tables=state.get("router_tables", []) or [],
                 ctx=ctx,
             )
-            connector_path_rules = _build_connector_path_rules(primary_table_l, other_tables)
+            connector_path_rules = _build_connector_path_rules(guidance_primary_table, other_tables)
             if wants_include_zero and exclusion_tables:
                 # Preserve include-zero semantics:
                 # if a table is explicitly in exclusion/no-data intent, do not also
                 # force existence for the same table at table-hint level.
                 existence_tables = {t for t in existence_tables if t not in exclusion_tables}
             mixed_intent_tables = exclusion_tables.intersection(existence_tables)
+            qtype_l = str(qtype or "").strip().lower()
+            metric_support_inner_targets = {
+                t for t in other_tables
+                if _should_prefer_inner_for_metric_support_table(
+                    question,
+                    str(t).strip(),
+                    qtype_l,
+                    ctx=ctx,
+                )
+            }
+            required_connector_inner_tables = _required_connector_tables_for_guidance(
+                guidance_primary_table,
+                list(existence_tables | mixed_intent_tables | metric_support_inner_targets),
+            )
 
             # Join type must be decided per table.
             # Global "requires_inner_join" is only a fallback when no table-level
@@ -3927,7 +4630,6 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 and not exclusion_tables
                 and not existence_tables
             )
-            qtype_l = str(qtype or "").strip().lower()
             exclusion_aggregate_prefers_inner_non_target = bool(
                 has_exclusion
                 and (qtype_l == "aggregate")
@@ -3938,7 +4640,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             # useful for FK path stability, but join type can be question
             # dependent, so do not make this an unconditional hard command.
             hint_msg = (
-                f"TABLE ORDER GUIDANCE: Prefer starting with FROM {primary_table_l}"
+                f"TABLE ORDER GUIDANCE: Prefer starting with FROM {guidance_primary_table}"
             )
             if other_tables:
                 join_steps = []
@@ -3946,13 +4648,23 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     join_target = str(t).strip()
                     if wants_include_zero and t in exclusion_tables:
                         join_steps.append(f"LEFT JOIN {join_target}")
+                    elif (
+                        parent_entity_grain_guidance
+                        and _prefer_inner_join_for_parent_entity_membership(
+                            guidance_primary_table,
+                            join_target,
+                        )
+                    ):
+                        join_steps.append(f"INNER JOIN {join_target}")
                     elif force_required_inner_chain:
                         join_steps.append(f"INNER JOIN {join_target}")
                     elif t in mixed_intent_tables:
                         join_steps.append(f"INNER JOIN {join_target}")
+                    elif t in required_connector_inner_tables:
+                        join_steps.append(f"INNER JOIN {join_target}")
                     elif (
                         wants_include_zero
-                        and _prefer_left_join_for_include_zero_guidance(primary_table_l, join_target)
+                        and _prefer_left_join_for_include_zero_guidance(guidance_primary_table, join_target)
                     ):
                         join_steps.append(f"LEFT JOIN {join_target}")
                     elif t in exclusion_tables:
@@ -3965,20 +4677,24 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                         # In exclusion+aggregate questions, non-target supporting tables
                         # are usually part of required positive slice (e.g., metric fact tables).
                         join_steps.append(f"INNER JOIN {join_target}")
-                    elif _prefer_inner_join_for_reference_guidance(primary_table_l, join_target):
+                    elif _prefer_inner_join_for_reference_guidance(guidance_primary_table, join_target):
                         join_steps.append(f"INNER JOIN {join_target}")
-                    elif _should_prefer_inner_for_metric_support_table(
-                        question,
-                        join_target,
-                        qtype_l,
-                        ctx=ctx,
-                    ):
+                    elif join_target in metric_support_inner_targets:
                         join_steps.append(f"INNER JOIN {join_target}")
                     else:
                         join_steps.append(f"LEFT JOIN {join_target}")
                 hint_msg += ", then " + ", ".join(join_steps)
-            if primary_reason:
-                hint_msg += f". Reason: {primary_reason}"
+            display_primary_reason = str(primary_reason or "").strip()
+            if display_primary_reason.lower() == "single table" and other_tables:
+                display_primary_reason = (
+                    "single-table router anchor; additional supporting tables inferred from schema-linked evidence"
+                )
+            if guidance_primary_table != primary_table_l and display_primary_reason:
+                display_primary_reason += "; guidance anchor refined from question grain"
+            elif guidance_primary_table != primary_table_l:
+                display_primary_reason = "guidance anchor refined from question grain"
+            if display_primary_reason:
+                hint_msg += f". Reason: {display_primary_reason}"
             hint_msg += (
                 ". Use this as base schema-path guidance only (it may be a partial path); "
                 "if selected metrics require additional supporting tables, extend the chain "
@@ -3987,6 +4703,29 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
 
             print(f"[PROMPT DEBUG] Adding hint: {hint_msg}")
             constraints.append(hint_msg)
+
+            if parent_entity_grain_guidance:
+                constraints.append(
+                    "ENTITY GRAIN GUIDANCE: The requested output grain is the explicitly named parent entity "
+                    f"`{guidance_primary_table}` and the question asks to preserve all of those rows. "
+                    f"Keep `{guidance_primary_table}` as the base domain in FROM. "
+                    "If a child table also contains a similarly named FK/category column, treat that child-side column "
+                    "only as a join attribute; do NOT replace the parent-entity anchor by grouping only from the child table."
+                )
+                if membership_tables:
+                    membership_str = ", ".join(f"`{t}`" for t in membership_tables)
+                    constraint = (
+                        "ENTITY MEMBERSHIP JOIN GUIDANCE: "
+                        f"The direct membership table(s) {membership_str} define which child rows belong to each "
+                        f"`{guidance_primary_table}` group, so keep that hop as INNER JOIN."
+                    )
+                    if optional_support_tables:
+                        support_str = ", ".join(f"`{t}`" for t in optional_support_tables)
+                        constraint += (
+                            f" Use LEFT JOIN only for downstream optional support table(s) {support_str} when the "
+                            "question asks to preserve parent/member rows even when related support rows are missing."
+                        )
+                    constraints.append(constraint)
 
             # JOIN TYPE GUIDANCE
             if wants_include_zero and exclusion_tables:
@@ -5377,6 +6116,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     # Cosmetic and execution-safety adjustments only
     # ---------------------------------------------------------------------------
     s = _simplify_default_window_frame(s, question)
+    s = _rewrite_same_group_avg_gap_window_to_partition_only(s, question)
     s = _rewrite_single_table_case_band_derived_subquery(s, question)
     s = _rewrite_correlated_offset_subquery_to_window(s, question)
     s = _rewrite_same_table_group_count_self_join_to_window(s, question)

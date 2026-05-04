@@ -439,6 +439,40 @@ def grouped_self_fk_independence_cues() -> list[str]:
 
 
 @lru_cache(maxsize=1)
+def existence_count_metric_phrases() -> list[str]:
+    defaults = [
+        "ever ordered",
+        "been ordered",
+        "ever been ordered",
+        "ordered at least once",
+    ]
+    return rule_list(("heuristic_repairs", "existence_count_metric", "phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def guidance_fact_support_phrases() -> list[str]:
+    defaults = [
+        "order line",
+        "order lines",
+        "ordered products",
+        "total quantity",
+        "total revenue",
+    ]
+    return rule_list(("prompt_guidance", "fact_support", "phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def group_average_difference_window_phrases() -> list[str]:
+    defaults = [
+        "gap between",
+        "difference between",
+        "gap from average",
+        "difference from average",
+    ]
+    return rule_list(("heuristic_repairs", "group_average_difference_window", "phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
 def ordering_superlative_keywords() -> list[str]:
     defaults = [
         "top", "bottom", "most", "least", "most expensive", "least expensive",

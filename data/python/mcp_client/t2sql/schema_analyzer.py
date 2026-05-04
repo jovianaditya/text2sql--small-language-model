@@ -495,6 +495,16 @@ class SchemaAnalyzer:
         """Return FK relationships: {table: {fk_col: target_table}}."""
         return self._fk_relationships
 
+    def get_fk_target_column(self, table: str, column: str) -> str:
+        """
+        Return FK target column name for a given source table.column when known.
+        """
+        t = str(table or "").strip().lower()
+        c = str(column or "").strip().lower()
+        if not t or not c:
+            return ""
+        return str(self._fk_target_columns.get(t, {}).get(c, "")).strip()
+
     def get_table_synonyms(self, table: str) -> List[str]:
         """
         Get all synonyms for a table (from column synonyms).
@@ -799,6 +809,11 @@ def is_transaction_table(table: str) -> bool:
 def get_fk_relationships() -> Dict[str, Dict[str, str]]:
     """Get all FK relationships from schema."""
     return get_schema_analyzer().get_fk_relationships()
+
+
+def get_fk_target_column(table: str, column: str) -> str:
+    """Get FK target column for a given source table.column when known."""
+    return get_schema_analyzer().get_fk_target_column(table, column)
 
 
 def find_table_by_keyword(keyword: str) -> Optional[str]:
@@ -1679,6 +1694,7 @@ __all__ = [
     'get_anchor_columns',
     'is_transaction_table',
     'get_fk_relationships',
+    'get_fk_target_column',
     'find_table_by_keyword',
     'get_table_type',
     'get_singular_form',

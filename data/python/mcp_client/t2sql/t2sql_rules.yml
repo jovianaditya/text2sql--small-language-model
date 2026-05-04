@@ -355,6 +355,12 @@ heuristic_repairs:
       - regardless of whether
       - independent of
       - may or may not be
+  existence_count_metric:
+    phrases:
+      - ever ordered
+      - been ordered
+      - ever been ordered
+      - ordered at least once
   threshold_count_object:
     local_stop_terms:
       - and
@@ -467,6 +473,23 @@ ordering_intent:
     - "\\bfrom\\s+(the\\s+)?(highest|lowest|latest|earliest|newest|oldest)"
     - "\\bfrom\\s+(a\\s+to\\s+z|z\\s+to\\s+a)"
     - "\\b(sorted|ordered)\\s+from\\b"
+
+prompt_guidance:
+  fact_support:
+    phrases:
+      - order line
+      - order lines
+      - ordered products
+      - total quantity
+      - total revenue
+
+heuristic_repairs:
+  group_average_difference_window:
+    phrases:
+      - gap between
+      - difference between
+      - gap from average
+      - difference from average
 
 grouping_intent:
   for_each_keywords:

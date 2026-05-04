@@ -75,8 +75,10 @@ from .rulebook import (
     aggregation_count_distinct_keywords,
     aggregation_count_distinct_phrases,
     any_phrase_in_text,
+    existence_count_metric_phrases,
     final_order_first_position_terms,
     final_order_metric_desc_cues,
+    group_average_difference_window_phrases,
     grouped_self_fk_independence_cues,
     identifier_id_like_terms,
     name_component_lexical_tokens,
@@ -17661,6 +17663,7 @@ def _rewrite_existence_sum_to_distinct_entity_count(
         re.search(r"\b(?:ever|at\s+least\s+once|at\s+least\s+one(?:\s+time)?)\b", q, flags=re.I)
         or re.search(r"\b(?:who|that|which)\s+(?:have|has)\s+(?:ever\s+)?(?:been\s+)?[a-z_]+\b", q, flags=re.I)
     )
+    has_existence_count_metric_phrase = any_phrase_in_text(q, existence_count_metric_phrases())
     has_reference_phrase = bool(
         re.search(r"\b(?:of|among)\s+(?:those|the)\b", q, flags=re.I)
     )
@@ -17749,6 +17752,9 @@ def _rewrite_existence_sum_to_distinct_entity_count(
     sum_direct_pat = re.compile(
         r"""(?is)^\s*SUM\s*\(\s*(?P<body>.+?)\s*\)\s*$"""
     )
+    simple_qualified_col_pat = re.compile(
+        r"""(?is)^\s*(?:(?P<alias>`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\.\s*)?(?P<col>`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$"""
+    )
 
     comparison_token_pat = re.compile(
         r"""(?is)(?:>=|<=|<>|!=|=|<|>|\bLIKE\b|\bREGEXP\b|\bRLIKE\b|\bBETWEEN\b|\bIN\s*\()"""
@@ -17833,6 +17839,15 @@ def _rewrite_existence_sum_to_distinct_entity_count(
             col = (m_not.group("c2") or "").strip("`")
             if alias and col:
                 return alias, f"{alias}.{col} IS NOT NULL"
+        m_simple = simple_qualified_col_pat.match(body)
+        if m_simple and has_existence_count_metric_phrase:
+            alias = (m_simple.group("alias") or "").strip("`").lower()
+            col = (m_simple.group("col") or "").strip("`")
+            if alias and col and alias in alias_to_table_l and alias != base_alias:
+                table_l = alias_to_table_l.get(alias, "")
+                role = str(get_column_role(table_l, col) or "").strip().lower() if table_l else ""
+                if role in {"measure", "metric", "amount", "quantity", "price", "value"}:
+                    return alias, f"{alias}.{col} IS NOT NULL"
         aliases = {
             str(a or "").strip("`").lower()
             for a in qualified_alias_pat.findall(body)
@@ -37980,6 +37995,138 @@ def _simplify_default_window_frame(sql: str, question: str = "") -> str:
     )
     out = frame_pat.sub("", sql)
     return out
+
+
+def _rewrite_same_group_avg_gap_window_to_partition_only(sql: str, question: str = "") -> str:
+    """
+    For "gap/difference from the same-group average" questions, a running AVG
+    window is semantically wrong. Rewrite:
+
+      AVG(x) OVER (PARTITION BY k ORDER BY seq [ROWS ...])
+
+    to:
+
+      AVG(x) OVER (PARTITION BY k)
+
+    This is intentionally narrow:
+    - question must mention average + same-group semantics
+    - question must include a short gap/difference cue
+    - running/cumulative questions are excluded
+    """
+    if not sql or not question:
+        return sql
+
+    q = str(question or "").strip().lower()
+    if not q:
+        return sql
+    if any(t in q for t in ("running", "cumulative", "kumulatif", "akumulatif")):
+        return sql
+    if not any(re.search(pat, q, flags=re.I) for pat in HELPERS_AVERAGE_INTENT_PATTERNS):
+        return sql
+    if not any(re.search(pat, q, flags=re.I) for pat in HELPERS_SAME_GROUP_INTENT_PATTERNS):
+        return sql
+    if not any_phrase_in_text(q, group_average_difference_window_phrases()):
+        return sql
+    if not re.search(r"\bAVG\s*\(", sql, flags=re.I):
+        return sql
+
+    def _find_matching_paren(text: str, open_idx: int) -> int:
+        depth = 0
+        quote = ""
+        i = open_idx
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _find_top_level_order_by(text: str) -> int:
+        target = "ORDER BY"
+        t_up = text.upper()
+        depth = 0
+        quote = ""
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                    quote = ""
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and t_up.startswith(target, i):
+                prev_ok = i == 0 or not (t_up[i - 1].isalnum() or t_up[i - 1] == "_")
+                after = i + len(target)
+                next_ok = after >= len(t_up) or not (t_up[after].isalnum() or t_up[after] == "_")
+                if prev_ok and next_ok:
+                    return i
+            i += 1
+        return -1
+
+    s = str(sql)
+    parts: list[str] = []
+    cursor = 0
+    changed = False
+    for m in re.finditer(r"\bAVG\s*\(", s, flags=re.I):
+        avg_start = m.start()
+        expr_open = s.find("(", m.start())
+        if expr_open < 0:
+            continue
+        expr_close = _find_matching_paren(s, expr_open)
+        if expr_close < 0:
+            continue
+        after_expr = s[expr_close + 1:]
+        over_match = re.match(r"\s*OVER\s*\(", after_expr, flags=re.I)
+        if not over_match:
+            continue
+        over_open = expr_close + 1 + over_match.group(0).rfind("(")
+        over_close = _find_matching_paren(s, over_open)
+        if over_close < 0:
+            continue
+
+        over_body = s[over_open + 1:over_close].strip()
+        if not re.match(r"(?is)^PARTITION\s+BY\b", over_body):
+            continue
+        order_pos = _find_top_level_order_by(over_body)
+        if order_pos < 0:
+            continue
+
+        partition_body = over_body[:order_pos].strip()
+        if not partition_body:
+            continue
+
+        replacement = f"AVG({s[expr_open + 1:expr_close].strip()}) OVER ({partition_body})"
+        parts.append(s[cursor:avg_start])
+        parts.append(replacement)
+        cursor = over_close + 1
+        changed = True
+
+    if not changed:
+        return sql
+
+    parts.append(s[cursor:])
+    return "".join(parts)
 
 def _remove_top_level_order_by_if_not_requested(sql: str, question: str) -> str:
     """
