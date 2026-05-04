@@ -4086,9 +4086,142 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     gate_reasons = set(state.get("ir_gate_reasons") or [])
     if "having_like_threshold_unresolved" in gate_reasons:
         return ""
+    suppress_filter_hints = "set_operation_ir_unsupported" in gate_reasons
+    suppress_lookup_execution_shape = suppress_filter_hints
 
     subject = str(intent_ir.get("subject_entity") or "").strip()
     qtype = str(intent_ir.get("qtype") or "").strip()
+    q_text = str(state.get("question") or "").strip().lower()
+
+    def _question_requests_conditional_null_breakdown() -> bool:
+        has_group_or_count = bool(
+            re.search(
+                r"\b(?:for\s+each|per|by|group|summarize|summarise|show|return|how\s+many|count)\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+        has_null_side = bool(
+            re.search(r"\b(?:missing|null|blank|empty)\b", q_text, flags=re.I)
+        )
+        has_present_side = bool(
+            re.search(r"\b(?:filled(?:\s+in)?|present|non[-\s]?null|commented)\b", q_text, flags=re.I)
+        )
+        has_pairing = bool(
+            re.search(
+                r"\bhow\s+many\b.*\b(?:filled(?:\s+in)?|present|commented)\b.*\bhow\s+many\b.*\b(?:missing|null|blank|empty)\b",
+                q_text,
+                flags=re.I,
+            )
+            or re.search(
+                r"\b(?:missing|null|blank|empty)\b.*\b(?:whether|or)\b.*\b(?:blank|null|empty)\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+        return bool(has_group_or_count and has_null_side and (has_present_side or has_pairing))
+
+    def _question_has_valid_multi_value_location_list() -> bool:
+        m = re.search(
+            r"\b(?:in|from)\s+([A-Za-z][A-Za-z\s-]{1,80}?(?:\s*,\s*[A-Za-z][A-Za-z\s-]{1,40})*(?:\s*,?\s*(?:or|and)\s+[A-Za-z][A-Za-z\s-]{1,40})+)"
+            r"(?=\s+(?:ordered|sorted|grouped|having|where|with|without|show|return|list|display|include|give)\b"
+            r"|\s+and\s+(?:show|return|list|display|include|give)\b|[.,;:!?]|\s*$)",
+            str(state.get("question") or ""),
+            flags=re.I,
+        )
+        if not m:
+            return False
+        raw_list = str(m.group(1) or "").strip().strip(".,;:!?")
+        raw_list = re.split(
+            r"\b(?:show|return|list|display|include|give)\b",
+            raw_list,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" \t\r\n'\".,;:!?")
+        raw_list = re.sub(r"\s+(?:or|and)\s+", ", ", raw_list, flags=re.I)
+        values = [
+            part.strip(" \t\r\n'\".,;:!?")
+            for part in raw_list.split(",")
+            if part.strip(" \t\r\n'\".,;:!?")
+        ]
+        return len(values) >= 2
+
+    def _safe_metric_hint_str(metric: dict) -> str:
+        if not isinstance(metric, dict):
+            return ""
+        agg = str(metric.get("agg") or "").strip().upper()
+        t = str(metric.get("table") or "").strip()
+        c = str(metric.get("column") or "*").strip()
+        if not agg:
+            return ""
+        if c == "*" and agg != "COUNT":
+            return ""
+        if not t:
+            return ""
+
+        table_l = t.lower()
+        col_l = c.lower()
+        agg_cols = {
+            str(col or "").strip().lower()
+            for col in (get_aggregatable_columns(table_l) or [])
+            if str(col or "").strip()
+        }
+        date_cols = {
+            str(col or "").strip().lower()
+            for col in (get_filterable_date_columns(table_l) or [])
+            if str(col or "").strip()
+        }
+        role = str(get_column_role(table_l, c) or "").strip().lower()
+
+        if agg == "COUNT":
+            distinct_kw = "DISTINCT " if bool(metric.get("distinct")) else ""
+            return f"{agg}({distinct_kw}{t}.{c})"
+        if agg == "PCT_NON_NULL":
+            if c != "*" and (col_l in date_cols or role in {"date", "dimension", "status", "text", "name"} or col_l in agg_cols):
+                return f"{agg}({t}.{c})"
+            return ""
+        if agg in {"SUM", "AVG"}:
+            if c != "*" and (col_l in agg_cols or role in {"metric", "measure", "amount", "quantity"}):
+                return f"{agg}({t}.{c})"
+            return ""
+        if agg in {"MIN", "MAX"}:
+            if c != "*" and (
+                col_l in agg_cols
+                or col_l in date_cols
+                or role in {"metric", "measure", "amount", "quantity", "date", "id", "fk", "pk"}
+            ):
+                return f"{agg}({t}.{c})"
+            return ""
+        return ""
+
+    def _safe_filter_hint_str(filter_obj: dict) -> str:
+        if not isinstance(filter_obj, dict):
+            return ""
+        t = str(filter_obj.get("table") or "").strip()
+        c = str(filter_obj.get("column") or "").strip()
+        op = str(filter_obj.get("op") or "").strip()
+        val = filter_obj.get("value")
+        val2 = filter_obj.get("value2")
+        if not (t and c and op):
+            return ""
+
+        val_text = str(val or "").strip().lower()
+        if op == "eq" and val_text in {"a to z", "z to a"}:
+            return ""
+        if op == "eq" and re.fullmatch(r"[a-z]\s+to\s+[a-z]", val_text):
+            return ""
+        if op == "eq" and c.lower() in {"country", "city"}:
+            if _question_has_valid_multi_value_location_list():
+                return ""
+        if op == "is_null_or_empty":
+            return f"{t}.{c} is_null_or_empty"
+        if op == "not_in" and isinstance(val, list) and val:
+            return f"{t}.{c} not_in {val}"
+        if op == "between" and val is not None and val2 is not None:
+            return f"{t}.{c} between {val} and {val2}"
+        if op == "month_between" and val is not None and val2 is not None:
+            return f"{t}.{c} month_between {val} and {val2}"
+        return f"{t}.{c} {op} {val}"
 
     parts = []
     if subject:
@@ -4117,34 +4250,21 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     if metrics:
         met_strs = []
         for m in metrics:
-            if not isinstance(m, dict):
-                continue
-            agg = str(m.get("agg") or "").strip().upper()
-            t = str(m.get("table") or "").strip()
-            c = str(m.get("column") or "*").strip()
-            # Skip bogus metrics like SUM(*), AVG(*) — only COUNT(*) is valid
-            if c == "*" and agg != "COUNT":
-                continue
-            if agg:
-                distinct_kw = "DISTINCT " if agg == "COUNT" and bool(m.get("distinct")) else ""
-                met_strs.append(f"{agg}({distinct_kw}{t}.{c})")
+            metric_hint = _safe_metric_hint_str(m)
+            if metric_hint:
+                met_strs.append(metric_hint)
         if met_strs:
             parts.append(f"Metrics: {', '.join(met_strs)}")
             has_structural = True
 
     # Filters
     filters = intent_ir.get("filters") or []
-    if filters:
+    if filters and not suppress_filter_hints:
         filt_strs = []
         for f in filters:
-            if not isinstance(f, dict):
-                continue
-            t = str(f.get("table") or "").strip()
-            c = str(f.get("column") or "").strip()
-            op = str(f.get("op") or "").strip()
-            val = f.get("value")
-            if t and c and op:
-                filt_strs.append(f"{t}.{c} {op} {val}")
+            filter_hint = _safe_filter_hint_str(f)
+            if filter_hint:
+                filt_strs.append(filter_hint)
         if filt_strs:
             parts.append(f"Filters: {', '.join(filt_strs)}")
             has_structural = True
@@ -4154,6 +4274,57 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     if isinstance(limit, int) and limit > 0:
         parts.append(f"Limit: {limit}")
         has_structural = True
+
+    dims = [d for d in (intent_ir.get("dimensions") or []) if isinstance(d, dict)]
+    metrics = [m for m in (intent_ir.get("metrics") or []) if isinstance(m, dict)]
+    existence = [e for e in (intent_ir.get("existence") or []) if isinstance(e, dict)]
+    filters = [f for f in (intent_ir.get("filters") or []) if isinstance(f, dict)]
+    ordering = [o for o in (intent_ir.get("ordering") or []) if isinstance(o, dict)]
+    subject_l = subject.strip().lower()
+    low_risk_single_table_lookup = bool(
+        qtype.lower() == "lookup"
+        and subject_l
+        and not metrics
+        and not existence
+        and dims
+        and all(str(d.get("table") or "").strip().lower() == subject_l for d in dims)
+        and all(
+            str(f.get("table") or "").strip().lower() == subject_l
+            and str(f.get("op") or "").strip().lower()
+            in {
+                "eq", "in", "not_in", "gt", "gte", "lt", "lte",
+                "between", "year_eq", "month_eq", "month_between",
+                "like_prefix", "regexp", "is_null_or_empty",
+                "col_gt", "col_gte", "col_lt", "col_lte",
+            }
+            for f in filters
+        )
+        and all(
+            (
+                str(o.get("kind") or "").strip().lower() == "column"
+                and str(o.get("table") or "").strip().lower() == subject_l
+            )
+            or str(o.get("kind") or "").strip().lower() in {"", "alias"}
+            for o in ordering
+        )
+    )
+    if low_risk_single_table_lookup and not suppress_lookup_execution_shape:
+        parts.append(
+            "Execution shape: direct single-table SELECT with simple WHERE predicates only; "
+            "avoid subqueries, set operations, and self-joins unless the question explicitly requires them"
+        )
+
+    aggregate_conditional_null_breakdown = bool(
+        qtype.lower() == "aggregate"
+        and subject_l
+        and _question_requests_conditional_null_breakdown()
+        and dims
+        and all(str(d.get("table") or "").strip().lower() == subject_l for d in dims)
+    )
+    if aggregate_conditional_null_breakdown:
+        parts.append(
+            "Aggregation shape: keep the grouped rows intact; compute filled/present and missing/blank/null counts as conditional CASE WHEN aggregates in SELECT, not as WHERE row filters"
+        )
 
     # Guard: require at least one structural field beyond subject+qtype
     if not has_structural:

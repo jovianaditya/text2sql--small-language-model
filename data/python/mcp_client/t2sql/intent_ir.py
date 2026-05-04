@@ -16,6 +16,7 @@ from .schema_analyzer import (
     get_all_tables,
     get_column_synonyms,
     get_column_description,
+    get_column_role,
     get_fk_relationships,
     get_id_column,
     get_name_column,
@@ -50,6 +51,20 @@ _NUMBER_WORDS = {
     "ten": 10,
     "eleven": 11,
     "twelve": 12,
+}
+_MONTH_NAME_TO_NUM = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
 }
 _FUNCTION_WORD_TOKENS = {
     "the", "a", "an",
@@ -124,6 +139,35 @@ def _safe_get_table_type(table: str) -> str:
         return "unknown"
 
 
+def _normalize_categorical_literal_value(
+    value: str,
+    *,
+    column: str = "",
+) -> str:
+    raw = str(value or "").strip(" \t\r\n'\".,;:!?")
+    if not raw:
+        return ""
+
+    raw = re.sub(r"^(?:either\s+the|either|the)\s+", "", raw, flags=re.I).strip()
+    raw = re.sub(r"\s+(?:territories|territory|regions|region)\s*$", "", raw, flags=re.I).strip()
+
+    col_words = set(re.findall(r"[a-z0-9]+", _camel_to_words(column or "").lower()))
+    if col_words:
+        suffix_terms = set()
+        for tok in col_words:
+            suffix_terms.add(tok)
+            if tok.endswith("y") and len(tok) > 1:
+                suffix_terms.add(tok[:-1] + "ies")
+            else:
+                suffix_terms.add(tok + "s")
+        raw_words = re.findall(r"[a-z0-9]+", raw.lower())
+        if raw_words and raw_words[-1] in suffix_terms and len(raw_words) >= 2:
+            kept_words = raw.split()
+            raw = " ".join(kept_words[:-1]).strip(" \t\r\n'\".,;:!?")
+
+    return raw
+
+
 @dataclass
 class IRDimension:
     table: str
@@ -146,7 +190,7 @@ class IRMetric:
 class IRFilter:
     table: str
     column: str
-    op: str  # eq|in|gt|gte|lt|lte|between|year_eq|like_prefix|regexp|is_null_or_empty|col_gt|col_gte|col_lt|col_lte
+    op: str  # eq|in|not_in|gt|gte|lt|lte|between|year_eq|month_eq|month_between|like_prefix|regexp|is_null_or_empty|col_gt|col_gte|col_lt|col_lte
     value: Any = None
     value2: Any = None
     value_column: str = ""
@@ -269,7 +313,10 @@ def _semantic_token_variants(token: str) -> List[str]:
         else:
             _add(tok[:-2])
     elif tok.endswith("es") and len(tok) > 3:
-        _add(tok[:-2])
+        if tok[:-1].endswith("e"):
+            _add(tok[:-1])
+        else:
+            _add(tok[:-2])
     elif tok.endswith("s") and len(tok) > 2 and not tok.endswith(("ss", "us")):
         _add(tok[:-1])
 
@@ -311,6 +358,26 @@ def _table_variants(table: str) -> Set[str]:
     out.add(singular.lower())
     out.add(singular.lower().replace("_", " "))
 
+    name_col = _safe_get_name_column(t)
+    if not name_col:
+        singular_compact = singular.lower().replace("_", "").replace(" ", "")
+        try:
+            analyzer = get_schema_analyzer()
+            for candidate in analyzer.get_table_columns(t):
+                cand_words = _camel_to_words(candidate)
+                cand_compact = cand_words.replace(" ", "")
+                if cand_compact and cand_compact == singular_compact:
+                    name_col = candidate
+                    break
+        except Exception:
+            name_col = None
+    if name_col:
+        name_words = _camel_to_words(name_col)
+        if name_words:
+            out.add(name_words)
+            out.add(_pluralize_last_token(name_words))
+            out.add(_singularize_last_token(name_words))
+
     for syn in _safe_get_table_synonyms(t):
         s = str(syn).strip().lower()
         if s:
@@ -326,10 +393,19 @@ def _column_variants(table: str, column: str) -> Set[str]:
         return set()
 
     c_low = c.lower()
+    original_c = c
+    try:
+        analyzer = get_schema_analyzer()
+        original_c = str(
+            analyzer._column_original_case.get(f"{t}.{c_low}", c)  # type: ignore[attr-defined]
+            or c
+        )
+    except Exception:
+        original_c = c
     out = {
         c_low,
         c_low.replace("_", " "),
-        _camel_to_words(c),
+        _camel_to_words(original_c),
     }
     for syn in _safe_get_column_synonyms(t, c):
         s = str(syn).strip().lower()
@@ -482,6 +558,27 @@ def _column_semantic_tokens(table: str, column: str) -> Set[str]:
     return tokens
 
 
+def _column_descriptor_tokens(table: str, column: str) -> Set[str]:
+    c = str(column or "").strip()
+    if not c:
+        return set()
+    desc = str(get_column_description(table, c) or "").strip()
+    if not desc:
+        return set()
+    desc_norm = _camel_to_words(desc)
+    return set(_tokenize_for_match(desc_norm, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+
+
+def _is_identifier_like_column(table: str, column: str) -> bool:
+    cl = str(column or "").strip().lower()
+    if not cl:
+        return False
+    if cl.endswith(("id", "number", "code", "key")):
+        return True
+    role = str(get_column_role(table, column) or "").strip().lower()
+    return role in {"id", "pk", "fk"}
+
+
 def _numeric_hint_terms(question_tokens: Optional[Set[str]] = None) -> Set[str]:
     global _NUMERIC_HINT_TERMS_CACHE
     base_hints = (
@@ -600,6 +697,90 @@ def _best_semantic_column_match(
     return best_col
 
 
+def _best_descriptor_column_match(
+    text: str,
+    table: str,
+    allowed: Dict[str, Set[str]],
+    *,
+    id_like_only: bool = False,
+    min_score: float = 1.0,
+) -> Optional[str]:
+    t = (table or "").strip().lower()
+    cols = list(allowed.get(t, set()))
+    if not cols:
+        return None
+
+    query_tokens = _tokenize_for_match(text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS)
+    if not query_tokens:
+        return None
+    query_token_set = set(query_tokens)
+
+    best_col = None
+    best_score = 0.0
+    best_overlap = 0
+    primary_id = str(_safe_get_id_column(t) or "").strip().lower()
+    for col in cols:
+        cl = str(col or "").strip().lower()
+        is_id_like = _is_identifier_like_column(t, col)
+        if id_like_only and not is_id_like:
+            continue
+
+        semantic_tokens = _column_semantic_tokens(t, col)
+        descriptor_tokens = _column_descriptor_tokens(t, col)
+        merged_tokens = semantic_tokens.union(descriptor_tokens)
+        overlap = query_token_set.intersection(merged_tokens)
+        if not overlap:
+            continue
+
+        score = float(len(overlap))
+        score += (len(query_token_set.intersection(descriptor_tokens)) * 0.35)
+        score += (len(overlap) / max(len(merged_tokens), 1)) * 0.35
+        if id_like_only and is_id_like and cl != primary_id:
+            score += 0.2
+
+        if score > best_score or (score == best_score and best_col is not None and len(col) < len(best_col)):
+            best_col = col
+            best_score = score
+            best_overlap = len(overlap)
+
+    if best_col is None:
+        return None
+    if best_score < float(min_score) and best_overlap < 2:
+        return None
+    return best_col
+
+
+def _prefer_specific_identifier_match(
+    semantic_col: Optional[str],
+    descriptor_col: Optional[str],
+    table: str,
+    text: str = "",
+) -> Optional[str]:
+    semantic = str(semantic_col or "").strip()
+    descriptor = str(descriptor_col or "").strip()
+    if descriptor and not semantic:
+        return descriptor
+    if semantic and not descriptor:
+        return semantic
+    if not semantic and not descriptor:
+        return None
+    if semantic.lower() == descriptor.lower():
+        return semantic
+
+    primary_id = str(_safe_get_id_column(table) or "").strip().lower()
+    semantic_is_primary = bool(primary_id) and semantic.lower() == primary_id
+    descriptor_is_primary = bool(primary_id) and descriptor.lower() == primary_id
+    if semantic_is_primary and not descriptor_is_primary and _is_identifier_like_column(table, descriptor):
+        query_tokens = set(_tokenize_for_match(text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+        descriptor_tokens = _column_semantic_tokens(table, descriptor).union(_column_descriptor_tokens(table, descriptor))
+        primary_tokens = _column_semantic_tokens(table, semantic).union(_column_descriptor_tokens(table, semantic))
+        generic_identifier_tokens = {"id", "ids", "number", "numbers", "code", "codes", "key", "keys", "employee", "customer", "order", "product"}
+        specific_relational_tokens = (descriptor_tokens - primary_tokens) - generic_identifier_tokens
+        if query_tokens.intersection(specific_relational_tokens):
+            return descriptor
+    return semantic
+
+
 def _extract_projection_segments(question: str) -> List[str]:
     q_raw = str(question or "").strip()
     if not q_raw:
@@ -607,7 +788,7 @@ def _extract_projection_segments(question: str) -> List[str]:
 
     matches = list(
         re.finditer(
-            r"\b(?:show|display|return|list)\b\s+([^.;!?]+)",
+            r"\b(?:show|display|return|list|include)\b\s+([^.;!?]+)",
             q_raw,
             flags=re.I,
         )
@@ -647,6 +828,23 @@ def _choose_subject(
     if p and p in allowed:
         return p
 
+    if len(table_mentions) >= 2:
+        projection_segments = _extract_projection_segments(question)
+        if projection_segments:
+            projection_scores: List[Tuple[int, int, str]] = []
+            for table, pos in table_mentions:
+                score = 0
+                for seg in projection_segments:
+                    if _best_semantic_column_match(seg, table, allowed, min_score=1.0):
+                        score += 1
+                projection_scores.append((score, -pos, table))
+            projection_scores.sort(reverse=True)
+            if projection_scores:
+                best_score, _, best_table = projection_scores[0]
+                next_score = projection_scores[1][0] if len(projection_scores) > 1 else 0
+                if best_score >= 2 and best_score > next_score:
+                    return best_table
+
     if table_mentions:
         return sorted(table_mentions, key=lambda x: x[1])[0][0]
 
@@ -676,17 +874,24 @@ def _choose_subject(
 
 def _detect_table_mentions(question: str, tables: Sequence[str]) -> List[Tuple[str, int]]:
     q = (question or "").lower()
-    out: List[Tuple[str, int]] = []
+    ranked: List[Tuple[str, int, int]] = []
     for t in tables:
         best = -1
+        best_len = -1
         for v in _table_variants(t):
             pos = _phrase_pos(q, v)
-            if pos >= 0 and (best < 0 or pos < best):
+            cur_len = len(str(v or "").strip())
+            if pos >= 0 and (
+                best < 0
+                or pos < best
+                or (pos == best and cur_len > best_len)
+            ):
                 best = pos
+                best_len = cur_len
         if best >= 0:
-            out.append((t.lower(), best))
-    out.sort(key=lambda x: x[1])
-    return out
+            ranked.append((t.lower(), best, best_len))
+    ranked.sort(key=lambda x: (x[1], -x[2], x[0]))
+    return [(t, pos) for (t, pos, _) in ranked]
 
 
 def _detect_column_mentions(question: str, allowed: Dict[str, Set[str]]) -> List[Tuple[str, str, int]]:
@@ -1448,6 +1653,52 @@ def _detect_dimensions(
                     return True
         return False
 
+    def _subject_column_is_missing_null_predicate_signal(table: str, col: str) -> bool:
+        if table != subject:
+            return False
+        for variant in _column_variants(table, col):
+            pat = re.escape(variant).replace(r"\ ", r"\s+")
+            if not pat:
+                continue
+            if re.search(
+                rf"\b(?:missing|null|empty|blank|without|lacking|no)\b"
+                rf"(?:\s+\w+){{0,4}}\s+{pat}\b",
+                q,
+                flags=re.I,
+            ):
+                return True
+            if re.search(
+                rf"\b(?:don['’]?t|doesn['’]?t|didn['’]?t|do\s+not|does\s+not|did\s+not)\s+have\b"
+                rf"(?:\s+\w+){{0,4}}\s+{pat}\b",
+                q,
+                flags=re.I,
+            ):
+                return True
+            if re.search(
+                rf"\b{pat}\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
+                rf"(?:is|are|was|were)\s+(?:missing|null|empty|blank)\b",
+                q,
+                flags=re.I,
+            ):
+                return True
+            if re.search(
+                rf"\b{pat}\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
+                rf"(?:listed|provided|specified|set|filled)\b",
+                q,
+                flags=re.I,
+            ) and re.search(
+                r"\b(?:don['’]?t|doesn['’]?t|didn['’]?t|do\s+not|does\s+not|did\s+not|without|missing|null|empty|blank|no)\b",
+                q,
+                flags=re.I,
+            ):
+                return True
+        return False
+
+    def _subject_column_is_predicate_only_lookup_signal(table: str, col: str) -> bool:
+        if (qtype or "").lower() != "lookup":
+            return False
+        return _subject_column_is_missing_null_predicate_signal(table, col)
+
     # Time bucket dimensions.
     if re.search(
         r"\b(for\s+each|per|by)\s+month\b|\beach\s+month(?:\s+name)?\b|\bmonth\s+names?\b",
@@ -1513,8 +1764,15 @@ def _detect_dimensions(
         # Keep dimensions conservative for IR planner:
         # only subject columns and direct parent references (planner-safe subset).
         if table == subject:
+            if _subject_column_is_predicate_only_lookup_signal(table, col):
+                continue
             if aggregate_like:
                 # In aggregate-like intents, keep grouping columns only.
+                if (
+                    not _explicit_group_dim_requested(table, col)
+                    and _subject_column_is_missing_null_predicate_signal(table, col)
+                ):
+                    continue
                 if col.lower() in nonnull_cols:
                     continue
                 if nonnull_percentage_grouping and not _explicit_group_dim_requested(table, col):
@@ -1540,15 +1798,69 @@ def _detect_dimensions(
     # Projection-list semantic enrichment for lookup questions:
     # use schema-grounded matching on explicit "show/display/return/list" tails.
     if (qtype or "").lower() == "lookup" and subject:
+        projection_cols: Set[str] = set()
         for seg in _extract_projection_segments(question):
-            resolved_col = _best_semantic_column_match(
+            explicit_projection_cols: List[str] = []
+            explicit_variants: Dict[str, str] = {}
+            for col in allowed.get(subject, set()):
+                for variant in _column_variants(subject, col):
+                    pat = re.escape(variant).replace(r"\ ", r"\s+")
+                    if pat and re.search(rf"\b{pat}\b", seg, flags=re.I):
+                        explicit_projection_cols.append(str(col).strip())
+                        explicit_variants.setdefault(str(col).strip(), variant)
+                        break
+            explicit_projection_cols = list(dict.fromkeys(explicit_projection_cols))
+            if len(explicit_projection_cols) == 1:
+                resolved_col = explicit_projection_cols[0]
+                seg_tokens = set(_tokenize_for_match(seg, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+                variant_tokens = set(
+                    _tokenize_for_match(
+                        explicit_variants.get(resolved_col, ""),
+                        stop_tokens=_LEXICAL_MATCH_STOP_TOKENS,
+                    )
+                )
+                extra_tokens = seg_tokens - variant_tokens
+                if not extra_tokens:
+                    projection_cols.add(str(resolved_col).strip().lower())
+                    add_dim(IRDimension(table=subject, column=resolved_col))
+                    continue
+
+            semantic_col = _best_semantic_column_match(
                 text=seg,
                 table=subject,
                 allowed=allowed,
                 min_score=1.0,
             )
+            descriptor_col = _best_descriptor_column_match(
+                text=seg,
+                table=subject,
+                allowed=allowed,
+                id_like_only=True,
+                min_score=1.0,
+            )
+            resolved_col = _prefer_specific_identifier_match(
+                semantic_col=semantic_col,
+                descriptor_col=descriptor_col,
+                table=subject,
+                text=seg,
+            )
             if resolved_col:
+                projection_cols.add(str(resolved_col).strip().lower())
                 add_dim(IRDimension(table=subject, column=resolved_col))
+            for col in explicit_projection_cols:
+                projection_cols.add(str(col).strip().lower())
+        if projection_cols:
+            dims = [
+                d for d in dims
+                if not (
+                    d.table == subject
+                    and str(d.column or "").strip().lower() not in projection_cols
+                )
+            ]
+            seen = {
+                (d.table.lower(), d.column.lower(), d.transform.lower(), d.alias.lower())
+                for d in dims
+            }
 
     # Top-N lookup enrichment: keep an identity column alongside the ranking field.
     if (
@@ -1614,6 +1926,22 @@ def _detect_filters(
     q = (question or "").lower()
     q_raw = (question or "").strip()
     filters: List[IRFilter] = []
+
+    def _question_requests_conditional_null_breakdown() -> bool:
+        has_group_or_count = bool(
+            re.search(r"\b(?:for\s+each|per|by|group|summarize|summarise|show|return|how\s+many|count)\b", q, flags=re.I)
+        )
+        has_null_side = bool(
+            re.search(r"\b(?:missing|null|blank|empty)\b", q, flags=re.I)
+        )
+        has_present_side = bool(
+            re.search(r"\b(?:filled(?:\s+in)?|present|non[-\s]?null|commented)\b", q, flags=re.I)
+        )
+        has_pairing = bool(
+            re.search(r"\bhow\s+many\b.*\b(?:filled(?:\s+in)?|present|commented)\b.*\bhow\s+many\b.*\b(?:missing|null|blank|empty)\b", q, flags=re.I)
+            or re.search(r"\b(?:missing|null|blank|empty)\b.*\b(?:whether|or)\b.*\b(?:blank|null|empty)\b", q, flags=re.I)
+        )
+        return bool(has_group_or_count and has_null_side and (has_present_side or has_pairing))
 
     def add_filter(f: IRFilter) -> None:
         for ex in filters:
@@ -1849,6 +2177,146 @@ def _detect_filters(
             return (subject, name_col)
         return None
 
+    def _pick_exact_numeric_target_column(anchor_pos: int) -> Optional[Tuple[str, str]]:
+        window_start = max(0, anchor_pos - 96)
+        anchor_window = q[window_start:anchor_pos]
+        semantic_match = _best_semantic_column_match(
+            text=anchor_window,
+            table=subject,
+            allowed=allowed,
+            min_score=1.0,
+        )
+        descriptor_match = _best_descriptor_column_match(
+            text=anchor_window,
+            table=subject,
+            allowed=allowed,
+            id_like_only=True,
+            min_score=1.0,
+        )
+        matched = _prefer_specific_identifier_match(
+            semantic_col=semantic_match,
+            descriptor_col=descriptor_match,
+            table=subject,
+            text=anchor_window,
+        )
+        if matched:
+            return (subject, matched)
+
+        best_local: Optional[Tuple[str, str]] = None
+        best_score = float("-inf")
+        best_distance = 10**9
+        for t, c, pos in column_mentions:
+            if t != subject:
+                continue
+            if not (_is_numeric_column(c) or _is_identifier_like_column(t, c)):
+                continue
+            distance = abs(pos - anchor_pos)
+            score = max(0.0, 2.0 - (distance / 48.0))
+            if pos <= anchor_pos:
+                score += 0.6
+            if score > best_score or (score == best_score and distance < best_distance):
+                best_local = (t, c)
+                best_score = score
+                best_distance = distance
+        return best_local
+
+    def _looks_like_alphabetical_sort_phrase(text: str) -> bool:
+        clean = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not clean:
+            return False
+        return bool(
+            re.fullmatch(r"[a-z]\s+to\s+[a-z]", clean)
+            or clean in {"a to z", "z to a"}
+        )
+
+    def _has_negated_membership_prefix(anchor_pos: int) -> bool:
+        prefix = q_raw[max(0, int(anchor_pos) - 28):int(anchor_pos)]
+        return bool(
+            re.search(
+                r"\b(?:not|excluding|except|outside)\s*$",
+                prefix,
+                flags=re.I,
+            )
+        )
+
+    def _looks_like_nonliteral_category_phrase(text: str) -> bool:
+        clean = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not clean:
+            return True
+        if re.match(r"^(?:the\s+)?(?:same|that|this|those|these|their|its)\b", clean):
+            return True
+        if re.search(r"\b(?:same\s+\w+|that\s+\w+|this\s+\w+|those\s+\w+|these\s+\w+)\b", clean):
+            return True
+        if re.search(r"\b(?:missing|null|blank|empty|filled|listed|provided|specified|have|has|had|whether)\b", clean):
+            return True
+        if _looks_like_alphabetical_sort_phrase(clean):
+            return True
+        return False
+
+    def _find_null_like_target_column() -> Optional[Tuple[str, str]]:
+        subject_mentions = [(t, c, p) for (t, c, p) in column_mentions if t == subject]
+        other_mentions = [(t, c, p) for (t, c, p) in column_mentions if t != subject]
+        for t, c, _ in subject_mentions + other_mentions:
+            for variant in _column_variants(t, c):
+                c_pat = re.escape(variant).replace(r"\ ", r"\s+")
+                if re.search(
+                    rf"\b{c_pat}\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
+                    rf"(?:is|are|was|were)\s+(?:missing|null|empty|blank)\b",
+                    q,
+                    flags=re.I,
+                ):
+                    return (t, c)
+                if re.search(
+                    rf"\b(?:missing|null|empty|blank|without|lacking|no)\b"
+                    rf"(?:\s+\w+){{0,4}}\s+{c_pat}\b",
+                    q,
+                    flags=re.I,
+                ):
+                    return (t, c)
+                if re.search(
+                    rf"\b(?:don['’]?t|doesn['’]?t|didn['’]?t|do\s+not|does\s+not|did\s+not)\s+have\b"
+                    rf"(?:\s+\w+){{0,4}}\s+{c_pat}\b",
+                    q,
+                    flags=re.I,
+                ):
+                    return (t, c)
+                if re.search(
+                    rf"\b{c_pat}\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
+                    rf"(?:listed|provided|specified|set|filled)\b",
+                    q,
+                    flags=re.I,
+                ) and re.search(
+                    r"\b(?:don['’]?t|doesn['’]?t|didn['’]?t|do\s+not|does\s+not|did\s+not|without|missing|null|empty|blank|no)\b",
+                    q,
+                    flags=re.I,
+                ):
+                    return (t, c)
+        for c in allowed.get(subject, set()):
+            for variant in _column_variants(subject, c):
+                c_pat = re.escape(variant).replace(r"\ ", r"\s+")
+                if re.search(
+                    rf"\b{c_pat}\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
+                    rf"(?:is|are|was|were)\s+(?:missing|null|empty|blank)\b",
+                    q,
+                    flags=re.I,
+                ):
+                    return (subject, c)
+                if re.search(
+                    rf"\b(?:missing|null|empty|blank|without|lacking|no)\b"
+                    rf"(?:\s+\w+){{0,4}}\s+{c_pat}\b",
+                    q,
+                    flags=re.I,
+                ):
+                    return (subject, c)
+                if re.search(
+                    rf"\b(?:don['’]?t|doesn['’]?t|didn['’]?t|do\s+not|does\s+not|did\s+not)\s+have\b"
+                    rf"(?:\s+\w+){{0,4}}\s+{c_pat}\b",
+                    q,
+                    flags=re.I,
+                ):
+                    return (subject, c)
+        return None
+
     # Numeric comparisons.
     numeric_col = None
     numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c)]
@@ -1960,6 +2428,17 @@ def _detect_filters(
         if v is not None:
             add_filter(IRFilter(table=t, column=c, op="lt", value=v))
 
+    m_eq_num = re.search(
+        rf"\b(?:is|equals?|equal\s+to|=)\s+({_NUMBER_TOKEN_PATTERN})\b",
+        q,
+        flags=re.I,
+    )
+    if m_eq_num:
+        v = _to_float_token(m_eq_num.group(1))
+        target = _pick_exact_numeric_target_column(m_eq_num.start())
+        if v is not None and target:
+            add_filter(IRFilter(table=target[0], column=target[1], op="eq", value=v))
+
     # Explicit full-date filters take priority over generic year-only fallback.
     full_date_match = re.search(r"\b((?:19|20)\d{2}-\d{2}-\d{2})\b", q)
     if full_date_match:
@@ -1975,6 +2454,85 @@ def _detect_filters(
                 add_filter(IRFilter(table=date_table, column=date_col, op="gt", value=date_literal))
             elif re.search(r"\b(?:before|earlier\s+than)\b", date_prefix):
                 add_filter(IRFilter(table=date_table, column=date_col, op="lt", value=date_literal))
+
+    quarter_map = {
+        "first": (1, 3),
+        "1st": (1, 3),
+        "q1": (1, 3),
+        "second": (4, 6),
+        "2nd": (4, 6),
+        "q2": (4, 6),
+        "third": (7, 9),
+        "3rd": (7, 9),
+        "q3": (7, 9),
+        "fourth": (10, 12),
+        "4th": (10, 12),
+        "q4": (10, 12),
+    }
+
+    def _question_uses_quarter_as_bucket() -> bool:
+        return bool(
+            re.search(
+                r"\b(?:group\s+the|group(?:ed)?\s+by|by|per|for\s+each)\s+"
+                r"(?:the\s+)?(?:calendar\s+)?quarter\b",
+                q,
+                flags=re.I,
+            )
+            or re.search(
+                r"\bquarter\s+number\b",
+                q,
+                flags=re.I,
+            )
+        )
+
+    def _quarter_match_is_filter_context(match_obj: re.Match[str]) -> bool:
+        token = str(match_obj.group(1) or match_obj.group(2) or "").strip().lower()
+        prefix = q[max(0, match_obj.start() - 40):match_obj.start()]
+        suffix = q[match_obj.end():match_obj.end() + 32]
+        if token.startswith("q"):
+            if re.search(r"\b(?:sort|sorted|order|ordered)\s+from\s*$", prefix, flags=re.I):
+                return False
+            if re.match(r"\s+to\s+q[1-4]\b", suffix, flags=re.I):
+                return False
+            if re.match(r"\s+to\s+quarter\s+[1-4]\b", suffix, flags=re.I):
+                return False
+            if _question_uses_quarter_as_bucket():
+                return False
+        return True
+
+    quarter_match = re.search(
+        r"\b(?:(first|1st|second|2nd|third|3rd|fourth|4th)\s+quarter|(q[1-4]))\b",
+        q,
+        flags=re.I,
+    )
+    month_range_match = re.search(
+        r"\b(" + "|".join(sorted(_MONTH_NAME_TO_NUM.keys(), key=len, reverse=True)) + r")\s+(?:through|thru|to|and)\s+("
+        + "|".join(sorted(_MONTH_NAME_TO_NUM.keys(), key=len, reverse=True)) + r")\b",
+        q,
+        flags=re.I,
+    )
+    date_table, date_col = _pick_date_target_column()
+    if quarter_match and date_col and _quarter_match_is_filter_context(quarter_match):
+        quarter_token = str(quarter_match.group(1) or quarter_match.group(2) or "").strip().lower()
+        bounds = quarter_map.get(quarter_token)
+        if bounds:
+            add_filter(IRFilter(table=date_table, column=date_col, op="month_between", value=int(bounds[0]), value2=int(bounds[1])))
+    elif month_range_match and date_col:
+        start_month = _MONTH_NAME_TO_NUM.get(str(month_range_match.group(1) or "").strip().lower())
+        end_month = _MONTH_NAME_TO_NUM.get(str(month_range_match.group(2) or "").strip().lower())
+        if start_month is not None and end_month is not None:
+            lo, hi = sorted((int(start_month), int(end_month)))
+            add_filter(IRFilter(table=date_table, column=date_col, op="month_between", value=lo, value2=hi))
+
+    month_match = re.search(
+        r"\b(?:month\s+of\s+)?(" + "|".join(sorted(_MONTH_NAME_TO_NUM.keys(), key=len, reverse=True)) + r")\b",
+        q,
+        flags=re.I,
+    )
+    if month_match and not quarter_match and not month_range_match:
+        month_num = _MONTH_NAME_TO_NUM.get(str(month_match.group(1) or "").strip().lower())
+        if month_num is not None and date_col:
+            add_filter(IRFilter(table=date_table, column=date_col, op="month_eq", value=int(month_num)))
 
     # Year filters.
     years = re.findall(r"\b((?:19|20)\d{2})\b", q)
@@ -2038,6 +2596,23 @@ def _detect_filters(
 
     # Country/city style location filter:
     # "customers in Japan", "customers from USA".
+    def _pick_categorical_target_column(text_hint: str = "") -> Optional[str]:
+        hint = str(text_hint or "").strip()
+        if hint:
+            matched = _best_semantic_column_match(
+                text=hint,
+                table=subject,
+                allowed=allowed,
+                min_score=1.0,
+            )
+            if matched and not _is_date_column(matched) and not _is_numeric_column(matched):
+                return matched
+        for preferred in ("country", "territory", "state", "city"):
+            for c in allowed.get(subject, set()):
+                if c.lower() == preferred:
+                    return c
+        return None
+
     location_match = re.search(
         r"\b(?:in|from)\s+([A-Za-z][A-Za-z\s-]{1,40}?)"
         r"(?=\s+(?:ordered|sorted|grouped|having|where|with|without|show|return|list|display|include|give)\b"
@@ -2045,6 +2620,43 @@ def _detect_filters(
         q_raw,
         flags=re.I,
     )
+    location_list_match = re.search(
+        r"\b(?:in|from)\s+([A-Za-z][A-Za-z\s-]{1,80}?(?:\s*,\s*[A-Za-z][A-Za-z\s-]{1,40})*(?:\s*,?\s*(?:or|and)\s+[A-Za-z][A-Za-z\s-]{1,40})+)"
+        r"(?=\s+(?:ordered|sorted|grouped|having|where|with|without|show|return|list|display|include|give)\b"
+        r"|\s+and\s+(?:show|return|list|display|include|give)\b|[.,;:!?]|\s*$)",
+        q_raw,
+        flags=re.I,
+    )
+    if location_list_match:
+        raw_list = str(location_list_match.group(1) or "").strip().strip(".,;:!?")
+        raw_list = re.split(
+            r"\b(?:show|return|list|display|include|give)\b",
+            raw_list,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" \t\r\n'\".,;:!?")
+        raw_list = re.sub(r"\s+(?:or|and)\s+", ", ", raw_list, flags=re.I)
+        values = [
+            part.strip(" \t\r\n'\".,;:!?")
+            for part in raw_list.split(",")
+            if part.strip(" \t\r\n'\".,;:!?")
+        ]
+        if _looks_like_nonliteral_category_phrase(raw_list):
+            values = []
+        values = list(dict.fromkeys(values))
+        if len(values) == 1 and _looks_like_alphabetical_sort_phrase(values[0]):
+            values = []
+        if len(values) >= 2:
+            target_col = _pick_categorical_target_column(raw_list)
+            if target_col:
+                values = [
+                    _normalize_categorical_literal_value(v, column=target_col)
+                    for v in values
+                    if _normalize_categorical_literal_value(v, column=target_col)
+                ]
+                op = "not_in" if _has_negated_membership_prefix(location_list_match.start()) else "in"
+                add_filter(IRFilter(table=subject, column=target_col, op=op, value=values))
+                location_match = None
     if location_match:
         loc = location_match.group(1).strip().strip(".,;:!?")
         loc_low = loc.lower()
@@ -2052,6 +2664,7 @@ def _detect_filters(
             "the", "a", "an", "that", "this", "those", "these",
             "latest", "earliest", "highest", "lowest",
             "year", "month", "week", "day",
+            "a to z", "z to a",
         }
         quantifier_starts = ("each ", "every ", "all ", "per ")
         is_deictic_ref = bool(re.search(r"^(?:that|this|those|these|their|its)\b", loc_low))
@@ -2074,20 +2687,17 @@ def _detect_filters(
             and not is_deictic_ref
             and not any(loc_low.startswith(prefix) for prefix in quantifier_starts)
             and not is_schema_reference_phrase
+            and not _looks_like_nonliteral_category_phrase(loc_low)
+            and not _looks_like_alphabetical_sort_phrase(loc_low)
         ):
-            # Prefer country column, fallback city.
-            target_col = None
-            for c in allowed.get(subject, set()):
-                if c.lower() == "country":
-                    target_col = c
-                    break
-            if not target_col:
-                for c in allowed.get(subject, set()):
-                    if c.lower() == "city":
-                        target_col = c
-                        break
+            target_col = _pick_categorical_target_column(loc)
             if target_col:
-                add_filter(IRFilter(table=subject, column=target_col, op="eq", value=loc))
+                norm_loc = _normalize_categorical_literal_value(loc, column=target_col)
+                if norm_loc:
+                    if _has_negated_membership_prefix(location_match.start()):
+                        add_filter(IRFilter(table=subject, column=target_col, op="not_in", value=[norm_loc]))
+                    else:
+                        add_filter(IRFilter(table=subject, column=target_col, op="eq", value=norm_loc))
 
     # Status IN ('a','b',...)
     quoted_values = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or "")
@@ -2108,6 +2718,8 @@ def _detect_filters(
     if negated_process_terms:
         proxy_col = _find_best_process_proxy_column(subject, negated_process_terms)
         enum_col = _find_best_enum_descriptor_column(subject)
+        if proxy_col:
+            add_filter(IRFilter(table=subject, column=proxy_col, op="is_null_or_empty"))
         if proxy_col and enum_col:
             candidate_values = _derive_nonfinal_enum_values(subject, enum_col)
             if candidate_values and _question_mentions_enum_values(candidate_values):
@@ -2119,6 +2731,7 @@ def _detect_filters(
     # Missing/empty (skip when intent is explicit non-null/not-null).
     if (
         re.search(r"\b(missing|null|empty|blank)\b", q)
+        and not _question_requests_conditional_null_breakdown()
         and not re.search(r"\b(?:non[-\s]?null|not\s+null)\b", q)
         and not _question_requests_null_fill_projection(question)
     ):
@@ -2134,6 +2747,16 @@ def _detect_filters(
                     break
         if target:
             add_filter(IRFilter(table=target[0], column=target[1], op="is_null_or_empty"))
+
+    if (
+        not _question_requests_conditional_null_breakdown()
+        and
+        not re.search(r"\b(?:non[-\s]?null|not\s+null)\b", q)
+        and not _question_requests_null_fill_projection(question)
+    ):
+        null_like_target = _find_null_like_target_column()
+        if null_like_target:
+            add_filter(IRFilter(table=null_like_target[0], column=null_like_target[1], op="is_null_or_empty"))
 
     # Prefix and regex pattern.
     strict_regex_applied = False
@@ -2395,6 +3018,16 @@ def _detect_ordering_and_limit(
     ordering: List[IROrder] = []
     limit: Optional[int] = None
 
+    def _looks_like_non_row_count_context(match_obj: re.Match[str]) -> bool:
+        tail = q[match_obj.end():match_obj.end() + 48]
+        return bool(
+            re.match(
+                r"\s+(?:character|characters|char|chars|letter|letters|digit|digits|word|words|byte|bytes)\b",
+                tail,
+                flags=re.I,
+            )
+        )
+
     def add_order(item: IROrder) -> None:
         for ex in ordering:
             if (
@@ -2547,7 +3180,7 @@ def _detect_ordering_and_limit(
         return {t for t in terms if t}
 
     m_lim = re.search(r"\b(?:top|bottom|first|last)\s+(\d+)\b", q)
-    if m_lim:
+    if m_lim and not _looks_like_non_row_count_context(m_lim):
         limit = int(m_lim.group(1))
     elif re.search(r"\b(?:highest|lowest|largest|smallest|newest|oldest|latest|earliest)\b", q):
         # Handles forms like "show the 10 products with the highest ..."
