@@ -623,7 +623,18 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         and any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_AVERAGE_INTENT_PATTERNS)
         and any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_SAME_GROUP_INTENT_PATTERNS)
     )
-    if not wants_winner_row and not all_other_same_group_avg:
+    same_group_avg_comparison_filter = (
+        any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_AVERAGE_INTENT_PATTERNS)
+        and any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_SAME_GROUP_INTENT_PATTERNS)
+        and re.search(
+            r"\b(?:higher|greater|more|above|over|lower|less|below|under)\s+than\s+(?:the\s+)?(?:avg|average|mean)\b"
+            r"|\b(?:avg|average|mean)\b[^.]{0,80}\b(?:higher|greater|more|above|over|lower|less|below|under)\b"
+            r"|\bwhose\b[^.]{0,80}\b(?:higher|greater|more|above|over|lower|less|below|under)\b[^.]{0,80}\b(?:avg|average|mean)\b",
+            q_lower,
+            flags=re.I,
+        )
+    )
+    if not wants_winner_row and not all_other_same_group_avg and not same_group_avg_comparison_filter:
         required_window_partition_col = _resolve_required_window_partition_column(question, ctx)
     return {
         "requires_projection_distinct": wants_projection_distinct,

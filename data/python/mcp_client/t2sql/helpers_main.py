@@ -4048,6 +4048,84 @@ Return JSON object with keys: complexity (simple/complex), qtype (lookup/aggrega
 # ======================================================================
 # ================ INTENT IR SOFT HINT (IR-INFORMED LLM) ===============
 # ======================================================================
+def _intent_ir_payload_tables(
+    intent_ir: Dict[str, Any],
+    *,
+    router_table: str = "",
+    context_allowed: Optional[Dict[str, Set[str]]] = None,
+) -> Set[str]:
+    tables: Set[str] = set()
+    subject = str((intent_ir or {}).get("subject_entity") or "").strip().lower()
+    if subject:
+        tables.add(subject)
+    for collection_name in ("dimensions", "metrics", "filters", "existence", "ordering"):
+        for item in (intent_ir or {}).get(collection_name) or []:
+            if not isinstance(item, dict):
+                continue
+            table = str(item.get("table") or "").strip().lower()
+            if table:
+                if (
+                    collection_name == "ordering"
+                    and router_table
+                    and table != router_table
+                    and str(item.get("kind") or "").strip().lower() == "column"
+                ):
+                    order_col = str(item.get("by") or "").strip().lower()
+                    router_cols = {
+                        str(col or "").strip().lower()
+                        for col in ((context_allowed or {}).get(router_table) or set())
+                        if str(col or "").strip()
+                    }
+                    if order_col and order_col in router_cols:
+                        continue
+                tables.add(table)
+    return tables
+
+
+def _context_scope_allows_intent_ir_hint(
+    state: "RAGState",
+    intent_ir: Dict[str, Any],
+    gate_reasons: Set[str],
+) -> bool:
+    context_allowed = _parse_allowed_identifiers(str((state or {}).get("context") or ""))
+    if len(context_allowed) <= 1:
+        return True
+
+    # Retrieval can include FK-neighbor noise for simple lookups. Trust it only
+    # when the router has compacted the executable scope to exactly one table
+    # and the IR payload itself does not reference anything outside that table.
+    if "router_complex_prefers_llm" in (gate_reasons or set()):
+        return False
+
+    router_tables = {
+        str(table or "").strip().lower()
+        for table in ((state or {}).get("router_tables") or [])
+        if str(table or "").strip()
+    }
+    if len(router_tables) != 1:
+        return False
+
+    hard_router_reasons = {
+        str(reason or "").strip()
+        for reason in (gate_reasons or set())
+        if str(reason or "").startswith("router_hard:")
+    }
+    if hard_router_reasons and hard_router_reasons != {"router_hard:window_aggregate"}:
+        return False
+
+    primary_table = str((state or {}).get("primary_table") or "").strip().lower()
+    if primary_table and primary_table not in router_tables:
+        return False
+
+    router_table = next(iter(router_tables))
+    payload_tables = _intent_ir_payload_tables(
+        intent_ir or {},
+        router_table=router_table,
+        context_allowed=context_allowed,
+    )
+    return bool(payload_tables) and payload_tables.issubset(router_tables)
+
+
 def _build_intent_ir_hint(state: "RAGState") -> str:
     """
     Build a soft intent IR hint for the LLM when IR was built but not used
@@ -4081,17 +4159,46 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     if "empty_ir_payload" in base_gate_reasons or "planner_incompatible" in base_gate_reasons:
         return ""
 
-    # Guard: skip if IR couldn't resolve a HAVING-like threshold —
-    # the filter (and often the metric) will be wrong, misleading the LLM.
     gate_reasons = set(state.get("ir_gate_reasons") or [])
-    if "having_like_threshold_unresolved" in gate_reasons:
-        return ""
     suppress_filter_hints = "set_operation_ir_unsupported" in gate_reasons
     suppress_lookup_execution_shape = suppress_filter_hints
 
     subject = str(intent_ir.get("subject_entity") or "").strip()
     qtype = str(intent_ir.get("qtype") or "").strip()
     q_text = str(state.get("question") or "").strip().lower()
+    context_allowed = _parse_allowed_identifiers(str(state.get("context") or ""))
+    context_table_count = len(context_allowed)
+
+    # A multi-table context usually means join semantics are in play. Until the
+    # IR can represent joins reliably, only allow retrieval-noise cases where
+    # the router and the IR payload agree on one executable table.
+    if not _context_scope_allows_intent_ir_hint(state, intent_ir, gate_reasons):
+        return ""
+
+    # Keep soft IR hints conservative for genuinely hard/complex shapes. These
+    # lanes need the full schema/join reasoning; a partial IR summary can
+    # overwrite important multi-table or subquery semantics.
+    hard_router_reasons = {
+        str(reason or "").strip()
+        for reason in gate_reasons
+        if str(reason or "").startswith("router_hard:")
+    }
+    safe_window_only = hard_router_reasons == {"router_hard:window_aggregate"}
+    unsafe_hard_router = bool(hard_router_reasons) and not safe_window_only
+    rank_language_without_rank_gate = bool(
+        re.search(r"\b(?:rank|dense\s+rank|row\s+number|position)\b", q_text, flags=re.I)
+        and "router_hard:window_aggregate" not in gate_reasons
+    )
+    if (
+        "router_complex_prefers_llm" in gate_reasons
+        or unsafe_hard_router
+        or rank_language_without_rank_gate
+        or (
+            "simple_having_requires_single_metric" in gate_reasons
+            and context_table_count > 1
+        )
+    ):
+        return ""
 
     def _question_requests_conditional_null_breakdown() -> bool:
         has_group_or_count = bool(
@@ -4174,6 +4281,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         role = str(get_column_role(table_l, c) or "").strip().lower()
 
         if agg == "COUNT":
+            if c == "*":
+                return "COUNT(*)"
             distinct_kw = "DISTINCT " if bool(metric.get("distinct")) else ""
             return f"{agg}({distinct_kw}{t}.{c})"
         if agg == "PCT_NON_NULL":
@@ -4223,23 +4332,282 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             return f"{t}.{c} month_between {val} and {val2}"
         return f"{t}.{c} {op} {val}"
 
+    number_words = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+    }
+
+    def _camel_words(value: str) -> str:
+        x = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value or "")
+        x = x.replace("_", " ")
+        return re.sub(r"\s+", " ", x).strip().lower()
+
+    def _structural_column_candidates() -> List[Tuple[str, str]]:
+        candidates: List[Tuple[str, str]] = []
+        for collection_name in ("dimensions", "metrics", "filters"):
+            for item in intent_ir.get(collection_name) or []:
+                if not isinstance(item, dict):
+                    continue
+                table = str(item.get("table") or "").strip()
+                column = str(item.get("column") or "").strip()
+                if table and column and column != "*":
+                    pair = (table, column)
+                    if pair not in candidates:
+                        candidates.append(pair)
+
+        allowed = _parse_allowed_identifiers(str(state.get("context") or ""))
+        if subject:
+            for column in allowed.get(subject.lower(), set()):
+                pair = (subject, str(column).strip())
+                if pair[1] and pair not in candidates:
+                    candidates.append(pair)
+        if subject and not any(t.lower() == subject.lower() for t, _ in candidates):
+            try:
+                analyzer = get_schema_analyzer()
+                for column in analyzer.get_table_columns(subject):
+                    pair = (subject, str(column).strip())
+                    if pair[1] and pair not in candidates:
+                        candidates.append(pair)
+            except Exception:
+                pass
+        return candidates
+
+    def _column_variant_texts(table: str, column: str) -> Set[str]:
+        variants = {column.lower(), _camel_words(column)}
+        for syn in get_column_synonyms(table.lower(), column) or []:
+            syn_text = str(syn or "").strip().lower()
+            if syn_text:
+                variants.add(syn_text.replace("_", " ").replace("-", " "))
+        return {re.sub(r"\s+", " ", v.strip().lower()) for v in variants if str(v or "").strip()}
+
+    def _column_match_score(phrase: str, table: str, column: str) -> int:
+        phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+        if not phrase_norm:
+            return 0
+        phrase_tokens = {tok for tok in re.findall(r"[a-z0-9]+", phrase_norm) if tok}
+        score = 0
+        for variant_norm in _column_variant_texts(table, column):
+            variant_pat = re.escape(variant_norm).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{variant_pat}\b", phrase_norm, flags=re.I):
+                score = max(score, len(variant_norm.split()) + 2)
+            variant_tokens = {tok for tok in re.findall(r"[a-z0-9]+", variant_norm) if tok}
+            score = max(score, len(phrase_tokens.intersection(variant_tokens)))
+        return score
+
+    def _column_is_date_like(table: str, column: str) -> bool:
+        col_l = str(column or "").strip().lower()
+        role = str(get_column_role(table.lower(), column) or "").strip().lower()
+        date_cols = {
+            str(col or "").strip().lower()
+            for col in (get_filterable_date_columns(table.lower()) or [])
+            if str(col or "").strip()
+        }
+        return col_l in date_cols or role == "date" or any(tok in col_l for tok in ("date", "time", "year", "month", "day"))
+
+    def _column_is_numeric_like(table: str, column: str) -> bool:
+        col_l = str(column or "").strip().lower()
+        role = str(get_column_role(table.lower(), column) or "").strip().lower()
+        agg_cols = {
+            str(col or "").strip().lower()
+            for col in (get_aggregatable_columns(table.lower()) or [])
+            if str(col or "").strip()
+        }
+        return col_l in agg_cols or role in {"metric", "measure", "amount", "quantity"}
+
+    def _resolve_derived_column(
+        phrase: str = "",
+        *,
+        date_like: bool = False,
+        numeric_like: bool = False,
+    ) -> Optional[Tuple[str, str]]:
+        candidates = _structural_column_candidates()
+        if date_like:
+            candidates = [(t, c) for t, c in candidates if _column_is_date_like(t, c)]
+        if numeric_like:
+            candidates = [(t, c) for t, c in candidates if _column_is_numeric_like(t, c)]
+        if not candidates:
+            return None
+
+        phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+        if phrase_norm:
+            scored = [
+                (_column_match_score(phrase_norm, table, column), table, column)
+                for table, column in candidates
+            ]
+            scored = [item for item in scored if item[0] > 0]
+            if scored:
+                scored.sort(key=lambda item: (item[0], item[1].lower() == subject.lower(), -len(item[2])), reverse=True)
+                return (scored[0][1], scored[0][2])
+
+        if subject:
+            subject_candidates = [(t, c) for t, c in candidates if t.lower() == subject.lower()]
+            if subject_candidates:
+                return subject_candidates[0]
+        return candidates[0]
+
+    def _question_has_grouping_language() -> bool:
+        return bool(
+            re.search(
+                r"\b(?:group(?:ed)?\s+(?:\w+\s+){0,3}?by|by|per|for\s+each|summari[sz]e|break\s+.*\s+down|classify)\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+
+    def _derived_grouping_hints() -> List[str]:
+        hints: List[str] = []
+
+        def add_hint(text: str) -> None:
+            if text and text not in hints:
+                hints.append(text)
+
+        if not _question_has_grouping_language():
+            return hints
+
+        quarter_match = re.search(r"\b(?:calendar\s+)?quarter\b|\bquarter\s+number\b", q_text, flags=re.I)
+        if quarter_match:
+            phrase_window = q_text[max(0, quarter_match.start() - 80):quarter_match.end() + 80]
+            resolved = _resolve_derived_column(phrase_window, date_like=True)
+            if resolved:
+                table, column = resolved
+                add_hint(
+                    f"Derived grouping: group by QUARTER({table}.{column}) as the visible quarter number/key; order by the quarter number when chronological quarter order is requested"
+                )
+
+        month_group = bool(
+            re.search(
+                r"\b(?:by|per|for\s+each|summari[sz]e|break\s+.*\s+down\s+by)\s+month\b|\bmonth\s+name\b|\bmonths?\s+chronologically\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+        if month_group:
+            resolved = _resolve_derived_column("month", date_like=True)
+            if resolved:
+                table, column = resolved
+                direction = "descending" if re.search(r"\b(?:latest\s+to\s+earliest|descending)\b", q_text, flags=re.I) else "ascending"
+                add_hint(
+                    f"Derived grouping: group by MONTH({table}.{column}) with DATE_FORMAT({table}.{column}, '%M') as the visible month name; order by MONTH({table}.{column}) {direction} when chronological month order is requested"
+                )
+
+        year_group = bool(
+            re.search(
+                r"\b(?:by|per|for\s+each)\s+(?:order\s+)?year\b|\b(?:order\s+)?year\b.*\bdistinct\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+        if year_group:
+            resolved = _resolve_derived_column("year", date_like=True)
+            if resolved:
+                table, column = resolved
+                add_hint(
+                    f"Derived grouping: group by YEAR({table}.{column}) as the visible year/key; order by that year when year ordering is requested"
+                )
+
+        m_prefix = re.search(
+            r"\bfirst\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+            r"(?:characters?|chars?|letters?|digits?)\s+of\s+(?:their\s+|the\s+)?"
+            r"([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
+            q_text,
+            flags=re.I,
+        )
+        if m_prefix:
+            raw_n = str(m_prefix.group(1) or "").strip().lower()
+            n = int(raw_n) if raw_n.isdigit() else number_words.get(raw_n)
+            phrase = re.sub(r"\s+", " ", str(m_prefix.group(2) or "").strip().lower())
+            resolved = _resolve_derived_column(phrase)
+            if n and n > 0 and resolved:
+                table, column = resolved
+                add_hint(
+                    f"Derived grouping: group by first {n} characters of {table}.{column} as the visible prefix/group key; do not add a row-level LENGTH filter for this grouping phrase"
+                )
+
+        m_length = re.search(
+            r"\b(?:by|per|for\s+each|group(?:ed)?\s+by)\s+([a-z][a-z0-9_ ]{1,60}?)\s+length\b|\blength\s+of\s+([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
+            q_text,
+            flags=re.I,
+        )
+        if m_length:
+            phrase = re.sub(r"\s+", " ", str(m_length.group(1) or m_length.group(2) or "").strip().lower())
+            resolved = _resolve_derived_column(phrase)
+            if resolved:
+                table, column = resolved
+                add_hint(
+                    f"Derived grouping: group by CHAR_LENGTH({table}.{column}) as the visible length key; use the same expression in SELECT/GROUP BY/ORDER BY and do not add the length condition as a row-level WHERE filter"
+                )
+
+        regex_bucket = bool(
+            re.search(r"\bby\s+whether\b.*\b(?:match|matches|pattern|exactly|followed\s+by)\b", q_text, flags=re.I)
+            or re.search(r"\bpattern\s+label\b", q_text, flags=re.I)
+        )
+        if regex_bucket:
+            target_phrase = ""
+            m_target = re.search(r"\bwhether\s+(?:the\s+)?([a-z][a-z0-9_ ]{1,50}?)\s+(?:has|matches|starts|is)\b", q_text, flags=re.I)
+            if m_target:
+                target_phrase = str(m_target.group(1) or "").strip()
+            resolved = _resolve_derived_column(target_phrase)
+            if resolved:
+                table, column = resolved
+                add_hint(
+                    f"Derived grouping: group by a CASE label based on whether {table}.{column} matches the requested pattern; use the requested match/non-match labels as the visible group key"
+                )
+
+        bucket_or_classification = bool(re.search(r"\b(?:bucket|bucket labels?|classify|bands?)\b", q_text, flags=re.I))
+        if bucket_or_classification and not regex_bucket:
+            numeric_band = bool(re.search(r"\b(?:below|between|above|under|over|<|>)\b", q_text, flags=re.I))
+            condition_scope = re.split(
+                r"\b(?:for\s+each\s+bucket|for\s+each\s+label|return|sort|order(?:ed)?\s+by|then\s+show)\b",
+                q_text,
+                maxsplit=1,
+                flags=re.I,
+            )[0]
+            resolved = _resolve_derived_column(condition_scope or q_text, numeric_like=numeric_band)
+            if resolved:
+                table, column = resolved
+                add_hint(
+                    f"Derived grouping: group by the requested CASE labels computed from {table}.{column}; use the CASE expression itself as the GROUP BY key and keep every row in exactly one label"
+                )
+
+        return hints
+
     parts = []
     if subject:
         parts.append(f"Subject entity: {subject}")
     if qtype:
-        parts.append(f"Query type: {qtype}")
+        display_qtype = (
+            "window_aggregate"
+            if any(str(reason or "").startswith("router_hard:window_aggregate") for reason in gate_reasons)
+            else qtype
+        )
+        parts.append(f"Query type: {display_qtype}")
 
     # Dimensions
     has_structural = False
     dims = intent_ir.get("dimensions") or []
     if dims:
         dim_strs = []
+        seen_dim_keys = set()
         for d in dims:
             if not isinstance(d, dict):
                 continue
             t = str(d.get("table") or "").strip()
             c = str(d.get("column") or "").strip()
             if t and c:
+                dim_key = (t.lower(), c.lower())
+                if dim_key in seen_dim_keys:
+                    continue
+                seen_dim_keys.add(dim_key)
                 dim_strs.append(f"{t}.{c}")
         if dim_strs:
             parts.append(f"Dimensions: {', '.join(dim_strs)}")
@@ -4268,6 +4636,248 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if filt_strs:
             parts.append(f"Filters: {', '.join(filt_strs)}")
             has_structural = True
+
+    derived_grouping_hints = _derived_grouping_hints()
+    if derived_grouping_hints:
+        parts.extend(derived_grouping_hints)
+        has_structural = True
+
+    def _window_aggregate_shape_hint() -> str:
+        is_window_aggregate = any(
+            str(reason or "").startswith("router_hard:window_aggregate")
+            for reason in gate_reasons
+        )
+        if not is_window_aggregate:
+            return ""
+
+        avg_metric = None
+        for metric in metrics:
+            if isinstance(metric, dict) and str(metric.get("agg") or "").strip().lower() == "avg":
+                avg_metric = metric
+                break
+        if not avg_metric:
+            return (
+                "Window shape: this is row-preserving window logic; keep one output row per source row, "
+                "do not GROUP BY, and do not mix bare aggregate functions with row-level columns"
+            )
+
+        metric_table = str(avg_metric.get("table") or "").strip()
+        metric_column = str(avg_metric.get("column") or "").strip()
+        if not (metric_table and metric_column and metric_column != "*"):
+            return ""
+        metric_expr = f"{metric_table}.{metric_column}"
+
+        def _same_group_phrase() -> str:
+            boundary_terms = (
+                r"where|when|return|show|sort|order|then|and|whose|which|with|without"
+            )
+            for pat in (
+                rf"\b(?:within|in|for)\s+the\s+same\s+([a-z][a-z0-9_ ]{{1,50}}?)(?=\s+\b(?:{boundary_terms})\b|[.,;!?]|$)",
+                rf"\bsame\s+([a-z][a-z0-9_ ]{{1,50}}?)(?=\s+\b(?:{boundary_terms})\b|[.,;!?]|$)",
+            ):
+                m = re.search(pat, q_text, flags=re.I)
+                if m:
+                    return re.sub(r"\s+", " ", str(m.group(1) or "").strip().lower())
+            return ""
+
+        def _partition_key_from_dims() -> str:
+            group_phrase = _same_group_phrase()
+            if group_phrase:
+                scored_dims: List[Tuple[int, str, str]] = []
+                for dim in dims:
+                    if not isinstance(dim, dict):
+                        continue
+                    dim_table = str(dim.get("table") or "").strip()
+                    dim_column = str(dim.get("column") or "").strip()
+                    if not (dim_table and dim_column):
+                        continue
+                    score = _column_match_score(group_phrase, dim_table, dim_column)
+                    if score > 0:
+                        scored_dims.append((score, dim_table, dim_column))
+                if scored_dims:
+                    scored_dims.sort(key=lambda item: (-item[0], item[1].lower(), item[2].lower()))
+                    return f"{scored_dims[0][1]}.{scored_dims[0][2]}"
+                resolved = _resolve_derived_column(group_phrase)
+                if resolved:
+                    return f"{resolved[0]}.{resolved[1]}"
+
+            for dim in dims:
+                if not isinstance(dim, dict):
+                    continue
+                dim_table = str(dim.get("table") or "").strip()
+                dim_column = str(dim.get("column") or "").strip()
+                if dim_table and dim_column:
+                    return f"{dim_table}.{dim_column}"
+            return ""
+
+        partition_key = _partition_key_from_dims()
+
+        wants_gap = bool(
+            re.search(
+                r"\b(?:gap|difference|diff|delta|variance)\b.*\b(?:avg|average|mean)\b"
+                r"|\b(?:avg|average|mean)\b.*\b(?:gap|difference|diff|delta|variance)\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+        wants_comparison_filter = bool(
+            re.search(
+                r"\b(?:higher|greater|more|above|over|lower|less|below|under)\s+than\s+(?:the\s+)?(?:avg|average|mean)\b"
+                r"|\b(?:avg|average|mean)\b.*\b(?:higher|greater|more|above|over|lower|less|below|under)\b"
+                r"|\bwhose\b.*\b(?:higher|greater|more|above|over|lower|less|below|under)\b.*\b(?:avg|average|mean)\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+        partition_clause = f" OVER (PARTITION BY {partition_key})" if partition_key else " OVER (...)"
+
+        if wants_comparison_filter and partition_key:
+            return (
+                "Comparison shape: filter rows by comparing the row metric to a same-group AVG using a correlated scalar subquery "
+                f"keyed by {partition_key}; keep the outer query row-level, do not GROUP BY, and do not put AVG({metric_expr}) OVER (...) in WHERE"
+            )
+
+        if wants_gap:
+            return (
+                "Window shape: row-preserving difference from a group average; keep row-level columns, "
+                f"do not GROUP BY, and do not use bare AVG({metric_expr}) with row columns. "
+                f"Compute {metric_expr} - AVG({metric_expr}){partition_clause}"
+            )
+
+        return (
+            "Window shape: row-preserving window aggregate; keep row-level columns, "
+            f"do not GROUP BY, and use AVG({metric_expr}){partition_clause} instead of a bare aggregate"
+        )
+
+    window_shape_hint = _window_aggregate_shape_hint()
+    if window_shape_hint:
+        parts.append(window_shape_hint)
+        has_structural = True
+
+    def _aggregate_threshold_shape_hint() -> str:
+        number_word_values = {
+            "zero": 0,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+            "eleven": 11,
+            "twelve": 12,
+        }
+        number_pat = r"-?\d[\d,]*(?:\.\d+)?|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+        threshold_re = re.compile(
+            rf"\b(?P<op>at\s+least|minimum\s+of|more\s+than|greater\s+than|above|over|at\s+most|maximum\s+of|less\s+than|below|under)\s+"
+            rf"(?P<num>{number_pat})\b(?P<tail>[^.;!?]{{0,80}})",
+            flags=re.I,
+        )
+        op_map = {
+            "at least": ">=",
+            "minimum of": ">=",
+            "more than": ">",
+            "greater than": ">",
+            "above": ">",
+            "over": ">",
+            "at most": "<=",
+            "maximum of": "<=",
+            "less than": "<",
+            "below": "<",
+            "under": "<",
+        }
+
+        count_metric = None
+        for metric in metrics:
+            if isinstance(metric, dict) and str(metric.get("agg") or "").strip().lower() == "count":
+                count_metric = metric
+                break
+        count_entity_terms: Set[str] = set()
+        if count_metric:
+            metric_table = str(count_metric.get("table") or "").strip().lower()
+            if metric_table:
+                count_entity_terms.add(metric_table)
+                try:
+                    singular = str(get_singular_form(metric_table) or "").strip().lower()
+                    if singular:
+                        count_entity_terms.add(singular)
+                except Exception:
+                    pass
+
+        for match in threshold_re.finditer(q_text):
+            tail = str(match.group("tail") or "")
+            prefix = q_text[max(0, match.start() - 80):match.start()]
+            threshold_targets_count = bool(
+                re.search(
+                    r"\b(?:line|lines|row|rows|record|records|entry|entries|item|items|group|groups|time|times)\b",
+                    tail,
+                    flags=re.I,
+                )
+                or re.search(
+                    r"\b(?:appear|appears|appearing|occur|occurs|occurring)\b",
+                    prefix,
+                    flags=re.I,
+                )
+                or any(
+                    re.search(rf"\b{re.escape(term)}\b", tail, flags=re.I)
+                    for term in count_entity_terms
+                    if term
+                )
+            )
+            if not threshold_targets_count:
+                continue
+
+            raw_num = str(match.group("num") or "").strip().lower()
+            if raw_num in number_word_values:
+                threshold_value = str(number_word_values[raw_num])
+            else:
+                threshold_value = raw_num.replace(",", "")
+            op = op_map.get(re.sub(r"\s+", " ", str(match.group("op") or "").strip().lower()), ">=")
+
+            count_expr = "COUNT(*)"
+            if count_metric:
+                table = str(count_metric.get("table") or "").strip()
+                column = str(count_metric.get("column") or "").strip()
+                distinct = bool(count_metric.get("distinct"))
+                if column and column != "*":
+                    qualified = f"{table}.{column}" if table else column
+                    count_expr = f"COUNT(DISTINCT {qualified})" if distinct else f"COUNT({qualified})"
+
+            if derived_grouping_hints:
+                group_text = "group first by the derived grouping expression above, then apply"
+            else:
+                group_keys: List[str] = []
+                seen_group_keys: Set[Tuple[str, str]] = set()
+                for dim in dims:
+                    if not isinstance(dim, dict):
+                        continue
+                    table = str(dim.get("table") or "").strip()
+                    column = str(dim.get("column") or "").strip()
+                    group_key = (table.lower(), column.lower())
+                    if table and column and group_key not in seen_group_keys:
+                        seen_group_keys.add(group_key)
+                        group_keys.append(f"{table}.{column}")
+                group_text = (
+                    f"group first by {', '.join(group_keys)}, then apply"
+                    if group_keys
+                    else "apply"
+                )
+
+            return (
+                f"Threshold shape: {group_text} the requested grouped threshold with HAVING {count_expr} {op} {threshold_value}; "
+                "do not turn this threshold into a WHERE row filter, WHERE/IN subquery, or LIMIT"
+            )
+
+        return (
+            "Threshold shape: aggregate/HAVING-like threshold was detected but not encoded as a row filter; "
+            "keep grouped rows intact and avoid converting that threshold into a WHERE predicate"
+        )
+
+    if "having_like_threshold_unresolved" in gate_reasons:
+        parts.append(_aggregate_threshold_shape_hint())
 
     # Limit
     limit = intent_ir.get("limit")
@@ -5217,13 +5827,18 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             ir_used = state.get("ir_used", False)
             base_reasons = set(state.get("ir_base_gate_reasons") or [])
             gate_reasons = set(state.get("ir_gate_reasons") or [])
+            context_scope_skipped = not _context_scope_allows_intent_ir_hint(
+                state,
+                ir_data,
+                gate_reasons,
+            )
             skip_reason = (
                 "ir_used_as_planner" if ir_used
                 else "no_intent_ir" if not ir_data
                 else f"low_confidence({ir_conf:.2f}<0.50)" if ir_conf < 0.50
                 else "empty_ir_payload" if "empty_ir_payload" in base_reasons
                 else "planner_incompatible" if "planner_incompatible" in base_reasons
-                else "having_like_threshold_unresolved" if "having_like_threshold_unresolved" in gate_reasons
+                else "multi_table_context" if context_scope_skipped
                 else "aggregate_without_valid_metrics" if str(ir_data.get("qtype") or "").lower() == "aggregate"
                 else "no_structural_fields"
             )
@@ -5758,6 +6373,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     r"\1 \2",
     s)
     s = _fix_missing_space_before_clauses(s)
+    s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
+    if DEBUG_WR: print("[REFINER - PH4] after early scalar-window subquery fix:", s)
+
     s = _canonicalize_single_computed_group_by_expression(s)
     s = _simplify_same_expression_group_threshold_subquery(s)
     s = _simplify_group_key_count_threshold_subquery(s)

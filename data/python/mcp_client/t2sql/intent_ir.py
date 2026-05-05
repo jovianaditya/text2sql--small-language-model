@@ -1206,9 +1206,22 @@ def _detect_metrics(
                 best_table = t
         return best_table if best_score > 0 else None
 
+    def _is_numeric_measure_column(col: str) -> bool:
+        # Numeric aggregates should not bind to temporal columns unless the
+        # caller explicitly takes the temporal-extrema path.
+        return _is_numeric_column(col) and not _is_date_column(col)
+
+    def _find_best_numeric_measure_column(table: str) -> Optional[str]:
+        cols = list(allowed.get((table or "").lower(), set()))
+        num_like = [c for c in cols if _is_numeric_measure_column(c)]
+        if not num_like:
+            return None
+        num_like.sort(key=lambda x: len(x))
+        return num_like[0]
+
     # Candidate numeric/date mentions from question.
     mentioned_numeric_cols = [
-        (t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c)
+        (t, c, p) for (t, c, p) in column_mentions if _is_numeric_measure_column(c)
     ]
     mentioned_date_cols = [
         (t, c, p) for (t, c, p) in column_mentions if _is_date_column(c)
@@ -1225,15 +1238,17 @@ def _detect_metrics(
         p = (phrase or "").lower().strip()
         if not p:
             return None
-        p_tokens = set(re.findall(r"[a-z0-9]+", p))
+        p_tokens = set(_semantic_phrase_tokens(p))
         if not p_tokens:
             return None
 
-        candidates = column_mentions or []
-        if not candidates:
-            for t, cols in allowed.items():
-                for c in cols:
+        candidates = list(column_mentions or [])
+        seen_candidates = {(t, c) for t, c, _ in candidates}
+        for t, cols in allowed.items():
+            for c in cols:
+                if (t, c) not in seen_candidates:
                     candidates.append((t, c, 10**9))
+                    seen_candidates.add((t, c))
 
         best: Optional[Tuple[str, str]] = None
         best_score = 0
@@ -1241,7 +1256,7 @@ def _detect_metrics(
         for t, c, pos in candidates:
             score = 0
             for v in _column_variants(t, c):
-                v_tokens = set(re.findall(r"[a-z0-9]+", v))
+                v_tokens = set(_semantic_phrase_tokens(v))
                 if not v_tokens:
                     continue
                 overlap = len(v_tokens.intersection(p_tokens))
@@ -1258,6 +1273,86 @@ def _detect_metrics(
                 best_score = score
                 best_pos = pos
         return best if best_score > 0 else None
+
+    def _extract_local_metric_phrase(kind: str) -> str:
+        """
+        Bind each aggregate to its own nearby noun phrase. This avoids using the
+        first numeric mention for every metric in questions like
+        "total X, average Y".
+        """
+        if kind == "sum":
+            patterns = (
+                r"\b(?:sum(?:\s+of)?|total)\s+([a-z][a-z0-9_ ]{1,64}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bfor\b|\bby\b|$))",
+            )
+        elif kind == "avg":
+            patterns = (
+                r"\b(?:avg|average|mean)\s+([a-z][a-z0-9_ ]{1,64}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bfor\b|\bby\b|$))",
+            )
+        elif kind == "max":
+            patterns = (
+                r"\b(?:max(?:imum)?|highest|largest)\s+([a-z][a-z0-9_ ]{1,64}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bfor\b|\bby\b|$))",
+            )
+        elif kind == "min":
+            patterns = (
+                r"\b(?:min(?:imum)?|lowest|smallest)\s+([a-z][a-z0-9_ ]{1,64}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bfor\b|\bby\b|$))",
+            )
+        else:
+            patterns = ()
+
+        for pat in patterns:
+            m = re.search(pat, q, flags=re.I)
+            if not m:
+                continue
+            phrase = re.sub(r"\s+", " ", str(m.group(1) or "").strip())
+            phrase = re.sub(
+                r"^(?:the|their|its|a|an)\s+",
+                "",
+                phrase,
+                flags=re.I,
+            ).strip()
+            if phrase:
+                return phrase
+        return ""
+
+    def _resolve_numeric_measure_from_phrase(phrase: str) -> Optional[Tuple[str, str]]:
+        p = re.sub(r"\s+", " ", str(phrase or "").strip())
+        if not p:
+            return None
+
+        phrase_tokens = set(_tokenize_for_match(p, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+        best: Optional[Tuple[str, str]] = None
+        best_score = 0.0
+        best_pos = 10**9
+        for t in metric_target_tables:
+            for c in allowed.get((t or "").lower(), set()):
+                if not _is_numeric_measure_column(c):
+                    continue
+                col_tokens = _column_semantic_tokens(t, c)
+                if not col_tokens:
+                    continue
+                overlap = phrase_tokens.intersection(col_tokens)
+                if not overlap:
+                    continue
+                pos = next((p0 for tm, cm, p0 in column_mentions if tm == t and cm == c), 10**9)
+                score = float(len(overlap) * 10)
+                score += (len(overlap) / max(len(col_tokens), 1)) * 2.0
+                score += 2.0 if phrase_tokens.issubset(col_tokens) else 0.0
+                score += 1.0 if t == subject else 0.0
+                if score > best_score or (score == best_score and pos < best_pos):
+                    best = (t, c)
+                    best_score = score
+                    best_pos = pos
+
+        if best is not None and best_score >= 10.0:
+            return best
+
+        resolved = _resolve_column_from_phrase(p)
+        if resolved:
+            t, c = resolved
+            if _is_numeric_measure_column(c):
+                return t, c
+
+        return None
 
     def _semantic_phrase_tokens(text: str) -> List[str]:
         out: List[str] = []
@@ -1521,11 +1616,27 @@ def _detect_metrics(
                 q,
                 flags=re.I,
             )
+            count_col = ""
             if m_count_of:
-                resolved = _resolve_table_from_phrase(m_count_of.group(1))
-                if resolved:
-                    count_table = resolved
-            id_col = _best_id_column(count_table, allowed, question) or "*"
+                count_phrase = re.sub(r"\s+", " ", str(m_count_of.group(1) or "").strip())
+                row_unit_count = bool(
+                    re.search(
+                        r"\b(?:line|lines|row|rows|record|records|entry|entries|item|items|detail|details)\b",
+                        count_phrase,
+                        flags=re.I,
+                    )
+                )
+                if row_unit_count:
+                    count_table = subject or count_table
+                    count_col = "*"
+                else:
+                    resolved_col = _resolve_column_from_phrase(count_phrase)
+                    resolved = _resolve_table_from_phrase(count_phrase)
+                    if resolved:
+                        count_table = resolved
+                    elif resolved_col:
+                        count_table, count_col = resolved_col
+            id_col = count_col or _best_id_column(count_table, allowed, question) or "*"
             alias = _safe_alias(f"{_safe_get_singular_form(count_table)}_count", "row_count")
             add_metric(IRMetric(agg="count", table=count_table, column=id_col, alias=alias))
 
@@ -1540,30 +1651,33 @@ def _detect_metrics(
             add_metric(IRMetric(agg="pct_non_null", table=t, column=c, alias=alias))
 
     # SUM / AVG
-    def _metric_target_for_numeric() -> Tuple[str, str]:
+    def _metric_target_for_numeric(local_phrase: str = "") -> Tuple[str, str]:
+        phrase_target = _resolve_numeric_measure_from_phrase(local_phrase)
+        if phrase_target:
+            return phrase_target
         if mentioned_numeric_cols:
             t, c, _ = mentioned_numeric_cols[0]
             return t, c
         for t in dict.fromkeys([subject] + [tm for tm, _ in table_mentions]):
             preferred = _prefer_numeric_column_from_question(question, t, allowed)
-            if preferred:
+            if preferred and _is_numeric_measure_column(preferred):
                 return t, preferred
         for t, _ in table_mentions:
-            col = _find_best_numeric_column(t, allowed)
+            col = _find_best_numeric_measure_column(t)
             if col:
                 return t, col
-        col = _find_best_numeric_column(subject, allowed)
+        col = _find_best_numeric_measure_column(subject)
         if col:
             return subject, col
         return subject, "*"
 
     if wants_sum:
-        t, c = _metric_target_for_numeric()
+        t, c = _metric_target_for_numeric(_extract_local_metric_phrase("sum"))
         alias = _safe_alias(f"total_{c}", "total_value")
         add_metric(IRMetric(agg="sum", table=t, column=c, alias=alias))
 
     if wants_avg:
-        t, c = _metric_target_for_numeric()
+        t, c = _metric_target_for_numeric(_extract_local_metric_phrase("avg"))
         alias = _safe_alias(f"avg_{c}", "avg_value")
         add_metric(IRMetric(agg="avg", table=t, column=c, alias=alias))
 
@@ -1577,7 +1691,7 @@ def _detect_metrics(
             if prefer_temporal_extrema and mentioned_date_cols:
                 t, c, _ = mentioned_date_cols[0]
             else:
-                t, c = _metric_target_for_numeric()
+                t, c = _metric_target_for_numeric(_extract_local_metric_phrase("max"))
             alias = _safe_alias(f"max_{c}", "max_value")
             add_metric(IRMetric(agg="max", table=t, column=c, alias=alias))
 
@@ -1585,7 +1699,7 @@ def _detect_metrics(
             if prefer_temporal_extrema and mentioned_date_cols:
                 t, c, _ = mentioned_date_cols[0]
             else:
-                t, c = _metric_target_for_numeric()
+                t, c = _metric_target_for_numeric(_extract_local_metric_phrase("min"))
             alias = _safe_alias(f"min_{c}", "min_value")
             add_metric(IRMetric(agg="min", table=t, column=c, alias=alias))
 
@@ -1720,13 +1834,18 @@ def _detect_dimensions(
     subject_id_requested = False
     if subject and subj_pat:
         id_like_token = r"(?:id|ids|code|codes|number(?!\s+of\b)|numbers(?!\s+of\b))"
-        direct_subject_id = bool(
-            re.search(
-                rf"\b(?:{subj_pat})\b(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+"
-                rf"{id_like_token}\b",
-                q,
-            )
+        direct_subject_pattern = (
+            rf"\b(?:{subj_pat})\b(?:[\s,;:()'\"-]+\w+){{0,6}}[\s,;:()'\"-]+"
+            rf"{id_like_token}\b"
         )
+        direct_subject_id = False
+        for direct_match in re.finditer(direct_subject_pattern, q, flags=re.I):
+            # Do not let a table-context mention capture an ID/code phrase that
+            # belongs to a later projection clause.
+            if re.search(r"\b(?:return|show|display|list|include)\b", direct_match.group(0), flags=re.I):
+                continue
+            direct_subject_id = True
+            break
         reverse_subject_id = bool(
             re.search(
                 rf"\b{id_like_token}\b(?:[\s,;:()'\"-]+\w+){{0,6}}"
@@ -1787,7 +1906,7 @@ def _detect_dimensions(
                 # (e.g. "customer number") should survive even if _is_numeric_column
                 # would otherwise discard them.
                 is_id_like = cl.endswith("id") or cl.endswith("number") or cl.endswith("code")
-                if is_id_like and not subject_id_requested:
+                if is_id_like and not subject_id_requested and not _explicit_group_dim_requested(table, col):
                     continue
                 if not is_id_like and _is_numeric_column(col):
                     continue
@@ -1955,6 +2074,76 @@ def _detect_filters(
             ):
                 return
         filters.append(f)
+
+    aggregate_metric_aggs = {
+        str(getattr(m, "agg", "") or "").strip().lower()
+        for m in (metrics or [])
+    }
+    aggregate_query_like = bool(
+        aggregate_metric_aggs.intersection({"count", "sum", "avg", "min", "max", "pct_non_null"})
+    )
+    grouped_aggregate_language = bool(
+        re.search(
+            r"\b(?:for\s+each|per|by|group(?:ed)?|summari[sz]e|break\s+.*\s+down)\b",
+            q,
+            flags=re.I,
+        )
+    )
+
+    def _threshold_has_row_count_tail(tail: str) -> bool:
+        scope_terms = (
+            list(allowed.keys())
+            + [_safe_get_singular_form(t) for t in allowed.keys()]
+        )
+        return bool(
+            re.search(
+                r"^\s+(?:\w+\s+){0,4}?(?:rows?|records?|lines?|entries|items?|groups?)\b",
+                tail,
+                flags=re.I,
+            )
+            or any(
+                re.search(
+                    rf"^\s+(?:\w+\s+){{0,4}}?{re.escape(str(term or '').strip().lower())}\b",
+                    tail,
+                    flags=re.I,
+                )
+                for term in scope_terms
+                if str(term or "").strip()
+            )
+        )
+
+    def _is_aggregate_bound_threshold(match_obj: re.Match[str]) -> bool:
+        if not aggregate_query_like:
+            return False
+
+        start = int(match_obj.start())
+        end = int(match_obj.end())
+        prefix = q[max(0, start - 96):start]
+        suffix = q[end:end + 96]
+
+        if _threshold_has_row_count_tail(suffix):
+            return True
+
+        if re.search(r"^\s+distinct\b", suffix, flags=re.I):
+            return True
+
+        if re.search(r"^\s+times\b", suffix, flags=re.I):
+            return True
+
+        if re.search(r"\b(?:appear|appears|appearing|occur|occurs|occurring)\b", prefix, flags=re.I):
+            return True
+
+        if re.search(r"\b(?:average|avg|mean)\b", prefix, flags=re.I):
+            return True
+
+        if grouped_aggregate_language and re.search(
+            r"\b(?:how\s+many|count|number\s+of|total\s+number)\b",
+            prefix,
+            flags=re.I,
+        ):
+            return True
+
+        return False
 
     def _pick_date_target_column() -> Tuple[str, Optional[str]]:
         date_col = None
@@ -2382,47 +2571,29 @@ def _detect_filters(
     m_gte = re.search(rf"\b(?:at\s+least|minimum\s+of)\s+({_NUMBER_TOKEN_PATTERN})\b", q)
     if m_gte and numeric_col:
         threshold_tail = q[m_gte.end():m_gte.end() + 96]
-        row_count_threshold = bool(
-            re.search(
-                r"^\s+(?:\w+\s+){0,4}?(?:rows?|records?|lines?|entries|items?|groups?)\b",
-                threshold_tail,
-                flags=re.I,
-            )
-            or any(
-                re.search(
-                    rf"^\s+(?:\w+\s+){{0,4}}?{re.escape(str(term or '').strip().lower())}\b",
-                    threshold_tail,
-                    flags=re.I,
-                )
-                for term in (
-                    list(allowed.keys())
-                    + [_safe_get_singular_form(t) for t in allowed.keys()]
-                )
-                if str(term or "").strip()
-            )
-        )
-        if not row_count_threshold:
+        row_count_threshold = _threshold_has_row_count_tail(threshold_tail)
+        if not row_count_threshold and not _is_aggregate_bound_threshold(m_gte):
             v = _to_float_token(m_gte.group(1))
             t, c = numeric_col
             if v is not None:
                 add_filter(IRFilter(table=t, column=c, op="gte", value=v))
 
     m_lte = re.search(rf"\b(?:at\s+most|maximum\s+of)\s+({_NUMBER_TOKEN_PATTERN})\b", q)
-    if m_lte and numeric_col:
+    if m_lte and numeric_col and not _is_aggregate_bound_threshold(m_lte):
         v = _to_float_token(m_lte.group(1))
         t, c = numeric_col
         if v is not None:
             add_filter(IRFilter(table=t, column=c, op="lte", value=v))
 
     m_gt = re.search(rf"\b(?:greater\s+than|more\s+than|above|over)\s+({_NUMBER_TOKEN_PATTERN})\b", q)
-    if m_gt and numeric_col:
+    if m_gt and numeric_col and not _is_aggregate_bound_threshold(m_gt):
         v = _to_float_token(m_gt.group(1))
         t, c = numeric_col
         if v is not None:
             add_filter(IRFilter(table=t, column=c, op="gt", value=v))
 
     m_lt = re.search(rf"\b(?:less\s+than|under|below)\s+({_NUMBER_TOKEN_PATTERN})\b", q)
-    if m_lt and numeric_col:
+    if m_lt and numeric_col and not _is_aggregate_bound_threshold(m_lt):
         v = _to_float_token(m_lt.group(1))
         t, c = numeric_col
         if v is not None:
@@ -2867,8 +3038,28 @@ def _detect_filters(
     if m_entity_code_list:
         ent_raw = (m_entity_code_list.group(1) or "").lower()
         tail = m_entity_code_list.group("tail") or ""
+        enumerated_entity_id_list = re.search(
+            r"\b\d+\b(?:\s*,\s*\d+\b)+(?:\s*,?\s*(?:or|and)\s+\d+\b)?",
+            tail,
+        )
+        conjunctive_entity_id_pair = re.search(
+            r"\b\d+\b\s*(?:or|and)\s*\d+\b",
+            tail,
+        )
+        comma_list_text = str(enumerated_entity_id_list.group(0) or "").strip() if enumerated_entity_id_list else ""
+        comma_list_is_thousands_literal = bool(
+            comma_list_text
+            and re.fullmatch(r"\d{1,3}(?:\s*,\s*\d{3})+", comma_list_text)
+        )
+        has_entity_id_list = bool(
+            (
+                enumerated_entity_id_list is not None
+                and not comma_list_is_thousands_literal
+            )
+            or conjunctive_entity_id_pair is not None
+        )
         nums = re.findall(r"\b\d+\b", tail)
-        if len(nums) >= 2:
+        if has_entity_id_list and len(nums) >= 2:
             ent = _safe_get_singular_form(ent_raw).replace("_", "").lower()
             subj_cols = list(allowed.get(subject, set()))
             target_col = None
@@ -2914,10 +3105,26 @@ def _detect_filters(
     id_context = re.search(r"\b(?:id|ids|code|codes|number|numbers)\b(?P<tail>[^.]{0,80})", q)
     if id_context and not in_applied:
         tail = id_context.group("tail") or ""
+        comma_list_match = re.search(r"\b\d+(?:\s*,\s*\d+)+\b", tail)
+        comma_list_text = str(comma_list_match.group(0) or "").strip() if comma_list_match else ""
+        comma_list_is_thousands_literal = bool(
+            comma_list_text
+            and re.fullmatch(r"\d{1,3}(?:\s*,\s*\d{3})+", comma_list_text)
+        )
+        enumerated_id_list = re.search(
+            r"\b\d+\b(?:\s*,\s*\d+\b)+(?:\s*,?\s*(?:or|and)\s+\d+\b)?",
+            tail,
+        )
+        conjunctive_id_pair = re.search(
+            r"\b\d+\b\s*(?:or|and)\s*\d+\b",
+            tail,
+        )
         has_list_signal = bool(
-            re.search(r"\b(or|and)\b", tail)
-            or re.search(r"\b\d+\s*,\s+\d+\b", tail)
-            or re.search(r"\b\d+,\d+,\d+\b", tail)
+            (
+                enumerated_id_list is not None
+                and not comma_list_is_thousands_literal
+            )
+            or conjunctive_id_pair is not None
         )
         nums_raw = re.findall(rf"\b{_NUMBER_TOKEN_PATTERN}\b", tail)
         nums = [n.replace(",", "") for n in nums_raw if n and not re.match(r"^\d{1,3}(,\d{3})+$", n)]

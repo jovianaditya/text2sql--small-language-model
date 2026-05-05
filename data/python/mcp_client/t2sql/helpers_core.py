@@ -5383,26 +5383,33 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
 
         return False
 
+    s_top = (sql or "").strip().rstrip(";").strip()
+    top_level_group_pos = _find_top_level_clause(s_top, "group by")
     parsed = _parse_select_from_groupby(sql)
+    if parsed and top_level_group_pos < 0:
+        return sql
     if not parsed:
         # Safety: do not apply relaxed fallback parser on queries with subqueries.
         # It can misinterpret inner GROUP BY as top-level and corrupt FROM/JOIN.
         if re.search(r"\b(?:FROM|JOIN)\s*\(", sql, flags=re.I):
             return sql
         # Relaxed fallback parser for GROUP BY queries with HAVING.
-        s = (sql or "").strip().rstrip(";").strip()
+        s = s_top
         m_sel = re.match(r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<after>.+)$", s)
         if not m_sel:
             return sql
         select_part = (m_sel.group("select") or "").strip()
         after_from = (m_sel.group("after") or "").strip()
 
-        gb_matches = list(re.finditer(r"\bGROUP\s+BY\b", after_from, flags=re.I))
-        if not gb_matches:
+        if top_level_group_pos < 0:
             return sql
-        gb_m = gb_matches[-1]
-        from_and_maybe_where = after_from[:gb_m.start()].strip()
-        after_gb = after_from[gb_m.end():].strip()
+        after_from_start = m_sel.start("after")
+        if top_level_group_pos < after_from_start:
+            return sql
+        group_start = top_level_group_pos - after_from_start
+        group_end = group_start + len("group by")
+        from_and_maybe_where = after_from[:group_start].strip()
+        after_gb = after_from[group_end:].strip()
         if not from_and_maybe_where or not after_gb:
             return sql
 
@@ -12081,6 +12088,50 @@ def _enforce_all_other_group_avg_self_exclusion(sql: str, question: str) -> str:
                 best_col = col
         return best_col if best_score > 0 else ""
 
+    def _column_with_case(table_name: str, column_name: str) -> str:
+        col_l = str(column_name or "").strip("`").strip().lower()
+        if not col_l:
+            return ""
+        for col in _table_columns(table_name):
+            if str(col or "").strip("`").strip().lower() == col_l:
+                return str(col).strip("`")
+        return ""
+
+    fk_map: Dict[str, Dict[str, str]] = {}
+    try:
+        fk_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_raw = {}
+    for src, mapping in (fk_raw or {}).items():
+        src_l = str(src or "").strip().lower()
+        if not src_l:
+            continue
+        for fk_col, tgt in (mapping or {}).items():
+            fk_col_l = str(fk_col or "").strip("`").strip().lower()
+            tgt_l = str(tgt or "").strip().lower()
+            if fk_col_l and tgt_l:
+                fk_map.setdefault(src_l, {})[fk_col_l] = tgt_l
+
+    def _resolve_metric_partition_col(metric_table: str, partition_table: str, partition_col: str) -> str:
+        metric_l = str(metric_table or "").strip().lower()
+        part_table_l = str(partition_table or "").strip().lower()
+        part_col_l = str(partition_col or "").strip("`").strip().lower()
+        if not metric_l or not part_col_l:
+            return ""
+
+        direct_col = _column_with_case(metric_l, part_col_l)
+        if direct_col:
+            return direct_col
+
+        for fk_col_l, target_l in (fk_map.get(metric_l, {}) or {}).items():
+            if target_l != part_table_l:
+                continue
+            target_id_l = str(get_id_column(target_l) or "").strip("`").strip().lower()
+            if part_col_l in {fk_col_l, target_id_l}:
+                return _column_with_case(metric_l, fk_col_l) or fk_col_l
+
+        return ""
+
     window_pred_pat = re.compile(
         r"(?is)"
         r"(?P<lhs>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*"
@@ -12140,8 +12191,14 @@ def _enforce_all_other_group_avg_self_exclusion(sql: str, question: str) -> str:
         part_qual, part_col = parsed_part
         part_table = _resolve_table(part_qual)
         if part_table and part_table != metric_table:
-            return sql
-        partition_col = str(part_col).strip("`")
+            partition_col = _resolve_metric_partition_col(metric_table, part_table, part_col)
+            if not partition_col:
+                return sql
+            part_qual = outer_alias
+        else:
+            partition_col = _resolve_metric_partition_col(metric_table, metric_table, part_col)
+            if not partition_col:
+                partition_col = str(part_col).strip("`")
     else:
         inner_body = str(m_scalar.group("inner") or "")
         outer_qualifiers = {
@@ -16510,6 +16567,7 @@ def _rewrite_scalar_window_subquery_to_correlated_aggregate(sql: str) -> str:
     Two equivalent malformed shapes are handled:
     - SELECT AVG(x) OVER (PARTITION BY group_col) FROM same_table
     - SELECT AVG(x) FROM same_table GROUP BY group_col
+    - SELECT AVG(x) FROM same_table WHERE group_col = same_table.group_col
 
     Both produce multiple rows as scalar subqueries.  The safe repair is a
     correlated aggregate constrained by the outer row's group key.
@@ -16563,6 +16621,7 @@ def _rewrite_scalar_window_subquery_to_correlated_aggregate(sql: str) -> str:
         \(\s*SELECT\s+
         (?P<agg>(?:AVG|SUM|MIN|MAX|COUNT))\s*\(\s*(?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)\s*
         FROM\s+\(?\s*`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<sub_alias>[A-Za-z_][A-Za-z0-9_]*))?\s*\)?\s*
+        (?:WHERE\s+.+?\s+)?
         GROUP\s+BY\s+(?P<partition>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
         \)
         """,
@@ -16584,36 +16643,100 @@ def _rewrite_scalar_window_subquery_to_correlated_aggregate(sql: str) -> str:
         )
         m = cmp_pat.search(where_body)
     if not m:
-        return sql
+        # Ambiguous same-table scalar aggregate:
+        #   ... WHERE lhs > (SELECT AVG(metric) FROM t WHERE k = t.k)
+        # When the inner table is unaliased and matches the outer table name,
+        # `t.k` binds to the inner scope in MySQL, collapsing the intended
+        # correlation into a tautology. Rewrite by introducing a distinct inner
+        # alias and wiring the equality explicitly to the outer row.
+        ambiguous_pat = re.compile(
+            r"""(?is)
+            (?P<lhs>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
+            (?P<op>>=|<=|=|>|<)\s*
+            \(\s*SELECT\s+
+            (?P<agg>(?:AVG|SUM|MIN|MAX|COUNT))\s*\(\s*(?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)\s*
+            FROM\s+`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?\s*
+            WHERE\s+
+            (?P<eq_left>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*=\s*
+            (?P<eq_right>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
+            \)
+            """,
+            flags=re.X,
+        )
+        m_amb = ambiguous_pat.search(where_body)
+        if not m_amb:
+            return sql
 
-    sub_table = (m.group("table") or "").strip("`")
-    if sub_table.lower() != outer_table.lower():
-        return sql
+        sub_table = (m_amb.group("table") or "").strip("`")
+        if sub_table.lower() != outer_table.lower():
+            return sql
+        if outer_alias.lower() != outer_table.lower():
+            return sql
 
-    agg = (m.group("agg") or "").upper()
-    metric = (m.group("metric") or "").strip()
-    partition = (m.group("partition") or "").strip()
-    lhs = (m.group("lhs") or "").strip()
-    op = (m.group("op") or "").strip()
-    sub_alias = (m.group("sub_alias") or "").strip() or "sq"
-    sub_alias_safe = re.sub(r"[^A-Za-z0-9_]", "", sub_alias) or "sq"
-    if not re.match(r"[A-Za-z_]", sub_alias_safe):
-        sub_alias_safe = f"sq_{sub_alias_safe}"
-    if sub_alias_safe.lower() == outer_alias.lower():
+        def _split_ref(expr: str) -> tuple[str, str]:
+            raw = str(expr or "").strip().replace("`", "")
+            if "." in raw:
+                qual, col = raw.split(".", 1)
+                return qual.strip(), col.strip()
+            return "", raw.strip()
+
+        left_qual, left_col = _split_ref(m_amb.group("eq_left") or "")
+        right_qual, right_col = _split_ref(m_amb.group("eq_right") or "")
+        if not left_col or not right_col or left_col.lower() != right_col.lower():
+            return sql
+
+        if left_qual.lower() == outer_table.lower() and not right_qual:
+            inner_col = right_col
+            outer_col = left_col
+        elif right_qual.lower() == outer_table.lower() and not left_qual:
+            inner_col = left_col
+            outer_col = right_col
+        else:
+            return sql
+
+        agg = (m_amb.group("agg") or "").upper()
+        metric = (m_amb.group("metric") or "").strip()
+        lhs = (m_amb.group("lhs") or "").strip()
         sub_alias_safe = "sq"
+        metric_col = metric.split(".")[-1].strip("`")
+        lhs_col = lhs.split(".")[-1].strip("`")
+        lhs_expr = f"{outer_alias}.{lhs_col}" if "." not in lhs else lhs
+        part_expr_outer = f"{outer_alias}.{outer_col}"
+        replacement = (
+            f"{lhs_expr} {m_amb.group('op').strip()} (SELECT {agg}({sub_alias_safe}.{metric_col}) "
+            f"FROM {sub_table} AS {sub_alias_safe} "
+            f"WHERE {sub_alias_safe}.{inner_col} = {part_expr_outer})"
+        )
+        where_fixed = where_body[: m_amb.start()] + replacement + where_body[m_amb.end() :]
+    else:
+        sub_table = (m.group("table") or "").strip("`")
+        if sub_table.lower() != outer_table.lower():
+            return sql
 
-    metric_col = metric.split(".")[-1].strip("`")
-    part_col = partition.split(".")[-1].strip("`")
-    lhs_col = lhs.split(".")[-1].strip("`")
-    lhs_expr = f"{outer_alias}.{lhs_col}" if "." not in lhs else lhs
-    part_expr_outer = f"{outer_alias}.{part_col}"
+        agg = (m.group("agg") or "").upper()
+        metric = (m.group("metric") or "").strip()
+        partition = (m.group("partition") or "").strip()
+        lhs = (m.group("lhs") or "").strip()
+        op = (m.group("op") or "").strip()
+        sub_alias = (m.group("sub_alias") or "").strip() or "sq"
+        sub_alias_safe = re.sub(r"[^A-Za-z0-9_]", "", sub_alias) or "sq"
+        if not re.match(r"[A-Za-z_]", sub_alias_safe):
+            sub_alias_safe = f"sq_{sub_alias_safe}"
+        if sub_alias_safe.lower() == outer_alias.lower():
+            sub_alias_safe = "sq"
 
-    replacement = (
-        f"{lhs_expr} {op} (SELECT {agg}({sub_alias_safe}.{metric_col}) "
-        f"FROM {sub_table} AS {sub_alias_safe} "
-        f"WHERE {sub_alias_safe}.{part_col} = {part_expr_outer})"
-    )
-    where_fixed = where_body[: m.start()] + replacement + where_body[m.end() :]
+        metric_col = metric.split(".")[-1].strip("`")
+        part_col = partition.split(".")[-1].strip("`")
+        lhs_col = lhs.split(".")[-1].strip("`")
+        lhs_expr = f"{outer_alias}.{lhs_col}" if "." not in lhs else lhs
+        part_expr_outer = f"{outer_alias}.{part_col}"
+
+        replacement = (
+            f"{lhs_expr} {op} (SELECT {agg}({sub_alias_safe}.{metric_col}) "
+            f"FROM {sub_table} AS {sub_alias_safe} "
+            f"WHERE {sub_alias_safe}.{part_col} = {part_expr_outer})"
+        )
+        where_fixed = where_body[: m.start()] + replacement + where_body[m.end() :]
 
     head = s0[:where_pos].rstrip()
     tail = s0[where_end:].strip()
