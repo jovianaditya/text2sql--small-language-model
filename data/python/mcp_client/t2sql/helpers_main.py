@@ -4314,6 +4314,16 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if not (t and c and op):
             return ""
 
+        weekday_num_to_name = {
+            1: "Sunday",
+            2: "Monday",
+            3: "Tuesday",
+            4: "Wednesday",
+            5: "Thursday",
+            6: "Friday",
+            7: "Saturday",
+        }
+
         val_text = str(val or "").strip().lower()
         if op == "eq" and val_text in {"a to z", "z to a"}:
             return ""
@@ -4324,12 +4334,30 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 return ""
         if op == "is_null_or_empty":
             return f"{t}.{c} is_null_or_empty"
+        if op == "is_not_null_or_empty":
+            return f"{t}.{c} is_not_null_or_empty"
         if op == "not_in" and isinstance(val, list) and val:
             return f"{t}.{c} not_in {val}"
         if op == "between" and val is not None and val2 is not None:
             return f"{t}.{c} between {val} and {val2}"
         if op == "month_between" and val is not None and val2 is not None:
             return f"{t}.{c} month_between {val} and {val2}"
+        if op == "weekday_eq" and val is not None:
+            day_name = weekday_num_to_name.get(int(val), str(val)) if str(val).isdigit() else str(val)
+            return f"{t}.{c} weekday_eq {day_name}"
+        if op in {"col_gt", "col_gte", "col_lt", "col_lte"}:
+            value_column = str(filter_obj.get("value_column") or "").strip()
+            if value_column:
+                return f"{t}.{c} {op} {value_column}"
+            return ""
+        if op == "word_count_eq" and val is not None:
+            return f"{t}.{c} word_count_eq {val}"
+        if op in {"len_eq", "len_gt", "len_gte", "len_lt", "len_lte"} and val is not None:
+            return f"{t}.{c} {op} {val}"
+        if op == "like_contains" and val is not None:
+            return f"{t}.{c} like_contains {val}"
+        if op == "not_like_suffix" and val is not None:
+            return f"{t}.{c} not_like_suffix {val}"
         return f"{t}.{c} {op} {val}"
 
     number_words = {
@@ -4625,6 +4653,26 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             parts.append(f"Metrics: {', '.join(met_strs)}")
             has_structural = True
 
+    if (
+        qtype.lower() == "lookup"
+        and bool(intent_ir.get("select_distinct"))
+    ):
+        distinct_targets = []
+        for d in dims:
+            if not isinstance(d, dict):
+                continue
+            if not bool(d.get("visible", True)):
+                continue
+            t = str(d.get("table") or "").strip()
+            c = str(d.get("column") or "").strip()
+            if t and c:
+                distinct_targets.append(f"{t}.{c}")
+        if distinct_targets:
+            parts.append(f"Metrics: DISTINCT projection on {', '.join(distinct_targets)}")
+        else:
+            parts.append("Metrics: DISTINCT projection on the returned lookup rows")
+        has_structural = True
+
     # Filters
     filters = intent_ir.get("filters") or []
     if filters and not suppress_filter_hints:
@@ -4634,8 +4682,40 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if filter_hint:
                 filt_strs.append(filter_hint)
         if filt_strs:
-            parts.append(f"Filters: {', '.join(filt_strs)}")
+            filter_logic = str(intent_ir.get("filter_logic") or "").strip().lower()
+            if len(filt_strs) >= 2 and filter_logic in {"and", "or"}:
+                joiner = f" {filter_logic.upper()} "
+                parts.append(f"Filters: {joiner.join(f'({x})' for x in filt_strs)}")
+            else:
+                parts.append(f"Filters: {', '.join(filt_strs)}")
             has_structural = True
+
+    if qtype.lower() == "lookup":
+        ordering = [o for o in (intent_ir.get("ordering") or []) if isinstance(o, dict)]
+        if ordering:
+            order_strs = []
+            for o in ordering:
+                kind = str(o.get("kind") or "").strip().lower()
+                by = str(o.get("by") or "").strip()
+                direction = str(o.get("direction") or "ASC").strip().upper() or "ASC"
+                table = str(o.get("table") or "").strip()
+                if not by:
+                    continue
+                if kind == "column" and table:
+                    order_strs.append(f"{table}.{by} {direction}")
+                else:
+                    order_strs.append(f"{by} {direction}")
+            if order_strs:
+                parts.append(f"Ordering: {', '.join(order_strs)}")
+                has_structural = True
+        else:
+            primary_order_column = str(intent_ir.get("order_by_column") or "").strip()
+            primary_order_direction = str(intent_ir.get("order_by_direction") or "").strip().upper()
+            if primary_order_column:
+                parts.append(
+                    f"Ordering: {primary_order_column} {primary_order_direction or 'ASC'}"
+                )
+                has_structural = True
 
     derived_grouping_hints = _derived_grouping_hints()
     if derived_grouping_hints:
@@ -4903,8 +4983,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             and str(f.get("op") or "").strip().lower()
             in {
                 "eq", "in", "not_in", "gt", "gte", "lt", "lte",
-                "between", "year_eq", "month_eq", "month_between",
-                "like_prefix", "regexp", "is_null_or_empty",
+                "between", "year_eq", "month_eq", "month_between", "weekday_eq",
+                "like_prefix", "like_contains", "not_like_suffix", "regexp", "word_count_eq", "len_eq", "len_gt", "len_gte", "len_lt", "len_lte", "is_null_or_empty", "is_not_null_or_empty",
                 "col_gt", "col_gte", "col_lt", "col_lte",
             }
             for f in filters
