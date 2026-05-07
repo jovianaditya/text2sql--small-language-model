@@ -98,6 +98,7 @@ from .helpers_core import (
     _drop_unrequested_schema_named_count_outputs,
     _normalize_timestampdiff_day_to_datediff,
     _drop_unrequested_current_date_filters,
+    _drop_unrequested_literal_row_filters,
     _rewrite_null_conditional_count_to_date_comparison,
     _rewrite_comparison_count_metrics,
     _rewrite_conditional_sum_value_to_count,
@@ -132,6 +133,7 @@ from .helpers_core import (
     _repair_single_table_friendly_column_names,
     _rewrite_explicit_single_table_scope,
     _append_requested_secondary_order_key,
+    _restore_requested_temporal_group_order,
     _rewrite_employee_latest_payment_customer_identity,
     _drop_tuple_in_filter_from_include_zero_ranked_winner,
     _rewrite_metric_aggregate_column_mismatch,
@@ -4302,7 +4304,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             return f"{agg}({distinct_kw}{t}.{c})"
         if agg == "PCT_NON_NULL":
             if c != "*" and (col_l in date_cols or role in {"date", "dimension", "status", "text", "name"} or col_l in agg_cols):
-                return f"{agg}({t}.{c})"
+                return f"percentage of rows with non-null {t}.{c}"
             return ""
         if agg in {"SUM", "AVG"}:
             if c != "*" and (col_l in agg_cols or role in {"metric", "measure", "amount", "quantity"}):
@@ -4320,11 +4322,76 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
     def _supplemental_metric_hint_strs() -> List[str]:
         hints: List[str] = []
+        existing_metric_keys = {
+            (
+                str(metric.get("agg") or "").strip().upper(),
+                str(metric.get("table") or "").strip().lower(),
+                str(metric.get("column") or "").strip().lower(),
+            )
+            for metric in (intent_ir.get("metrics") or [])
+            if isinstance(metric, dict)
+        }
+        q_metric_text = re.split(
+            r"\b(?:sort(?:ed)?\s+by|order(?:ed)?\s+by|sort(?:ed)?\s+from|order(?:ed)?\s+from)\b",
+            q_text,
+            maxsplit=1,
+            flags=re.I,
+        )[0]
+        lookup_dimension_keys = {
+            (
+                str(d.get("table") or "").strip().lower(),
+                str(d.get("column") or "").strip().lower(),
+            )
+            for d in (intent_ir.get("dimensions") or [])
+            if isinstance(d, dict)
+            and bool(d.get("visible", True))
+            and str(d.get("table") or "").strip()
+            and str(d.get("column") or "").strip()
+        }
+        lookup_order_keys = {
+            (
+                str(o.get("table") or "").strip().lower(),
+                str(o.get("by") or "").strip().lower(),
+            )
+            for o in (intent_ir.get("ordering") or [])
+            if isinstance(o, dict)
+            and str(o.get("kind") or "").strip().lower() == "column"
+            and str(o.get("table") or "").strip()
+            and str(o.get("by") or "").strip()
+        }
+        lookup_rankish_ordering_intent = bool(
+            qtype.lower() == "lookup"
+            and (
+                bool(intent_ir.get("limit"))
+                or re.search(
+                    r"\b(?:top\s+\d+|\d+\s+(?:highest|lowest|largest|smallest|most|least))\b",
+                    q_text,
+                    flags=re.I,
+                )
+                or re.search(
+                    r"\b(?:starting\s+from|from)\s+the\s+(?:latest|newest|earliest|oldest)\b",
+                    q_text,
+                    flags=re.I,
+                )
+                or re.search(
+                    r"\b(?:with\s+the\s+)?(?:highest|lowest|largest|smallest|latest|newest|earliest|oldest)\b",
+                    q_text,
+                    flags=re.I,
+                )
+            )
+        )
 
         def add_hint(text: str) -> None:
             clean = str(text or "").strip()
             if clean and clean not in hints:
                 hints.append(clean)
+
+        def has_metric(agg: str, table: str, column: str) -> bool:
+            return (
+                str(agg or "").strip().upper(),
+                str(table or "").strip().lower(),
+                str(column or "").strip().lower(),
+            ) in existing_metric_keys
 
         def add_case_when_hint(agg: str, table: str, column: str) -> None:
             agg_text = str(agg or "").strip().upper()
@@ -4332,6 +4399,16 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             column_text = str(column or "").strip()
             if agg_text and table_text and column_text:
                 add_hint(f"{agg_text}({table_text}.{column_text}) with CASE WHEN")
+
+        def generic_metric_only_phrase(phrase: str) -> bool:
+            phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+            return bool(
+                re.fullmatch(
+                    r"(?:the\s+)?(?:percentage|percent|ratio|rate|count|counts|total|totals|average|avg|mean|sum|"
+                    r"minimum|min|max|maximum|number(?:\s+of)?|rows?)",
+                    phrase_norm,
+                )
+            )
 
         m_date_gap = re.search(
             r"\b(?:avg|average|mean)\s+(?:number\s+of\s+)?days?\s+between\s+"
@@ -4381,7 +4458,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 add_case_when_hint("SUM", table, column)
 
         m_conditional_date_count = re.search(
-            r"\b(?:how\s+many|count|number\s+of)\b(?:\s+[a-z][a-z0-9_-]*){0,6}?\s+have\s+"
+            r"\b(?:how\s+many|count|number\s+of)\b(?:\s+[a-z][a-z0-9_-]*){0,6}?\s+"
+            r"(?:have\s+)?(?:(?:were|was|are|is)\s+)?"
             r"([a-z][a-z0-9_ ]{1,40}?)\s+"
             r"(earlier\s+than|before|later\s+than|after)\s+"
             r"([a-z][a-z0-9_ ]{1,40}?)"
@@ -4422,6 +4500,58 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     break
             if resolved_target:
                 add_case_when_hint("SUM", resolved_target[0], resolved_target[1])
+
+        extrema_patterns = [
+            (
+                r"\b(?:earliest|oldest)\s+([a-z][a-z0-9_ ]{1,48}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bkeep\b|\bonly\b|\breturn\b|\bshow\b|\bsort\b|\border\b|$))",
+                "MIN",
+                True,
+            ),
+            (
+                r"\b(?:latest|newest|most\s+recent)\s+([a-z][a-z0-9_ ]{1,48}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bkeep\b|\bonly\b|\breturn\b|\bshow\b|\bsort\b|\border\b|$))",
+                "MAX",
+                True,
+            ),
+            (
+                r"\b(?:lowest|smallest)\s+([a-z][a-z0-9_ ]{1,48}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bkeep\b|\bonly\b|\breturn\b|\bshow\b|\bsort\b|\border\b|$))",
+                "MIN",
+                False,
+            ),
+            (
+                r"\b(?:highest|largest)\s+([a-z][a-z0-9_ ]{1,48}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bkeep\b|\bonly\b|\breturn\b|\bshow\b|\bsort\b|\border\b|$))",
+                "MAX",
+                False,
+            ),
+        ]
+        for pattern, agg_name, prefer_date in extrema_patterns:
+            for match in re.finditer(pattern, q_metric_text, flags=re.I):
+                phrase = re.sub(r"\s+", " ", str(match.group(1) or "").strip())
+                if not phrase:
+                    continue
+                if generic_metric_only_phrase(phrase):
+                    continue
+                resolved = (
+                    _resolve_derived_column(phrase, date_like=True)
+                    if prefer_date
+                    else _resolve_derived_column(phrase)
+                )
+                if not resolved:
+                    resolved = _resolve_derived_column(phrase)
+                if not resolved:
+                    continue
+                table, column = resolved
+                if (
+                    qtype.lower() == "lookup"
+                    and (table.lower(), column.lower()) in lookup_dimension_keys
+                    and (
+                        (table.lower(), column.lower()) in lookup_order_keys
+                        or lookup_rankish_ordering_intent
+                    )
+                ):
+                    continue
+                if has_metric(agg_name, table, column):
+                    continue
+                add_hint(f"{agg_name}({table}.{column})")
 
         m_percentage_share = re.search(
             r"\b(?:percent|percentage|ratio|rate)\s+of\s+the\s+total\s+"
@@ -4484,6 +4614,14 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if op == "eq" and c.lower() in {"country", "city"}:
             if _question_has_valid_multi_value_location_list():
                 return ""
+        if op == "eq" and re.search(
+            r"^(?:with\s+(?:at\s+least|at\s+most|more\s+than|less\s+than|above|below)|"
+            r"having\s+(?:at\s+least|at\s+most|more\s+than|less\s+than|above|below)|"
+            r"at\s+least\b|at\s+most\b|more\s+than\b|less\s+than\b|above\b|below\b)",
+            val_text,
+            flags=re.I,
+        ):
+            return ""
         if op == "is_null_or_empty":
             return f"{t}.{c} is_null_or_empty"
         if op == "is_not_null_or_empty":
@@ -4614,6 +4752,126 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 segments.append(seg)
         return segments
 
+    def _metric_like_projection_segment(seg_l: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:count|sum|avg|average|mean|min|max|minimum|maximum|lowest|highest|smallest|largest|"
+                r"latest|newest|earliest|oldest|percentage|percent|ratio|rate|how\s+many|number\s+of|"
+                r"gap|difference|delta|variance|rank|position|total)\b",
+                seg_l,
+                flags=re.I,
+            )
+        )
+
+    def _merge_dim_dicts(primary: List[dict], extras: List[dict]) -> List[dict]:
+        merged: List[dict] = []
+        seen_keys: Set[Tuple[str, str, str]] = set()
+        for item in list(primary or []) + list(extras or []):
+            if not isinstance(item, dict):
+                continue
+            table = str(item.get("table") or "").strip()
+            column = str(item.get("column") or "").strip()
+            transform = str(item.get("transform") or "").strip().lower()
+            if not (table and column):
+                continue
+            key = (table.lower(), column.lower(), transform)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged.append(item)
+        return merged
+
+    def _aggregate_projection_backbone_dims() -> List[dict]:
+        projection_segments = _extract_projection_segments_local(str(state.get("question") or ""))
+        if not projection_segments:
+            return []
+        projection_dims: List[dict] = []
+        seen_keys: Set[Tuple[str, str, str]] = set()
+        projection_candidates = _structural_column_candidates()
+        for seg in projection_segments:
+            seg_l = re.sub(r"\s+", " ", str(seg or "").strip().lower())
+            if not seg_l or _metric_like_projection_segment(seg_l):
+                continue
+            explicit_pairs: List[Tuple[str, str]] = []
+            for table, column in projection_candidates:
+                for variant_norm in _column_variant_texts(table, column):
+                    variant_pat = re.escape(variant_norm).replace(r"\ ", r"\s+")
+                    if re.search(rf"\b{variant_pat}\b", seg_l, flags=re.I):
+                        pair = (table, str(column).strip())
+                        if pair not in explicit_pairs:
+                            explicit_pairs.append(pair)
+                        break
+            if explicit_pairs:
+                for table, column in explicit_pairs:
+                    dim_key = (table.lower(), column.lower(), "none")
+                    if dim_key in seen_keys:
+                        continue
+                    seen_keys.add(dim_key)
+                    projection_dims.append(
+                        {
+                            "table": table,
+                            "column": column,
+                            "alias": "",
+                            "transform": "none",
+                            "visible": True,
+                        }
+                    )
+                continue
+            resolved = _resolve_derived_column(seg_l)
+            if not resolved:
+                continue
+            table, column = resolved
+            dim_key = (table.lower(), column.lower(), "none")
+            if dim_key in seen_keys:
+                continue
+            seen_keys.add(dim_key)
+            projection_dims.append(
+                {
+                    "table": table,
+                    "column": column,
+                    "alias": "",
+                    "transform": "none",
+                    "visible": True,
+                }
+            )
+        return projection_dims
+
+    def _aggregate_intro_backbone_dims() -> List[dict]:
+        q_raw_local = str(state.get("question") or "").strip()
+        if not q_raw_local:
+            return []
+        intro_match = re.search(
+            r"\b(?:return|show|display|list|include|give)\b",
+            q_raw_local,
+            flags=re.I,
+        )
+        intro = q_raw_local[:intro_match.start()] if intro_match else q_raw_local
+        intro_l = re.sub(r"\s+", " ", intro.strip().lower())
+        if not intro_l:
+            return []
+        projection_candidates = _structural_column_candidates()
+        dims: List[dict] = []
+        seen_keys: Set[Tuple[str, str, str]] = set()
+        for table, column in projection_candidates:
+            for variant_norm in _column_variant_texts(table, column):
+                variant_pat = re.escape(variant_norm).replace(r"\ ", r"\s+")
+                if re.search(rf"\b{variant_pat}\b", intro_l, flags=re.I):
+                    dim_key = (table.lower(), column.lower(), "none")
+                    if dim_key in seen_keys:
+                        break
+                    seen_keys.add(dim_key)
+                    dims.append(
+                        {
+                            "table": table,
+                            "column": column,
+                            "alias": "",
+                            "transform": "none",
+                            "visible": True,
+                        }
+                    )
+                    break
+        return dims
+
     def _hint_display_dimensions() -> List[dict]:
         raw_dims = [d for d in (intent_ir.get("dimensions") or []) if isinstance(d, dict)]
         is_window_hint = any(
@@ -4702,8 +4960,32 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if qtype.lower() != "aggregate":
             return raw_dims
 
+        projection_backbone_dims = _aggregate_projection_backbone_dims()
+        intro_backbone_dims = _aggregate_intro_backbone_dims()
+
+        quarter_match = re.search(r"\b(?:calendar\s+)?quarter\b|\bquarter\s+number\b", q_text, flags=re.I)
+        if quarter_match:
+            phrase_window = q_text[max(0, quarter_match.start() - 80):quarter_match.end() + 80]
+            resolved = _resolve_derived_column(phrase_window, date_like=True)
+            quarter_dims: List[dict] = []
+            if resolved:
+                quarter_dims.append(
+                    {
+                        "table": resolved[0],
+                        "column": resolved[1],
+                        "alias": "",
+                        "transform": "none",
+                        "visible": True,
+                    }
+                )
+            if quarter_dims:
+                return quarter_dims
+            return raw_dims
+
         if regex_bucket_query or bucket_or_classification_query:
-            return []
+            if intro_backbone_dims:
+                return intro_backbone_dims
+            return raw_dims
 
         derived_grouping_hints = _derived_grouping_hints()
         expression_only_grouping = any(
@@ -4744,7 +5026,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 explicit_dims.append(d)
                 seen_keys.add(dim_key)
 
-        return explicit_dims or raw_dims
+        base_dims = explicit_dims or raw_dims
+        if projection_backbone_dims:
+            return _merge_dim_dicts(base_dims, projection_backbone_dims)
+        return base_dims
 
     def _column_match_score(phrase: str, table: str, column: str) -> int:
         phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
@@ -4971,19 +5256,18 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
     # Metrics
     metrics = intent_ir.get("metrics") or []
-    if metrics:
-        met_strs = []
-        for m in metrics:
-            metric_hint = _safe_metric_hint_str(m)
-            if metric_hint:
-                met_strs.append(metric_hint)
-        supplemental_metric_hints = _supplemental_metric_hint_strs()
-        for metric_hint in supplemental_metric_hints:
-            if metric_hint and metric_hint not in met_strs:
-                met_strs.append(metric_hint)
-        if met_strs:
-            parts.append(f"Metrics: {', '.join(met_strs)}")
-            has_structural = True
+    met_strs = []
+    for m in metrics:
+        metric_hint = _safe_metric_hint_str(m)
+        if metric_hint:
+            met_strs.append(metric_hint)
+    supplemental_metric_hints = _supplemental_metric_hint_strs()
+    for metric_hint in supplemental_metric_hints:
+        if metric_hint and metric_hint not in met_strs:
+            met_strs.append(metric_hint)
+    if met_strs:
+        parts.append(f"Metrics: {', '.join(met_strs)}")
+        has_structural = True
 
     if (
         qtype.lower() == "lookup"
@@ -6503,6 +6787,28 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             flags=re.I,
         )
 
+    def _normalize_misaliased_double_colon_expr(sql: str) -> str:
+        """
+        Normalize malformed `expr::'alias'` / `expr::"alias"` outputs into
+        MySQL-style `expr AS alias`.
+
+        This targets a common small-model mistake where `::` is used as if it
+        introduced an output alias. It is applied conservatively only when the
+        right-hand side is a quoted identifier-like alias, so real cast-like
+        forms such as `amount::DECIMAL` are left untouched.
+        """
+        if not sql or "::" not in sql:
+            return sql
+
+        pattern = re.compile(
+            r"(?P<expr>(?:"
+            r"`?[A-Za-z_][A-Za-z0-9_.]*`?"
+            r"|[A-Za-z_][A-Za-z0-9_]*\s*\([^;]*?\)"
+            r"))\s*::\s*(['\"`])(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\2",
+            flags=re.I,
+        )
+        return pattern.sub(lambda m: f"{m.group('expr')} AS {m.group('alias')}", sql)
+
     def _rewrite_pipes_concat_mysql(text: str) -> str:
         """
         Convert common string-concat style `a || b` into MySQL-safe CONCAT(a, b).
@@ -6534,6 +6840,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
 
     s = _norm_kw(s)
     s = _fix_date_format_quarter(s)
+    s = _normalize_misaliased_double_colon_expr(s)
     s = _normalize_timestampdiff_day_to_datediff(s)
     s = _rewrite_pipes_concat_mysql(s)
     s = _fix_missing_space_before_clauses(s)
@@ -7189,6 +7496,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         if DEBUG_WR: print("[REFINER - PH4] after post-repair group-key filter drop:", s)
         s = _drop_unrequested_positive_row_filters(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after unrequested positive row-filter drop:", s)
+        s = _drop_unrequested_literal_row_filters(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after unrequested literal row-filter drop:", s)
         s = _drop_tautological_positive_count_having(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after post-repair tautological HAVING drop:", s)
 
@@ -7311,6 +7620,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested group-key filter drop fix: {s}")
     s = _drop_unrequested_positive_row_filters(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested positive row-filter drop fix: {s}")
+    s = _drop_unrequested_literal_row_filters(s, question, ctx)
+    if DEBUG_WR: print(f"[REFINER - PH6] after unrequested literal row-filter drop fix: {s}")
     s = _drop_unrequested_length_filter_for_prefix_grouping(s, question)
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested prefix-length filter drop fix: {s}")
     s = _drop_tautological_positive_count_having(s, question, ctx)
@@ -7429,6 +7740,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     s = _enforce_requested_base_projection_in_single_table_window(s, question)
     s = _enforce_requested_order_direction(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
+    s = _restore_requested_temporal_group_order(s, question)
     s = _prefer_requested_count_desc_final_order(s, question)
     s = _drop_unrequested_grouped_limit(s, question)
     s = _maybe_add_limit(question, s)

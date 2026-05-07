@@ -31374,6 +31374,177 @@ def _drop_unrequested_positive_row_filters(sql: str, question: str, ctx: str = "
     return fixed
 
 
+def _drop_unrequested_literal_row_filters(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Drop hallucinated string-literal row filters in grouped single-table queries.
+
+    Conservative scope:
+    - grouped flat query only
+    - single-table FROM (no JOIN / derived table)
+    - top-level AND-only WHERE
+    - only simple `col = 'literal'` / `col IN ('a', 'b', ...)` predicates
+    - never drops when the question explicitly mentions the filtered column
+      or any of the literal values
+    """
+    if not sql or not question:
+        return sql
+
+    q = str(question or "").strip().lower()
+    if not q:
+        return sql
+
+    parsed = _parse_select_from_groupby(sql) or _parse_flat_groupby_clauses(sql)
+    if not parsed:
+        return sql
+
+    from_core = str(parsed.get("from_core") or "").strip()
+    if not from_core or re.search(r"(?is)\bjoin\b", from_core) or "(" in from_core:
+        return sql
+
+    where_clause = (parsed.get("where") or "").strip()
+    if not where_clause or not where_clause.lower().startswith("where "):
+        return sql
+    where_body = where_clause[6:].strip()
+    if not where_body or _has_top_level_or(where_body):
+        return sql
+
+    group_items = _split_top_level_commas(parsed.get("groupby") or "")
+    if not group_items:
+        return sql
+
+    simple_col_pat = re.compile(
+        r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$"""
+    )
+    grouped_cols: Set[str] = set()
+    for item in group_items:
+        m_group = simple_col_pat.match(str(item or "").strip())
+        if not m_group:
+            continue
+        grouped_cols.add((m_group.group(2) or "").strip().lower())
+
+    string_lit_pat = r"""(?:'[^']*'|"[^"]*")"""
+    eq_pat = re.compile(
+        rf"""(?is)^\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*=\s*(?P<lit>{string_lit_pat})\s*$"""
+    )
+    eq_rev_pat = re.compile(
+        rf"""(?is)^\s*(?P<lit>{string_lit_pat})\s*=\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$"""
+    )
+    neq_pat = re.compile(
+        rf"""(?is)^\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*(?:!=|<>)\s*(?P<lit>{string_lit_pat})\s*$"""
+    )
+    neq_rev_pat = re.compile(
+        rf"""(?is)^\s*(?P<lit>{string_lit_pat})\s*(?:!=|<>)\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$"""
+    )
+    in_pat = re.compile(
+        rf"""(?is)^\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s+IN\s*\(\s*(?P<items>{string_lit_pat}(?:\s*,\s*{string_lit_pat})*)\s*\)\s*$"""
+    )
+    not_in_pat = re.compile(
+        rf"""(?is)^\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s+NOT\s+IN\s*\(\s*(?P<items>{string_lit_pat}(?:\s*,\s*{string_lit_pat})*)\s*\)\s*$"""
+    )
+
+    def _col_name(expr: str) -> str:
+        m = simple_col_pat.match(str(expr or "").strip())
+        if not m:
+            return ""
+        return (m.group(2) or "").strip().lower()
+
+    q_tokens = set(re.findall(r"[a-z0-9]+", q))
+
+    def _column_mentioned(col_name: str) -> bool:
+        if not col_name:
+            return False
+        col_phrase = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(col_name or ""))
+        col_phrase = re.sub(r"[_\W]+", " ", col_phrase).strip().lower()
+        if not col_phrase:
+            return False
+        phrase_pat = re.escape(col_phrase).replace(r"\ ", r"\s+")
+        if re.search(rf"\b{phrase_pat}\b", q, flags=re.I):
+            return True
+        col_tokens = [t for t in re.findall(r"[a-z0-9]+", col_phrase) if len(t) >= 3]
+        return bool(col_tokens) and any(t in q_tokens for t in col_tokens)
+
+    def _literal_text(token: str) -> str:
+        raw = str(token or "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1]
+        return raw.strip().lower()
+
+    def _literal_mentioned(token: str) -> bool:
+        lit = _literal_text(token)
+        if not lit:
+            return False
+        lit_pat = re.escape(lit).replace(r"\ ", r"\s+")
+        return re.search(rf"\b{lit_pat}\b", q, flags=re.I) is not None
+
+    conds = _split_top_level_and(where_body)
+    if not conds:
+        return sql
+
+    keep_conds: List[str] = []
+    removed_any = False
+    for cond in conds:
+        c0 = str(cond or "").strip()
+        if not c0:
+            continue
+
+        match = eq_pat.match(c0) or eq_rev_pat.match(c0) or neq_pat.match(c0) or neq_rev_pat.match(c0)
+        if match:
+            col_l = _col_name(match.group("col") or "")
+            lit = match.group("lit") or ""
+            if (
+                col_l
+                and col_l not in grouped_cols
+                and not _column_mentioned(col_l)
+                and not _literal_mentioned(lit)
+            ):
+                removed_any = True
+                continue
+            keep_conds.append(c0)
+            continue
+
+        in_match = in_pat.match(c0) or not_in_pat.match(c0)
+        if in_match:
+            col_l = _col_name(in_match.group("col") or "")
+            lit_tokens = [
+                tok.strip()
+                for tok in str(in_match.group("items") or "").split(",")
+                if tok.strip()
+            ]
+            if (
+                col_l
+                and col_l not in grouped_cols
+                and lit_tokens
+                and not _column_mentioned(col_l)
+                and not any(_literal_mentioned(tok) for tok in lit_tokens)
+            ):
+                removed_any = True
+                continue
+            keep_conds.append(c0)
+            continue
+
+        keep_conds.append(c0)
+
+    if not removed_any:
+        return sql
+
+    out_lines = [
+        f"SELECT {parsed['select'].strip()}",
+        f"FROM {from_core}",
+    ]
+    if keep_conds:
+        out_lines.append(f"WHERE {' AND '.join(keep_conds)}")
+    out_lines.append(f"GROUP BY {parsed['groupby'].strip()}")
+    if parsed.get("having"):
+        out_lines.append(parsed["having"].strip())
+    if parsed.get("tail"):
+        out_lines.append(parsed["tail"].strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _drop_unrequested_metric_operand_group_keys(sql: str, question: str, ctx: str = "") -> str:
     """
     Drop leaked raw group keys that are only serving as aggregate operand columns.
@@ -35483,6 +35654,188 @@ def _append_requested_secondary_order_key(sql: str, question: str) -> str:
     if limit_pos >= 0:
         rebuilt += " " + s0[limit_pos:].lstrip()
     return rebuilt.rstrip() + trailing
+
+
+def _restore_requested_temporal_group_order(sql: str, question: str) -> str:
+    """
+    Restore a missing top-level ORDER BY for grouped temporal rollups when the
+    question explicitly requests chronological quarter/month/year ordering.
+
+    Conservative behavior:
+    - only applies when there is no existing top-level ORDER BY
+    - only for top-level GROUP BY queries
+    - only when the question clearly asks for chronological temporal ordering
+    - orders by the grouped temporal expression itself, or MONTH(date) when the
+      visible grouping key is a month-name expression
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q:
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    s0 = s[:-1].rstrip() if trailing else s
+
+    if _find_top_level_clause(s0, "order by") >= 0:
+        return sql
+
+    group_pos = _find_top_level_clause(s0, "group by")
+    from_pos = _find_top_level_clause(s0, "from")
+    if group_pos < 0 or from_pos < 0:
+        return sql
+
+    def _has_quarter_order_request(text: str) -> bool:
+        return bool(
+            re.search(r"\bq1\s+to\s+q4\b|\bquarter\s+1\s+to\s+(?:quarter\s+)?4\b", text, flags=re.I)
+            or (
+                re.search(r"\bquarter\b", text, flags=re.I)
+                and re.search(
+                    r"\b(?:chronological|chronologically|ascending|asc|earliest\s+to\s+latest|oldest\s+to\s+newest)\b",
+                    text,
+                    flags=re.I,
+                )
+            )
+        )
+
+    def _has_quarter_desc_request(text: str) -> bool:
+        return bool(
+            re.search(r"\bq4\s+to\s+q1\b|\bquarter\s+4\s+to\s+(?:quarter\s+)?1\b", text, flags=re.I)
+            or (
+                re.search(r"\bquarter\b", text, flags=re.I)
+                and re.search(
+                    r"\b(?:descending|desc|latest\s+to\s+earliest|newest\s+to\s+oldest)\b",
+                    text,
+                    flags=re.I,
+                )
+            )
+        )
+
+    def _has_month_order_request(text: str) -> bool:
+        return bool(
+            re.search(r"\bmonth(?:s)?\s+chronologically\b|\bchronological(?:ly)?\b", text, flags=re.I)
+            or (
+                re.search(r"\bmonth\b", text, flags=re.I)
+                and re.search(
+                    r"\b(?:ascending|asc|earliest\s+to\s+latest|oldest\s+to\s+newest)\b",
+                    text,
+                    flags=re.I,
+                )
+            )
+        )
+
+    def _has_month_desc_request(text: str) -> bool:
+        return bool(
+            re.search(r"\bmonth\b", text, flags=re.I)
+            and re.search(
+                r"\b(?:descending|desc|latest\s+to\s+earliest|newest\s+to\s+oldest)\b",
+                text,
+                flags=re.I,
+            )
+        )
+
+    def _has_year_order_request(text: str) -> bool:
+        return bool(
+            re.search(r"\byear\b", text, flags=re.I)
+            and re.search(
+                r"\b(?:chronological|chronologically|ascending|asc|earliest\s+to\s+latest|oldest\s+to\s+newest)\b",
+                text,
+                flags=re.I,
+            )
+        )
+
+    def _has_year_desc_request(text: str) -> bool:
+        return bool(
+            re.search(r"\byear\b", text, flags=re.I)
+            and re.search(
+                r"\b(?:descending|desc|latest\s+to\s+earliest|newest\s+to\s+oldest)\b",
+                text,
+                flags=re.I,
+            )
+        )
+
+    temporal_kind = ""
+    direction = "ASC"
+    if _has_quarter_desc_request(q):
+        temporal_kind = "quarter"
+        direction = "DESC"
+    elif _has_quarter_order_request(q):
+        temporal_kind = "quarter"
+        direction = "ASC"
+    elif _has_month_desc_request(q):
+        temporal_kind = "month"
+        direction = "DESC"
+    elif _has_month_order_request(q):
+        temporal_kind = "month"
+        direction = "ASC"
+    elif _has_year_desc_request(q):
+        temporal_kind = "year"
+        direction = "DESC"
+    elif _has_year_order_request(q):
+        temporal_kind = "year"
+        direction = "ASC"
+    else:
+        return sql
+
+    stop_positions = [
+        pos for pos in (
+            _find_top_level_clause(s0, "having", group_pos + len("group by")),
+            _find_top_level_clause(s0, "limit", group_pos + len("group by")),
+        )
+        if pos >= 0
+    ]
+    group_end = min(stop_positions) if stop_positions else len(s0)
+    group_clause = s0[group_pos + len("group by"):group_end].strip()
+    if not group_clause:
+        return sql
+
+    select_items = _split_top_level_commas(s0[len("select"):from_pos].strip()) if s0[:6].lower() == "select" else []
+    alias_to_expr: Dict[str, str] = {}
+    for item in select_items:
+        expr, alias = _split_select_expr_alias(item)
+        alias_l = str(alias or "").strip("` ").lower()
+        expr_text = str(expr or "").strip()
+        if alias_l and expr_text:
+            alias_to_expr[alias_l] = expr_text
+
+    def _month_order_expr(expr: str) -> Optional[str]:
+        m = re.search(
+            r"(?is)\bDATE_FORMAT\s*\(\s*([^,]+?)\s*,\s*(['\"])(%M|%b)\2\s*\)",
+            expr,
+        )
+        if m:
+            inner = str(m.group(1) or "").strip()
+            if inner:
+                return f"MONTH({inner})"
+        return None
+
+    def _temporal_order_expr(expr: str) -> Optional[str]:
+        expr_text = str(expr or "").strip()
+        if not expr_text:
+            return None
+        if temporal_kind == "quarter" and re.search(r"(?is)\bQUARTER\s*\(", expr_text):
+            return expr_text
+        if temporal_kind == "year" and re.search(r"(?is)\bYEAR\s*\(", expr_text):
+            return expr_text
+        if temporal_kind == "month":
+            if re.search(r"(?is)\bMONTH\s*\(", expr_text):
+                return expr_text
+            return _month_order_expr(expr_text)
+        return None
+
+    order_expr = None
+    for item in _split_top_level_commas(group_clause):
+        group_expr = str(item or "").strip()
+        if not group_expr:
+            continue
+        resolved_expr = alias_to_expr.get(group_expr.strip("` ").lower(), group_expr)
+        order_expr = _temporal_order_expr(resolved_expr)
+        if order_expr:
+            break
+
+    if not order_expr:
+        return sql
+
+    return s0.rstrip() + f" ORDER BY {order_expr} {direction}" + trailing
 
 
 def _add_having_for_required_temporal_left_join(sql: str, question: str, ctx: str = "") -> str:

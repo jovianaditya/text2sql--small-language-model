@@ -1538,6 +1538,62 @@ def _detect_metrics(
 
         return False
 
+    def _question_requests_total_row_count() -> Optional[str]:
+        """
+        Detect `total <entity>` phrases that are better interpreted as row counts
+        rather than numeric sums.
+
+        Examples:
+        - "total orders"
+        - "total payments"
+
+        Returns the best target table when the phrase clearly points to an
+        entity/table and does not resolve to a numeric measure column.
+        """
+        if not re.search(r"\btotal\b", q, flags=re.I):
+            return None
+        if re.search(r"\btotal\s+(?:number|count)(?:\s+of)?\b", q, flags=re.I):
+            return None
+
+        candidate_phrases = [
+            str(m.group(1) or "").strip()
+            for m in re.finditer(r"\btotal\s+([a-z][a-z0-9_ ]{1,48})\b", q, flags=re.I)
+        ]
+        candidate_phrases = [p for p in candidate_phrases if p]
+        if not candidate_phrases:
+            return None
+
+        row_unit_terms = {
+            "row", "rows", "record", "records", "entry", "entries",
+            "item", "items", "line", "lines", "detail", "details",
+            "result", "results",
+        }
+
+        for phrase in candidate_phrases:
+            phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+            if not phrase_norm:
+                continue
+
+            phrase_tokens = [
+                tok for tok in re.findall(r"[a-z0-9_'-]+", phrase_norm) if tok
+            ]
+            if phrase_tokens and all(tok in row_unit_terms for tok in phrase_tokens):
+                return subject or first_mentioned
+
+            resolved_numeric = _resolve_numeric_measure_from_phrase(phrase_norm)
+            if resolved_numeric:
+                continue
+
+            resolved_col = _resolve_column_from_phrase(phrase_norm)
+            if resolved_col and _is_numeric_measure_column(resolved_col[1]):
+                continue
+
+            resolved_table = _resolve_table_from_phrase(phrase_norm)
+            if resolved_table:
+                return resolved_table
+
+        return None
+
     def _semantic_phrase_tokens(text: str) -> List[str]:
         out: List[str] = []
         for tok in re.findall(r"[a-z0-9_'-]+", str(text or "").lower()):
@@ -1545,6 +1601,10 @@ def _detect_metrics(
                 if cur:
                     out.append(cur)
         return out
+
+    total_row_count_table = _question_requests_total_row_count()
+    if total_row_count_table:
+        wants_count = True
 
     wants_sum = bool(has_explicit_sum_signal or _question_requests_total_metric())
 
@@ -1796,13 +1856,15 @@ def _detect_metrics(
                 )
             )
         else:
-            count_table = first_mentioned or subject
+            count_table = total_row_count_table or first_mentioned or subject
             m_count_of = re.search(
                 r"\b(?:number|count|total\s+number)\s+of\s+([a-z][a-z0-9_ ]{1,40})\b",
                 q,
                 flags=re.I,
             )
             count_col = ""
+            if total_row_count_table:
+                count_col = "*"
             if m_count_of:
                 count_phrase = re.sub(r"\s+", " ", str(m_count_of.group(1) or "").strip())
                 row_unit_count = bool(
@@ -2762,6 +2824,8 @@ def _detect_filters(
             return True
         if any(clean.startswith(prefix) for prefix in ("each ", "every ", "per ", "all ")):
             return True
+        if any(clean.startswith(prefix) for prefix in ("for all ", "for every ", "for each ")):
+            return True
         if re.match(r"^(?:the\s+)?(?:same|that|this|those|these|their|its)\b", clean):
             return True
         if re.search(r"\b(?:dataset|data|result|results|count|counts)\b", clean):
@@ -2769,6 +2833,20 @@ def _detect_filters(
         if re.search(r"\b(?:same\s+\w+|that\s+\w+|this\s+\w+|those\s+\w+|these\s+\w+)\b", clean):
             return True
         if re.search(r"\b(?:missing|null|blank|empty|filled|listed|provided|specified|have|has|had|whether)\b", clean):
+            return True
+        if re.search(r"\bfor\s+all\b", clean):
+            return True
+        if re.search(
+            r"\b(?:longer|shorter|greater|less|more|fewer)\s+than\b|\bat\s+least\b|\bat\s+most\b",
+            clean,
+            flags=re.I,
+        ):
+            return True
+        if re.search(
+            r"\b(?:characters?|chars?|letters?|digits?|words?|bytes?)\b",
+            clean,
+            flags=re.I,
+        ) and re.search(r"\b\d+\b", clean):
             return True
         if _looks_like_alphabetical_sort_phrase(clean):
             return True
@@ -2780,6 +2858,7 @@ def _detect_filters(
             "containing", "end", "ends", "ending", "between", "above", "below",
             "under", "over", "greater", "less", "after", "before", "missing",
             "null", "empty", "blank", "exactly", "followed", "higher", "lower",
+            "longer", "shorter", "more", "fewer",
             "equal", "equals", "same", "than", "like", "matching", "match",
             "ascending", "descending", "asc", "desc", "sort", "sorted",
             "order", "ordered",
@@ -2790,12 +2869,28 @@ def _detect_filters(
         )
         best: Optional[Tuple[int, IRFilter]] = None
 
-        for table, column, pos in column_mentions:
+        eq_candidates: List[Tuple[str, str]] = []
+        seen_eq_candidates: Set[Tuple[str, str]] = set()
+        for table, column, _ in column_mentions:
             if table != subject:
                 continue
             if not _supports_categorical_text_filter(table, column):
                 continue
+            key = (table, column)
+            if key in seen_eq_candidates:
+                continue
+            seen_eq_candidates.add(key)
+            eq_candidates.append(key)
+        for column in allowed.get(subject, set()):
+            if not _supports_categorical_text_filter(subject, column):
+                continue
+            key = (subject, column)
+            if key in seen_eq_candidates:
+                continue
+            seen_eq_candidates.add(key)
+            eq_candidates.append(key)
 
+        for table, column in eq_candidates:
             for variant in sorted(_column_variants(table, column), key=len, reverse=True):
                 variant_text = str(variant or "").strip()
                 if not variant_text:
@@ -2803,7 +2898,7 @@ def _detect_filters(
                 c_pat = re.escape(variant_text).replace(r"\ ", r"\s+")
                 match = re.search(
                     rf"\b{c_pat}\b(?:\s+(?:of|is|=|equals?|equal\s+to))?\s+"
-                    rf"""["'“”]?([A-Za-z0-9][A-Za-z0-9/&:._'/-]{{0,40}}?)["'“”]?(?={clause_stop})""",
+                    rf"""["'“”]?([A-Za-z0-9][A-Za-z0-9/&:._'/-]*(?:\s+[A-Za-z0-9/&:._'/-]+){{0,5}}?)["'“”]?(?={clause_stop})""",
                     q_raw,
                     flags=re.I,
                 )
@@ -3356,8 +3451,28 @@ def _detect_filters(
     def _find_non_null_like_target_column() -> Optional[Tuple[str, str]]:
         subject_mentions = [(t, c, p) for (t, c, p) in column_mentions if t == subject]
         other_mentions = [(t, c, p) for (t, c, p) in column_mentions if t != subject]
+        candidate_pairs: List[Tuple[str, str]] = []
+        seen_pairs: Set[Tuple[str, str]] = set()
+        for t, c, _ in subject_mentions:
+            key = (t, c)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            candidate_pairs.append(key)
+        for c in allowed.get(subject, set()):
+            key = (subject, c)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            candidate_pairs.append(key)
+        for t, c, _ in other_mentions:
+            key = (t, c)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            candidate_pairs.append(key)
         clause_stop = r"(?:[.,;:!?]|\s+(?:return|show|list|display|include|give|sort|order|ordered|sorted|where|having)\b|$)"
-        for t, c, _ in subject_mentions + other_mentions:
+        for t, c in candidate_pairs:
             for variant in _column_variants(t, c):
                 c_pat = re.escape(variant).replace(r"\ ", r"\s+")
                 if re.search(
@@ -3374,7 +3489,7 @@ def _detect_filters(
                     if not re.search(
                         r"\b(?:along\s+with|together\s+with|highest|lowest|largest|smallest|top|bottom|"
                         r"average|avg|mean|above|below|under|over|between|at\s+least|at\s+most|"
-                        r"sorted?|order(?:ed)?|ascending|descending)\b",
+                        r"sort(?:ed)?|order(?:ed)?\s+by|ascending|descending)\b",
                         local_text,
                         flags=re.I,
                     ):
@@ -3393,7 +3508,7 @@ def _detect_filters(
                     if not re.search(
                         r"\b(?:along\s+with|together\s+with|highest|lowest|largest|smallest|top|bottom|"
                         r"average|avg|mean|above|below|under|over|between|at\s+least|at\s+most|"
-                        r"sorted?|order(?:ed)?|ascending|descending)\b",
+                        r"sort(?:ed)?|order(?:ed)?\s+by|ascending|descending)\b",
                         local_text,
                         flags=re.I,
                     ):
