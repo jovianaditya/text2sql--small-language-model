@@ -432,7 +432,7 @@ cases:
       groundtruth_sql: |
         SELECT 
           DATE_FORMAT(orderDate, '%M') AS month_name,
-          COUNT(orderNumber) AS order_count
+          COUNT(*) AS order_count
         FROM orders
         WHERE YEAR(orderDate) = 2004
         GROUP BY MONTH(orderDate), DATE_FORMAT(orderDate, '%M')
@@ -478,7 +478,7 @@ cases:
       groundtruth_sql: |
         SELECT
           status,
-          COUNT(orderNumber) AS total_orders,
+          COUNT(*) AS total_orders,
           MIN(orderDate) AS earliest_order_date
         FROM orders
         GROUP BY status;

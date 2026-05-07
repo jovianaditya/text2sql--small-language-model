@@ -16803,6 +16803,95 @@ def _drop_unrequested_fixed_year_filter_for_yearly_rollup(sql: str, question: st
     return fixed
 
 
+def _drop_unrequested_length_filter_for_prefix_grouping(sql: str, question: str) -> str:
+    """
+    Drop hallucinated LENGTH/CHAR_LENGTH row filters when the question asks to
+    group by the first N characters of a value, not to filter rows by exact
+    string length.
+
+    Conservative scope:
+    - flat grouped query only
+    - top-level AND-only WHERE
+    - only removes simple LENGTH/CHAR_LENGTH(column) = integer predicates
+    - only when the question explicitly asks for first N characters/prefix
+      grouping and does not ask for exact length filtering
+    """
+    s = (sql or "").strip()
+    q = (question or "").strip().lower()
+    if not s or not q:
+        return sql
+
+    if re.search(
+        r"\b(?:length|char(?:acter)?\s+length)\b.*\b(?:equal|equals|exactly|same|at\s+least|at\s+most|greater|less|longer|shorter)\b"
+        r"|\bexact(?:ly)?\s+\d+\s+(?:characters?|chars?|letters?|digits?)\b",
+        q,
+        flags=re.I,
+    ):
+        return sql
+
+    m_prefix_group = re.search(
+        r"\bfirst\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(?:characters?|chars?|letters?|digits?)\s+of\s+",
+        q,
+        flags=re.I,
+    )
+    if not m_prefix_group:
+        return sql
+
+    parsed = _parse_select_from_groupby(s) or _parse_flat_groupby_clauses(s)
+    if not parsed:
+        return sql
+
+    where_clause = str(parsed.get("where") or "").strip()
+    if not where_clause or not where_clause.lower().startswith("where "):
+        return sql
+    where_body = where_clause[6:].strip()
+    if not where_body or _has_top_level_or(where_body):
+        return sql
+
+    length_eq_pat = re.compile(
+        r"""(?is)^\s*(?:CHAR_LENGTH|CHARACTER_LENGTH|LENGTH)\s*\(\s*
+            (?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
+            \)\s*=\s*(?P<num>\d+)\s*$""",
+        flags=re.X,
+    )
+
+    conds = _split_top_level_and(where_body)
+    if not conds:
+        return sql
+
+    keep_conds: List[str] = []
+    removed_any = False
+    for cond in conds:
+        c0 = str(cond or "").strip()
+        if not c0:
+            continue
+        if length_eq_pat.match(c0):
+            removed_any = True
+            continue
+        keep_conds.append(c0)
+
+    if not removed_any:
+        return sql
+
+    out_lines = [
+        f"SELECT {parsed['select'].strip()}",
+        f"FROM {parsed['from_core'].strip()}",
+    ]
+    if keep_conds:
+        out_lines.append(f"WHERE {' AND '.join(keep_conds)}")
+    out_lines.append(f"GROUP BY {parsed['groupby'].strip()}")
+    if parsed.get("having"):
+        out_lines.append(str(parsed["having"]).strip())
+    if parsed.get("tail"):
+        out_lines.append(str(parsed["tail"]).strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if s.endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _rewrite_conditional_sum_value_to_count(sql: str, question: str) -> str:
     """
     Convert SUM(CASE WHEN condition THEN value ELSE 0 END) into a conditional
@@ -20809,6 +20898,7 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
     role_cache: Dict[Tuple[str, str], str] = {}
     term_cache: Dict[Tuple[str, str], Set[str]] = {}
     identity_cache: Dict[str, Set[str]] = {}
+    original_cols_cache: Dict[str, Dict[str, str]] = {}
 
     def _clean_ident(s: str) -> str:
         return (s or "").replace("`", "").strip().lower()
@@ -20840,25 +20930,52 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
             identity_cache[table_l] = ids
         return identity_cache[table_l]
 
+    def _original_column_names(table_l: str) -> Dict[str, str]:
+        table_l = str(table_l or "").strip().lower()
+        if not table_l:
+            return {}
+        if table_l in original_cols_cache:
+            return original_cols_cache[table_l]
+        mapping: Dict[str, str] = {}
+        try:
+            for raw_col in analyzer.get_table_columns(table_l):
+                raw = str(raw_col or "").strip("`")
+                if raw:
+                    mapping.setdefault(raw.lower(), raw)
+        except Exception:
+            pass
+        original_cols_cache[table_l] = mapping
+        return mapping
+
     def _column_semantic_terms(table_l: str, col_l: str) -> Set[str]:
         key = (table_l, col_l)
         if key in term_cache:
             return term_cache[key]
 
         terms: Set[str] = set()
-        candidate_texts = [col_l]
-        try:
-            candidate_texts.extend(analyzer.get_column_synonyms(table_l, col_l) or [])
-        except Exception:
-            pass
+        original_name = _original_column_names(table_l).get(col_l, col_l)
+        candidate_texts = [original_name, col_l]
+        for synonym_key in (original_name, col_l):
+            try:
+                candidate_texts.extend(analyzer.get_column_synonyms(table_l, synonym_key) or [])
+            except Exception:
+                pass
 
         for text in candidate_texts:
+            raw_text = str(text or "").replace("_", " ")
             normalized = re.sub(
                 r"([a-z0-9])([A-Z])",
                 r"\1 \2",
-                str(text or "").replace("_", " ").lower(),
+                raw_text,
             )
-            terms.update(tok for tok in re.findall(r"[a-z0-9]+", normalized) if tok)
+            terms.update(tok for tok in re.findall(r"[a-z0-9]+", normalized.lower()) if tok)
+            # Recover question-grounded subterms from fused schema identifiers
+            # like "quantityordered" when metadata casing/separators are absent.
+            compact = re.sub(r"[^a-z0-9]+", "", str(normalized or "").lower())
+            if compact:
+                for tok in query_tokens:
+                    if len(tok) >= 4 and tok in compact:
+                        terms.add(tok)
 
         role = _column_role_cached(table_l, col_l)
         if role in {"metric", "measure", "amount", "quantity"}:
@@ -20883,7 +21000,11 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
             return True
         return bool(_column_semantic_terms(table_l, col_l) & HELPERS_METRIC_AGG_IDLIKE_TOKENS)
 
-    def _pick_metric_col(table_l: str, current_col_l: str) -> Optional[str]:
+    def _pick_metric_col(
+        table_l: str,
+        current_col_l: str,
+        preferred_terms: Optional[Set[str]] = None,
+    ) -> Optional[str]:
         try:
             cols = [c.lower() for c in analyzer.get_table_columns(table_l)]
         except Exception:
@@ -20900,16 +21021,25 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
         if not candidates:
             return None
 
+        preferred = {
+            str(term or "").strip().lower()
+            for term in (preferred_terms or set())
+            if str(term or "").strip()
+        }
+
         def _score(c: str) -> int:
             score = 0
             candidate_terms = _column_semantic_terms(table_l, c)
             term_overlap = candidate_terms & metric_query_terms
+            preferred_overlap = candidate_terms & preferred
             if c in anchor_cols:
                 score += 20
             if _is_metric_like(table_l, c):
                 score += 8
             if term_overlap:
                 score += 10 + (4 * len(term_overlap))
+            if preferred_overlap:
+                score += 24 + (8 * len(preferred_overlap))
             if _is_id_like(table_l, c):
                 score -= 8
             return score
@@ -20970,6 +21100,18 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
             distinct_kw = m_agg.group("distinct") or ""
             qual_raw = m_agg.group("q")
             col_raw = m_agg.group("c") or ""
+            alias_tokens = {
+                tok
+                for tok in re.findall(
+                    r"[a-z0-9]+",
+                    re.sub(
+                        r"([a-z0-9])([A-Z])",
+                        r"\1 \2",
+                        str(alias_part or "").replace("_", " ").lower(),
+                    ),
+                )
+                if tok
+            }
 
             alias_l = str(alias_part or "").replace("_", " ").lower()
             if func in {"MIN", "MAX"} and re.search(
@@ -20993,7 +21135,7 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
             except Exception:
                 table_cols = set()
             if table_cols and col_l not in table_cols:
-                replacement = _pick_metric_col(table_l, col_l)
+                replacement = _pick_metric_col(table_l, col_l, preferred_terms=alias_tokens)
                 if not replacement:
                     return m_agg.group(0)
                 changed = True
@@ -21004,7 +21146,7 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
             if _is_metric_like(table_l, col_l) or not _is_id_like(table_l, col_l):
                 return m_agg.group(0)
 
-            replacement = _pick_metric_col(table_l, col_l)
+            replacement = _pick_metric_col(table_l, col_l, preferred_terms=alias_tokens)
             if not replacement:
                 return m_agg.group(0)
 
@@ -21024,6 +21166,18 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
                 qual_raw = m_bool.group("q")
                 col_raw = m_bool.group("c") or ""
                 col_l = _clean_ident(col_raw)
+                alias_tokens = {
+                    tok
+                    for tok in re.findall(
+                        r"[a-z0-9]+",
+                        re.sub(
+                            r"([a-z0-9])([A-Z])",
+                            r"\1 \2",
+                            str(alias_part or "").replace("_", " ").lower(),
+                        ),
+                    )
+                    if tok
+                }
 
                 table_l = None
                 if qual_raw:
@@ -21035,7 +21189,7 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
                 if not table_l:
                     return m_bool.group(0)
 
-                replacement = _pick_metric_col(table_l, col_l)
+                replacement = _pick_metric_col(table_l, col_l, preferred_terms=alias_tokens)
                 if not replacement:
                     return m_bool.group(0)
 
@@ -21103,7 +21257,16 @@ def _rewrite_metric_aggregate_column_mismatch(sql: str, question: str, ctx: str 
                 elif len(table_universe) == 1:
                     table_l = next(iter(table_universe))
                 if table_l and _is_id_like(table_l, col_l):
-                    replacement = _pick_metric_col(table_l, col_l)
+                    preferred_alias_terms = {
+                        term
+                        for term in alias_metric_terms
+                        if term not in generic_total_terms
+                    }
+                    replacement = _pick_metric_col(
+                        table_l,
+                        col_l,
+                        preferred_terms=preferred_alias_terms,
+                    )
                     if replacement:
                         changed = True
                         prefix = f"{qual_raw}." if qual_raw else ""
@@ -37064,6 +37227,8 @@ def _preserve_requested_base_columns_in_running_self_join(sql: str, question: st
     base_alias = str(base_src.alias_or_name or base_table).strip()
     if not base_table or not base_alias:
         return sql
+    base_table_l = base_table.lower()
+    base_alias_l = base_alias.lower()
 
     same_table_join_aliases: Set[str] = set()
     for join in sel.args.get("joins") or []:
@@ -37175,6 +37340,263 @@ def _preserve_requested_base_columns_in_running_self_join(sql: str, question: st
 
     sel.set("expressions", new_exprs)
     sel.set("group", exp.Group(expressions=group_exprs))
+    try:
+        return ast.sql(dialect="mysql")
+    except Exception:
+        return sql
+
+
+def _enforce_requested_base_projection_in_single_table_window(sql: str, question: str) -> str:
+    """
+    Preserve explicitly requested base-row columns in single-table window
+    queries and allow helper partition/order columns to be dropped when they
+    replace requested output columns.
+
+    Typical near-miss:
+      SELECT officeCode, jobTitle, COUNT(employeeNumber) OVER (PARTITION BY officeCode)
+      FROM employees
+
+    when the question requested:
+      employee number, job title, and how many employees work in that same office
+
+    Safety:
+    - only single-table, no-join top-level SELECTs
+    - requires at least one top-level window expression
+    - only simple base-table columns are adjusted
+    - only drops unrequested helper columns when a requested base column is
+      missing and the helper column is used inside the window partition/order
+    """
+    s = (sql or "").strip()
+    q = (question or "").strip()
+    if not s or not q or "over" not in s.lower():
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(s, read="mysql")
+    except Exception:
+        return sql
+
+    sel = ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return sql
+    if sel.args.get("joins") or sel.args.get("group") or sel.args.get("having") or sel.args.get("distinct"):
+        return sql
+
+    from_expr = sel.args.get("from") or sel.args.get("from_")
+    base_src = getattr(from_expr, "this", None) if from_expr is not None else None
+    if not isinstance(base_src, exp.Table):
+        return sql
+
+    base_table = str(base_src.name or "").strip()
+    base_alias = str(base_src.alias_or_name or base_table).strip()
+    if not base_table or not base_alias:
+        return sql
+    base_table_l = base_table.lower()
+    base_alias_l = base_alias.lower()
+
+    window_exprs = list(sel.find_all(exp.Window))
+    if not window_exprs:
+        return sql
+
+    requested_segment = _extract_requested_output_segment(q)
+    if not requested_segment:
+        return sql
+    projection_segment = requested_segment
+    metric_clause_match = re.search(
+        r"(?is)\b(?:and|plus|with)\b\s+(?:the\s+)?"
+        r"(?:gap|difference|delta|avg|average|mean|sum|total|count|number|"
+        r"percentage|percent|ratio|share|rank|dense\s+rank|row\s+number|"
+        r"running\s+total|cumulative|lag|lead|how\s+many|how\s+much|what\s+percentage)\b",
+        projection_segment,
+    )
+    if metric_clause_match:
+        projection_segment = projection_segment[:metric_clause_match.start()].strip(" ,.;")
+    if projection_segment:
+        requested_segment = projection_segment
+
+    try:
+        analyzer = get_schema_analyzer()
+        table_cols = [
+            str(c).strip("`")
+            for c in analyzer.get_table_columns(base_table)
+            if str(c).strip()
+        ]
+    except Exception:
+        table_cols = []
+        analyzer = None
+    if not table_cols:
+        return sql
+
+    def _identifier_parts(text: str) -> List[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        raw = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)
+        raw = raw.replace("_", " ").replace("-", " ")
+        return [tok for tok in re.findall(r"[a-z0-9]+", raw.lower()) if tok]
+
+    def _identifier_variants(parts: List[str]) -> Set[str]:
+        if not parts:
+            return set()
+        variants: Set[str] = {" ".join(parts)}
+        suffix_terms = {str(x or "").strip().lower() for x in identifier_id_like_terms() if str(x or "").strip()}
+        if len(parts) >= 2 and parts[-1] in suffix_terms:
+            prefix = parts[:-1]
+            for suffix in sorted(suffix_terms):
+                variants.add(" ".join(prefix + [suffix]))
+        return {v.strip() for v in variants if v.strip()}
+
+    requested_hits: List[Tuple[int, str]] = []
+    requested_segment_l = requested_segment.lower()
+    requested_token_positions: List[Tuple[int, str]] = [
+        (m.start(), m.group(0).lower())
+        for m in re.finditer(r"[a-z0-9]+", requested_segment_l)
+    ]
+    for col in table_cols:
+        col_l = str(col or "").strip().lower()
+        if not col_l:
+            continue
+        candidate_texts = [col]
+        if analyzer is not None:
+            try:
+                candidate_texts.extend(analyzer.get_column_synonyms(base_table, col_l) or [])
+            except Exception:
+                pass
+        best_pos: Optional[int] = None
+        for text in candidate_texts:
+            for phrase in _identifier_variants(_identifier_parts(text)):
+                phrase_regex = re.escape(phrase).replace(r"\ ", r"\s+")
+                m_phrase = re.search(rf"\b{phrase_regex}\b", requested_segment_l, flags=re.I)
+                if m_phrase:
+                    pos = m_phrase.start()
+                    if best_pos is None or pos < best_pos:
+                        best_pos = pos
+            if best_pos is None:
+                compact = re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+                compact_hits = [
+                    (pos, tok) for pos, tok in requested_token_positions
+                    if len(tok) >= 3 and tok in compact
+                ]
+                distinct_hit_roots = {_to_singular(tok) for _pos, tok in compact_hits if tok}
+                if len(distinct_hit_roots) >= 2:
+                    pos = min(pos for pos, _tok in compact_hits)
+                    if best_pos is None or pos < best_pos:
+                        best_pos = pos
+        if best_pos is not None:
+            requested_hits.append((best_pos, col_l))
+    if not requested_hits:
+        return sql
+
+    requested_cols = [col_l for _pos, col_l in sorted(requested_hits, key=lambda x: (x[0], x[1]))]
+
+    def _norm_expr(e: "exp.Expression") -> str:
+        try:
+            return re.sub(r"[\s`]+", "", e.sql(dialect="mysql").lower())
+        except Exception:
+            return ""
+
+    def _is_base_scope(alias_l: str) -> bool:
+        alias_l = str(alias_l or "").strip().lower()
+        return not alias_l or alias_l == base_alias_l or alias_l == base_table_l
+
+    helper_cols: Set[str] = set()
+    for win in window_exprs:
+        partition = win.args.get("partition_by")
+        part_exprs = []
+        if isinstance(partition, exp.Partition):
+            part_exprs = list(partition.expressions or [])
+        elif isinstance(partition, list):
+            part_exprs = list(partition)
+        for expr_item in part_exprs:
+            if isinstance(expr_item, exp.Column):
+                alias_l = str(expr_item.table or "").strip().lower()
+                col_l = str(expr_item.name or "").strip().lower()
+                if _is_base_scope(alias_l) and col_l:
+                    helper_cols.add(col_l)
+        order = win.args.get("order")
+        if isinstance(order, exp.Order):
+            for ordered in order.expressions or []:
+                expr_item = ordered.this if isinstance(ordered, exp.Ordered) else ordered
+                if isinstance(expr_item, exp.Column):
+                    alias_l = str(expr_item.table or "").strip().lower()
+                    col_l = str(expr_item.name or "").strip().lower()
+                    if _is_base_scope(alias_l) and col_l:
+                        helper_cols.add(col_l)
+
+    new_exprs: List["exp.Expression"] = []
+    projected_base_cols: List[str] = []
+    seen_projected_norms: Set[str] = set()
+    window_insert_idx = len(sel.expressions or [])
+
+    for idx, item in enumerate(sel.expressions or []):
+        base = item.this if isinstance(item, exp.Alias) else item
+        if isinstance(base, exp.Window):
+            window_insert_idx = min(window_insert_idx, idx)
+        if isinstance(base, exp.Column):
+            alias_l = str(base.table or "").strip().lower()
+            col_l = str(base.name or "").strip().lower()
+            if _is_base_scope(alias_l) and col_l:
+                projected_base_cols.append(col_l)
+        norm = _norm_expr(base)
+        if norm:
+            seen_projected_norms.add(norm)
+        new_exprs.append(item.copy())
+
+    missing_cols = [col_l for col_l in requested_cols if col_l not in projected_base_cols]
+    if not missing_cols:
+        return sql
+
+    removable_helper_cols = [
+        col_l for col_l in projected_base_cols
+        if col_l not in requested_cols and col_l in helper_cols
+    ]
+    if not removable_helper_cols and not missing_cols:
+        return sql
+
+    filtered_exprs: List["exp.Expression"] = []
+    removed_helpers: Set[str] = set()
+    removable_budget = min(len(removable_helper_cols), len(missing_cols))
+    for item in new_exprs:
+        base = item.this if isinstance(item, exp.Alias) else item
+        if (
+            removable_budget > 0
+            and isinstance(base, exp.Column)
+            and _is_base_scope(str(base.table or "").strip().lower())
+        ):
+            col_l = str(base.name or "").strip().lower()
+            if col_l in removable_helper_cols and col_l not in removed_helpers:
+                removed_helpers.add(col_l)
+                removable_budget -= 1
+                continue
+        filtered_exprs.append(item)
+
+    existing_norms = {
+        _norm_expr(expr_item.this if isinstance(expr_item, exp.Alias) else expr_item)
+        for expr_item in filtered_exprs
+    }
+    insert_at = min(window_insert_idx, len(filtered_exprs))
+    added_any = False
+    for col_l in missing_cols:
+        col_expr = exp.column(col_l, table=base_alias)
+        col_norm = _norm_expr(col_expr)
+        if col_norm and col_norm in existing_norms:
+            continue
+        filtered_exprs.insert(insert_at, col_expr)
+        insert_at += 1
+        if col_norm:
+            existing_norms.add(col_norm)
+        added_any = True
+
+    if not added_any and not removed_helpers:
+        return sql
+
+    sel.set("expressions", filtered_exprs)
     try:
         return ast.sql(dialect="mysql")
     except Exception:

@@ -191,7 +191,7 @@ class IRMetric:
 class IRFilter:
     table: str
     column: str
-    op: str  # eq|in|not_in|gt|gte|lt|lte|between|year_eq|month_eq|month_between|weekday_eq|like_prefix|like_contains|not_like_suffix|regexp|word_count_eq|len_eq|len_gt|len_gte|len_lt|len_lte|is_null_or_empty|is_not_null_or_empty|col_gt|col_gte|col_lt|col_lte
+    op: str  # eq|in|not_in|gt|gte|lt|lte|between|year_eq|month_eq|month_between|weekday_eq|like_prefix|like_suffix|like_contains|not_like_contains|not_like_prefix|not_like_suffix|regexp|word_count_eq|len_eq|len_gt|len_gte|len_lt|len_lte|is_null_or_empty|is_not_null_or_empty|col_gt|col_gte|col_lt|col_lte
     value: Any = None
     value2: Any = None
     value_column: str = ""
@@ -587,6 +587,16 @@ def _prune_redundant_filters(filters: Sequence[IRFilter], filter_logic: str = ""
             for _, f in entries
             if str(f.op or "").strip().lower() == "like_prefix" and f.value is not None
         }
+        suffix_values = {
+            str(f.value or "")
+            for _, f in entries
+            if str(f.op or "").strip().lower() == "like_suffix" and f.value is not None
+        }
+        contains_values = {
+            str(f.value or "")
+            for _, f in entries
+            if str(f.op or "").strip().lower() == "like_contains" and f.value is not None
+        }
         regex_values = [
             str(f.value or "")
             for _, f in entries
@@ -610,6 +620,14 @@ def _prune_redundant_filters(filters: Sequence[IRFilter], filter_logic: str = ""
                 continue
 
             if any(val == prefix for prefix in prefix_values):
+                drop_indexes.add(idx)
+                continue
+
+            if any(val == suffix for suffix in suffix_values):
+                drop_indexes.add(idx)
+                continue
+
+            if any(val == contained for contained in contains_values):
                 drop_indexes.add(idx)
                 continue
 
@@ -1201,6 +1219,18 @@ def _detect_metrics(
     has_explicit_min = bool(re.search(r"\bmin(?:imum)?\b", q))
     has_upper_superlative = bool(re.search(r"\b(highest|largest)\b", q))
     has_lower_superlative = bool(re.search(r"\b(lowest|smallest)\b", q))
+    metric_body_q = re.split(
+        r"\b(?:sort(?:ed)?\s+by|order(?:ed)?\s+by)\b",
+        q,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    has_explicit_max_phrase = bool(
+        re.search(r"\b(?:max(?:imum)?|highest|largest)\s+[a-z]", metric_body_q, flags=re.I)
+    )
+    has_explicit_min_phrase = bool(
+        re.search(r"\b(?:min(?:imum)?|lowest|smallest)\s+[a-z]", metric_body_q, flags=re.I)
+    )
     directional_superlative_sort = bool(
         re.search(
             r"\b(?:order(?:ed)?|sort(?:ed)?)\b[^.]{0,120}\b(?:highest|largest|lowest|smallest)\b",
@@ -1218,8 +1248,8 @@ def _detect_metrics(
             flags=re.I,
         )
     )
-    wants_max = has_explicit_max or (has_upper_superlative and not directional_superlative_sort)
-    wants_min = has_explicit_min or (has_lower_superlative and not directional_superlative_sort)
+    wants_max = has_explicit_max or has_explicit_max_phrase or (has_upper_superlative and not directional_superlative_sort)
+    wants_min = has_explicit_min or has_explicit_min_phrase or (has_lower_superlative and not directional_superlative_sort)
     wants_percentage = bool(re.search(r"\b(percent|percentage|ratio|rate)\b|%\s*of", q))
     wants_count_distinct = _wants_count_distinct(q)
 
@@ -1260,40 +1290,6 @@ def _detect_metrics(
     )
     if not metric_target_tables:
         metric_target_tables = [subject]
-
-    def _question_requests_total_metric() -> bool:
-        if not re.search(r"\btotal\b", q, flags=re.I):
-            return False
-        if re.search(r"\btotal\s+(?:number|count)(?:\s+of)?\b", q, flags=re.I):
-            return False
-
-        candidate_phrases = [question]
-        candidate_phrases.extend(
-            str(m.group(1) or "").strip()
-            for m in re.finditer(r"\btotal\s+([a-z][a-z0-9_ ]{1,48})\b", q, flags=re.I)
-        )
-        candidate_phrases = [p for p in candidate_phrases if p]
-        if not candidate_phrases:
-            return False
-
-        for phrase in candidate_phrases:
-            for table_name in metric_target_tables:
-                matched = _best_semantic_column_match(
-                    text=phrase,
-                    table=table_name,
-                    allowed=allowed,
-                    numeric_only=True,
-                    min_score=1.0,
-                )
-                if matched:
-                    return True
-
-        return any(
-            t in metric_target_tables and _is_numeric_column(c)
-            for (t, c, _) in column_mentions
-        )
-
-    wants_sum = bool(has_explicit_sum_signal or _question_requests_total_metric())
 
     def _resolve_table_from_phrase(phrase: str) -> Optional[str]:
         p = (phrase or "").lower().strip()
@@ -1437,6 +1433,36 @@ def _detect_metrics(
         p = re.sub(r"\s+", " ", str(phrase or "").strip())
         if not p:
             return None
+        p_norm = p.lower()
+
+        explicit_variant_hits: List[Tuple[int, int, str, str]] = []
+        for t in metric_target_tables:
+            for c in allowed.get((t or "").lower(), set()):
+                if not _is_numeric_measure_column(c):
+                    continue
+                best_variant_score = 0
+                for v in _column_variants(t, c):
+                    v_norm = re.sub(r"\s+", " ", str(v or "").strip().lower())
+                    if not v_norm:
+                        continue
+                    v_pat = re.escape(v_norm).replace(r"\ ", r"\s+")
+                    if p_norm == v_norm:
+                        best_variant_score = max(best_variant_score, len(v_norm.split()) + 10)
+                    elif re.search(rf"\b{v_pat}\b", p_norm, flags=re.I):
+                        best_variant_score = max(best_variant_score, len(v_norm.split()) + 6)
+                if best_variant_score > 0:
+                    explicit_variant_hits.append(
+                        (
+                            best_variant_score,
+                            1 if t == subject else 0,
+                            t,
+                            c,
+                        )
+                    )
+        if explicit_variant_hits:
+            explicit_variant_hits.sort(key=lambda item: (-item[0], -item[1], item[2].lower(), len(item[3])))
+            _, _, best_t, best_c = explicit_variant_hits[0]
+            return best_t, best_c
 
         phrase_tokens = set(_tokenize_for_match(p, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
         best: Optional[Tuple[str, str]] = None
@@ -1473,6 +1499,45 @@ def _detect_metrics(
 
         return None
 
+    def _question_requests_total_metric() -> bool:
+        if not re.search(r"\btotal\b", q, flags=re.I):
+            return False
+        if re.search(r"\btotal\s+(?:number|count)(?:\s+of)?\b", q, flags=re.I):
+            return False
+
+        candidate_phrases = [
+            str(m.group(1) or "").strip()
+            for m in re.finditer(r"\btotal\s+([a-z][a-z0-9_ ]{1,48})\b", q, flags=re.I)
+        ]
+        candidate_phrases = [p for p in candidate_phrases if p]
+        if not candidate_phrases:
+            candidate_phrases = [question]
+
+        for phrase in candidate_phrases:
+            matched_numeric = _resolve_numeric_measure_from_phrase(phrase)
+            if matched_numeric:
+                return True
+
+            resolved_table = _resolve_table_from_phrase(phrase)
+            resolved_col = _resolve_column_from_phrase(phrase)
+            if resolved_table and not (
+                resolved_col and _is_numeric_measure_column(resolved_col[1])
+            ):
+                continue
+
+            for table_name in metric_target_tables:
+                matched = _best_semantic_column_match(
+                    text=phrase,
+                    table=table_name,
+                    allowed=allowed,
+                    numeric_only=True,
+                    min_score=1.0,
+                )
+                if matched:
+                    return True
+
+        return False
+
     def _semantic_phrase_tokens(text: str) -> List[str]:
         out: List[str] = []
         for tok in re.findall(r"[a-z0-9_'-]+", str(text or "").lower()):
@@ -1480,6 +1545,8 @@ def _detect_metrics(
                 if cur:
                     out.append(cur)
         return out
+
+    wants_sum = bool(has_explicit_sum_signal or _question_requests_total_metric())
 
     def _count_distinct_container_terms() -> Set[str]:
         """
@@ -2032,6 +2099,50 @@ def _detect_dimensions(
                 if _is_date_column(col) and not date_day_group_requested:
                     continue
             add_dim(IRDimension(table=table, column=col))
+
+    if aggregate_like and subject:
+        for m in re.finditer(
+            r"\b(?:for\s+each|per|by|group\s+by)\s+([a-z][a-z0-9_ ]{1,48}?)"
+            r"(?=\s*(?:,|;|\.|\breturn\b|\bshow\b|\bdisplay\b|\blist\b|\binclude\b|\bgive\b|\bkeep\b|\bonly\b|\bsort\b|\border\b|\band\b|$))",
+            q,
+            flags=re.I,
+        ):
+            phrase = re.sub(r"\s+", " ", str(m.group(1) or "").strip())
+            if not phrase:
+                continue
+            if phrase in {"month", "year", "date", "day"}:
+                continue
+            phrase_norm = phrase.lower()
+            subject_variants = {
+                re.sub(r"\s+", " ", str(v or "").strip().lower())
+                for v in (_table_variants(subject) or {subject})
+                if str(v or "").strip()
+            }
+            if phrase_norm in subject_variants:
+                id_col = _best_id_column(subject, allowed, question)
+                if id_col:
+                    add_dim(IRDimension(table=subject, column=id_col))
+                continue
+            semantic_col = _best_semantic_column_match(
+                text=phrase,
+                table=subject,
+                allowed=allowed,
+                min_score=1.0,
+            )
+            descriptor_col = _best_descriptor_column_match(
+                text=phrase,
+                table=subject,
+                allowed=allowed,
+                min_score=1.0,
+            )
+            resolved_col = _prefer_specific_identifier_match(
+                semantic_col=semantic_col,
+                descriptor_col=descriptor_col,
+                table=subject,
+                text=phrase,
+            )
+            if resolved_col and not _is_numeric_column(resolved_col):
+                add_dim(IRDimension(table=subject, column=resolved_col))
 
     # Projection-list semantic enrichment for lookup questions:
     # use schema-grounded matching on explicit "show/display/return/list" tails.
@@ -2644,9 +2755,16 @@ def _detect_filters(
         clean = re.sub(r"\s+", " ", str(text or "").strip().lower())
         if not clean:
             return True
-        if clean in {"value", "values", "field", "fields", "information", "info", "data"}:
+        if clean in {
+            "value", "values", "field", "fields", "information", "info", "data",
+            "count", "counts", "dataset", "result", "results",
+        }:
+            return True
+        if any(clean.startswith(prefix) for prefix in ("each ", "every ", "per ", "all ")):
             return True
         if re.match(r"^(?:the\s+)?(?:same|that|this|those|these|their|its)\b", clean):
+            return True
+        if re.search(r"\b(?:dataset|data|result|results|count|counts)\b", clean):
             return True
         if re.search(r"\b(?:same\s+\w+|that\s+\w+|this\s+\w+|those\s+\w+|these\s+\w+)\b", clean):
             return True
@@ -2704,6 +2822,21 @@ def _detect_filters(
                 raw_value_l = raw_value.lower()
                 if raw_value_l.split() and raw_value_l.split()[0] in stop_head_terms:
                     continue
+                scope_terms = {
+                    str(subject or "").strip().lower(),
+                    str(_safe_get_singular_form(subject) or "").strip().lower(),
+                }
+                prefix_local = q_raw[max(0, int(match.start()) - 32):int(match.start())]
+                if (
+                    aggregate_query_like
+                    and raw_value_l in scope_terms
+                    and re.search(
+                        r"\b(?:total|commented|filled|present|missing(?:-[a-z]+)?|count(?:ed)?|number\s+of)\b",
+                        prefix_local,
+                        flags=re.I,
+                    )
+                ):
+                    continue
                 if _looks_like_nonliteral_category_phrase(raw_value):
                     continue
                 if re.search(r"\b(?:or|and)\b", raw_value_l):
@@ -2711,6 +2844,8 @@ def _detect_filters(
 
                 norm_value = _normalize_categorical_literal_value(raw_value, column=column)
                 if not norm_value:
+                    continue
+                if _looks_like_nonliteral_category_phrase(norm_value):
                     continue
 
                 enum_values = _extract_enum_values_from_description(table, column)
@@ -2779,6 +2914,8 @@ def _detect_filters(
             norm_value = _normalize_categorical_literal_value(raw_value, column=matched)
             if not norm_value:
                 continue
+            if _looks_like_nonliteral_category_phrase(norm_value):
+                continue
             return IRFilter(table=subject, column=matched, op="eq", value=norm_value)
 
         return None
@@ -2826,6 +2963,8 @@ def _detect_filters(
                     norm_value = _normalize_categorical_literal_value(clean, column=column)
                     if not norm_value:
                         continue
+                    if _looks_like_nonliteral_category_phrase(norm_value):
+                        continue
                     key = norm_value.lower()
                     if key in seen_values:
                         continue
@@ -2870,6 +3009,8 @@ def _detect_filters(
             norm_value = _normalize_categorical_literal_value(clean, column=matched)
             if not norm_value:
                 continue
+            if _looks_like_nonliteral_category_phrase(norm_value):
+                continue
             key = norm_value.lower()
             if key in seen_values:
                 continue
@@ -2893,6 +3034,10 @@ def _detect_filters(
             flags=re.I,
         )
         if not match:
+            return None
+
+        neg_prefix = q_raw[max(0, match.start() - 20):match.start()]
+        if re.search(r"\b(?:doesn['’]?t|does\s+not|do\s+not|not)\b", neg_prefix, flags=re.I):
             return None
 
         raw_value = str(match.group(1) or "").strip(" \t\r\n'\".,;:!?")
@@ -2927,6 +3072,73 @@ def _detect_filters(
             table=target[0],
             column=target[1],
             op="like_contains",
+            value=raw_value,
+        )
+
+    def _extract_not_like_contains_filter() -> Optional[IRFilter]:
+        clause_stop = (
+            r"(?:[.,;:!?]|"
+            r"\s+(?:but|except|excluding|return|show|list|display|include|give|sort|order|ordered|sorted|where|having)\b|$)"
+        )
+        match = re.search(
+            rf"\b(?:doesn['’]?t|does\s+not|do\s+not|not)\s+contain(?:s|ing)?\b"
+            rf"(?:\s+(?:the\s+)?(?:word|words|letter|letters|text|string|phrase))?\s*"
+            rf"""["'“”]?([A-Za-z0-9][A-Za-z0-9/&:' -]{{0,40}}?)["'“”]?(?={clause_stop})""",
+            q_raw,
+            flags=re.I,
+        )
+        if not match:
+            match = re.search(
+                rf"\bwithout\b\s+(?:the\s+)?(?:word|words|letter|letters|text|string|phrase)\s*"
+                rf"""["'“”]?([A-Za-z0-9][A-Za-z0-9/&:' -]{{0,40}}?)["'“”]?(?={clause_stop})""",
+                q_raw,
+                flags=re.I,
+            )
+        if not match:
+            return None
+
+        raw_value = str(match.group(1) or "").strip(" \t\r\n'\".,;:!?")
+        if not raw_value:
+            return None
+        if _looks_like_nonliteral_category_phrase(raw_value):
+            return None
+
+        name_contains_intent = bool(
+            re.search(
+                r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,6}[\s,;:()'\"-]+contain(?:s|ing)?\b",
+                q,
+                flags=re.I,
+            )
+            or re.search(
+                r"\bcontain(?:s|ing)?\b(?:[\s,;:()'\"-]+\w+){0,6}[\s,;:()'\"-]+\bnames?\b",
+                q,
+                flags=re.I,
+            )
+            or re.search(
+                r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,6}[\s,;:()'\"-]+\bwithout\b",
+                q,
+                flags=re.I,
+            )
+            or re.search(
+                r"\bwithout\b(?:[\s,;:()'\"-]+\w+){0,6}[\s,;:()'\"-]+\bnames?\b",
+                q,
+                flags=re.I,
+            )
+        )
+        target = None
+        if name_contains_intent:
+            name_col = _best_name_column(subject, allowed)
+            if name_col:
+                target = (subject, name_col)
+        if not target:
+            target = _pick_text_target_column(anchor_pos=match.start())
+        if not target:
+            return None
+
+        return IRFilter(
+            table=target[0],
+            column=target[1],
+            op="not_like_contains",
             value=raw_value,
         )
 
@@ -2990,6 +3202,90 @@ def _detect_filters(
             table=target[0],
             column=target[1],
             op="not_like_suffix",
+            value=raw_value,
+        )
+
+    def _extract_like_suffix_filter() -> Optional[IRFilter]:
+        clause_stop = (
+            r"(?:[.,;:!?]|"
+            r"\s+(?:but|except|excluding|return|show|list|display|include|give|sort|order|ordered|sorted|where|having)\b|$)"
+        )
+        match = re.search(
+            rf"\bend(?:s)?\s+with\b"
+            rf"(?:\s+(?:the\s+)?(?:word|words|letter|letters|text|string|phrase))?\s*"
+            rf"""["'“”]?([A-Za-z0-9][A-Za-z0-9/&:' -]{{0,20}}?)["'“”]?(?={clause_stop})""",
+            q_raw,
+            flags=re.I,
+        )
+        if not match:
+            return None
+
+        neg_prefix = q_raw[max(0, match.start() - 16):match.start()]
+        if re.search(r"\b(?:doesn['’]?t|does\s+not|do\s+not|not)\b", neg_prefix, flags=re.I):
+            return None
+
+        raw_value = str(match.group(1) or "").strip(" \t\r\n'\".,;:!?")
+        if not raw_value or _looks_like_nonliteral_category_phrase(raw_value):
+            return None
+
+        target = None
+        name_suffix_intent = bool(
+            re.search(r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+\bend(?:s)?\b", q, flags=re.I)
+            or re.search(r"\bend(?:s)?\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+\bnames?\b", q, flags=re.I)
+        )
+        if name_suffix_intent:
+            name_col = _best_name_column(subject, allowed)
+            if name_col:
+                target = (subject, name_col)
+        if not target:
+            target = _pick_text_target_column(anchor_pos=match.start())
+        if not target:
+            return None
+
+        return IRFilter(
+            table=target[0],
+            column=target[1],
+            op="like_suffix",
+            value=raw_value,
+        )
+
+    def _extract_not_like_prefix_filter() -> Optional[IRFilter]:
+        clause_stop = (
+            r"(?:[.,;:!?]|"
+            r"\s+(?:but|except|excluding|return|show|list|display|include|give|sort|order|ordered|sorted|where|having)\b|$)"
+        )
+        match = re.search(
+            rf"\b(?:doesn['’]?t|does\s+not|do\s+not|not)\s+(?:start(?:s)?|begin(?:s)?)\s+with\b"
+            rf"(?:\s+(?:the\s+)?(?:word|words|letter|letters|text|string|phrase))?\s*"
+            rf"""["'“”]?([A-Za-z0-9][A-Za-z0-9/&:' -]{{0,20}}?)["'“”]?(?={clause_stop})""",
+            q_raw,
+            flags=re.I,
+        )
+        if not match:
+            return None
+
+        raw_value = str(match.group(1) or "").strip(" \t\r\n'\".,;:!?")
+        if not raw_value or _looks_like_nonliteral_category_phrase(raw_value):
+            return None
+
+        target = None
+        name_prefix_intent = bool(
+            re.search(r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+(?:start(?:s)?|begin(?:s)?)\b", q, flags=re.I)
+            or re.search(r"\b(?:start(?:s)?|begin(?:s)?)\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+\bnames?\b", q, flags=re.I)
+        )
+        if name_prefix_intent:
+            name_col = _best_name_column(subject, allowed)
+            if name_col:
+                target = (subject, name_col)
+        if not target:
+            target = _pick_text_target_column(anchor_pos=match.start())
+        if not target:
+            return None
+
+        return IRFilter(
+            table=target[0],
+            column=target[1],
+            op="not_like_prefix",
             value=raw_value,
         )
 
@@ -3069,7 +3365,20 @@ def _detect_filters(
                     q,
                     flags=re.I,
                 ):
-                    return (t, c)
+                    local_span = re.search(
+                        rf"\b(?:have|has)\b(?:[\s,;:()'\"-]+\w+){{0,4}}[\s,;:()'\"-]+{c_pat}\b(?={clause_stop})",
+                        q,
+                        flags=re.I,
+                    )
+                    local_text = q[max(0, local_span.start() - 16):min(len(q), local_span.end() + 24)] if local_span else ""
+                    if not re.search(
+                        r"\b(?:along\s+with|together\s+with|highest|lowest|largest|smallest|top|bottom|"
+                        r"average|avg|mean|above|below|under|over|between|at\s+least|at\s+most|"
+                        r"sorted?|order(?:ed)?|ascending|descending)\b",
+                        local_text,
+                        flags=re.I,
+                    ):
+                        return (t, c)
                 if re.search(
                     rf"\bwith\b(?:[\s,;:()'\"-]+\w+){{0,2}}[\s,;:()'\"-]+{c_pat}\b(?={clause_stop})",
                     q,
@@ -3083,7 +3392,8 @@ def _detect_filters(
                     local_text = q[max(0, local_span.start() - 16):min(len(q), local_span.end() + 24)] if local_span else ""
                     if not re.search(
                         r"\b(?:along\s+with|together\s+with|highest|lowest|largest|smallest|top|bottom|"
-                        r"above|below|under|over|between|at\s+least|at\s+most|sorted?|order(?:ed)?|ascending|descending)\b",
+                        r"average|avg|mean|above|below|under|over|between|at\s+least|at\s+most|"
+                        r"sorted?|order(?:ed)?|ascending|descending)\b",
                         local_text,
                         flags=re.I,
                     ):
@@ -3728,6 +4038,10 @@ def _detect_filters(
     if explicit_categorical_eq is not None:
         add_filter(explicit_categorical_eq)
 
+    not_like_contains_filter = _extract_not_like_contains_filter()
+    if not_like_contains_filter is not None:
+        add_filter(not_like_contains_filter)
+
     contains_filter = _extract_contains_filter()
     if contains_filter is not None:
         add_filter(contains_filter)
@@ -3735,6 +4049,14 @@ def _detect_filters(
     not_like_suffix_filter = _extract_not_like_suffix_filter()
     if not_like_suffix_filter is not None:
         add_filter(not_like_suffix_filter)
+
+    like_suffix_filter = _extract_like_suffix_filter()
+    if like_suffix_filter is not None:
+        add_filter(like_suffix_filter)
+
+    not_like_prefix_filter = _extract_not_like_prefix_filter()
+    if not_like_prefix_filter is not None:
+        add_filter(not_like_prefix_filter)
 
     # Status IN ('a','b',...)
     quoted_values = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or "")
