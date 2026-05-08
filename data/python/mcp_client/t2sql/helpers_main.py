@@ -4185,7 +4185,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             and (regex_bucket_query or bucket_or_classification_query)
         )
     )
-    suppress_lookup_execution_shape = suppress_filter_hints
+    suppress_lookup_execution_shape = bool(
+        suppress_filter_hints
+        or "scalar_extrema_date_subquery_ir_unsupported" in gate_reasons
+    )
 
     # A multi-table context usually means join semantics are in play. Until the
     # IR can represent joins reliably, only allow retrieval-noise cases where
@@ -5562,6 +5565,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             "below": "<",
             "under": "<",
         }
+        saw_group_filter_candidate = False
+        concrete_hint_confidence = 0.90
 
         count_metric = None
         for metric in metrics:
@@ -5607,6 +5612,25 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                         count_entity_terms.add(singular)
                 except Exception:
                     pass
+        count_metric_dimension_terms: Set[str] = set()
+        if count_metric:
+            metric_column = str(count_metric.get("column") or "").strip()
+            if metric_column and metric_column != "*":
+                metric_phrase = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", metric_column)
+                metric_phrase = re.sub(r"[_\W]+", " ", metric_phrase).strip().lower()
+                if metric_phrase:
+                    count_metric_dimension_terms.add(metric_phrase)
+                    metric_parts = [p for p in metric_phrase.split() if p]
+                    if metric_parts:
+                        last = metric_parts[-1]
+                        plural_last = last
+                        if last.endswith("y") and len(last) > 1 and last[-2] not in "aeiou":
+                            plural_last = last[:-1] + "ies"
+                        elif last.endswith(("s", "x", "z", "ch", "sh")):
+                            plural_last = last + "es"
+                        else:
+                            plural_last = last + "s"
+                        count_metric_dimension_terms.add(" ".join(metric_parts[:-1] + [plural_last]))
 
         def _qualified_metric_expr(metric_obj: Optional[dict]) -> str:
             if not isinstance(metric_obj, dict):
@@ -5630,6 +5654,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     return f"COUNT({subject}.{id_col})"
             return "COUNT(*)"
 
+        def _term_boundary_pat(term: str) -> str:
+            escaped = re.escape(str(term or "")).replace(r"\ ", r"\s+")
+            return rf"\b{escaped}\b"
+
         for match in threshold_re.finditer(q_text):
             tail = str(match.group("tail") or "")
             prefix = q_text[max(0, match.start() - 80):match.start()]
@@ -5649,10 +5677,19 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     for term in count_entity_terms
                     if term
                 )
+                or (
+                    count_metric
+                    and bool(count_metric.get("distinct"))
+                    and (
+                        re.search(r"\bdistinct\b", tail, flags=re.I)
+                        or any(
+                            re.search(_term_boundary_pat(term), tail, flags=re.I)
+                            for term in count_metric_dimension_terms
+                            if term
+                        )
+                    )
+                )
             )
-            if not threshold_targets_count:
-                continue
-
             raw_num = str(match.group("num") or "").strip().lower()
             if raw_num in number_word_values:
                 threshold_value = str(number_word_values[raw_num])
@@ -5696,44 +5733,38 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             elif re.search(r"\b(?:maximum|max|highest|largest)\b", prefix, flags=re.I) and max_metric:
                 aggregate_metric_expr = _qualified_metric_expr(max_metric)
 
-            if derived_grouping_hints:
-                group_text = "group first by the derived grouping expression above, then apply"
-            else:
-                group_keys: List[str] = []
-                seen_group_keys: Set[Tuple[str, str]] = set()
-                for dim in dims:
-                    if not isinstance(dim, dict):
-                        continue
-                    table = str(dim.get("table") or "").strip()
-                    column = str(dim.get("column") or "").strip()
-                    group_key = (table.lower(), column.lower())
-                    if table and column and group_key not in seen_group_keys:
-                        seen_group_keys.add(group_key)
-                        group_keys.append(f"{table}.{column}")
-                group_text = (
-                    f"group first by {', '.join(group_keys)}, then apply"
-                    if group_keys
-                    else "apply"
-                )
+            if threshold_targets_count or aggregate_metric_expr:
+                saw_group_filter_candidate = True
 
-            if aggregate_metric_expr and not threshold_targets_count:
-                return (
-                    f"Threshold shape: {group_text} the requested grouped threshold with HAVING {aggregate_metric_expr} {op} {threshold_value}; "
-                    "do not turn this threshold into a WHERE row filter, WHERE/IN subquery, or LIMIT"
-                )
+            if confidence >= concrete_hint_confidence:
+                if aggregate_metric_expr and not threshold_targets_count:
+                    return f"{aggregate_metric_expr} {op} {threshold_value}"
+                if threshold_targets_count:
+                    return f"{count_expr} {op} {threshold_value}"
 
             if not threshold_targets_count:
                 continue
 
-            return (
-                f"Threshold shape: {group_text} the requested grouped threshold with HAVING {count_expr} {op} {threshold_value}; "
-                "do not turn this threshold into a WHERE row filter, WHERE/IN subquery, or LIMIT"
-            )
+            return "HAVING required"
 
-        return (
-            "Threshold shape: aggregate/HAVING-like threshold was detected but not encoded as a row filter; "
-            "keep grouped rows intact and avoid converting that threshold into a WHERE predicate"
-        )
+        if saw_group_filter_candidate:
+            return "HAVING required"
+        return ""
+
+    group_filter_qtype = qtype.lower()
+    router_decision = state.get("router_decision") or {}
+    if any(str(reason or "").startswith("router_hard:window_aggregate") for reason in gate_reasons):
+        group_filter_qtype = "window_aggregate"
+    elif bool(router_decision.get("is_set_operation_intent", False)) and bool(
+        router_decision.get("is_simple_set_operation", False)
+    ):
+        group_filter_qtype = AGENT_ROUTER_QTYPE_SET_OPERATION
+
+    if group_filter_qtype in {"aggregate", "window_aggregate", AGENT_ROUTER_QTYPE_SET_OPERATION}:
+        group_filter_hint = _aggregate_threshold_shape_hint().strip()
+        if group_filter_hint:
+            parts.append(f"Group Filters: {group_filter_hint}")
+            has_structural = True
 
     # Limit
     limit = intent_ir.get("limit")
@@ -6576,6 +6607,16 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "STRICT GROUP BY RULE (Error 1055): If you GROUP BY a derived column (e.g. `CASE WHEN`), "
             "you MUST NOT select the original raw column (e.g. `MSRP`) unless it is wrapped in an aggregate function (COUNT, SUM). "
             "ONLY select the derived expression and Aggregates."
+        )
+    if re.search(
+        r"\bfirst\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(?:characters?|chars?|letters?|digits?)\s+of\s+",
+        question,
+        flags=re.I,
+    ):
+        constraints.append(
+            "PREFIX GROUPING RULE: When grouping by the first N characters of a column, use the derived prefix expression as the group key. "
+            "Do NOT invent a literal prefix row filter unless the question explicitly gives that prefix value."
         )
     # 5. Pattern Matching Rule (Balanced & Robust)
     # Trigger dipersempit hanya untuk kata yang benar-benar butuh presisi

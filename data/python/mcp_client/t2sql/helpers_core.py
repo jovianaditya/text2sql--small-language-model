@@ -15915,8 +15915,14 @@ def _fix_misplaced_entity_count_threshold(sql: str, question: str) -> str:
     )
     tm = None
     count_object_cue = False
+    frequency_tail_pat = re.compile(r"^\s+times?\b", flags=re.I)
+    frequency_prefix_pat = re.compile(
+        r"\b(?:appear|appears|appearing|occur|occurs|occurring|repeat|repeats?|show\s+up|shows\s+up)\b",
+        flags=re.I,
+    )
     for cand in sorted(threshold_matches, key=lambda m: m.start()):
         threshold_tail = q[cand.end():cand.end() + 96]
+        threshold_prefix = q[max(0, cand.start() - 64):cand.start()]
         if local_stop_alt:
             threshold_tail = re.split(
                 rf"\b(?:{local_stop_alt})\b",
@@ -15929,6 +15935,10 @@ def _fix_misplaced_entity_count_threshold(sql: str, question: str) -> str:
             threshold_tail,
             flags=re.I,
         ):
+            tm = cand
+            count_object_cue = True
+            break
+        if frequency_tail_pat.search(threshold_tail) and frequency_prefix_pat.search(threshold_prefix):
             tm = cand
             count_object_cue = True
             break
@@ -15945,8 +15955,11 @@ def _fix_misplaced_entity_count_threshold(sql: str, question: str) -> str:
     # inner GROUP BY inside a subquery, which is exactly the bad shape this
     # repair needs to remove.
     where_pos = _find_top_level_clause(s, "where")
-    group_pos = _find_top_level_clause(s, "group by", max(0, where_pos + len("where")))
-    if where_pos < 0 or group_pos < 0:
+    if where_pos >= 0:
+        group_pos = _find_top_level_clause(s, "group by", max(0, where_pos + len("where")))
+    else:
+        group_pos = _find_top_level_clause(s, "group by")
+    if group_pos < 0:
         return s
 
     having_pos = _find_top_level_clause(s, "having", group_pos + len("group by"))
@@ -15954,10 +15967,6 @@ def _fix_misplaced_entity_count_threshold(sql: str, question: str) -> str:
     limit_pos = _find_top_level_clause(s, "limit", group_pos + len("group by"))
     group_end = min([p for p in (having_pos, order_pos, limit_pos, len(s)) if p >= 0])
     group_text = s[group_pos + len("group by"):group_end].lower()
-
-    where_text = s[where_pos + len("where"):group_pos]
-    where_start = where_pos
-    where_end = group_pos
 
     def _has_count_threshold(text: str) -> bool:
         return bool(re.search(
@@ -15987,6 +15996,15 @@ def _fix_misplaced_entity_count_threshold(sql: str, question: str) -> str:
             return text
         insert_pos = gb_m.end() + end_m.start()
         return text[:insert_pos] + f" HAVING {having_condition} " + text[insert_pos:]
+
+    if where_pos < 0:
+        if _has_count_threshold(s):
+            return s
+        return re.sub(r"\s{2,}", " ", _insert_count_having(s)).strip()
+
+    where_text = s[where_pos + len("where"):group_pos]
+    where_start = where_pos
+    where_end = group_pos
 
     # --- split WHERE by AND, look for misplaced threshold ---
     parts = re.split(r"\bAND\b", where_text, flags=re.I)
@@ -16805,14 +16823,15 @@ def _drop_unrequested_fixed_year_filter_for_yearly_rollup(sql: str, question: st
 
 def _drop_unrequested_length_filter_for_prefix_grouping(sql: str, question: str) -> str:
     """
-    Drop hallucinated LENGTH/CHAR_LENGTH row filters when the question asks to
-    group by the first N characters of a value, not to filter rows by exact
-    string length.
+    Drop hallucinated row-level filters when the question asks to group by the
+    first N characters of a value, not to restrict rows to one concrete prefix
+    or exact string length.
 
     Conservative scope:
     - flat grouped query only
     - top-level AND-only WHERE
-    - only removes simple LENGTH/CHAR_LENGTH(column) = integer predicates
+    - only removes simple exact-length predicates or prefix-literal filters on
+      the same source column used by the derived prefix grouping
     - only when the question explicitly asks for first N characters/prefix
       grouping and does not ask for exact length filtering
     """
@@ -16830,13 +16849,37 @@ def _drop_unrequested_length_filter_for_prefix_grouping(sql: str, question: str)
         return sql
 
     m_prefix_group = re.search(
-        r"\bfirst\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
-        r"(?:characters?|chars?|letters?|digits?)\s+of\s+",
+        r"\bfirst\s+(?P<num>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(?:characters?|chars?|letters?|digits?)\s+of\s+(?P<target>.+?)"
+        r"(?:(?:\s*,\s*|\s+)(?:return|show|list|find|give|include|keep|only|order|sort)\b|[.?!]|$)",
         q,
         flags=re.I,
     )
     if not m_prefix_group:
         return sql
+    number_word_values = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+    }
+    raw_requested_n = str(m_prefix_group.group("num") or "").strip().lower()
+    requested_n = int(raw_requested_n) if raw_requested_n.isdigit() else number_word_values.get(raw_requested_n, 0)
+    if requested_n <= 0:
+        return sql
+    target_span = str(m_prefix_group.group("target") or "").strip().lower()
+    target_tokens = {
+        tok for tok in re.findall(r"[a-z0-9]+", target_span)
+        if tok
+    }
 
     parsed = _parse_select_from_groupby(s) or _parse_flat_groupby_clauses(s)
     if not parsed:
@@ -16849,12 +16892,75 @@ def _drop_unrequested_length_filter_for_prefix_grouping(sql: str, question: str)
     if not where_body or _has_top_level_or(where_body):
         return sql
 
-    length_eq_pat = re.compile(
+    group_items = _split_top_level_commas(parsed.get("groupby") or "")
+
+    length_cmp_pat = re.compile(
         r"""(?is)^\s*(?:CHAR_LENGTH|CHARACTER_LENGTH|LENGTH)\s*\(\s*
             (?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
-            \)\s*=\s*(?P<num>\d+)\s*$""",
+            \)\s*(?P<op>=|>=|>)\s*(?P<num>\d+)\s*$""",
         flags=re.X,
     )
+    simple_col_pat = re.compile(
+        r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$"""
+    )
+    derived_prefix_col_pat = re.compile(
+        r"""(?is)\b(?:LEFT|SUBSTRING|SUBSTR)\s*\(\s*
+            (?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
+            ,\s*(?:1\s*,\s*)?(?P<num>\d+)\s*\)""",
+        flags=re.X,
+    )
+    like_prefix_pat = re.compile(
+        r"""(?is)^\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s+
+            LIKE\s+(?P<lit>'[^']*'|"[^"]*")\s*$""",
+        flags=re.X,
+    )
+    derived_prefix_eq_pat = re.compile(
+        r"""(?is)^\s*(?:LEFT|SUBSTRING|SUBSTR)\s*\(\s*
+            (?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
+            ,\s*(?:1\s*,\s*)?(?P<num>\d+)\s*\)\s*
+            =\s*(?P<lit>'[^']*'|"[^"]*")\s*$""",
+        flags=re.X,
+    )
+
+    def _col_name_raw(expr: str) -> str:
+        m = simple_col_pat.match(str(expr or "").strip())
+        if not m:
+            return ""
+        return (m.group(2) or "").strip()
+
+    def _col_name(expr: str) -> str:
+        return _col_name_raw(expr).lower()
+
+    def _literal_text(token: str) -> str:
+        raw = str(token or "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1]
+        return raw.strip().lower()
+
+    def _literal_mentioned(token: str) -> bool:
+        lit = _literal_text(token)
+        if not lit:
+            return False
+        lit_pat = re.escape(lit).replace(r"\ ", r"\s+")
+        return re.search(rf"\b{lit_pat}\b", q, flags=re.I) is not None
+
+    def _question_targets_column(col_name: str) -> bool:
+        phrase = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(col_name or ""))
+        phrase = re.sub(r"[_\W]+", " ", phrase).strip().lower()
+        if not phrase or not target_span:
+            return False
+        phrase_pat = re.escape(phrase).replace(r"\ ", r"\s+")
+        if re.search(rf"\b{phrase_pat}\b", target_span, flags=re.I):
+            return True
+        col_tokens = [tok for tok in re.findall(r"[a-z0-9]+", phrase) if len(tok) >= 3]
+        return bool(col_tokens) and set(col_tokens).issubset(target_tokens)
+
+    prefix_group_cols: Set[str] = set()
+    for item in group_items:
+        for match in derived_prefix_col_pat.finditer(str(item or "")):
+            col_l = _col_name(match.group("col") or "")
+            if col_l:
+                prefix_group_cols.add(col_l)
 
     conds = _split_top_level_and(where_body)
     if not conds:
@@ -16866,9 +16972,53 @@ def _drop_unrequested_length_filter_for_prefix_grouping(sql: str, question: str)
         c0 = str(cond or "").strip()
         if not c0:
             continue
-        if length_eq_pat.match(c0):
-            removed_any = True
-            continue
+        m_len = length_cmp_pat.match(c0)
+        if m_len:
+            col_raw = _col_name_raw(m_len.group("col") or "")
+            col_l = col_raw.lower()
+            op = str(m_len.group("op") or "").strip()
+            try:
+                num = int(m_len.group("num") or "0")
+            except Exception:
+                num = -1
+            is_common_prefix_length_shape = (
+                (op == "=" and num == requested_n)
+                or (op == ">=" and num == requested_n)
+                or (op == ">" and num == requested_n - 1)
+            )
+            if is_common_prefix_length_shape and (
+                col_l in prefix_group_cols or _question_targets_column(col_raw)
+            ):
+                removed_any = True
+                continue
+
+        m_like = like_prefix_pat.match(c0)
+        if m_like:
+            col_raw = _col_name_raw(m_like.group("col") or "")
+            col_l = col_raw.lower()
+            lit = m_like.group("lit") or ""
+            lit_text = _literal_text(lit)
+            is_prefix_literal = lit_text.endswith("%") and "%" not in lit_text[:-1] and "_" not in lit_text
+            if (
+                is_prefix_literal
+                and (col_l in prefix_group_cols or _question_targets_column(col_raw))
+                and not _literal_mentioned(lit_text[:-1])
+            ):
+                removed_any = True
+                continue
+
+        m_derived = derived_prefix_eq_pat.match(c0)
+        if m_derived:
+            col_raw = _col_name_raw(m_derived.group("col") or "")
+            col_l = col_raw.lower()
+            lit = m_derived.group("lit") or ""
+            if (
+                (col_l in prefix_group_cols or _question_targets_column(col_raw))
+                and not _literal_mentioned(lit)
+            ):
+                removed_any = True
+                continue
+
         keep_conds.append(c0)
 
     if not removed_any:

@@ -467,6 +467,23 @@ Preferred wording:
 
 Do not use `Execution shape` for complex medium/hard aggregate or window families.
 
+When an otherwise simple lookup is gated into an unsupported family where this
+wording would become misleading, suppress the section instead of replacing it
+with a more specialized mini-plan.
+
+Examples of suppression-first cases:
+
+- scalar-extrema lookup families that need a same-table scalar subquery
+- other unsupported lookup subfamilies where the backbone lookup wording would
+  incorrectly discourage the required shape
+
+Policy intent:
+
+- keep `IR-HINT` backbone-only
+- prefer omission over specialized fallback prose
+- avoid turning `IR-HINT` into an implementation-shaped execution recipe
+- reduce false positives from over-eager structural advice
+
 ## Sections intentionally avoided or minimized
 To reduce noise and over-steering, the following sections should generally be avoided or removed unless there is a strong generic reason:
 
