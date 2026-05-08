@@ -47,6 +47,7 @@ from .config import (
     AGENT_PROMPT_V2_ENABLED,
     AGENT_PROMPT_ABSTAIN_ENABLED,
     AGENT_PROMPT_ABSTAIN_NOTES_PREFIX,
+    AGENT_ROUTER_QTYPE_SET_OPERATION,
     SQL_PARSE_DIALECT,
 )
 from .schema_analyzer import (
@@ -4380,6 +4381,29 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 )
             )
         )
+        visible_dimension_keys = {
+            (
+                str(d.get("table") or "").strip().lower(),
+                str(d.get("column") or "").strip().lower(),
+            )
+            for d in (intent_ir.get("dimensions") or [])
+            if isinstance(d, dict)
+            and bool(d.get("visible", True))
+            and str(d.get("table") or "").strip()
+            and str(d.get("column") or "").strip()
+        }
+        temporal_directional_ordering_intent = bool(
+            re.search(
+                r"\b(?:latest|newest)\s+to\s+(?:earliest|oldest)\b|\b(?:earliest|oldest)\s+to\s+(?:latest|newest)\b",
+                q_text,
+                flags=re.I,
+            )
+            or re.search(
+                r"\b(?:starting|listing|ordered|sorted)\b[^.]{0,80}\b(?:latest|newest|earliest|oldest)\b",
+                q_text,
+                flags=re.I,
+            )
+        )
 
         def add_hint(text: str) -> None:
             clean = str(text or "").strip()
@@ -4482,6 +4506,19 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if left_col and right_col and left_col != right_col and cmp_phrase in op_map:
                 add_case_when_hint("SUM", left_col[0], left_col[1])
 
+        m_conditional_pattern_count = re.search(
+            r"\b(?:how\s+many|count|number\s+of)\b(?:\s+[a-z][a-z0-9_-]*){0,6}?\s+"
+            r"(?:have\s+)?(?:an?\s+|their\s+)?([a-z][a-z0-9_ ]{1,50}?)\s+"
+            r"that\s+(?:looks?\s+like|matches?|is\s+followed\s+by|starts?\s+with|ends?\s+with)\b",
+            q_text,
+            flags=re.I,
+        )
+        if m_conditional_pattern_count:
+            phrase = re.sub(r"\s+", " ", str(m_conditional_pattern_count.group(1) or "").strip())
+            resolved = _resolve_derived_column(phrase)
+            if resolved:
+                add_case_when_hint("SUM", resolved[0], resolved[1])
+
         if _question_requests_conditional_null_breakdown():
             candidate_phrases: List[str] = []
             for pat in (
@@ -4540,6 +4577,12 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 if not resolved:
                     continue
                 table, column = resolved
+                if (
+                    prefer_date
+                    and temporal_directional_ordering_intent
+                    and (table.lower(), column.lower()) in visible_dimension_keys
+                ):
+                    continue
                 if (
                     qtype.lower() == "lookup"
                     and (table.lower(), column.lower()) in lookup_dimension_keys
@@ -4982,6 +5025,13 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 return quarter_dims
             return raw_dims
 
+        transformed_temporal_dims = [
+            d for d in raw_dims
+            if str(d.get("transform") or "").strip().lower() in {"year", "month_name", "month_num"}
+        ]
+        if transformed_temporal_dims:
+            return transformed_temporal_dims
+
         if regex_bucket_query or bucket_or_classification_query:
             if intro_backbone_dims:
                 return intro_backbone_dims
@@ -5226,11 +5276,14 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     if subject:
         parts.append(f"Subject entity: {subject}")
     if qtype:
-        display_qtype = (
-            "window_aggregate"
-            if any(str(reason or "").startswith("router_hard:window_aggregate") for reason in gate_reasons)
-            else qtype
-        )
+        router_decision = state.get("router_decision") or {}
+        display_qtype = qtype
+        if any(str(reason or "").startswith("router_hard:window_aggregate") for reason in gate_reasons):
+            display_qtype = "window_aggregate"
+        elif bool(router_decision.get("is_set_operation_intent", False)) and bool(
+            router_decision.get("is_simple_set_operation", False)
+        ):
+            display_qtype = AGENT_ROUTER_QTYPE_SET_OPERATION
         parts.append(f"Query type: {display_qtype}")
 
     # Dimensions
