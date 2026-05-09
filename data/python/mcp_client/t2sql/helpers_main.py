@@ -147,6 +147,7 @@ from .helpers_core import (
     _drop_unrequested_positive_row_filters,
     _drop_unrequested_metric_operand_group_keys,
     _drop_tautological_positive_count_having,
+    _dedupe_top_level_having_conjuncts,
     _drop_unrequested_temporal_filters,
     _drop_unrequested_fixed_year_filter_for_yearly_rollup,
     _drop_unrequested_length_filter_for_prefix_grouping,
@@ -5858,6 +5859,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     is_simple_multi_table_candidate = bool(
         router_decision.get("simple_multi_table_candidate", False)
     )
+    intent_hint_preview = _build_intent_ir_hint(state) if state else ""
+    group_filters_hint_present = bool(
+        intent_hint_preview
+        and re.search(r"(?m)^\s*-\s+Group Filters:\s+", intent_hint_preview)
+    )
+    if state is not None:
+        state["ir_hint_group_filters_present"] = group_filters_hint_present
     router_tables = state.get("router_tables", []) if state else []
     ranked_tables_for_prompt = {
         str(tbl or "").strip().lower()
@@ -6080,11 +6088,15 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 "Just SELECT the column directly. Use 'ORDER BY column DESC' for 'latest/newest/highest'."
             )
         elif qtype == "aggregate":
-            # Simple aggregate queries must use GROUP BY
             constraints.append(
                 "AGGREGATE RULE: When computing aggregates (COUNT, SUM, AVG, MIN, MAX) 'per each X', "
                 "you MUST use GROUP BY on the grouping column. Use HAVING for filters on aggregates, NOT WHERE."
             )
+    if group_filters_hint_present:
+        constraints.append(
+            "GROUP FILTERS RULE (CRITICAL): If the intent summary includes Group Filters, "
+            "keep grouped or aggregate thresholds in HAVING and keep ordinary row filters in WHERE."
+        )
 
     if is_simple_scalar_subquery_single_table:
         constraints.append(
@@ -6694,9 +6706,8 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         constraint_block = "\n[STRICT CONSTRAINTS & HEURISTICS]:\n" + "\n".join([f"- {c}" for c in constraints])
 
     # --- 3.5. INTENT IR SOFT HINT (IR-informed LLM) ---
-    intent_hint = ""
+    intent_hint = intent_hint_preview if state else ""
     if state:
-        intent_hint = _build_intent_ir_hint(state)
         if intent_hint:
             state["ir_hint_passed"] = True
             ir_conf = float((state.get("intent_ir") or {}).get("confidence", 0.0) or 0.0)
@@ -6704,7 +6715,8 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             print(
                 f"[IR-HINT] Intent IR passed as soft hint to LLM "
                 f"(confidence={ir_conf:.2f}, "
-                f"gate_reasons={ir_reasons or ['planner_fallback']})"
+                f"gate_reasons={ir_reasons or ['planner_fallback']}, "
+                f"group_filters_present={group_filters_hint_present})"
             )
             print(f"[IR-HINT] Content:{intent_hint}")
         else:
@@ -7594,6 +7606,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         if DEBUG_WR: print("[REFINER - PH4] after unrequested literal row-filter drop:", s)
         s = _drop_tautological_positive_count_having(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after post-repair tautological HAVING drop:", s)
+        s = _dedupe_top_level_having_conjuncts(s)
+        if DEBUG_WR: print("[REFINER - PH4] after HAVING dedupe:", s)
 
         s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after grouped winner-row fallback:", s)
@@ -7720,6 +7734,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested prefix-length filter drop fix: {s}")
     s = _drop_tautological_positive_count_having(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after tautological count HAVING drop fix: {s}")
+    s = _dedupe_top_level_having_conjuncts(s)
+    if DEBUG_WR: print(f"[REFINER - PH6] after HAVING dedupe fix: {s}")
     # ---------------------------------------------------------------------------
     # Phase 6.5 — Strip Hallucinated WHERE on GROUP BY Column for "For Each" Queries
     # ---------------------------------------------------------------------------
@@ -8225,6 +8241,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
 
     if should_early_stop:
         s = _apply_final_question_repairs(s)
+        s = _dedupe_top_level_having_conjuncts(s)
         s = _collapse_spaces_outside_quotes(s)
         _dbg_print_two("[REFINER - NORMALIZE] output sql:", s)
         return s
@@ -8239,6 +8256,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
         s, _ = _ast_stabilize(s)
 
     s = _apply_final_question_repairs(s)
+    s = _dedupe_top_level_having_conjuncts(s)
 
     _dbg_print_two("[REFINER - NORMALIZE] output sql:", s)
     return s

@@ -57,6 +57,7 @@ class RAGState(TypedDict, total=False):
     ir_semantic_fallback_used: bool
     ir_semantic_fallback_model: str
     ir_hint_passed: bool  # True if intent IR was passed as soft hint to LLM
+    ir_hint_group_filters_present: bool  # True if IR soft hint included Group Filters
     # Jenis query hasil classifier ('lookup', 'aggregate', 'rank', dst.)
     qtype: str
     # Flag apakah pertanyaan ini butuh REGEXP/pattern handling
@@ -135,6 +136,7 @@ def make_state(
         "ir_semantic_fallback_used": False,
         "ir_semantic_fallback_model": "",
         "ir_hint_passed": False,
+        "ir_hint_group_filters_present": False,
         "qtype": "",
         "requires_regex": False,
         "sql_confidence": 0.0,

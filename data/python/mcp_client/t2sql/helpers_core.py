@@ -31980,6 +31980,90 @@ def _drop_tautological_positive_count_having(sql: str, question: str = "", ctx: 
     return fixed
 
 
+def _dedupe_top_level_having_conjuncts(sql: str) -> str:
+    """
+    Drop duplicated top-level HAVING conjuncts after repair rewrites.
+
+    Conservative scope:
+    - GROUP BY query with a top-level HAVING clause
+    - top-level AND-only HAVING body
+    - only removes semantically identical conjuncts after lightweight
+      normalization; preserves original order of the first occurrence
+    """
+    if not sql or "having" not in sql.lower():
+        return sql
+
+    parsed = _parse_select_from_groupby(sql) or _parse_flat_groupby_clauses(sql)
+    if not parsed:
+        return sql
+
+    having_clause = str(parsed.get("having") or "").strip()
+    if not having_clause.lower().startswith("having "):
+        return sql
+    having_body = having_clause[7:].strip()
+    if not having_body or _has_top_level_or(having_body):
+        return sql
+
+    def _strip_outer_parens(text: str) -> str:
+        s0 = str(text or "").strip()
+        while s0.startswith("(") and s0.endswith(")"):
+            inner = s0[1:-1].strip()
+            if not inner:
+                break
+            depth = 0
+            balanced = True
+            for idx, ch in enumerate(s0):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth < 0:
+                        balanced = False
+                        break
+                    if depth == 0 and idx != len(s0) - 1:
+                        balanced = False
+                        break
+            if not balanced or depth != 0:
+                break
+            s0 = inner
+        return s0
+
+    keep: List[str] = []
+    seen: Set[str] = set()
+    removed = False
+    for cond in _split_top_level_and(having_body):
+        c0 = str(cond or "").strip()
+        if not c0:
+            continue
+        norm = _normalize_sql_expr_for_match(_strip_outer_parens(c0))
+        if norm and norm in seen:
+            removed = True
+            continue
+        if norm:
+            seen.add(norm)
+        keep.append(c0)
+
+    if not removed:
+        return sql
+
+    out_lines = [
+        f"SELECT {parsed['select'].strip()}",
+        f"FROM {str(parsed.get('from_core') or '').strip()}",
+    ]
+    if (parsed.get("where") or "").strip():
+        out_lines.append(str(parsed["where"]).strip())
+    out_lines.append(f"GROUP BY {str(parsed.get('groupby') or '').strip()}")
+    if keep:
+        out_lines.append("HAVING " + " AND ".join(keep))
+    if (parsed.get("tail") or "").strip():
+        out_lines.append(str(parsed["tail"]).strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if sql.strip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _drop_unrequested_temporal_filters(sql: str, question: str, ctx: str = "") -> str:
     """
     Remove hallucinated temporal WHERE predicates when question has no temporal intent.
@@ -36173,9 +36257,57 @@ def _ast_guardrails(sql: str, ctx: str = "", question: str = "") -> Tuple[str, D
         ql = (q or "").lower()
         if not ql:
             return False
-        agg_tokens = ("average", "avg", "sum", "total", "count", "maximum", "minimum", "max", "min")
-        cmp_tokens = ("above", "below", "greater", "less", "over", "under", "more than", "less than", ">", "<", ">=", "<=")
-        return any(t in ql for t in agg_tokens) and any(t in ql for t in cmp_tokens)
+        if _extract_numeric_aggregate_threshold(q, require_filter_intent=True) is None:
+            return False
+        if re.search(r"\b(?:when|if)\b[^.]{0,96}\b(?:otherwise|else)\b", ql, flags=re.I):
+            return False
+        if re.search(r"\b(?:average|avg|mean|sum|maximum|minimum|max|min)\b", ql, flags=re.I):
+            return True
+        if not re.search(r"\btotal\b", ql, flags=re.I):
+            return False
+
+        entity_terms: Set[str] = {
+            "row", "rows", "record", "records", "entry", "entries",
+            "item", "items", "line", "lines", "group", "groups",
+        }
+        try:
+            for table_name in get_all_tables() or []:
+                table_l = str(table_name or "").strip().lower()
+                if not table_l:
+                    continue
+                entity_terms.add(table_l)
+                singular = str(get_singular_form(table_l) or "").strip().lower()
+                if singular:
+                    entity_terms.add(singular)
+                for syn in get_table_synonyms(table_l) or []:
+                    syn_l = str(syn or "").strip().lower()
+                    if syn_l:
+                        entity_terms.add(syn_l)
+        except Exception:
+            pass
+
+        threshold_match = re.search(
+            r"\b(?:more\s+than|over|greater\s+than|above|exceeds?|at\s+least|no\s+fewer\s+than|"
+            r"less\s+than|fewer\s+than|under|below|at\s+most|no\s+more\s+than|exactly)\s+"
+            r"(?:\d[\d,]*(?:\.\d+)?|[a-z]+(?:[\s-]+[a-z]+){0,4})\b(?P<tail>[^.;!?]{0,48})",
+            ql,
+            flags=re.I,
+        )
+        if not threshold_match:
+            return True
+
+        threshold_prefix = ql[max(0, threshold_match.start() - 56):threshold_match.start()]
+        threshold_tail = str(threshold_match.group("tail") or "")
+        for term in sorted(entity_terms, key=len, reverse=True):
+            term_l = str(term or "").strip().lower()
+            if not term_l:
+                continue
+            term_pat = re.escape(term_l).replace(r"\ ", r"\s+")
+            if re.search(rf"\b(?:count|number\s+of|total)\s+(?:{term_pat})\b", threshold_prefix, flags=re.I):
+                return False
+            if re.search(rf"\b{term_pat}\b", threshold_tail, flags=re.I):
+                return False
+        return True
 
     def _parse_number_words(text: str) -> Optional[float]:
         ql = (text or "").strip().lower()
@@ -40222,6 +40354,12 @@ def _add_missing_count_for_group_by(sql: str, question: str = "") -> str:
     sql_up = sql.upper()
     question_lower = question.lower()
     select_clause_raw = s[select_pos + len("select"):from_pos].strip()
+    counted_entity_terms: Set[str] = set()
+    for table_name in re.findall(r"\b(?:FROM|JOIN)\s+`?([A-Za-z_][A-Za-z0-9_]*)`?", s, flags=re.I):
+        table_l = str(table_name or "").strip().lower()
+        if not table_l:
+            continue
+        counted_entity_terms.update(_table_object_terms(table_l))
 
     # GUARDRAIL 1: Must have GROUP BY
     if "GROUP BY" not in sql_up:
@@ -40259,15 +40397,37 @@ def _add_missing_count_for_group_by(sql: str, question: str = "") -> str:
             if stop_clause_alt
             else question_lower
         )
-        if not _question_has_count_intent(output_part):
+        def _explicit_total_entity_alias() -> str:
+            if not output_part or not counted_entity_terms:
+                return ""
+            for term in sorted(counted_entity_terms, key=len, reverse=True):
+                term_l = str(term or "").strip().lower()
+                if not term_l:
+                    continue
+                term_pat = re.escape(term_l).replace(r"\ ", r"\s+")
+                m_total = re.search(
+                    rf"\btotal\s+(?:number\s+of\s+)?(?P<entity>{term_pat})\b(?=\s*(?:,|and\b|or\b|$))",
+                    output_part,
+                    flags=re.I,
+                )
+                if not m_total:
+                    continue
+                entity_phrase = str(m_total.group("entity") or "").strip().lower()
+                entity_slug = re.sub(r"[^a-z0-9]+", "_", entity_phrase).strip("_")
+                if entity_slug:
+                    return f"total_{entity_slug}"
             return ""
+
+        total_entity_alias = _explicit_total_entity_alias()
+        if not _question_has_count_intent(output_part):
+            return total_entity_alias
         m_count = re.search(
             r"\b(?P<phrase>[a-z][a-z0-9_\s-]{0,40}?)\s+(?:row\s+)?count\b",
             output_part,
             flags=re.I,
         )
         if not m_count:
-            return fallback_alias
+            return total_entity_alias or fallback_alias
         phrase = str(m_count.group("phrase") or "")
         tokens = [
             tok
@@ -40307,7 +40467,7 @@ def _add_missing_count_for_group_by(sql: str, question: str = "") -> str:
 
     # GUARDRAIL 4: Count requests only; generic metric words like "total"
     # should not trigger COUNT(*) rewrites on their own.
-    if not _question_has_count_intent(question_lower):
+    if not explicit_count_alias and not _question_has_count_intent(question_lower):
         return sql
 
     # GUARDRAIL 5: COUNT not already in SELECT

@@ -9075,6 +9075,17 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     
     if not draft_sql.endswith(";"): draft_sql += ";"
     print(f"[DRAFTER] After cleanup: {draft_sql}")
+    group_filters_hint_present = bool(state.get("ir_hint_group_filters_present", False))
+    draft_has_group_by = bool(re.search(r"\bGROUP\s+BY\b", draft_sql, flags=re.I))
+    draft_has_where = bool(re.search(r"\bWHERE\b", draft_sql, flags=re.I))
+    draft_has_having = bool(re.search(r"\bHAVING\b", draft_sql, flags=re.I))
+    print(
+        "[DRAFTER] HAVING telemetry: "
+        f"group_filters_hint_present={group_filters_hint_present}, "
+        f"draft_has_group_by={draft_has_group_by}, "
+        f"draft_has_where={draft_has_where}, "
+        f"draft_has_having={draft_has_having}"
+    )
     return {
         **state,
         "target_model": target_model,
