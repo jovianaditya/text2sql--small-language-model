@@ -9079,12 +9079,28 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     draft_has_group_by = bool(re.search(r"\bGROUP\s+BY\b", draft_sql, flags=re.I))
     draft_has_where = bool(re.search(r"\bWHERE\b", draft_sql, flags=re.I))
     draft_has_having = bool(re.search(r"\bHAVING\b", draft_sql, flags=re.I))
+    draft_has_agg_in_where = bool(
+        re.search(
+            r"\bWHERE\b(?:(?!\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b).)*\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(",
+            draft_sql,
+            flags=re.I | re.S,
+        )
+    )
+    draft_has_where_in_subquery_having = bool(
+        re.search(
+            r"\bWHERE\b[\s\S]*?\bIN\s*\(\s*SELECT\b[\s\S]*?\bHAVING\b",
+            draft_sql,
+            flags=re.I,
+        )
+    )
     print(
         "[DRAFTER] HAVING telemetry: "
         f"group_filters_hint_present={group_filters_hint_present}, "
         f"draft_has_group_by={draft_has_group_by}, "
         f"draft_has_where={draft_has_where}, "
-        f"draft_has_having={draft_has_having}"
+        f"draft_has_having={draft_has_having}, "
+        f"draft_has_agg_in_where={draft_has_agg_in_where}, "
+        f"draft_has_where_in_subquery_having={draft_has_where_in_subquery_having}"
     )
     return {
         **state,

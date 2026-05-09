@@ -6095,7 +6095,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     if group_filters_hint_present:
         constraints.append(
             "GROUP FILTERS RULE (CRITICAL): If the intent summary includes Group Filters, "
-            "keep grouped or aggregate thresholds in HAVING and keep ordinary row filters in WHERE."
+            "treat it as a possible grouped-filter signal. Prefer HAVING for group-level thresholds "
+            "and keep ordinary row filters in WHERE. If the threshold is about how many rows or items "
+            "are in each group, do not invent a separate row-level comparison on another numeric column."
+        )
+        constraints.append(
+            "PROJECTION STABILITY: When grouped filtering is needed, preserve the requested output columns "
+            "and requested aggregate measures in SELECT."
         )
 
     if is_simple_scalar_subquery_single_table:
