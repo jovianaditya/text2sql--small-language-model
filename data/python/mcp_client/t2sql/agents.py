@@ -8509,6 +8509,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             "len_lte",
             "is_null_or_empty",
             "is_not_null_or_empty",
+            "col_eq",
             "col_gt",
             "col_gte",
             "col_lt",
@@ -8647,7 +8648,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         )
         has_column_compare_filter = any(
             isinstance(f, dict)
-            and str(f.get("op") or "").strip().lower() in {"col_gt", "col_gte", "col_lt", "col_lte"}
+            and str(f.get("op") or "").strip().lower() in {"col_eq", "col_gt", "col_gte", "col_lt", "col_lte"}
             for f in ir_filters
         )
         has_resolved_ordering = any(

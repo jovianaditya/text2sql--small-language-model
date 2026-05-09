@@ -191,7 +191,7 @@ class IRMetric:
 class IRFilter:
     table: str
     column: str
-    op: str  # eq|in|not_in|gt|gte|lt|lte|between|year_eq|month_eq|month_between|weekday_eq|like_prefix|like_suffix|like_contains|not_like_contains|not_like_prefix|not_like_suffix|regexp|word_count_eq|len_eq|len_gt|len_gte|len_lt|len_lte|is_null_or_empty|is_not_null_or_empty|col_gt|col_gte|col_lt|col_lte
+    op: str  # eq|in|not_in|gt|gte|lt|lte|between|year_eq|month_eq|month_between|weekday_eq|like_prefix|like_suffix|like_contains|not_like_contains|not_like_prefix|not_like_suffix|regexp|word_count_eq|len_eq|len_gt|len_gte|len_lt|len_lte|is_null_or_empty|is_not_null_or_empty|col_eq|col_gt|col_gte|col_lt|col_lte
     value: Any = None
     value2: Any = None
     value_column: str = ""
@@ -3950,6 +3950,9 @@ def _detect_filters(
     # to similarly described columns in related tables.
     if not metrics:
         compare_phrase_specs = (
+            (r"\b(?:is\s+)?equal\s+to\b", "col_eq"),
+            (r"\bequals\b", "col_eq"),
+            (r"\b(?:is\s+)?(?:the\s+)?same\s+as\b", "col_eq"),
             (r"\bon\s+or\s+after\b", "col_gte"),
             (r"\bon\s+or\s+before\b", "col_lte"),
             (r"\b(?:later\s+than|(?<!on or )after)\b", "col_gt"),
@@ -3989,6 +3992,9 @@ def _detect_filters(
         # Conservative fallback: explicit same-table date-like column mentions
         # with a short span between them.
         compare_specs = (
+            (r"\b(?:is\s+)?equal\s+to\b", "col_eq"),
+            (r"\bequals\b", "col_eq"),
+            (r"\b(?:is\s+)?(?:the\s+)?same\s+as\b", "col_eq"),
             (r"\bon\s+or\s+after\b", "col_gte"),
             (r"\bon\s+or\s+before\b", "col_lte"),
             (r"\b(?:later\s+than|(?<!on or )after)\b", "col_gt"),

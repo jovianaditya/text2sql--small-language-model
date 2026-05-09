@@ -4682,7 +4682,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if op == "weekday_eq" and val is not None:
             day_name = weekday_num_to_name.get(int(val), str(val)) if str(val).isdigit() else str(val)
             return f"{t}.{c} weekday_eq {day_name}"
-        if op in {"col_gt", "col_gte", "col_lt", "col_lte"}:
+        if op in {"col_eq", "col_gt", "col_gte", "col_lt", "col_lte"}:
             value_column = str(filter_obj.get("value_column") or "").strip()
             if value_column:
                 return f"{t}.{c} {op} {value_column}"
@@ -5793,7 +5793,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 "eq", "in", "not_in", "gt", "gte", "lt", "lte",
                 "between", "year_eq", "month_eq", "month_between", "weekday_eq",
                 "like_prefix", "like_suffix", "like_contains", "not_like_contains", "not_like_prefix", "not_like_suffix", "regexp", "word_count_eq", "len_eq", "len_gt", "len_gte", "len_lt", "len_lte", "is_null_or_empty", "is_not_null_or_empty",
-                "col_gt", "col_gte", "col_lt", "col_lte",
+                "col_eq", "col_gt", "col_gte", "col_lt", "col_lte",
             }
             for f in filters
         )
