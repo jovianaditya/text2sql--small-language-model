@@ -5326,23 +5326,230 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
         return hints
 
+    router_decision = state.get("router_decision") or {}
+    display_qtype = qtype
+    if any(str(reason or "").startswith("router_hard:window_aggregate") for reason in gate_reasons):
+        display_qtype = "window_aggregate"
+    elif bool(router_decision.get("is_set_operation_intent", False)) and bool(
+        router_decision.get("is_simple_set_operation", False)
+    ):
+        display_qtype = AGENT_ROUTER_QTYPE_SET_OPERATION
+
+    dims = _hint_display_dimensions()
+
+    def _output_shape_anchor(
+        phrase: str = "",
+        *,
+        date_like: bool = False,
+        numeric_like: bool = False,
+    ) -> str:
+        phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+        raw_dim_candidates = [
+            d for d in (intent_ir.get("dimensions") or [])
+            if isinstance(d, dict)
+        ]
+
+        best_dim_score = 0
+        best_dim_anchor = ""
+        if phrase_norm:
+            for dim in raw_dim_candidates:
+                dim_table = str(dim.get("table") or "").strip()
+                dim_column = str(dim.get("column") or "").strip()
+                if not (dim_table and dim_column):
+                    continue
+                score = _column_match_score(phrase_norm, dim_table, dim_column)
+                if score > best_dim_score:
+                    best_dim_score = score
+                    best_dim_anchor = f"{dim_table}.{dim_column}"
+            for dim in dims:
+                if not isinstance(dim, dict):
+                    continue
+                dim_table = str(dim.get("table") or "").strip()
+                dim_column = str(dim.get("column") or "").strip()
+                if not (dim_table and dim_column):
+                    continue
+                score = _column_match_score(phrase_norm, dim_table, dim_column)
+                if score > best_dim_score:
+                    best_dim_score = score
+                    best_dim_anchor = f"{dim_table}.{dim_column}"
+
+            resolved = _resolve_derived_column(
+                phrase_norm,
+                date_like=date_like,
+                numeric_like=numeric_like,
+            )
+            if resolved:
+                resolved_score = _column_match_score(phrase_norm, resolved[0], resolved[1])
+                if resolved_score > best_dim_score:
+                    return f"{resolved[0]}.{resolved[1]}"
+
+            if best_dim_anchor:
+                return best_dim_anchor
+
+        for dim in dims:
+            if not isinstance(dim, dict):
+                continue
+            dim_table = str(dim.get("table") or "").strip()
+            dim_column = str(dim.get("column") or "").strip()
+            if dim_table and dim_column:
+                return f"{dim_table}.{dim_column}"
+        return ""
+
+    def _output_shape_hint() -> str:
+        shape_qtype = str(display_qtype or "").strip().lower()
+        if not shape_qtype:
+            return ""
+
+        if shape_qtype == AGENT_ROUTER_QTYPE_SET_OPERATION:
+            if re.search(
+                r"\b(?:remove|without|deduplicat(?:e|ed|ion))\s+duplicates?\b"
+                r"|\bduplicates?\s+removed\b"
+                r"|\bunique\b"
+                r"|\bdistinct\b",
+                q_text,
+                flags=re.I,
+            ):
+                return "combined compatible branches with duplicates removed"
+            if re.search(
+                r"\b(?:keep|include|retain)\s+duplicates?\b"
+                r"|\bkeep\s+duplicate\s+rows?\b"
+                r"|\bappears?\s+in\s+both\b",
+                q_text,
+                flags=re.I,
+            ):
+                return "combined compatible branches with duplicates kept"
+            return "combined compatible branches"
+
+        if shape_qtype == "window_aggregate":
+            return ""
+
+        if shape_qtype != "aggregate":
+            return ""
+
+        raw_dims_for_shape = [
+            d for d in (intent_ir.get("dimensions") or [])
+            if isinstance(d, dict)
+        ]
+
+        def _shape_has_multiple_anchor_columns() -> bool:
+            distinct_cols = {
+                (
+                    str(d.get("table") or "").strip().lower(),
+                    str(d.get("column") or "").strip().lower(),
+                )
+                for d in (list(raw_dims_for_shape) + list(dims))
+                if isinstance(d, dict)
+                and str(d.get("table") or "").strip()
+                and str(d.get("column") or "").strip()
+            }
+            return len(distinct_cols) >= 2
+
+        quarter_match = re.search(r"\b(?:calendar\s+)?quarter\b|\bquarter\s+number\b", q_text, flags=re.I)
+        if quarter_match:
+            phrase_window = q_text[max(0, quarter_match.start() - 80):quarter_match.end() + 80]
+            anchor = _output_shape_anchor(phrase_window, date_like=True)
+            if anchor:
+                return f"grouped summary with one row per quarter derived from {anchor}"
+            return "grouped summary with one row per quarter"
+
+        month_group = bool(
+            re.search(
+                r"\b(?:by|per|for\s+each|summari[sz]e|break\s+.*\s+down\s+by)\s+month\b|\bmonth\s+name\b|\bmonths?\s+chronologically\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+        if month_group:
+            anchor = _output_shape_anchor("month", date_like=True)
+            if anchor:
+                return f"grouped summary with one row per month derived from {anchor}"
+            return "grouped summary with one row per month"
+
+        year_group = bool(
+            re.search(
+                r"\b(?:by|per|for\s+each)\s+(?:order\s+)?year\b|\b(?:order\s+)?year\b.*\bdistinct\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+        if year_group:
+            anchor = _output_shape_anchor("year", date_like=True)
+            if anchor:
+                return f"grouped summary with one row per year derived from {anchor}"
+            return "grouped summary with one row per year"
+
+        m_prefix = re.search(
+            r"\bfirst\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+            r"(?:characters?|chars?|letters?|digits?)\s+of\s+(?:their\s+|the\s+)?"
+            r"([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
+            q_text,
+            flags=re.I,
+        )
+        if m_prefix:
+            phrase = re.sub(r"\s+", " ", str(m_prefix.group(2) or "").strip().lower())
+            anchor = _output_shape_anchor(phrase)
+            if anchor:
+                return f"grouped summary with one row per prefix derived from {anchor}"
+            return "grouped summary with one row per prefix"
+
+        m_length = re.search(
+            r"\b(?:by|per|for\s+each|group(?:ed)?\s+by)\s+([a-z][a-z0-9_ ]{1,60}?)\s+length\b|\blength\s+of\s+([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
+            q_text,
+            flags=re.I,
+        )
+        if m_length:
+            phrase = re.sub(r"\s+", " ", str(m_length.group(1) or m_length.group(2) or "").strip().lower())
+            anchor = _output_shape_anchor(phrase)
+            if anchor:
+                return f"grouped summary with one row per length derived from {anchor}"
+            return "grouped summary with one row per length"
+
+        regex_bucket = bool(
+            re.search(r"\bby\s+whether\b.*\b(?:match|matches|pattern|exactly|followed\s+by)\b", q_text, flags=re.I)
+            or re.search(r"\bpattern\s+label\b", q_text, flags=re.I)
+        )
+        if regex_bucket:
+            target_phrase = ""
+            m_target = re.search(r"\bwhether\s+(?:the\s+)?([a-z][a-z0-9_ ]{1,50}?)\s+(?:has|matches|starts|is)\b", q_text, flags=re.I)
+            if m_target:
+                target_phrase = str(m_target.group(1) or "").strip()
+            anchor = ""
+            if not _shape_has_multiple_anchor_columns():
+                anchor = _output_shape_anchor(target_phrase)
+            if anchor:
+                return f"grouped summary with one row per label derived from {anchor}"
+            return "grouped summary with one row per derived label"
+
+        bucket_or_classification = bool(re.search(r"\b(?:bucket|bucket labels?|classify|bands?)\b", q_text, flags=re.I))
+        if bucket_or_classification:
+            condition_scope = re.split(
+                r"\b(?:for\s+each\s+bucket|for\s+each\s+label|return|sort|order(?:ed)?\s+by|then\s+show)\b",
+                q_text,
+                maxsplit=1,
+                flags=re.I,
+            )[0]
+            anchor = ""
+            if not _shape_has_multiple_anchor_columns():
+                anchor = _output_shape_anchor(condition_scope, numeric_like=True)
+            if anchor:
+                return f"grouped summary with one row per label derived from {anchor}"
+            return "grouped summary with one row per derived label"
+
+        return ""
+
     parts = []
     if subject:
         parts.append(f"Subject entity: {subject}")
     if qtype:
-        router_decision = state.get("router_decision") or {}
-        display_qtype = qtype
-        if any(str(reason or "").startswith("router_hard:window_aggregate") for reason in gate_reasons):
-            display_qtype = "window_aggregate"
-        elif bool(router_decision.get("is_set_operation_intent", False)) and bool(
-            router_decision.get("is_simple_set_operation", False)
-        ):
-            display_qtype = AGENT_ROUTER_QTYPE_SET_OPERATION
         parts.append(f"Query type: {display_qtype}")
 
     # Dimensions
     has_structural = False
-    dims = _hint_display_dimensions()
+    output_shape_hint = _output_shape_hint().strip()
+    if output_shape_hint:
+        parts.append(f"Output shape: {output_shape_hint}")
+        has_structural = True
+
     if dims:
         dim_strs = []
         seen_dim_keys = set()
