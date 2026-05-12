@@ -489,6 +489,53 @@ def threshold_count_object_stop_terms() -> list[str]:
 
 
 @lru_cache(maxsize=1)
+def ordered_quantity_repair_order_terms() -> list[str]:
+    defaults = ["order", "ordered"]
+    return rule_list(("heuristic_repairs", "ordered_quantity_stock_aggregate", "order_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordered_quantity_repair_quantity_terms() -> list[str]:
+    defaults = ["quantity", "qty", "unit", "units"]
+    return rule_list(("heuristic_repairs", "ordered_quantity_stock_aggregate", "quantity_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def latest_year_scope_aggregate_terms() -> list[str]:
+    defaults = [
+        "sum",
+        "total",
+        "jumlah",
+        "aggregate",
+        "aggregated",
+        "average",
+        "avg",
+        "mean",
+        "count",
+        "amount",
+        "quantity",
+        "value",
+        "price",
+        "cost",
+        "rate",
+        "ratio",
+        "percent",
+    ]
+    return rule_list(("heuristic_repairs", "latest_year_same_year_aggregate", "aggregate_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_question_token_stopwords() -> Set[str]:
+    defaults = [
+        "the", "and", "for", "with", "from", "that", "this", "those",
+        "these", "their", "there", "have", "has", "had", "into", "onto",
+        "than", "then", "show", "list", "find", "give", "return", "display",
+    ]
+    vals = rule_list(("agent_semantics", "question_token_stopwords"), defaults)
+    return {normalized_text(v) for v in vals if normalized_text(v)}
+
+
+@lru_cache(maxsize=1)
 def semantic_phrase_token_stopwords() -> Set[str]:
     defaults = [
         "a", "an", "the", "that", "this", "those", "these", "same",

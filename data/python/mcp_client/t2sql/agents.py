@@ -469,12 +469,13 @@ from .schema_analyzer import (
 )
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
     _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline,
-    _find_tables_with_implicit_columns, _extract_fk_from_context)
+    _find_tables_with_implicit_columns, _extract_fk_from_context, _ordered_token_is_sort_only_context)
 from .helpers_core import (
     has_join,
     _ast_guardrails,
     _fix_winner_row_metric_order_priority,
     _question_wants_latest_year_scope_with_aggregate,
+    _rewrite_missing_temporal_exclusion_from_null_filter,
     _rewrite_grouped_winner_row_ranked_aggregate,
     _rewrite_joined_ranked_subquery_to_outer_winner,
     _rewrite_malformed_window_winner_clause,
@@ -508,6 +509,7 @@ from .helpers_core import (
 )
 from .rulebook import (
     any_phrase_in_text,
+    group_average_difference_window_phrases,
     order_term_token_stopwords,
     ordering_direction_asc_terms,
     ordering_direction_desc_terms,
@@ -517,6 +519,7 @@ from .rulebook import (
     ordering_temporal_intent_terms,
     rule_list,
     semantic_phrase_token_stopwords,
+    temporal_year_column_terms,
 )
 
 
@@ -601,6 +604,11 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         and not wants_projection_null_fill
     )
     wants_offset_window = _question_has_offset_window_sequence_intent(question)
+    wants_same_group_avg_difference = (
+        any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_AVERAGE_INTENT_PATTERNS)
+        and any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_SAME_GROUP_INTENT_PATTERNS)
+        and any_phrase_in_text(q_lower, group_average_difference_window_phrases())
+    )
     wants_final_order = _question_requests_ordering(question)
     wants_boundary_regex = _question_requires_word_boundary_regex(question)
     wants_regex = _question_requires_regex(question)
@@ -644,6 +652,7 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         "requires_include_zero": wants_include_zero,
         "requires_final_order": wants_final_order,
         "requires_offset_window": wants_offset_window,
+        "requires_same_group_avg_difference": wants_same_group_avg_difference,
         "requires_boundary_regex": wants_boundary_regex,
         "requires_regex": wants_regex,
         "requires_structural_regex": wants_structural_regex,
@@ -2180,6 +2189,41 @@ def _normalize_order_term_tokens(text: str) -> Set[str]:
     return set(normalized)
 
 
+def _requested_order_phrase_token_variants(question: str, phrase: str) -> List[Set[str]]:
+    base_tokens = _normalize_order_term_tokens(phrase)
+    if not base_tokens:
+        return []
+
+    variants: List[Set[str]] = [base_tokens]
+    semantic_stop_tokens = {
+        str(tok or "").strip().lower()
+        for tok in semantic_phrase_token_stopwords()
+        if len(str(tok or "").strip()) > 1
+    }
+
+    def _append_variant(tokens: Set[str]) -> None:
+        if not tokens:
+            return
+        if any(tokens == existing for existing in variants):
+            return
+        variants.append(tokens)
+
+    semantic_reduced = {tok for tok in base_tokens if tok not in semantic_stop_tokens}
+    _append_variant(semantic_reduced)
+
+    if not _question_wants_latest_year_scope_with_aggregate(question):
+        return variants
+
+    temporal_scope_tokens: Set[str] = set()
+    for term in ordering_temporal_intent_terms() + temporal_year_column_terms():
+        temporal_scope_tokens.update(_normalize_order_term_tokens(term))
+
+    for token_set in list(variants):
+        reduced_tokens = {tok for tok in token_set if tok not in temporal_scope_tokens}
+        _append_variant(reduced_tokens)
+    return variants
+
+
 def _normalize_order_reference(expr: str) -> str:
     text = str(expr or "").strip()
     if not text:
@@ -2374,26 +2418,34 @@ def _build_requested_final_order_mapping(
 
     mapped: List[Dict[str, Any]] = []
     for phrase, direction in requested:
-        phrase_tokens = _normalize_order_term_tokens(phrase)
-        if not phrase_tokens:
+        phrase_token_variants = _requested_order_phrase_token_variants(question, phrase)
+        if not phrase_token_variants:
             return None
 
         scored: List[Tuple[int, Dict[str, Any]]] = []
         for candidate in candidates:
             candidate_tokens = set(candidate.get("tokens") or set())
-            overlap = len(phrase_tokens.intersection(candidate_tokens))
-            extra_tokens = candidate_tokens - phrase_tokens
-            if phrase_tokens.issubset(candidate_tokens):
-                exact_bonus = 30 if candidate_tokens == phrase_tokens else 0
-                # Prefer the closest projection match when multiple projected
-                # columns share the requested tokens, e.g. "total quantity"
-                # should map to total_quantity before highest_total_quantity.
-                closeness_penalty = 4 * len(extra_tokens)
-                scored.append((100 + exact_bonus + overlap - closeness_penalty, candidate))
-            elif overlap and overlap == len(phrase_tokens):
-                exact_bonus = 30 if candidate_tokens == phrase_tokens else 0
-                closeness_penalty = 4 * len(extra_tokens)
-                scored.append((50 + exact_bonus + overlap - closeness_penalty, candidate))
+            best_variant_score: Optional[int] = None
+            for phrase_tokens in phrase_token_variants:
+                overlap = len(phrase_tokens.intersection(candidate_tokens))
+                extra_tokens = candidate_tokens - phrase_tokens
+                if phrase_tokens.issubset(candidate_tokens):
+                    exact_bonus = 30 if candidate_tokens == phrase_tokens else 0
+                    # Prefer the closest projection match when multiple projected
+                    # columns share the requested tokens, e.g. "total quantity"
+                    # should map to total_quantity before highest_total_quantity.
+                    closeness_penalty = 4 * len(extra_tokens)
+                    score = 100 + exact_bonus + overlap - closeness_penalty
+                elif overlap and overlap == len(phrase_tokens):
+                    exact_bonus = 30 if candidate_tokens == phrase_tokens else 0
+                    closeness_penalty = 4 * len(extra_tokens)
+                    score = 50 + exact_bonus + overlap - closeness_penalty
+                else:
+                    continue
+                if best_variant_score is None or score > best_variant_score:
+                    best_variant_score = score
+            if best_variant_score is not None:
+                scored.append((best_variant_score, candidate))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         if not scored:
@@ -2768,6 +2820,128 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
     return rebuilt.rstrip() + trailing_semicolon
 
 
+def _has_same_group_avg_difference_shape(sql: str) -> bool:
+    s = str(sql or "")
+    if not s:
+        return False
+    return bool(
+        re.search(
+            r"""(?is)
+            (?:`?[A-Za-z_][A-Za-z0-9_]*`?(?:\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+            \s*-\s*
+            AVG\s*\([^)]*\)\s*OVER\s*\(
+            """,
+            s,
+            flags=re.I | re.X,
+        )
+    )
+
+
+def _rewrite_same_group_avg_projection_to_difference(sql: str, question: str) -> str:
+    """
+    Repair a common near-miss for questions like:
+      "gap/difference between each row value and the average value for the same group"
+
+    If the draft already has a row-preserving AVG(...) OVER (PARTITION BY ...)
+    projection but forgets the subtraction, rewrite only that projected window
+    metric into `base_metric - AVG(base_metric) OVER (...)`.
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q:
+        return sql
+    if not (
+        any(re.search(pat, q, flags=re.I) for pat in HELPERS_AVERAGE_INTENT_PATTERNS)
+        and any(re.search(pat, q, flags=re.I) for pat in HELPERS_SAME_GROUP_INTENT_PATTERNS)
+        and any_phrase_in_text(q, group_average_difference_window_phrases())
+    ):
+        return sql
+    if _has_same_group_avg_difference_shape(s):
+        return sql
+    if re.search(r"\bJOIN\b", s, flags=re.I):
+        return sql
+    if not re.search(r"\bAVG\s*\([^)]*\)\s*OVER\s*\(\s*PARTITION\s+BY\b", s, flags=re.I):
+        return sql
+
+    from_pos = _find_top_level_kw(s, "from")
+    if from_pos < 0:
+        return sql
+
+    select_prefix = re.match(r"(?is)^\s*SELECT\s+", s)
+    if not select_prefix:
+        return sql
+    select_body = s[select_prefix.end():from_pos].strip()
+    if not select_body:
+        return sql
+
+    select_items = _split_top_level_csv(select_body)
+    if not select_items:
+        return sql
+
+    def _split_expr_alias(item: str) -> Tuple[str, str]:
+        raw = str(item or "").strip()
+        if not raw:
+            return "", ""
+        m = re.match(
+            r"""(?is)^\s*(?P<expr>.*?)\s+AS\s+(?P<alias>`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            raw,
+        )
+        if m:
+            return (m.group("expr") or "").strip(), (m.group("alias") or "").strip()
+        return raw, ""
+
+    plain_metric_refs: Dict[str, str] = {}
+    for item in select_items:
+        expr, _alias = _split_expr_alias(item)
+        if not expr or re.search(r"\b(?:COUNT|SUM|AVG|MIN|MAX|OVER|CASE)\s*\(", expr, flags=re.I):
+            continue
+        m_col = re.fullmatch(
+            r"""(?is)(?P<ref>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<col>[A-Za-z_][A-Za-z0-9_]*)`?)""",
+            expr.strip(),
+        )
+        if not m_col:
+            continue
+        plain_metric_refs[(m_col.group("col") or "").strip("`").lower()] = (m_col.group("ref") or "").strip()
+
+    avg_item_pattern = re.compile(
+        r"""(?is)^\s*
+        AVG\s*\(\s*(?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<metric_col>[A-Za-z_][A-Za-z0-9_]*)`?)\s*\)
+        \s*OVER\s*\(\s*PARTITION\s+BY\s+(?P<partition>.*?)\s*\)
+        \s*$
+        """,
+        re.X,
+    )
+
+    changed = False
+    rewritten_items: List[str] = []
+    for item in select_items:
+        raw = str(item or "").strip()
+        expr, alias = _split_expr_alias(raw)
+        if not expr:
+            rewritten_items.append(raw)
+            continue
+        m_avg = avg_item_pattern.match(expr)
+        if not m_avg:
+            rewritten_items.append(raw)
+            continue
+
+        metric_col = (m_avg.group("metric_col") or "").strip("`").lower()
+        base_metric_ref = plain_metric_refs.get(metric_col, "")
+        if not base_metric_ref:
+            rewritten_items.append(raw)
+            continue
+
+        diff_expr = f"{base_metric_ref} - {expr.strip()}"
+        rewritten_items.append(f"{diff_expr} AS {alias}" if alias else diff_expr)
+        changed = True
+
+    if not changed:
+        return sql
+
+    rebuilt_select = ", ".join(rewritten_items)
+    return s[:select_prefix.end()] + rebuilt_select + " " + s[from_pos:].lstrip()
+
+
 def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[str, List[str], List[str]]:
     """
     Apply low-risk semantic repairs and report any remaining unmet contracts.
@@ -2846,6 +3020,10 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
             violations.append("missing_winner_row")
 
     if contract["requires_anti_existence"]:
+        fixed = _rewrite_missing_temporal_exclusion_from_null_filter(out_sql, question, ctx)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: synthesized anti-existence from temporal null-filter shortcut")
         if not _has_anti_existence_shape(out_sql):
             violations.append("missing_anti_existence")
 
@@ -2898,6 +3076,14 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
             )
         if not _has_required_window_partition(out_sql, required_window_partition_col):
             violations.append("missing_required_window_partition")
+
+    if bool(contract.get("requires_same_group_avg_difference")):
+        fixed = _rewrite_same_group_avg_projection_to_difference(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: enforced same-group average difference projection")
+        if not _has_same_group_avg_difference_shape(out_sql):
+            violations.append("missing_same_group_avg_difference")
 
     # Apply top-level final ordering late, after structural rewrites such as
     # window-partition normalization, so later repairs do not invalidate a
@@ -2968,6 +3154,8 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         active_contracts.append("final_order")
     if bool(contract.get("requires_offset_window")):
         active_contracts.append("offset_window")
+    if bool(contract.get("requires_same_group_avg_difference")):
+        active_contracts.append("same_group_avg_difference")
     if bool(contract.get("requires_scalar_extrema_date_filter")):
         active_contracts.append("scalar_extrema_date_filter")
     if required_window_partition_col:
@@ -3679,7 +3867,7 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
         if (
             AGENT_COLUMN_ORDERED_TOKEN
             and token == AGENT_COLUMN_ORDERED_TOKEN
-            and re.search(AGENT_COLUMN_ORDERED_BY_PATTERN, question_lower)
+            and _ordered_token_is_sort_only_context(question_lower)
         ):
             continue
         token_forms = {token}

@@ -13,6 +13,7 @@
 # ======================================================================
 import re
 import json
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 # ======================================================================
@@ -62,6 +63,7 @@ from .schema_analyzer import (
     get_id_column,
     get_name_column,
     get_table_synonyms,
+    get_all_entity_variants,
     get_column_synonyms,
     get_column_entity_variants,
     get_column_role,
@@ -2481,7 +2483,7 @@ def _infer_tables_from_question_columns(
             if (
                 AGENT_COLUMN_ORDERED_TOKEN
                 and token == AGENT_COLUMN_ORDERED_TOKEN
-                and re.search(AGENT_COLUMN_ORDERED_BY_PATTERN, q_text)
+                and _ordered_token_is_sort_only_context(q_text)
             ):
                 continue
             if re.search(rf"\b{re.escape(token)}\b", q_text):
@@ -2737,6 +2739,31 @@ def _guidance_informative_terms(terms: Set[str]) -> Set[str]:
     return filtered or informative
 
 
+@lru_cache(maxsize=1)
+def _guidance_schema_entity_stop_terms() -> Set[str]:
+    stop_terms: Set[str] = set()
+    for table in sorted(get_all_tables()):
+        table_l = str(table or "").strip().lower()
+        if not table_l:
+            continue
+        try:
+            variants = get_all_entity_variants(table_l) or set()
+        except Exception:
+            variants = {table_l}
+            singular = get_singular_form(table_l)
+            if singular:
+                variants.add(singular)
+            try:
+                variants.update(get_table_synonyms(table_l) or [])
+            except Exception:
+                pass
+        for variant in variants:
+            stop_terms.update(
+                _guidance_informative_terms(_guidance_semantic_tokens(variant))
+            )
+    return stop_terms
+
+
 def _guidance_column_semantic_terms(table: str, column: str) -> Set[str]:
     terms: Set[str] = set()
     table_l = str(table or "").strip().lower()
@@ -2803,6 +2830,22 @@ def _guidance_grouping_anchor_table(question: str, tables: List[str]) -> str:
     return best_table
 
 
+def _ordered_token_is_sort_only_context(question_text: str) -> bool:
+    q_text = str(question_text or "").lower()
+    ordered_token = str(AGENT_COLUMN_ORDERED_TOKEN or "").strip().lower()
+    if not q_text or not ordered_token:
+        return False
+    if not re.search(AGENT_COLUMN_ORDERED_BY_PATTERN, q_text):
+        return False
+    return not bool(
+        re.search(
+            rf"\b{re.escape(ordered_token)}\b(?!\s+(?:by|in\s+(?:ascending|descending)\s+order|ascending|descending)\b)",
+            q_text,
+            flags=re.I,
+        )
+    )
+
+
 def _guidance_has_direct_table_mention(question: str, table: str) -> bool:
     q = str(question or "").lower()
     table_l = str(table or "").strip().lower()
@@ -2859,24 +2902,41 @@ def _guidance_table_columns(
     if not table_l:
         return []
 
+    seen: Set[str] = set()
     cols: List[str] = []
+
+    def _add_col(col_name: str) -> None:
+        col_text = str(col_name or "").strip()
+        if not col_text:
+            return
+        col_l = col_text.lower()
+        if col_l in seen:
+            return
+        seen.add(col_l)
+        cols.append(col_text)
+
     for original_tbl, table_cols in (allowed_identifiers or {}).items():
         if str(original_tbl or "").strip().lower() == table_l:
-            cols.extend(str(col or "").strip() for col in (table_cols or set()) if str(col or "").strip())
+            for col in (table_cols or set()):
+                _add_col(col)
             break
-    if cols:
-        return cols
 
-    seen: Set[str] = set()
     for tbl, col in (ranked_cols or []):
         tbl_l = str(tbl or "").strip().lower()
         col_name = str(col or "").strip()
         if tbl_l != table_l or not col_name:
             continue
-        if col_name.lower() in seen:
-            continue
-        seen.add(col_name.lower())
-        cols.append(col_name)
+        _add_col(col_name)
+
+    # TABLE ORDER GUIDANCE pruning should stay schema-aware even when the
+    # prompt context only exposed a narrowed identifier subset for the table.
+    try:
+        analyzer = get_schema_analyzer()
+        for col_name in (analyzer.get_table_columns(table_l) or []):
+            _add_col(col_name)
+    except Exception:
+        pass
+
     return cols
 
 
@@ -2894,7 +2954,6 @@ def _guidance_column_is_covered_by_tables(
 
     col_lower = col_name.lower()
     candidate_terms = _guidance_column_cover_terms(src_l, col_name)
-    col_words = set(re.findall(r"[a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", col_name).replace("_", " ").lower()))
 
     for cover_table in cover_tables:
         table_l = str(cover_table or "").strip().lower()
@@ -2915,15 +2974,6 @@ def _guidance_column_is_covered_by_tables(
                         return True
                     if len(overlap) / max(1, len(candidate_terms)) >= 0.60:
                         return True
-
-            avail_words = set(
-                re.findall(
-                    r"[a-z0-9]+",
-                    re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(avail_col or "")).replace("_", " ").lower(),
-                )
-            )
-            if col_words and avail_words and col_words.intersection(avail_words):
-                return True
 
     return False
 
@@ -3029,12 +3079,12 @@ def _find_schema_support_tables_for_guidance(
         if phrase_in_text(question, phrase)
     ]
     fact_support_cue_terms: Set[str] = set()
-    generic_fact_support_terms = {"order", "orders", "product", "products", "payment", "payments", "total"}
+    schema_entity_stop_terms = _guidance_schema_entity_stop_terms()
     for phrase in matched_fact_support_phrases:
         fact_support_cue_terms.update(
             term
             for term in _guidance_informative_terms(_guidance_semantic_tokens(phrase))
-            if term not in generic_fact_support_terms
+            if term not in schema_entity_stop_terms
         )
 
     explicit_metric_terms = {
@@ -3920,7 +3970,7 @@ def _find_tables_with_implicit_columns(
             if (
                 AGENT_COLUMN_ORDERED_TOKEN
                 and token == AGENT_COLUMN_ORDERED_TOKEN
-                and re.search(AGENT_COLUMN_ORDERED_BY_PATTERN, q_text)
+                and _ordered_token_is_sort_only_context(q_text)
             ):
                 continue
             if re.search(rf"\b{re.escape(token)}\b", q_text):
@@ -5867,16 +5917,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     if state is not None:
         state["ir_hint_group_filters_present"] = group_filters_hint_present
     router_tables = state.get("router_tables", []) if state else []
-    ranked_tables_for_prompt = {
+    routed_tables_for_prompt = {
         str(tbl or "").strip().lower()
-        for tbl, _ in ((state or {}).get("ranked_cols", []) or [])
+        for tbl in (router_tables or [])
         if str(tbl or "").strip()
     }
-    has_fact_support_prompt_candidate = bool(
-        state
-        and any_phrase_in_text(question, guidance_fact_support_phrases())
-        and len(ranked_tables_for_prompt) > 1
-    )
+    routed_table_count = int(router_decision.get("table_count") or len(routed_tables_for_prompt))
+    has_multi_table_question = routed_table_count > 1
     
     # Detect tiebreaker pattern: "if multiple...choose the one with latest/earliest"
     has_tiebreaker = bool(re.search(
@@ -6203,13 +6250,10 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         )
 
     # [D] PRIMARY TABLE GUIDANCE (CRITICAL FOR ALL MULTI-TABLE QUERIES)
-    # Apply to ALL non-simple queries (lookup, aggregate, ranking) to prevent wrong FROM clause order
-    # This ensures the LLM uses the correct primary table as the first table in FROM clause
-    if (
-        complexity != "simple"
-        or is_simple_multi_table_candidate
-        or has_fact_support_prompt_candidate
-    ) and state:
+    # Emit join-order guidance only when the routed question scope is truly
+    # multi-table. Single-table easy/medium prompts must not receive it even if
+    # other heuristics mark them as complex or infer optional support tables.
+    if has_multi_table_question and state:
         primary_table = state.get("primary_table")
         primary_reason = state.get("primary_table_reason")
         join_key_hints = _build_join_key_hints_for_prompt(state, max_edges=8)
@@ -6359,17 +6403,6 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     else:
                         join_steps.append(f"LEFT JOIN {join_target}")
                 hint_msg += ", then " + ", ".join(join_steps)
-            display_primary_reason = str(primary_reason or "").strip()
-            if display_primary_reason.lower() == "single table" and other_tables:
-                display_primary_reason = (
-                    "single-table router anchor; additional supporting tables inferred from schema-linked evidence"
-                )
-            if guidance_primary_table != primary_table_l and display_primary_reason:
-                display_primary_reason += "; guidance anchor refined from question grain"
-            elif guidance_primary_table != primary_table_l:
-                display_primary_reason = "guidance anchor refined from question grain"
-            if display_primary_reason:
-                hint_msg += f". Reason: {display_primary_reason}"
             hint_msg += (
                 ". Use this as base schema-path guidance only (it may be a partial path); "
                 "if selected metrics require additional supporting tables, extend the chain "
@@ -6623,7 +6656,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     if has_grouping or "group" in question.lower():
         constraints.append(
             "STRICT GROUP BY RULE (Error 1055): If you GROUP BY a derived column (e.g. `CASE WHEN`), "
-            "you MUST NOT select the original raw column (e.g. `MSRP`) unless it is wrapped in an aggregate function (COUNT, SUM). "
+            "you MUST NOT select the original raw source column unless it is wrapped in an aggregate function (COUNT, SUM). "
             "ONLY select the derived expression and Aggregates."
         )
     if re.search(

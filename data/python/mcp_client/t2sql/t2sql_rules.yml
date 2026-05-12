@@ -484,6 +484,34 @@ prompt_guidance:
       - total revenue
 
 heuristic_repairs:
+  ordered_quantity_stock_aggregate:
+    order_terms:
+      - order
+      - ordered
+    quantity_terms:
+      - quantity
+      - qty
+      - unit
+      - units
+  latest_year_same_year_aggregate:
+    aggregate_terms:
+      - sum
+      - total
+      - jumlah
+      - aggregate
+      - aggregated
+      - average
+      - avg
+      - mean
+      - count
+      - amount
+      - quantity
+      - value
+      - price
+      - cost
+      - rate
+      - ratio
+      - percent
   group_average_difference_window:
     phrases:
       - gap between
@@ -511,6 +539,31 @@ grouping_intent:
     - rata-rata
 
 agent_semantics:
+  question_token_stopwords:
+    - the
+    - and
+    - for
+    - with
+    - from
+    - that
+    - this
+    - those
+    - these
+    - their
+    - there
+    - have
+    - has
+    - had
+    - into
+    - onto
+    - than
+    - then
+    - show
+    - list
+    - find
+    - give
+    - return
+    - display
   phrase_token_stopwords:
     - a
     - an
