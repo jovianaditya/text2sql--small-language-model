@@ -18468,7 +18468,7 @@ def _prefer_conditional_count_final_order(sql: str, question: str) -> str:
     sorts by the overall row count, prefer the conditional-count alias.
 
     Conservative shape:
-    - flat grouped SELECT with exactly one SUM(CASE WHEN ... THEN 1 ELSE 0 END)
+    - flat grouped SELECT with exactly one conditional count metric
     - at least one plain COUNT projection
     - existing top-level ORDER BY starts with the plain count alias
     - question's sort/order phrase mentions "count"
@@ -18499,12 +18499,29 @@ def _prefer_conditional_count_final_order(sql: str, question: str) -> str:
     conditional_aliases: List[str] = []
     total_count_aliases: List[str] = []
     dimension_aliases: List[str] = []
+
+    def _is_conditional_count_expr(expr: str) -> bool:
+        text = str(expr or "")
+        if re.search(
+            r"\bSUM\s*\(\s*CASE\s+WHEN\b.+?\bTHEN\s+1\s+ELSE\s+0\s+END\s*\)",
+            text,
+            flags=re.I | re.S,
+        ):
+            return True
+        return bool(
+            re.search(
+                r"\bCOUNT\s*\(\s*CASE\s+WHEN\b.+?\bTHEN\s+1(?:\s+ELSE\s+NULL)?\s+END\s*\)",
+                text,
+                flags=re.I | re.S,
+            )
+        )
+
     for item in select_items:
         expr, alias = _split_select_expr_alias(item)
         alias_name = (alias or _extract_alias_or_colname(expr) or "").strip("`")
         if not alias_name:
             continue
-        if re.search(r"\bSUM\s*\(\s*CASE\s+WHEN\b.+?\bTHEN\s+1\s+ELSE\s+0\s+END\s*\)", expr, flags=re.I | re.S):
+        if _is_conditional_count_expr(expr):
             conditional_aliases.append(alias_name)
         elif re.match(r"(?is)^\s*COUNT\s*\(", expr):
             total_count_aliases.append(alias_name)

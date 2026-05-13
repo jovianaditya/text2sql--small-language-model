@@ -5620,9 +5620,98 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 parts.append(f"Filters: {', '.join(filt_strs)}")
             has_structural = True
 
+    ordering = [o for o in (intent_ir.get("ordering") or []) if isinstance(o, dict)]
+
+    def _requested_order_component_count(question_text: str) -> int:
+        text = str(question_text or "").strip()
+        if not text:
+            return 0
+        order_verbs = [
+            str(t).strip().lower()
+            for t in rule_list(("heuristic_repairs", "final_order", "verbs"), [])
+            if str(t).strip()
+        ]
+        final_output_terms = [
+            str(t).strip().lower()
+            for t in rule_list(("heuristic_repairs", "final_order", "final_output_terms"), [])
+            if str(t).strip()
+        ]
+        sequence_terms = [
+            str(t).strip().lower()
+            for t in rule_list(("heuristic_repairs", "final_order", "sequence_terms"), [])
+            if str(t).strip()
+        ]
+        if not order_verbs:
+            order_verbs = ["sort", "sorted", "order", "ordered", "arrange", "arranged"]
+        if not sequence_terms:
+            sequence_terms = ["then"]
+        verb_alt = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in order_verbs)
+        final_output_alt = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in final_output_terms)
+        sequence_alt = "|".join(re.escape(v).replace(r"\ ", r"\s+") for v in sequence_terms)
+
+        matches: List[Tuple[int, int, str]] = []
+        order_patterns = [
+            (2, rf"\b(?:{verb_alt})\s+(?:the\s+)?(?:{final_output_alt})\s+by\s+(?P<body>[^.]+)") if final_output_alt else None,
+            (1, rf"\b(?:{verb_alt})\s+by\s+(?P<body>[^.]+)"),
+        ]
+        for item in order_patterns:
+            if item is None:
+                continue
+            priority, pat = item
+            for m in re.finditer(pat, text, flags=re.I):
+                body = str(m.group("body") or "").strip()
+                if body:
+                    matches.append((priority, m.start(), body))
+        if not matches:
+            return 0
+        matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        body = matches[0][2]
+        parts = [
+            p.strip(" ,;")
+            for p in re.split(rf"\s*[;,]?\s+(?:{sequence_alt})\s+|\s*,\s*", body, flags=re.I)
+            if p.strip(" ,;")
+        ]
+        return len(parts)
+
+    def _should_emit_ordering_hint(order_items: List[dict]) -> bool:
+        shape_qtype = str(display_qtype or "").strip().lower()
+        if shape_qtype != AGENT_ROUTER_QTYPE_SET_OPERATION:
+            return True
+        if not order_items:
+            return False
+
+        requested_order_component_count = _requested_order_component_count(q_text)
+        if requested_order_component_count > 1 and len(order_items) < requested_order_component_count:
+            return False
+
+        visible_dim_keys = {
+            (
+                str(d.get("table") or "").strip().lower(),
+                str(d.get("column") or "").strip().lower(),
+            )
+            for d in dims
+            if isinstance(d, dict)
+            and bool(d.get("visible", True))
+            and str(d.get("table") or "").strip()
+            and str(d.get("column") or "").strip()
+        }
+        if not visible_dim_keys:
+            return False
+
+        for o in order_items:
+            kind = str(o.get("kind") or "").strip().lower()
+            by = str(o.get("by") or "").strip().lower()
+            table = str(o.get("table") or "").strip().lower()
+            if not by:
+                return False
+            if kind != "column" or not table:
+                return False
+            if (table, by) not in visible_dim_keys:
+                return False
+        return True
+
     if qtype.lower() == "lookup":
-        ordering = [o for o in (intent_ir.get("ordering") or []) if isinstance(o, dict)]
-        if ordering:
+        if ordering and _should_emit_ordering_hint(ordering):
             order_strs = []
             for o in ordering:
                 kind = str(o.get("kind") or "").strip().lower()
@@ -5638,7 +5727,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if order_strs:
                 parts.append(f"Ordering: {', '.join(order_strs)}")
                 has_structural = True
-        else:
+        elif not ordering:
             primary_order_column = str(intent_ir.get("order_by_column") or "").strip()
             primary_order_direction = str(intent_ir.get("order_by_direction") or "").strip().upper()
             if primary_order_column:
@@ -5824,6 +5913,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             "under": "<",
         }
         saw_group_filter_candidate = False
+        semantic_group_filter_hint = ""
         concrete_hint_confidence = 0.90
 
         count_metric = None
@@ -5916,6 +6006,28 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             escaped = re.escape(str(term or "")).replace(r"\ ", r"\s+")
             return rf"\b{escaped}\b"
 
+        def _semantic_group_filter_family(
+            *,
+            threshold_targets_count: bool,
+            aggregate_metric_family: str,
+            count_metric_is_distinct_dim: bool,
+        ) -> str:
+            if threshold_targets_count:
+                if count_metric and bool(count_metric.get("distinct")) and count_metric_is_distinct_dim:
+                    return "post-aggregation distinct-count threshold"
+                return "post-aggregation row-count threshold"
+
+            family = str(aggregate_metric_family or "").strip().lower()
+            if family == "average":
+                return "post-aggregation average threshold"
+            if family == "sum":
+                return "post-aggregation sum threshold"
+            if family == "minimum":
+                return "post-aggregation minimum threshold"
+            if family == "maximum":
+                return "post-aggregation maximum threshold"
+            return "post-aggregation threshold"
+
         for match in threshold_re.finditer(q_text):
             tail = str(match.group("tail") or "")
             prefix = q_text[max(0, match.start() - 80):match.start()]
@@ -5982,17 +6094,28 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 count_expr = _row_count_expr()
 
             aggregate_metric_expr = ""
+            aggregate_metric_family = ""
             if re.search(r"\b(?:average|avg|mean)\b", prefix, flags=re.I) and avg_metric:
                 aggregate_metric_expr = _qualified_metric_expr(avg_metric)
+                aggregate_metric_family = "average"
             elif re.search(r"\b(?:sum|total)\b", prefix, flags=re.I) and sum_metric:
                 aggregate_metric_expr = _qualified_metric_expr(sum_metric)
+                aggregate_metric_family = "sum"
             elif re.search(r"\b(?:minimum|min|lowest|smallest)\b", prefix, flags=re.I) and min_metric:
                 aggregate_metric_expr = _qualified_metric_expr(min_metric)
+                aggregate_metric_family = "minimum"
             elif re.search(r"\b(?:maximum|max|highest|largest)\b", prefix, flags=re.I) and max_metric:
                 aggregate_metric_expr = _qualified_metric_expr(max_metric)
+                aggregate_metric_family = "maximum"
 
             if threshold_targets_count or aggregate_metric_expr:
                 saw_group_filter_candidate = True
+                if not semantic_group_filter_hint:
+                    semantic_group_filter_hint = _semantic_group_filter_family(
+                        threshold_targets_count=threshold_targets_count,
+                        aggregate_metric_family=aggregate_metric_family,
+                        count_metric_is_distinct_dim=count_metric_is_distinct_dim,
+                    )
 
             if confidence >= concrete_hint_confidence:
                 if aggregate_metric_expr and not threshold_targets_count:
@@ -6003,10 +6126,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if not threshold_targets_count:
                 continue
 
-            return "HAVING required"
+            return semantic_group_filter_hint or "post-aggregation threshold"
 
         if saw_group_filter_candidate:
-            return "HAVING required"
+            return semantic_group_filter_hint or "post-aggregation threshold"
         return ""
 
     group_filter_qtype = qtype.lower()
