@@ -289,6 +289,28 @@ def _camel_to_words(s: str) -> str:
     return re.sub(r"\s+", " ", x).strip().lower()
 
 
+def _phrase_spacing_variants(text: str) -> Set[str]:
+    base = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not base:
+        return set()
+    variants: Set[str] = {base}
+    queue = [base]
+    while queue:
+        cur = queue.pop()
+        candidates = [
+            re.sub(r"(?<=[a-z])(?=\d)", " ", cur),
+            re.sub(r"(?<=\d)(?=[a-z])", " ", cur),
+            re.sub(r"(?<=[a-z])\s+(?=\d)", "", cur),
+            re.sub(r"(?<=\d)\s+(?=[a-z])", "", cur),
+        ]
+        for candidate in candidates:
+            normalized = re.sub(r"\s+", " ", str(candidate or "").strip().lower())
+            if normalized and normalized not in variants:
+                variants.add(normalized)
+                queue.append(normalized)
+    return variants
+
+
 def _semantic_token_variants(token: str) -> List[str]:
     tok = str(token or "").strip().lower()
     if not tok:
@@ -421,12 +443,12 @@ def _column_variants(table: str, column: str) -> Set[str]:
 
     expanded: Set[str] = set()
     for v in out:
-        vv = re.sub(r"\s+", " ", (v or "").strip().lower())
-        if not vv:
-            continue
-        expanded.add(vv)
-        expanded.add(_pluralize_last_token(vv))
-        expanded.add(_singularize_last_token(vv))
+        for vv in _phrase_spacing_variants(v):
+            if not vv:
+                continue
+            expanded.add(vv)
+            expanded.add(_pluralize_last_token(vv))
+            expanded.add(_singularize_last_token(vv))
 
     if c_low.endswith("number"):
         stem = c_low[:-6].strip("_")
@@ -689,6 +711,10 @@ def _column_semantic_tokens(table: str, column: str) -> Set[str]:
     structural_stop_tokens = _FUNCTION_WORD_TOKENS.union({"in", "on", "at", "by"})
     tokens: Set[str] = set()
     for phrase in phrases:
+        for spaced_phrase in _phrase_spacing_variants(phrase):
+            for tok in _tokenize_for_match(spaced_phrase, stop_tokens=structural_stop_tokens):
+                if tok:
+                    tokens.add(tok)
         for tok in _tokenize_for_match(phrase, stop_tokens=structural_stop_tokens):
             if tok:
                 tokens.add(tok)
@@ -4918,7 +4944,7 @@ def _detect_ordering_and_limit(
         phrase = m_order.group(1).strip()
         segments = [
             seg.strip(" ,")
-            for seg in re.split(r"\s*,\s*|\s+\bthen\b\s+", phrase, flags=re.I)
+            for seg in re.split(r"\s*,\s*|\s+\bthen\b\s+|\s+\band\b\s+", phrase, flags=re.I)
             if seg.strip(" ,")
         ]
         if not segments:

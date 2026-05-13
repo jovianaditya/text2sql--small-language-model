@@ -1924,8 +1924,75 @@ def _canonicalize_table_names(sql: str, ctx: str) -> str:
     if not allowed:
         return sql
 
+    def _normalize_table_token(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(name or "").strip().lower())
+
     # lower(table) -> canonical table name dari ALLOWED
     canon_by_lower = {t.lower(): t for t in allowed.keys()}
+    canon_forms: Dict[str, Set[str]] = {}
+    for canon in allowed.keys():
+        canon_l = str(canon or "").strip().lower()
+        if not canon_l:
+            continue
+        forms = {canon_l}
+        singular = str(get_singular_form(canon_l) or "").strip().lower()
+        if singular:
+            forms.add(singular)
+        for form in forms:
+            form_norm = _normalize_table_token(form)
+            if form_norm:
+                canon_forms.setdefault(str(canon).strip(), set()).add(form_norm)
+
+    def _resolve_table_candidate(raw_table: str) -> Optional[str]:
+        raw = str(raw_table or "").strip()
+        if not raw:
+            return None
+        exact = canon_by_lower.get(raw.lower())
+        if exact:
+            return exact
+
+        raw_norm = _normalize_table_token(raw)
+        if len(raw_norm) < 5:
+            return None
+
+        scored: List[Tuple[int, int, str]] = []
+        for canon, form_set in canon_forms.items():
+            best_score = None
+            best_gap = None
+            for form_norm in form_set:
+                if not form_norm:
+                    continue
+                if form_norm == raw_norm:
+                    return canon
+                if form_norm.startswith(raw_norm):
+                    gap = len(form_norm) - len(raw_norm)
+                    if gap > 4:
+                        continue
+                    score = len(raw_norm)
+                elif raw_norm.startswith(form_norm):
+                    gap = len(raw_norm) - len(form_norm)
+                    if gap > 2:
+                        continue
+                    score = len(form_norm) - gap
+                else:
+                    continue
+                if best_score is None or score > best_score or (score == best_score and gap < (best_gap or 999)):
+                    best_score = score
+                    best_gap = gap
+            if best_score is not None and best_gap is not None:
+                scored.append((best_score, -best_gap, canon))
+
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        top_score, top_gap_neg, top_canon = scored[0]
+        tied = [
+            canon for score, gap_neg, canon in scored
+            if score == top_score and gap_neg == top_gap_neg
+        ]
+        if len(tied) == 1:
+            return top_canon
+        return None
 
     # Match FROM/JOIN <db.?>table <alias?>
     pat = re.compile(
@@ -1942,12 +2009,12 @@ def _canonicalize_table_names(sql: str, ctx: str) -> str:
 
         if "." in full:
             db, tbl = full.split(".", 1)
-            canon = canon_by_lower.get(tbl.lower())
+            canon = _resolve_table_candidate(tbl)
             if not canon:
                 return m.group(0)
             return f"{kw}{db}.{canon}{alias}"
 
-        canon = canon_by_lower.get(full.lower())
+        canon = _resolve_table_candidate(full)
         if not canon:
             return m.group(0)
         return f"{kw}{canon}{alias}"
@@ -6762,6 +6829,53 @@ def _drop_unrequested_missing_filter_columns(sql: str, question: str, ctx: str =
         dedup_phrase_candidates: List[str] = []
         seen_phrases: Set[str] = set()
         for phr in phrase_candidates:
+            p = str(phr or "").strip()
+            if not p or p in seen_phrases:
+                continue
+            seen_phrases.add(p)
+            dedup_phrase_candidates.append(p)
+
+        schema_phrase_candidates: List[str] = []
+        try:
+            for variant in get_column_entity_variants(base_table, col_name) or set():
+                phrase = re.sub(r"\s+", " ", str(variant or "").replace("_", " ").strip().lower())
+                if phrase:
+                    schema_phrase_candidates.append(phrase)
+        except Exception:
+            pass
+        try:
+            analyzer = get_schema_analyzer()
+        except Exception:
+            analyzer = None
+        if analyzer is not None:
+            try:
+                for syn in analyzer.get_column_synonyms(base_table, col_name) or []:
+                    phrase = re.sub(r"\s+", " ", str(syn or "").replace("_", " ").strip().lower())
+                    if phrase:
+                        schema_phrase_candidates.append(phrase)
+            except Exception:
+                pass
+        try:
+            desc = str(get_column_description(base_table, col_name) or "").strip()
+        except Exception:
+            desc = ""
+        if desc:
+            for raw_part in re.split(r"[;,.()]+", desc):
+                phrase = re.sub(
+                    r"\s+",
+                    " ",
+                    re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(raw_part or "").replace("_", " ")).strip().lower(),
+                )
+                if not phrase:
+                    continue
+                schema_phrase_candidates.append(phrase)
+                toks = [tok for tok in phrase.split() if tok]
+                if len(toks) >= 3:
+                    for start in range(1, len(toks) - 1):
+                        tail = " ".join(toks[start:])
+                        if len(tail.split()) >= 3:
+                            schema_phrase_candidates.append(tail)
+        for phr in schema_phrase_candidates:
             p = str(phr or "").strip()
             if not p or p in seen_phrases:
                 continue
@@ -27613,7 +27727,7 @@ def _rewrite_latest_year_tuple_in_filter(sql: str, question: str, ctx: str = "")
 
         chosen: List[str] = []
         used_exprs: Set[str] = set()
-        segments = re.split(r"\bthen\b", sort_clause, flags=re.I)
+        segments = re.split(r"\bthen\b|\band\b", sort_clause, flags=re.I)
         for seg in segments:
             for part in _split_csv(seg):
                 seg_text = part.strip()
@@ -40060,7 +40174,7 @@ def _enforce_requested_order_direction(sql: str, question: str) -> str:
     explicit_dirs: List[str] = []
     sort_parts: List[str] = []
     if sort_clause:
-        segments = re.split(r"\bthen\b", sort_clause, flags=re.I)
+        segments = re.split(r"\bthen\b|\band\b", sort_clause, flags=re.I)
         for seg in segments:
             for part in _split_top_level_csv(seg):
                 s = part.strip().lower()

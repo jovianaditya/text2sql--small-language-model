@@ -10238,6 +10238,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             return ""
 
         requested_output_segment = _extract_requested_output_segment_local(question)
+        requested_output_text = str(requested_output_segment or question or "")
 
         def _question_explicitly_requests_column(col_name: str) -> bool:
             seg = str(requested_output_segment or "").strip().lower()
@@ -10338,7 +10339,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 # Also allow optional words before for non-suffix columns
                 pattern = rf'\b(?:\w+\s+)*{re.escape(clean_name)}\b|\b{re.escape(clean_name)}\b'
 
-            if re.search(pattern, question, re.IGNORECASE):
+            if re.search(pattern, requested_output_text, re.IGNORECASE):
                 missing_cols.append(col_raw)
 
         if missing_cols:

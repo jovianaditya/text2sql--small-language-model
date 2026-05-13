@@ -260,7 +260,7 @@ def infer_dataset_name_from_testset(testset_path: str | None) -> str | None:
         tokens = tokens[1:]
 
     trailing_tags = {
-        "devset", "testset", "easy", "medium", "hard",
+        "devset", "testset", "test", "easy", "medium", "hard",
         "evaluation", "eval",
         "ori", "original", "formal",
         "mix", "mixed",
@@ -1658,6 +1658,14 @@ async def run_batch_eval(
     else:
         cases = all_cases
         print(f"No difficulty filter - running all {len(cases)} test cases")
+
+    if not cases:
+        filter_text = ", ".join(filter_desc) if difficulty_filters else "none"
+        raise ValueError(
+            f"No test cases selected from {testset_path}. "
+            f"Loaded={len(all_cases)}, filters={filter_text}. "
+            "Check the testset contents and difficulty/ID filter arguments."
+        )
     
     # Default paths for JSONL - resolve from config like CLI does
     if paths is None or len(paths) == 0:
@@ -1718,6 +1726,11 @@ async def run_batch_eval(
 
     # Calculate metrics
     total = len(results)
+    if total == 0:
+        raise ValueError(
+            "Evaluation produced zero results. "
+            "No test cases were executed; check filtering and testset loading."
+        )
     va_success = sum(1 for r in results if r["va_success"])
     exec_success = sum(1 for r in results if r["exec_success"])
     result_match = sum(1 for r in results if r["result_match"])

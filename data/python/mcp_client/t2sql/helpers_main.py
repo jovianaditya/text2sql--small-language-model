@@ -4138,6 +4138,18 @@ def _intent_ir_payload_tables(
     return tables
 
 
+def _intent_ir_dimension_metric_tables(intent_ir: Dict[str, Any]) -> Set[str]:
+    tables: Set[str] = set()
+    for collection_name in ("dimensions", "metrics"):
+        for item in (intent_ir or {}).get(collection_name) or []:
+            if not isinstance(item, dict):
+                continue
+            table = str(item.get("table") or "").strip().lower()
+            if table:
+                tables.add(table)
+    return tables
+
+
 def _context_scope_allows_intent_ir_hint(
     state: "RAGState",
     intent_ir: Dict[str, Any],
@@ -4180,6 +4192,37 @@ def _context_scope_allows_intent_ir_hint(
         context_allowed=context_allowed,
     )
     return bool(payload_tables) and payload_tables.issubset(router_tables)
+
+
+def _context_scope_allows_reduced_multi_table_intent_ir_hint(
+    state: "RAGState",
+    intent_ir: Dict[str, Any],
+    gate_reasons: Set[str],
+) -> bool:
+    context_allowed = _parse_allowed_identifiers(str((state or {}).get("context") or ""))
+    if len(context_allowed) <= 1:
+        return False
+
+    if "router_complex_prefers_llm" in (gate_reasons or set()):
+        return False
+
+    router_tables = {
+        str(table or "").strip().lower()
+        for table in ((state or {}).get("router_tables") or [])
+        if str(table or "").strip()
+    }
+    if len(router_tables) <= 1:
+        return False
+
+    # Reduced multi-table hints intentionally expose only query type,
+    # dimensions, and metrics. If the IR already carries explicit row-level
+    # filters, emitting a truncated hint becomes materially lossy and can
+    # steer the drafter away from required constraints.
+    if any(isinstance(f, dict) for f in (intent_ir.get("filters") or [])):
+        return False
+
+    payload_tables = _intent_ir_dimension_metric_tables(intent_ir or {})
+    return len(payload_tables) > 1 and payload_tables.issubset(router_tables)
 
 
 def _build_intent_ir_hint(state: "RAGState") -> str:
@@ -4241,11 +4284,19 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         or "scalar_extrema_date_subquery_ir_unsupported" in gate_reasons
     )
 
-    # A multi-table context usually means join semantics are in play. Until the
-    # IR can represent joins reliably, only allow retrieval-noise cases where
-    # the router and the IR payload agree on one executable table.
-    if not _context_scope_allows_intent_ir_hint(state, intent_ir, gate_reasons):
-        return ""
+    # A multi-table context usually means join semantics are in play. Keep the
+    # existing richer hint shape single-table only, but allow a reduced
+    # multi-table hint that exposes only the semantic target (qtype,
+    # dimensions, metrics) while leaving join-path reasoning to TABLE ORDER
+    # GUIDANCE and schema context.
+    full_hint_scope_allowed = _context_scope_allows_intent_ir_hint(state, intent_ir, gate_reasons)
+    reduced_multi_table_hint = False
+    if not full_hint_scope_allowed:
+        reduced_multi_table_hint = _context_scope_allows_reduced_multi_table_intent_ir_hint(
+            state, intent_ir, gate_reasons
+        )
+        if not reduced_multi_table_hint:
+            return ""
 
     # Keep soft IR hints conservative for genuinely hard/complex shapes. These
     # lanes need the full schema/join reasoning; a partial IR summary can
@@ -5200,6 +5251,167 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 return subject_candidates[0]
         return candidates[0]
 
+    def _reduced_multi_table_arithmetic_metric_hints() -> List[Tuple[str, str, Set[Tuple[str, str]]]]:
+        if not reduced_multi_table_hint:
+            return []
+
+        q_metric_text_local = re.split(
+            r"\b(?:sort(?:ed)?\s+by|order(?:ed)?\s+by|sort(?:ed)?\s+from|order(?:ed)?\s+from)\b",
+            q_text,
+            maxsplit=1,
+            flags=re.I,
+        )[0]
+        if not re.search(r"\b(?:multiplied\s+by|times|\*)\b", q_metric_text_local, flags=re.I):
+            return []
+
+        def _agg_family_from_text(text: str) -> str:
+            if re.search(r"\b(?:average|avg|mean)\b", text, flags=re.I):
+                return "AVG"
+            if re.search(r"\b(?:minimum|min|lowest|smallest)\b", text, flags=re.I):
+                return "MIN"
+            if re.search(r"\b(?:maximum|max|highest|largest)\b", text, flags=re.I):
+                return "MAX"
+            if re.search(r"\b(?:sum|total)\b", text, flags=re.I):
+                return "SUM"
+            return ""
+
+        def _clean_operand_phrase(text: str) -> str:
+            phrase = re.sub(r"\s+", " ", str(text or "").strip().lower())
+            phrase = re.sub(r"^(?:the|a|an)\s+", "", phrase, flags=re.I)
+            phrase = phrase.strip(" ,;:.!?()[]{}'\"")
+            return phrase
+
+        def _numeric_candidate_pairs() -> List[Tuple[str, str]]:
+            pairs: List[Tuple[str, str]] = []
+            seen: Set[Tuple[str, str]] = set()
+
+            def add_pair(table: str, column: str) -> None:
+                t = str(table or "").strip()
+                c = str(column or "").strip()
+                if not (t and c):
+                    return
+                key = (t.lower(), c.lower())
+                if key in seen:
+                    return
+                seen.add(key)
+                pairs.append((t, c))
+
+            for table, column in _structural_column_candidates():
+                if _column_is_numeric_like(table, column):
+                    add_pair(table, column)
+
+            for table, columns in (context_allowed or {}).items():
+                for column in columns or []:
+                    if _column_is_numeric_like(table, column):
+                        add_pair(table, column)
+
+            try:
+                analyzer = get_schema_analyzer()
+                for table in (state.get("router_tables") or []):
+                    table_text = str(table or "").strip()
+                    if not table_text:
+                        continue
+                    for column in analyzer.get_table_columns(table_text):
+                        if _column_is_numeric_like(table_text, column):
+                            add_pair(table_text, column)
+            except Exception:
+                pass
+
+            return pairs
+
+        numeric_candidates = _numeric_candidate_pairs()
+        if len(numeric_candidates) < 2:
+            return []
+
+        def _resolve_numeric_operand(
+            phrase: str,
+            *,
+            exclude: Optional[Set[Tuple[str, str]]] = None,
+        ) -> Optional[Tuple[str, str]]:
+            phrase_norm = _clean_operand_phrase(phrase)
+            if not phrase_norm:
+                return None
+            scored = []
+            for table, column in numeric_candidates:
+                key = (table.lower(), column.lower())
+                if exclude and key in exclude:
+                    continue
+                score = _column_match_score(phrase_norm, table, column)
+                if score > 0:
+                    scored.append((score, table, column))
+            if not scored:
+                return None
+            scored.sort(
+                key=lambda item: (
+                    item[0],
+                    item[1].lower() in {
+                        str(t or "").strip().lower() for t in (state.get("router_tables") or [])
+                    },
+                    -len(item[2]),
+                ),
+                reverse=True,
+            )
+            return (scored[0][1], scored[0][2])
+
+        boundary_terms = (
+            "for|per|by|group|where|with|without|and|sort|order|having|whose|which|that|who|return|show|display|list|include|give"
+        )
+        patterns = [
+            re.compile(
+                rf"\b(?P<agg>sum|total|average|avg|mean|minimum|min|lowest|smallest|maximum|max|highest|largest)\s+of\s+"
+                rf"(?P<left>[a-z][a-z0-9_ ]{{1,60}}?)\s+"
+                rf"(?P<op>multiplied\s+by|times|\*)\s+"
+                rf"(?P<right>[a-z][a-z0-9_ ]{{1,60}}?)(?=[.,;!?]|$|\s+(?:{boundary_terms})\b)",
+                flags=re.I,
+            ),
+            re.compile(
+                rf"\b(?P<left>[a-z][a-z0-9_ ]{{1,60}}?)\s+"
+                rf"(?P<op>multiplied\s+by|times|\*)\s+"
+                rf"(?P<right>[a-z][a-z0-9_ ]{{1,60}}?)(?=[.,;!?]|$|\s+(?:{boundary_terms})\b)",
+                flags=re.I,
+            ),
+        ]
+
+        hints: List[Tuple[str, str, Set[Tuple[str, str]]]] = []
+        seen_hints: Set[str] = set()
+        for pat in patterns:
+            for match in pat.finditer(q_metric_text_local):
+                agg_family = _agg_family_from_text(str(match.groupdict().get("agg") or "") or q_metric_text_local)
+                if agg_family not in {"SUM", "AVG", "MIN", "MAX"}:
+                    continue
+                left_phrase = _clean_operand_phrase(str(match.group("left") or ""))
+                right_phrase = _clean_operand_phrase(str(match.group("right") or ""))
+                if not (left_phrase and right_phrase):
+                    continue
+                left_resolved = _resolve_numeric_operand(left_phrase)
+                if not left_resolved:
+                    continue
+                left_key = (left_resolved[0].lower(), left_resolved[1].lower())
+                right_resolved = _resolve_numeric_operand(right_phrase, exclude={left_key})
+                if not right_resolved:
+                    continue
+                if (right_resolved[0].lower(), right_resolved[1].lower()) == left_key:
+                    continue
+
+                hint_text = (
+                    f"{agg_family}({left_resolved[0]}.{left_resolved[1]} * "
+                    f"{right_resolved[0]}.{right_resolved[1]})"
+                )
+                if hint_text in seen_hints:
+                    continue
+                seen_hints.add(hint_text)
+                hints.append(
+                    (
+                        hint_text,
+                        agg_family,
+                        {
+                            (left_resolved[0].lower(), left_resolved[1].lower()),
+                            (right_resolved[0].lower(), right_resolved[1].lower()),
+                        },
+                    )
+                )
+        return hints
+
     def _question_has_grouping_language() -> bool:
         return bool(
             re.search(
@@ -5538,17 +5750,18 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         return ""
 
     parts = []
-    if subject:
+    if subject and not reduced_multi_table_hint:
         parts.append(f"Subject entity: {subject}")
     if qtype:
         parts.append(f"Query type: {display_qtype}")
 
     # Dimensions
     has_structural = False
-    output_shape_hint = _output_shape_hint().strip()
-    if output_shape_hint:
-        parts.append(f"Output shape: {output_shape_hint}")
-        has_structural = True
+    if not reduced_multi_table_hint:
+        output_shape_hint = _output_shape_hint().strip()
+        if output_shape_hint:
+            parts.append(f"Output shape: {output_shape_hint}")
+            has_structural = True
 
     if dims:
         dim_strs = []
@@ -5579,13 +5792,54 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     for metric_hint in supplemental_metric_hints:
         if metric_hint and metric_hint not in met_strs:
             met_strs.append(metric_hint)
+    arithmetic_metric_hints = _reduced_multi_table_arithmetic_metric_hints()
+    if arithmetic_metric_hints:
+        count_language_requested = bool(
+            re.search(r"\b(?:count|how\s+many|number\s+of|total\s+number)\b", q_text, flags=re.I)
+        )
+
+        def _is_conflicting_scalar_metric_hint(
+            hint_text: str,
+            agg_family: str,
+            operand_keys: Set[Tuple[str, str]],
+        ) -> bool:
+            m = re.match(
+                r"(?is)^\s*(SUM|AVG|MIN|MAX)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*$",
+                str(hint_text or "").strip(),
+            )
+            if not m:
+                return False
+            hint_agg = str(m.group(1) or "").strip().upper()
+            hint_key = (str(m.group(2) or "").strip().lower(), str(m.group(3) or "").strip().lower())
+            return hint_agg == agg_family and hint_key in operand_keys
+
+        filtered_met_strs = []
+        for hint_text in met_strs:
+            if (
+                not count_language_requested
+                and re.match(r"(?is)^\s*COUNT\s*\(", str(hint_text or "").strip())
+            ):
+                continue
+            if any(
+                _is_conflicting_scalar_metric_hint(hint_text, agg_family, operand_keys)
+                for _, agg_family, operand_keys in arithmetic_metric_hints
+            ):
+                continue
+            filtered_met_strs.append(hint_text)
+        met_strs = filtered_met_strs
+        for hint_text, _, _ in arithmetic_metric_hints:
+            if hint_text not in met_strs:
+                met_strs.append(hint_text)
     if met_strs:
         parts.append(f"Metrics: {', '.join(met_strs)}")
         has_structural = True
 
     if (
+        not reduced_multi_table_hint
+        and (
         qtype.lower() == "lookup"
         and bool(intent_ir.get("select_distinct"))
+        )
     ):
         distinct_targets = []
         for d in dims:
@@ -5605,7 +5859,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
     # Filters
     filters = intent_ir.get("filters") or []
-    if filters and not suppress_filter_hints:
+    if not reduced_multi_table_hint and filters and not suppress_filter_hints:
         filt_strs = []
         for f in filters:
             filter_hint = _safe_filter_hint_str(f)
@@ -5710,7 +5964,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 return False
         return True
 
-    if qtype.lower() == "lookup":
+    if not reduced_multi_table_hint and qtype.lower() == "lookup":
         if ordering and _should_emit_ordering_hint(ordering):
             order_strs = []
             for o in ordering:
@@ -6146,6 +6400,19 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if group_filter_hint:
             parts.append(f"Group Filters: {group_filter_hint}")
             has_structural = True
+
+    if reduced_multi_table_hint:
+        if not has_structural:
+            return ""
+        if qtype.lower() == "aggregate" and not met_strs:
+            return ""
+        hint = (
+            f"\n[CANDIDATE INTENT SUMMARY] (confidence={confidence:.2f}):\n"
+            + "\n".join(f"  - {p}" for p in parts)
+            + "\nUse this intent only as a semantic target reference. "
+            "Determine join path from TABLE ORDER GUIDANCE and schema context if any conflict appears."
+        )
+        return hint
 
     # Limit
     limit = intent_ir.get("limit")
@@ -7483,6 +7750,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         for alias, original in case_aliases.items():
             select_segment = select_segment.replace(alias, original)
         s = select_segment + remainder_segment
+
+    s = _canonicalize_table_names(s, ctx)
 
     # NEW: Normalize overly long aliases by removing filler words
     s = _normalize_alias_lengths(s)
