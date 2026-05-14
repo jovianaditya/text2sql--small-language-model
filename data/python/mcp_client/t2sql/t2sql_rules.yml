@@ -616,6 +616,8 @@ ordering_intent:
     - terendah
     - terbaru
     - terlama
+    - termahal
+    - termurah
   window_context_regex:
     - "\\brank\\b.*\\b(ascending|descending)\\s+order\\b"
     - "\\brow[_\\s]?number\\b.*\\b(ascending|descending)\\s+order\\b"
@@ -625,10 +627,35 @@ ordering_intent:
     - "\\b(cumulative|running)\\b.*\\bordered\\s+by\\b"
     - "\\b(second|third|fourth|fifth|\\d+(?:st|nd|rd|th))\\b.*\\b(sorted|ordered)\\s+by\\b"
     - "\\b(sorted|ordered)\\s+by\\b.*\\b(second|third|fourth|fifth|\\d+(?:st|nd|rd|th))\\b"
+    - "\\brank\\b[^.]{0,96}\\bby\\b[^.]{0,64}\\b(?:ascending|descending|asc|desc)\\b"
+    - "\\brow[_\\s]?number\\b[^.]{0,96}\\bby\\b[^.]{0,64}\\b(?:ascending|descending|asc|desc)\\b"
+    - "\\bdense[_\\s]?rank\\b[^.]{0,96}\\bby\\b[^.]{0,64}\\b(?:ascending|descending|asc|desc)\\b"
+    - "\\bwithin\\s+(?:each|the\\s+same)\\b[^.]{0,96}\\bby\\b[^.]{0,64}\\b(?:ascending|descending|asc|desc)\\b"
+    - "\\brank\\b[^.]{0,96}\\bordered\\s+by\\b"
+    - "\\brow[_\\s]?number\\b[^.]{0,96}\\bordered\\s+by\\b"
+    - "\\bdense[_\\s]?rank\\b[^.]{0,96}\\bordered\\s+by\\b"
   ordering_phrase_regex:
     - "\\bfrom\\s+(the\\s+)?(highest|lowest|latest|earliest|newest|oldest)"
     - "\\bfrom\\s+(a\\s+to\\s+z|z\\s+to\\s+a)"
     - "\\b(sorted|ordered)\\s+from\\b"
+    - "\\b(?:start|starting|begin|beginning)\\s+(?:with|from)\\s+(?:the\\s+)?(?:highest|lowest|latest|earliest|newest|oldest|most\\s+recent|least\\s+recent)"
+    - "\\b(?:most\\s+recent|least\\s+recent|latest|earliest|newest|oldest)\\s+first\\b"
+    - "\\b(?:largest|highest|greatest|biggest|lowest|smallest|least)\\b[^.]{0,48}\\b(?:at|on)\\s+the\\s+(?:top|bottom)\\b"
+    - "\\bsort\\s+from\\b"
+    - "\\b(?:order|sort|arrange)(?:ed)?\\s+(?:the\\s+)?(?:[a-z0-9_-]+\\s+){0,6}chronologically\\b"
+    - "\\bin\\s+chronological\\s+order\\b"
+  final_output_sort_regex:
+    - "\\b(?:final\\s+)?(?:result|results|output|rows?)\\s+(?:should\\s+be\\s+)?(?:sorted|ordered|arranged)\\s+by\\b"
+    - "\\bsort(?:ed)?\\s+(?:the\\s+)?(?:final\\s+)?(?:result|results|output|rows?)\\s+by\\b"
+    - "\\border(?:ed)?\\s+(?:the\\s+)?(?:final\\s+)?(?:result|results|output|rows?)\\s+by\\b"
+    - "\\barrange\\s+(?:the\\s+)?(?:final\\s+)?(?:result|results|output|rows?)\\s+by\\b"
+  explicit_sort_command_regex:
+    - "(?:^|[.;!?]\\s*)(?:sort|sorted|order|ordered|arrange|arranged)\\s+by\\b"
+    - "(?:^|[.;!?]\\s*|,\\s*then\\s+)(?:sort|order|arrange)\\s+by\\b"
+  first_last_row_selection_regex:
+    - "\\b(?:first|last)\\s+\\d+\\b(?!\\s*(?:characters?|chars?|letters?|digits?|words?|months?|years?|days?|quarters?))"
+    - "\\b(?:first|last)\\s+(?:row|rows|record|records|entry|entries|result|results|item|items|tuple|tuples)\\b"
+    - "\\b(?:the\\s+)?(?:first|last)\\s+page\\b"
 
 prompt_guidance:
   fact_support:
@@ -977,6 +1004,109 @@ ranking_intent:
     - highest per
     - largest per
     - latest per
+
+winner_row_intent:
+  rank_terms:
+    - largest
+    - highest
+    - greatest
+    - maximum
+    - max
+    - biggest
+    - smallest
+    - lowest
+    - least
+    - minimum
+    - min
+    - best
+    - worst
+    - top
+    - bottom
+    - best-selling
+    - best selling
+    - top-selling
+    - top selling
+    - terbesar
+    - tertinggi
+    - maksimum
+    - terkecil
+    - terendah
+    - minimum
+    - paling besar
+    - paling kecil
+  grouped_report_terms:
+    - summarize
+    - summary
+    - group
+    - grouped
+    - aggregate
+    - break down
+    - roll up
+  row_object_terms:
+    - row
+    - record
+    - id
+    - code
+    - name
+    - date
+    - number
+    - who
+    - which
+  reporting_verbs:
+    - show
+    - list
+    - display
+    - find
+    - return
+  same_row_terms:
+    - and its
+    - and their
+    - and the
+    - along with
+    - dan
+    - beserta
+    - serta
+    - which
+    - that
+    - who
+    - yang mana
+    - yang
+  context_terms:
+    - when
+    - date when
+    - occurred
+    - on what date
+    - at what date
+    - what date
+    - which date
+    - kapan
+    - tanggal
+    - pada tanggal
+    - waktu
+    - tanggalnya
+    - kapan terjadinya
+  multi_attr_connectors:
+    - and
+    - with
+    - beserta
+    - dan
+  tie_terms:
+    - if multiple
+    - if there are multiple
+    - if there is still a tie
+    - tie
+    - ties
+    - tied
+    - choose the one
+    - pick the one
+  benchmark_metric_terms:
+    - total
+    - sum
+    - average
+    - avg
+    - count
+    - number of
+    - quantity
 
 exclusion_intent:
   negative_keywords:

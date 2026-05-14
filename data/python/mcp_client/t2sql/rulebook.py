@@ -640,9 +640,151 @@ def ordering_superlative_keywords() -> list[str]:
     defaults = [
         "top", "bottom", "most", "least", "most expensive", "least expensive",
         "cheapest", "highest", "lowest", "largest", "smallest", "newest",
-        "latest", "earliest", "oldest",
+        "latest", "earliest", "oldest", "termahal", "termurah",
     ]
     return rule_list(("ordering_intent", "superlative_keywords"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_window_context_regex_patterns() -> list[str]:
+    defaults = [
+        r"\brank\b.*\b(ascending|descending)\s+order\b",
+        r"\brow[_\s]?number\b.*\b(ascending|descending)\s+order\b",
+        r"\bdense[_\s]?rank\b.*\b(ascending|descending)\s+order\b",
+        r"\bpartition\s+by\b.*\b(ascending|descending)\b",
+        r"\bbased\s+on\b.*\b(ascending|descending)\s+order\b",
+        r"\b(cumulative|running)\b.*\bordered\s+by\b",
+        r"\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b.*\b(sorted|ordered)\s+by\b",
+        r"\b(sorted|ordered)\s+by\b.*\b(second|third|fourth|fifth|\d+(?:st|nd|rd|th))\b",
+        r"\brank\b[^.]{0,96}\bby\b[^.]{0,64}\b(?:ascending|descending|asc|desc)\b",
+        r"\brow[_\s]?number\b[^.]{0,96}\bby\b[^.]{0,64}\b(?:ascending|descending|asc|desc)\b",
+        r"\bdense[_\s]?rank\b[^.]{0,96}\bby\b[^.]{0,64}\b(?:ascending|descending|asc|desc)\b",
+        r"\bwithin\s+(?:each|the\s+same)\b[^.]{0,96}\bby\b[^.]{0,64}\b(?:ascending|descending|asc|desc)\b",
+        r"\brank\b[^.]{0,96}\bordered\s+by\b",
+        r"\brow[_\s]?number\b[^.]{0,96}\bordered\s+by\b",
+        r"\bdense[_\s]?rank\b[^.]{0,96}\bordered\s+by\b",
+    ]
+    return rule_list(("ordering_intent", "window_context_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_phrase_regex_patterns() -> list[str]:
+    defaults = [
+        r"\bfrom\s+(the\s+)?(highest|lowest|latest|earliest|newest|oldest)",
+        r"\bfrom\s+(a\s+to\s+z|z\s+to\s+a)",
+        r"\b(sorted|ordered)\s+from\b",
+        r"\b(?:start|starting|begin|beginning)\s+(?:with|from)\s+(?:the\s+)?(?:highest|lowest|latest|earliest|newest|oldest|most\s+recent|least\s+recent)",
+        r"\b(?:most\s+recent|least\s+recent|latest|earliest|newest|oldest)\s+first\b",
+        r"\b(?:largest|highest|greatest|biggest|lowest|smallest|least)\b[^.]{0,48}\b(?:at|on)\s+the\s+(?:top|bottom)\b",
+        r"\bsort\s+from\b",
+        r"\b(?:order|sort|arrange)(?:ed)?\s+(?:the\s+)?(?:[a-z0-9_-]+\s+){0,6}chronologically\b",
+        r"\bin\s+chronological\s+order\b",
+    ]
+    return rule_list(("ordering_intent", "ordering_phrase_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_final_output_sort_regex_patterns() -> list[str]:
+    defaults = [
+        r"\b(?:final\s+)?(?:result|results|output|rows?)\s+(?:should\s+be\s+)?(?:sorted|ordered|arranged)\s+by\b",
+        r"\bsort(?:ed)?\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
+        r"\border(?:ed)?\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
+        r"\barrange\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
+    ]
+    return rule_list(("ordering_intent", "final_output_sort_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_explicit_sort_command_regex_patterns() -> list[str]:
+    defaults = [
+        r"(?:^|[.;!?]\s*)(?:sort|sorted|order|ordered|arrange|arranged)\s+by\b",
+        r"(?:^|[.;!?]\s*|,\s*then\s+)(?:sort|order|arrange)\s+by\b",
+    ]
+    return rule_list(("ordering_intent", "explicit_sort_command_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordering_first_last_row_selection_regex_patterns() -> list[str]:
+    defaults = [
+        r"\b(?:first|last)\s+\d+\b(?!\s*(?:characters?|chars?|letters?|digits?|words?|months?|years?|days?|quarters?))",
+        r"\b(?:first|last)\s+(?:row|rows|record|records|entry|entries|result|results|item|items|tuple|tuples)\b",
+        r"\b(?:the\s+)?(?:first|last)\s+page\b",
+    ]
+    return rule_list(("ordering_intent", "first_last_row_selection_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_rank_terms() -> list[str]:
+    defaults = [
+        "largest", "highest", "greatest", "maximum", "max", "biggest",
+        "smallest", "lowest", "least", "minimum", "min",
+        "best", "worst", "top", "bottom",
+        "best-selling", "best selling", "top-selling", "top selling",
+        "terbesar", "tertinggi", "maksimum",
+        "terkecil", "terendah", "minimum",
+        "paling besar", "paling kecil",
+    ]
+    return rule_list(("winner_row_intent", "rank_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_grouped_report_terms() -> list[str]:
+    defaults = ["summarize", "summary", "group", "grouped", "aggregate", "break down", "roll up"]
+    return rule_list(("winner_row_intent", "grouped_report_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_row_object_terms() -> list[str]:
+    defaults = ["row", "record", "id", "code", "name", "date", "number", "who", "which"]
+    return rule_list(("winner_row_intent", "row_object_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_reporting_verbs() -> list[str]:
+    defaults = ["show", "list", "display", "find", "return"]
+    return rule_list(("winner_row_intent", "reporting_verbs"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_same_row_terms() -> list[str]:
+    defaults = [
+        "and its", "and their", "and the", "along with",
+        "dan", "beserta", "serta",
+        "which", "that", "who",
+        "yang mana", "yang",
+    ]
+    return rule_list(("winner_row_intent", "same_row_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_context_terms() -> list[str]:
+    defaults = [
+        "when", "date when", "occurred", "on what date", "at what date",
+        "what date", "which date",
+        "kapan", "tanggal", "pada tanggal", "waktu", "tanggalnya", "kapan terjadinya",
+    ]
+    return rule_list(("winner_row_intent", "context_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_multi_attr_connectors() -> list[str]:
+    defaults = ["and", "with", "beserta", "dan"]
+    return rule_list(("winner_row_intent", "multi_attr_connectors"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_tie_terms() -> list[str]:
+    defaults = [
+        "if multiple", "if there are multiple", "if there is still a tie",
+        "tie", "ties", "tied", "choose the one", "pick the one",
+    ]
+    return rule_list(("winner_row_intent", "tie_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_benchmark_metric_terms() -> list[str]:
+    defaults = ["total", "sum", "average", "avg", "count", "number of", "quantity"]
+    return rule_list(("winner_row_intent", "benchmark_metric_terms"), defaults)
 
 
 @lru_cache(maxsize=1)

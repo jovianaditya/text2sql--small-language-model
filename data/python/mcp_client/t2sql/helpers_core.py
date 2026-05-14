@@ -94,7 +94,12 @@ from .rulebook import (
     name_component_synonym_hints,
     ordered_quantity_repair_order_terms,
     ordered_quantity_repair_quantity_terms,
+    ordering_explicit_sort_command_regex_patterns,
+    ordering_final_output_sort_regex_patterns,
+    ordering_first_last_row_selection_regex_patterns,
+    ordering_phrase_regex_patterns,
     ordering_superlative_keywords,
+    ordering_window_context_regex_patterns,
     question_wants_combined_full_name,
     question_wants_split_name_components,
     rule_list,
@@ -116,6 +121,15 @@ from .rulebook import (
     set_operation_union_all_terms,
     temporal_year_column_terms,
     threshold_count_object_stop_terms,
+    winner_row_benchmark_metric_terms,
+    winner_row_context_terms,
+    winner_row_grouped_report_terms,
+    winner_row_multi_attr_connectors,
+    winner_row_rank_terms,
+    winner_row_reporting_verbs,
+    winner_row_row_object_terms,
+    winner_row_same_row_terms,
+    winner_row_tie_terms,
 )
 # ======================================================================
 # ================== REGEX PATTERN CACHING UTILITIES ===================
@@ -10027,43 +10041,55 @@ def _question_wants_winner_row(question: str) -> bool:
     if explicit_rank_sig and not explicit_single_pick_sig:
         return False
 
-    rank_terms = [
-        "largest", "highest", "greatest", "maximum", "max", "biggest",
-        "smallest", "lowest", "least", "minimum", "min",
-        "best", "worst", "top", "bottom",
-        "best-selling", "best selling", "top-selling", "top selling",
-        "terbesar", "tertinggi", "maksimum",
-        "terkecil", "terendah", "minimum",
-        "paling besar", "paling kecil",
-    ]
-    rank_patterns = [
-        re.escape(term).replace(r"\ ", r"\s+")
-        for term in rank_terms
-    ]
-    rank_sig = any(
-        re.search(rf"\b{pattern}\b", q_rank_scope, flags=re.I)
-        for pattern in rank_patterns
+    winner_rank_term_alt = _regex_alt_from_terms(
+        {str(term).strip().lower() for term in winner_row_rank_terms() if str(term).strip()},
+        r"$^",
+    )
+    rank_sig = bool(
+        winner_rank_term_alt != r"$^"
+        and re.search(rf"\b(?:{winner_rank_term_alt})\b", q_rank_scope, flags=re.I)
     )
 
     if not rank_sig:
         return False
 
-    grouped_report_sig = bool(re.search(
-        r"\b(?:summarize|summary|group(?:ed)?|aggregate|break\s+down|roll\s+up)\b.{0,100}\bby\b",
-        q_rank_scope,
-        flags=re.I | re.S,
-    ))
-    row_object_after_rank_sig = bool(re.search(
-        r"\b(?:largest|highest|greatest|maximum|max|biggest|smallest|lowest|least|minimum|min|top|bottom)\b"
-        r".{0,80}\b(?:row|record|id|code|name|date|number|who|which)\b",
-        q_rank_scope,
-        flags=re.I | re.S,
-    ))
+    grouped_report_term_alt = _regex_alt_from_terms(
+        {str(term).strip().lower() for term in winner_row_grouped_report_terms() if str(term).strip()},
+        r"$^",
+    )
+    grouped_report_sig = bool(
+        grouped_report_term_alt != r"$^"
+        and re.search(
+            rf"\b(?:{grouped_report_term_alt})\b.{{0,100}}\bby\b",
+            q_rank_scope,
+            flags=re.I | re.S,
+        )
+    )
+    row_object_term_alt = _regex_alt_from_terms(
+        {str(term).strip().lower() for term in winner_row_row_object_terms() if str(term).strip()},
+        r"$^",
+    )
+    row_object_after_rank_sig = bool(
+        winner_rank_term_alt != r"$^"
+        and row_object_term_alt != r"$^"
+        and re.search(
+            rf"\b(?:{winner_rank_term_alt})\b.{{0,80}}\b(?:{row_object_term_alt})\b",
+            q_rank_scope,
+            flags=re.I | re.S,
+        )
+    )
 
-    explicit_multirow_rank_sig = bool(re.search(
-        r"\b(?:show|list|display|find|return)\s+(?:the\s+)?(?:top\s+)?(?:[2-9]|\d{2,})\b",
-        q_rank_scope,
-    ))
+    reporting_verb_alt = _regex_alt_from_terms(
+        {str(term).strip().lower() for term in winner_row_reporting_verbs() if str(term).strip()},
+        r"$^",
+    )
+    explicit_multirow_rank_sig = bool(
+        reporting_verb_alt != r"$^"
+        and re.search(
+            rf"\b(?:{reporting_verb_alt})\s+(?:the\s+)?(?:top\s+)?(?:[2-9]|\d{{2,}})\b",
+            q_rank_scope,
+        )
+    )
     # Also treat bare global top/bottom-N asks as multi-row ranking, even when
     # they do not start with a reporting verb.
     explicit_multirow_rank_sig = explicit_multirow_rank_sig or bool(
@@ -10076,19 +10102,10 @@ def _question_wants_winner_row(question: str) -> bool:
     )
 
     # Sinyal 1: eksplisit minta atribut dari "baris yang sama"
-    same_row_sig = any(k in q_rank_scope for k in [
-        "and its", "and their", "and the", "along with",
-        "dan", "beserta", "serta",
-        "which", "that", "who",
-        "yang mana", "yang",
-    ])
+    same_row_sig = any_phrase_in_text(q_rank_scope, winner_row_same_row_terms())
 
     # Sinyal 2: minta informasi temporal/kontekstual
-    generic_context_sig = any(k in q_rank_scope for k in [
-        "when", "date when", "occurred", "on what date", "at what date",
-        "what date", "which date",
-        "kapan", "tanggal", "pada tanggal", "waktu", "tanggalnya", "kapan terjadinya",
-    ])
+    generic_context_sig = any_phrase_in_text(q_rank_scope, winner_row_context_terms())
     schema_temporal_context_sig = _question_mentions_any_phrase(
         q_rank_scope,
         _winner_row_schema_temporal_phrases(),
@@ -10096,28 +10113,31 @@ def _question_wants_winner_row(question: str) -> bool:
     context_sig = generic_context_sig or schema_temporal_context_sig
 
     # Sinyal 3: pola "X and Y" atau "X with Y" (multi-attribute request)
-    multi_attr_sig = bool(re.search(
-        r"\b(largest|highest|greatest|maximum|biggest|best|worst|top|bottom|least|smallest|terbesar|tertinggi)\s+\w+\s+(and|with|beserta|dan)\s+",
-        q_rank_scope
-    ))
+    multi_attr_connector_alt = _regex_alt_from_terms(
+        {str(term).strip().lower() for term in winner_row_multi_attr_connectors() if str(term).strip()},
+        r"$^",
+    )
+    multi_attr_sig = bool(
+        winner_rank_term_alt != r"$^"
+        and multi_attr_connector_alt != r"$^"
+        and re.search(
+            rf"\b(?:{winner_rank_term_alt})\b\s+\w+\s+\b(?:{multi_attr_connector_alt})\b\s+",
+            q_rank_scope,
+            flags=re.I,
+        )
+    )
 
-    tie_sig = any(k in q_rank_scope for k in [
-        "if multiple", "if there are multiple", "if there is still a tie",
-        "tie", "ties", "tied", "choose the one", "pick the one",
-    ])
+    tie_sig = any_phrase_in_text(q_rank_scope, winner_row_tie_terms())
 
     # Guard: comparative benchmark phrasing like
     # "for every X ... highest ... within the same Y" is usually a full-population
     # report (window/baseline comparison), not winner-row filtering.
-    full_population_benchmark_sig = bool(
+    comparative_group_benchmark_sig = bool(
         re.search(r"\bfor\s+(?:every|each)\b", q_rank_scope, flags=re.I)
         and re.search(r"\bwithin\s+the\s+same\b", q_rank_scope, flags=re.I)
-        and any(
-            k in q_rank_scope
-            for k in ["total", "sum", "average", "avg", "count", "number of", "quantity"]
-        )
+        and any_phrase_in_text(q_rank_scope, winner_row_benchmark_metric_terms())
     )
-    if full_population_benchmark_sig and not explicit_single_pick_sig and not tie_sig:
+    if comparative_group_benchmark_sig and not explicit_single_pick_sig and not tie_sig:
         return False
 
     per_group_sig = bool(
@@ -38585,24 +38605,11 @@ def _question_requests_ordering(question: str) -> bool:
         return re.search(rf"\b{pat}\b", q, flags=re.I) is not None
 
     def _window_ordering_context() -> bool:
-        supplemental_patterns = [
-            r"\brank\b[^.]{0,96}\bby\b[^.]{0,64}\b(?:ascending|descending|asc|desc)\b",
-            r"\brow[_\s]?number\b[^.]{0,96}\bby\b[^.]{0,64}\b(?:ascending|descending|asc|desc)\b",
-            r"\bdense[_\s]?rank\b[^.]{0,96}\bby\b[^.]{0,64}\b(?:ascending|descending|asc|desc)\b",
-            r"\bwithin\s+(?:each|the\s+same)\b[^.]{0,96}\bby\b[^.]{0,64}\b(?:ascending|descending|asc|desc)\b",
-            r"\brank\b[^.]{0,96}\bordered\s+by\b",
-            r"\brow[_\s]?number\b[^.]{0,96}\bordered\s+by\b",
-            r"\bdense[_\s]?rank\b[^.]{0,96}\bordered\s+by\b",
-        ]
-        configured_patterns = [
+        window_context_patterns = [
             str(p).strip()
-            for p in rule_list(
-                ("ordering_intent", "window_context_regex"),
-                [],
-            )
+            for p in ordering_window_context_regex_patterns()
             if str(p).strip()
         ]
-        window_context_patterns = list(dict.fromkeys(configured_patterns + supplemental_patterns))
         sequence_window_patterns = [
             rf"\b{sequence_term_pattern}\b.*\b(?:sorted|ordered)\s+by\b",
             rf"\b(?:sorted|ordered)\s+by\b.*\b{sequence_term_pattern}\b",
@@ -38635,10 +38642,9 @@ def _question_requests_ordering(question: str) -> bool:
     )
 
     final_output_sort_patterns = [
-        r"\b(?:final\s+)?(?:result|results|output|rows?)\s+(?:should\s+be\s+)?(?:sorted|ordered|arranged)\s+by\b",
-        r"\bsort(?:ed)?\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
-        r"\border(?:ed)?\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
-        r"\barrange\s+(?:the\s+)?(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
+        str(p).strip()
+        for p in ordering_final_output_sort_regex_patterns()
+        if str(p).strip()
     ]
     if any(re.search(pat, q, flags=re.I) for pat in final_output_sort_patterns):
         return True
@@ -38646,8 +38652,9 @@ def _question_requests_ordering(question: str) -> bool:
     # Strong imperative final-sort cue. This should win even when another
     # sentence contains window-sequence wording like "... ordered by date".
     explicit_sort_command_patterns = [
-        r"(?:^|[.;!?]\s*)(?:sort|sorted|order|ordered|arrange|arranged)\s+by\b",
-        r"(?:^|[.;!?]\s*|,\s*then\s+)(?:sort|order|arrange)\s+by\b",
+        str(p).strip()
+        for p in ordering_explicit_sort_command_regex_patterns()
+        if str(p).strip()
     ]
     if any(re.search(pat, q, flags=re.I) for pat in explicit_sort_command_patterns):
         return True
@@ -38691,30 +38698,12 @@ def _question_requests_ordering(question: str) -> bool:
     # Keep this conservative. Bare "first"/"last" is too ambiguous because it
     # often appears in projection phrases like "first names" / "last names".
     # Treat "first"/"last" as ordering only in bounded row-selection shapes.
-    superlative_keywords = rule_list(
-        ("ordering_intent", "superlative_keywords"),
-        [
-            "top ",
-            "bottom ",
-            "highest",
-            "lowest",
-            "most expensive",
-            "cheapest",
-            "terbesar",
-            "terkecil",
-            "tertinggi",
-            "terendah",
-            "termahal",
-            "termurah",
-            "terbaru",
-            "terlama",
-        ],
-    )
+    superlative_keywords = ordering_superlative_keywords()
 
     first_last_row_selection_patterns = [
-        r"\b(?:first|last)\s+\d+\b(?!\s*(?:characters?|chars?|letters?|digits?|words?|months?|years?|days?|quarters?))",
-        rf"\b(?:first|last)\s+{row_container_pattern}\b",
-        r"\b(?:the\s+)?(?:first|last)\s+page\b",
+        str(p).strip()
+        for p in ordering_first_last_row_selection_regex_patterns()
+        if str(p).strip()
     ]
     has_first_last_row_selection = any(re.search(pat, q) for pat in first_last_row_selection_patterns)
 
@@ -38761,26 +38750,11 @@ def _question_requests_ordering(question: str) -> bool:
     
     # --- Pattern 5: Phrase-based ordering intent ---
     # "from highest to lowest", "from latest", "from A to Z"
-    supplemental_ordering_phrases = [
-        r"\bfrom\s+(the\s+)?(highest|lowest|latest|earliest|newest|oldest)",
-        r"\b(?:start|starting|begin|beginning)\s+(?:with|from)\s+(?:the\s+)?(?:highest|lowest|latest|earliest|newest|oldest|most\s+recent|least\s+recent)",
-        r"\b(?:most\s+recent|least\s+recent|latest|earliest|newest|oldest)\s+first\b",
-        r"\b(?:largest|highest|greatest|biggest|lowest|smallest|least)\b[^.]{0,48}\b(?:at|on)\s+the\s+(?:top|bottom)\b",
-        r"\bfrom\s+(a\s+to\s+z|z\s+to\s+a)",
-        r"\b(sorted|ordered)\s+from\b",
-        r"\bsort\s+from\b",
-        r"\b(?:order|sort|arrange)(?:ed)?\s+(?:the\s+)?(?:[a-z0-9_-]+\s+){0,6}chronologically\b",
-        r"\bin\s+chronological\s+order\b",
-    ]
-    configured_ordering_phrases = [
+    ordering_phrases = [
         str(p).strip()
-        for p in rule_list(
-            ("ordering_intent", "ordering_phrase_regex"),
-            [],
-        )
+        for p in ordering_phrase_regex_patterns()
         if str(p).strip()
     ]
-    ordering_phrases = list(dict.fromkeys(configured_ordering_phrases + supplemental_ordering_phrases))
     
     if not has_window_context and not winner_like_context and any(re.search(pat, q) for pat in ordering_phrases):
         return True
