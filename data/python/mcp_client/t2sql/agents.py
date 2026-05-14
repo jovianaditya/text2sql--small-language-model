@@ -47,6 +47,7 @@ from .config import (
     AGENT_AST_GUARDS_ENABLED,
     AGENT_AST_GUARDS_DEBUG,
     AGENT_REGEN_PRECHECK_ENABLED,
+    AGENT_CONFIDENCE_THRESHOLD,
     AGENT_CONFIDENCE_RETRY_MIN_IMPROVEMENT,
     AGENT_INSTANT_REJECT_PATTERNS,
     AGENT_DEFINITE_SQL_PATTERNS,
@@ -224,9 +225,6 @@ from .retrieval import build_expanded_context_from_state
 from .intent_ir import build_intent_ir, is_ir_plannable
 from .confidence import compute_sql_confidence
 
-# Confidence threshold - below this, log warning
-CONFIDENCE_THRESHOLD = 0.70
-
 
 def _log_confidence_result(confidence_result: dict) -> None:
     """Log confidence score with threshold-aware formatting."""
@@ -234,15 +232,15 @@ def _log_confidence_result(confidence_result: dict) -> None:
     signals = confidence_result.get("signals", {})
     warnings = confidence_result.get("warnings", [])
     
-    if score >= CONFIDENCE_THRESHOLD:
+    if score >= AGENT_CONFIDENCE_THRESHOLD:
         _dbg_print_two(
             "[REFINER - CONFIDENCE]",
-            f"score={score:.1%} (threshold={CONFIDENCE_THRESHOLD:.0%}) ✓"
+            f"score={score:.1%} (threshold={AGENT_CONFIDENCE_THRESHOLD:.0%}) ✓"
         )
     else:
         # Log warning with details
         low_signals = [f"{k}={v:.1%}" for k, v in signals.items() if v < 0.7]
-        detail = f"score={score:.1%} (threshold={CONFIDENCE_THRESHOLD:.0%}) ⚠"
+        detail = f"score={score:.1%} (threshold={AGENT_CONFIDENCE_THRESHOLD:.0%}) ⚠"
         if low_signals:
             detail += f" | low_signals=[{', '.join(low_signals)}]"
         if warnings:
@@ -11070,7 +11068,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     
     # Confidence-based retry (1x max) if below threshold
     confidence_retry_used = False
-    if confidence_result["confidence"] < CONFIDENCE_THRESHOLD:
+    if confidence_result["confidence"] < AGENT_CONFIDENCE_THRESHOLD:
         retry_result = _attempt_confidence_retry(
             question=question,
             ctx=ctx,
@@ -11115,6 +11113,6 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         "sql_confidence": confidence_result["confidence"],
         "confidence_signals": confidence_result["signals"],
         "confidence_warnings": confidence_result["warnings"],
-        "confidence_low": confidence_result["confidence"] < CONFIDENCE_THRESHOLD,
+        "confidence_low": confidence_result["confidence"] < AGENT_CONFIDENCE_THRESHOLD,
         "confidence_retry_used": confidence_retry_used,
     }

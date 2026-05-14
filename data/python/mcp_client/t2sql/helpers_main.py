@@ -137,7 +137,7 @@ from .helpers_core import (
     _rewrite_explicit_single_table_scope,
     _append_requested_secondary_order_key,
     _restore_requested_temporal_group_order,
-    _rewrite_employee_latest_payment_customer_identity,
+    _rewrite_include_zero_winner_row_identifier_source,
     _drop_tuple_in_filter_from_include_zero_ranked_winner,
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
@@ -181,7 +181,36 @@ from .helpers_core import (
     _enforce_requested_base_projection_in_single_table_window,
     _repair_explicit_iso_date_filter_from_question, _repair_enum_process_proxy_filter_from_question,
 )
-from .rulebook import any_phrase_in_text, guidance_fact_support_phrases, phrase_in_text, rule_list
+from .rulebook import (
+    aggregate_threshold_intent_aggregate_terms,
+    aggregate_threshold_intent_clause_terms,
+    aggregate_threshold_intent_comparison_terms,
+    any_phrase_in_text,
+    guidance_fact_support_phrases,
+    name_request_terms,
+    phrase_in_text,
+    query_classification_aggregate_shape_terms,
+    query_classification_aggregate_terms,
+    query_classification_group_terms,
+    query_classification_ordinal_superlative_terms,
+    query_classification_ordinal_terms,
+    query_classification_row_container_terms,
+    query_classification_sort_terms,
+    retrieval_probe_aggregate_temporal_fallback_terms,
+    retrieval_probe_count_terms,
+    retrieval_probe_geo_city_targets,
+    retrieval_probe_geo_city_terms,
+    retrieval_probe_geo_country_targets,
+    retrieval_probe_geo_country_terms,
+    retrieval_probe_geo_region_terms,
+    retrieval_probe_generic_temporal_fallback_terms,
+    retrieval_probe_id_like_terms,
+    retrieval_probe_metric_fallback_terms,
+    retrieval_probe_semantic_stopwords,
+    retrieval_probe_short_query_fallback_terms,
+    retrieval_probe_temporal_terms,
+    rule_list,
+)
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
 # ======================================================================
@@ -569,16 +598,31 @@ def _question_asks_for_winner_row_object(q_text: str) -> bool:
     return False
 
 
+def _phrase_alt_from_terms(terms: List[str]) -> str:
+    phrases = [
+        re.escape(str(term).strip()).replace(r"\ ", r"\s+")
+        for term in terms
+        if str(term).strip()
+    ]
+    return "|".join(sorted(phrases, key=len, reverse=True))
+
+
 def classify_query(question: str) -> str:
     q = " " + (question or "").strip().lower() + " "
+    ordinal_alt = _phrase_alt_from_terms(query_classification_ordinal_terms())
+    ordinal_superlative_alt = _phrase_alt_from_terms(query_classification_ordinal_superlative_terms())
+    row_container_alt = _phrase_alt_from_terms(query_classification_row_container_terms())
+    sort_alt = _phrase_alt_from_terms(query_classification_sort_terms())
+    group_alt = _phrase_alt_from_terms(query_classification_group_terms())
+    aggregate_alt = _phrase_alt_from_terms(query_classification_aggregate_terms())
     # ---------------------------------------------------------------------------
     # --- 0. DETEKSI ORDINAL RANKING (always "rank") ---
     # "second highest", "third largest", etc. ALWAYS need ROW_NUMBER subquery
     # ---------------------------------------------------------------------------
-    ordinal_pattern = r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th|kedua|ketiga|keempat|kelima)(?:\s+|-)+(highest|lowest|largest|smallest|biggest|top|bottom|best|worst|most|least|terbesar|terkecil|tertinggi|terendah)\b"
-    ordinal_row_pattern = r"\b(second|third|fourth|fifth|2nd|3rd|4th|5th|kedua|ketiga|keempat|kelima)\b(?:\s+\w+){0,8}\s+(row|record|entry)\b"
+    ordinal_pattern = rf"\b(?:{ordinal_alt})\b(?:\s+|-)+(?:{ordinal_superlative_alt})\b" if ordinal_alt and ordinal_superlative_alt else r"$^"
+    ordinal_row_pattern = rf"\b(?:{ordinal_alt})\b(?:\s+\w+){{0,8}}\s+(?:{row_container_alt})\b" if ordinal_alt and row_container_alt else r"$^"
     if re.search(ordinal_pattern, q) or (
-        re.search(ordinal_row_pattern, q) and re.search(r"\b(sorted|ordered)\s+by\b", q)
+        re.search(ordinal_row_pattern, q) and re.search(rf"\b(?:{sort_alt})\s+by\b", q)
     ):
         return "rank"
     # ---------------------------------------------------------------------------
@@ -586,7 +630,7 @@ def classify_query(question: str) -> str:
     # Syarat: Mencari 'baris data' tunggal dalam sebuah kelompok.
     # Pattern: [Group Context] + [Superlative] + [Object, not count]
     # ---------------------------------------------------------------------------
-    has_group = re.search(r"\b(per|each|every|within|partition)\b", q)
+    has_group = re.search(rf"\b(?:{group_alt})\b", q) if group_alt else None
     has_superlative = any_phrase_in_text(
         q,
         rule_list(
@@ -597,7 +641,7 @@ def classify_query(question: str) -> str:
     # Mencari objek row/entity secara generic, atau entity mention yang
     # muncul dekat superlative, bukan noun bisnis yang di-hardcode.
     asks_for_object = _question_asks_for_winner_row_object(q)
-    is_math_agg = re.search(r"\b(count|sum|total|average|avg|number of)\b", q)
+    is_math_agg = re.search(rf"\b(?:{aggregate_alt})\b", q) if aggregate_alt else None
 
     if has_group and has_superlative and asks_for_object and not is_math_agg:
         return "rank"
@@ -605,7 +649,10 @@ def classify_query(question: str) -> str:
     # --- 2. DETEKSI AGGREGATE (The "Math/Summary" Pattern) ---
     # Ciri: Melakukan operasi matematika pada sekumpulan baris.
     # ---------------------------------------------------------------------------
-    if is_math_agg or re.search(r"\b(classify|bands?|grouping|distribution)\b", q):
+    if is_math_agg or any_phrase_in_text(
+        q,
+        query_classification_aggregate_shape_terms(),
+    ):
         return "aggregate"
     # ---------------------------------------------------------------------------
     # --- 3. DEFAULT (The "Data Retrieval" Pattern) ---
@@ -683,7 +730,7 @@ def _mentions_id_like_for_probe(text: str) -> bool:
     t = (text or "").lower()
     # buang pola 'number of', 'total number of', dll
     t = re.sub(r"\b(total\s+)?number\s+of\b", "", t)
-    return bool(re.search(r"\b(id|identifier|nomor|no|code|kode)\b", t))
+    return any_phrase_in_text(t, retrieval_probe_id_like_terms())
 
 def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: int = 16) -> str:
     """
@@ -766,12 +813,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         if _strict_table_mentioned(q, t)
     }
 
-    semantic_stopwords = {
-        "a", "an", "the", "of", "for", "to", "in", "on", "at", "by", "with",
-        "and", "or", "from", "per", "each", "every", "all", "any", "this",
-        "that", "these", "those", "show", "list", "return", "display", "give",
-        "find", "fetch", "get", "table", "column", "data", "value", "values",
-    }
+    semantic_stopwords = retrieval_probe_semantic_stopwords()
     metric_roles = {"metric", "measure", "amount", "quantity"}
 
     def _semantic_tokens(text: str) -> Set[str]:
@@ -1011,14 +1053,10 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
 
     # Base lexical signals.
     has_metric_word = bool(metric_terms_in_question)
-    has_count_word = any(k in q for k in [
-        "count", "berapa banyak", "how many"
-    ])
-    has_time_word = any(k in q for k in [
-        "today", "yesterday", "last", "this", "bulan", "minggu", "tahun",
-        "quarter", "month", "week", "year", "tanggal", "hari",
-        "mingguan", "bulanan", "202", "201"
-    ])
+    count_terms = retrieval_probe_count_terms()
+    temporal_terms = retrieval_probe_temporal_terms()
+    has_count_word = any(k in q for k in count_terms)
+    has_time_word = any(k in q for k in temporal_terms) or bool(re.search(r"\b(?:19|20)\d{2}\b", q))
 
     id_like = _mentions_id_like_for_probe(q)
 
@@ -1030,14 +1068,14 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         base = []
     elif qtype in {"aggregate_by", "aggregate_all"}:
         if has_metric_word:
-            base += metric_terms_in_question[:3] or schema_metric_terms[:3] or ["amount", "price"]
+            base += metric_terms_in_question[:3] or schema_metric_terms[:3] or retrieval_probe_metric_fallback_terms()
         if has_count_word:
             base += ["count"]
         if has_time_word:
-            base += ["date", "year", "month"]
+            base += retrieval_probe_aggregate_temporal_fallback_terms()
     else:
         if has_time_word:
-            base += ["date"]
+            base += retrieval_probe_generic_temporal_fallback_terms()
 
     # ---------------------------------------------------------------------------
     # 2) Schema-driven table and column hints
@@ -1048,15 +1086,15 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     # ---------------------------------------------------------------------------
     # 2b) Geography hints
     # ---------------------------------------------------------------------------
-    mentions_country_word = any(k in q for k in ["country", "negara"])
-    mentions_city_word = any(k in q for k in ["city", "kota"])
-    mentions_region_word = any(k in q for k in ["region", "wilayah", "territory", "territories"])
+    mentions_country_word = any_phrase_in_text(q, retrieval_probe_geo_country_terms())
+    mentions_city_word = any_phrase_in_text(q, retrieval_probe_geo_city_terms())
+    mentions_region_word = any_phrase_in_text(q, retrieval_probe_geo_region_terms())
     has_country_column = any(
-        _table_has_geo_variant(table, {"country", "nation"})
+        _table_has_geo_variant(table, retrieval_probe_geo_country_targets())
         for table in mentioned_tables_dynamic
     )
     has_city_column = any(
-        _table_has_geo_variant(table, {"city", "municipality", "town"})
+        _table_has_geo_variant(table, retrieval_probe_geo_city_targets())
         for table in mentioned_tables_dynamic
     )
     geo_tokens: List[str] = []
@@ -1080,12 +1118,12 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     base += geo_tokens
 
     # Generic name hint.
-    if any(k in q for k in ["name", "nama"]):
+    if any_phrase_in_text(q, name_request_terms()):
         base += ["name"]
 
     # Very short questions still need a tiny semantic tail.
     if len(toks_q) <= 2 and not base:
-        base += ["amount", "date"]
+        base += retrieval_probe_short_query_fallback_terms()
 
     # ---------------------------------------------------------------------------
     # 3) Deduplicate and truncate
@@ -3631,25 +3669,28 @@ def _question_has_aggregate_threshold_intent(question: str) -> bool:
     q = (question or "").strip().lower()
     if not q:
         return False
+    aggregate_alt = _phrase_alt_from_terms(aggregate_threshold_intent_aggregate_terms())
     has_agg_cue = bool(
         re.search(
-            r"\b(?:count|sum|total|avg|average|mean|number\s+of)\b",
+            rf"\b(?:{aggregate_alt})\b" if aggregate_alt else r"$^",
             q,
             flags=re.I,
         )
     )
     if not has_agg_cue:
         return False
+    comparison_alt = _phrase_alt_from_terms(aggregate_threshold_intent_comparison_terms())
     has_cmp_cue = bool(
         re.search(
-            r"\b(?:more\s+than|over|greater\s+than|at\s+least|less\s+than|under|below|exceeds?)\b",
+            rf"\b(?:{comparison_alt})\b" if comparison_alt else r"$^",
             q,
             flags=re.I,
         )
     )
     if not has_cmp_cue:
         return False
-    return bool(re.search(r"\b(?:where|whose|having|with)\b", q, flags=re.I))
+    clause_alt = _phrase_alt_from_terms(aggregate_threshold_intent_clause_terms())
+    return bool(re.search(rf"\b(?:{clause_alt})\b" if clause_alt else r"$^", q, flags=re.I))
 
 
 def _should_prefer_inner_for_metric_support_table(
@@ -8099,7 +8140,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _rewrite_average_ratio_to_sum_over_distinct_count(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after avg-ratio rollup fix:", s)
 
-        s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
+        s = _rewrite_include_zero_winner_row_identifier_source(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after include-zero winner-row id-source fix:", s)
 
         s = _drop_tuple_in_filter_from_include_zero_ranked_winner(s, question, ctx)
@@ -8308,7 +8349,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             s = _rewrite_average_ratio_to_sum_over_distinct_count(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after avg-ratio rollup fix: {s}")
 
-            s = _rewrite_employee_latest_payment_customer_identity(s, question, ctx)
+            s = _rewrite_include_zero_winner_row_identifier_source(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after include-zero winner-row id-source fix: {s}")
 
             s = _rewrite_existence_sum_to_distinct_entity_count(s, question, ctx)

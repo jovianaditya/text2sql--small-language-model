@@ -20,6 +20,7 @@ from pathlib import Path
 from .rulebook import (
     config_default_dict,
     config_default_list,
+    config_default_scalar,
     retrieval_extra_stopwords,
     retrieval_generic_mention_terms,
     retrieval_join_signals,
@@ -500,6 +501,13 @@ AGENT_AST_SEMANTIC_FIRST = bool(int(os.getenv("AGENT_AST_SEMANTIC_FIRST", "1")))
 AGENT_NORMALIZE_REWRITE_BUDGET = int(os.getenv("AGENT_NORMALIZE_REWRITE_BUDGET", "1"))
 AGENT_NORMALIZE_EARLY_STOP = bool(int(os.getenv("AGENT_NORMALIZE_EARLY_STOP", "1")))
 AGENT_REGEN_PRECHECK_ENABLED = bool(int(os.getenv("AGENT_REGEN_PRECHECK_ENABLED", "1")))
+AGENT_CONFIDENCE_THRESHOLD = float(
+    _env_get_with_alias(
+        "AGENT_CONFIDENCE_THRESHOLD",
+        str(config_default_scalar("agent_confidence_threshold", 0.70)),
+    ).strip()
+    or "0.70"
+)
 AGENT_CONFIDENCE_RETRY_MIN_IMPROVEMENT = float(
     os.getenv("AGENT_CONFIDENCE_RETRY_MIN_IMPROVEMENT", "0.03")
 )

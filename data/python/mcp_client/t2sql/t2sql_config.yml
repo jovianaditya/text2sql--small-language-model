@@ -1,6 +1,8 @@
 schema_version: 1
 description: Auto-generated config lexical defaults extracted from config.py
 config:
+  scalars:
+    agent_confidence_threshold: 0.7
   lists:
     agent_column_stop_tokens:
     - id

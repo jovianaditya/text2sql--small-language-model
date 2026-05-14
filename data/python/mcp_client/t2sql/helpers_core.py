@@ -74,8 +74,12 @@ from .config import (
     AGENT_SQL_NUMERIC_BETWEEN_PATTERN,
 )
 from .rulebook import (
+    existence_anti_phrases,
+    existence_positive_phrases,
     aggregation_count_distinct_keywords,
     aggregation_count_distinct_phrases,
+    missing_value_phrases,
+    present_value_phrases,
     any_phrase_in_text,
     existence_count_metric_phrases,
     final_order_first_position_terms,
@@ -96,6 +100,20 @@ from .rulebook import (
     rule_list,
     rule_value,
     semantic_question_token_stopwords,
+    set_operation_action_terms,
+    set_operation_branch_label_hints,
+    set_operation_branch_label_connector_terms,
+    set_operation_combined_result_phrases,
+    set_operation_distinct_union_cues,
+    set_operation_duplicate_no_remove_phrases,
+    set_operation_duplicate_object_terms,
+    set_operation_duplicate_passive_verbs,
+    set_operation_duplicate_preserve_verbs,
+    set_operation_explicit_union_terms,
+    set_operation_forbid_union_phrases,
+    set_operation_keywords,
+    set_operation_result_noun_terms,
+    set_operation_union_all_terms,
     temporal_year_column_terms,
     threshold_count_object_stop_terms,
 )
@@ -3167,14 +3185,7 @@ def _question_wants_anti_existence(question: str, ctx: str = "") -> bool:
     q = (question or "").lower()
     entity_kw = _build_entity_kw(ctx)
 
-    eng = [
-        "with no", "without any", "who have no", "who has no",
-        "that have no", "that has no",
-        "never", "have never", "has never",
-        "without", "tanpa",
-    ]
-
-    if any(p in q for p in eng):
+    if any_phrase_in_text(q, existence_anti_phrases()):
         return True
 
     if re.search(rf"\bno\s+{entity_kw}\b", q, flags=re.I):
@@ -3188,15 +3199,7 @@ def _question_wants_anti_existence(question: str, ctx: str = "") -> bool:
 
 def _question_wants_existence(question: str) -> bool:
     q = (question or "").lower()
-
-    eng = [
-        "who have", "who has", "that have", "that has",
-        "with at least one", "having at least one",
-        "have at least one", "has at least one",
-        "with any", "have any", "has any",
-    ]
-
-    return any(p in q for p in eng)
+    return any_phrase_in_text(q, existence_positive_phrases())
 
 def _rewrite_inner_join_existence_to_exists(sql: str, question: str, ctx: str = "") -> str:
     if not sql:
@@ -12543,7 +12546,7 @@ def _preexecute_sql_safety_pass(sql: str, question: str = "") -> str:
         s = _fix_outer_order_by_for_derived_alias(s)
         s = _rewrite_missing_overall_avg_having(s, question)
         s = _enforce_all_other_group_avg_self_exclusion(s, question)
-        s = _rewrite_employee_latest_payment_customer_identity(s, question)
+        s = _rewrite_include_zero_winner_row_identifier_source(s, question)
 
         # Winner-row fallback: force rewrite if query still looks like MAX-date misuse.
         # IMPORTANT: skip for "latest year + aggregate amount" intent, where MAX(date)
@@ -12561,7 +12564,7 @@ def _preexecute_sql_safety_pass(sql: str, question: str = "") -> str:
                     "GROUP BY" in forced.upper() and "ROW_NUMBER" in forced.upper()
                 ):
                     s = forced
-                    s = _rewrite_employee_latest_payment_customer_identity(s, question)
+                    s = _rewrite_include_zero_winner_row_identifier_source(s, question)
 
         s = _drop_aggregate_or_window_items_from_group_by(s)
 
@@ -19813,7 +19816,7 @@ def _rewrite_missing_overall_avg_having(sql: str, question: str, ctx: str = "") 
     return out or sql
 
 
-def _rewrite_employee_latest_payment_customer_identity(sql: str, question: str, ctx: str = "") -> str:
+def _rewrite_include_zero_winner_row_identifier_source(sql: str, question: str, ctx: str = "") -> str:
     """
     Dynamic include-zero winner-row repair.
 
@@ -33572,10 +33575,20 @@ def _repair_temporal_not_exists_scope(sql: str, ctx: str = "") -> str:
         if not isinstance(where_expr, exp.Where) or where_expr.this is None:
             continue
 
+        def _is_current_select_column(col_expr) -> bool:
+            anc = getattr(col_expr, "parent", None)
+            while anc is not None:
+                if isinstance(anc, exp.Select):
+                    return anc is inner
+                anc = getattr(anc, "parent", None)
+            return False
+
         replacement_alias_by_col: Dict[str, str] = {}
         joins_to_add = []
 
         for col_expr in list(where_expr.find_all(exp.Column)):
+            if not _is_current_select_column(col_expr):
+                continue
             col_name = str(col_expr.name or "").strip("`").lower()
             if not _is_temporal_col(col_name):
                 continue
@@ -33637,6 +33650,8 @@ def _repair_temporal_not_exists_scope(sql: str, ctx: str = "") -> str:
 
             def _rewrite_col(node):
                 if not isinstance(node, exp.Column):
+                    return node
+                if not _is_current_select_column(node):
                     return node
                 col_name = str(node.name or "").strip("`").lower()
                 target_alias = replacement_alias_by_col.get(col_name, "")
@@ -34633,22 +34648,33 @@ def _question_wants_union_distinct_set_operation(question: str) -> bool:
     q = (question or "").lower()
     if not q:
         return False
-    if re.search(
-        r"\b(?:keep|preserve|allow|include|including)\s+(?:the\s+)?(?:duplicate|duplicates|duplicate\s+rows|duplicated\s+rows)\b"
-        r"|\b(?:do\s+not|don't|dont)\s+remove\s+(?:the\s+)?(?:duplicate|duplicates|duplicate\s+rows|duplicated\s+rows)\b"
-        r"|\bwithout\s+removing\s+(?:the\s+)?(?:duplicate|duplicates|duplicate\s+rows|duplicated\s+rows)\b",
-        q,
-        flags=re.I,
-    ):
-        return False
-    return bool(
-        re.search(
-            r"\b(?:remove\s+duplicate\s+rows|without\s+duplicates|no\s+duplicate|distinct)\b"
-            r"|\b(?:deduplicate|deduplicated|deduped|dedup|de[-\s]?duplicate|de[-\s]?duplicated|de[-\s]?duped|de[-\s]?dup)\b",
+    duplicate_obj_alt = _regex_alt_from_terms(set_operation_duplicate_object_terms(), r"$^")
+    preserve_verb_alt = _regex_alt_from_terms(set_operation_duplicate_preserve_verbs(), r"$^")
+    no_remove_alt = _regex_alt_from_terms(set_operation_duplicate_no_remove_phrases(), r"$^")
+
+    if (
+        duplicate_obj_alt != r"$^"
+        and preserve_verb_alt != r"$^"
+        and re.search(
+            rf"\b(?:{preserve_verb_alt})\b\s+(?:the\s+)?(?:{duplicate_obj_alt})\b",
             q,
             flags=re.I,
         )
-    )
+    ):
+        return False
+
+    if (
+        duplicate_obj_alt != r"$^"
+        and no_remove_alt != r"$^"
+        and re.search(
+            rf"\b(?:{no_remove_alt})\b\s+(?:the\s+)?(?:{duplicate_obj_alt})\b",
+            q,
+            flags=re.I,
+        )
+    ):
+        return False
+
+    return any_phrase_in_text(q, set_operation_distinct_union_cues())
 
 
 def _question_wants_union_all_set_operation(question: str) -> bool:
@@ -34661,15 +34687,45 @@ def _question_wants_union_all_set_operation(question: str) -> bool:
     if not q:
         return False
 
-    duplicate_obj = r"(?:duplicate|duplicates|duplicate\s+rows|duplicated\s+rows)"
-    patterns = [
-        r"\bunion\s+all\b",
-        rf"\b(?:keep|preserve|allow|include|including)\s+(?:the\s+)?{duplicate_obj}\b",
-        rf"\b{duplicate_obj}\s+(?:are\s+)?(?:allowed|kept|preserved|included)\b",
-        rf"\b(?:do\s+not|don't|dont)\s+remove\s+(?:the\s+)?{duplicate_obj}\b",
-        rf"\bwithout\s+removing\s+(?:the\s+)?{duplicate_obj}\b",
-    ]
-    return any(re.search(pat, q, flags=re.I) for pat in patterns)
+    duplicate_obj_alt = _regex_alt_from_terms(set_operation_duplicate_object_terms(), r"$^")
+    preserve_verb_alt = _regex_alt_from_terms(set_operation_duplicate_preserve_verbs(), r"$^")
+    passive_verb_alt = _regex_alt_from_terms(set_operation_duplicate_passive_verbs(), r"$^")
+    no_remove_alt = _regex_alt_from_terms(set_operation_duplicate_no_remove_phrases(), r"$^")
+
+    if any_phrase_in_text(q, set_operation_union_all_terms()):
+        return True
+
+    if (
+        duplicate_obj_alt != r"$^"
+        and preserve_verb_alt != r"$^"
+        and re.search(
+            rf"\b(?:{preserve_verb_alt})\b\s+(?:the\s+)?(?:{duplicate_obj_alt})\b",
+            q,
+            flags=re.I,
+        )
+    ):
+        return True
+
+    if (
+        duplicate_obj_alt != r"$^"
+        and passive_verb_alt != r"$^"
+        and re.search(
+            rf"\b(?:{duplicate_obj_alt})\b\s+(?:are\s+)?(?:{passive_verb_alt})\b",
+            q,
+            flags=re.I,
+        )
+    ):
+        return True
+
+    return bool(
+        duplicate_obj_alt != r"$^"
+        and no_remove_alt != r"$^"
+        and re.search(
+            rf"\b(?:{no_remove_alt})\b\s+(?:the\s+)?(?:{duplicate_obj_alt})\b",
+            q,
+            flags=re.I,
+        )
+    )
 
 
 def _enforce_set_operation_operator_from_question(sql: str, question: str) -> str:
@@ -34758,29 +34814,48 @@ def _question_has_set_operation_intent(question: str) -> bool:
     if not q:
         return False
 
-    if re.search(r"\b(?:do\s+not|don't|dont)\s+use\s+union\b", q, flags=re.I):
+    if any_phrase_in_text(q, set_operation_forbid_union_phrases()):
         return False
 
-    set_action = r"(?:combin(?:e|ed|ing)|merg(?:e|ed|ing)|append(?:ed|ing)?|stack(?:ed|ing)?|concatenat(?:e|ed|ing))"
-    explicit_union = bool(re.search(r"\bunion(?:\s+all)?\b", q, flags=re.I))
+    action_terms = {
+        str(term).strip().lower()
+        for term in set_operation_action_terms()
+        if str(term).strip()
+    }
+    set_action = _regex_alt_from_terms(action_terms, r"$^")
+    set_keywords = set_operation_keywords()
+    explicit_union = any_phrase_in_text(q, set_operation_explicit_union_terms())
+    combined_result_phrases = set_operation_combined_result_phrases()
+    result_noun_terms = {
+        str(term).strip().lower()
+        for term in set_operation_result_noun_terms()
+        if str(term).strip()
+    }
+    result_noun_alt = _regex_alt_from_terms(result_noun_terms, r"$^")
     quoted_literals = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", question or "")
+    branch_label_hints = set_operation_branch_label_hints()
     has_set_operation_cue = bool(
         explicit_union
-        or re.search(rf"\b{set_action}\b", q, flags=re.I)
-        or re.search(r"\b(?:in|into)\s+one\s+result(?:\s+set)?\b", q, flags=re.I)
-        or re.search(r"\b(?:one|single)\s+combined\s+(?:result|list)\b", q, flags=re.I)
+        or any_phrase_in_text(q, set_keywords)
+        or (set_action != r"$^" and re.search(rf"\b{set_action}\b", q, flags=re.I))
+        or any_phrase_in_text(q, combined_result_phrases)
     )
     has_result_set_append_shape = bool(
-        re.search(
+        set_action != r"$^"
+        and result_noun_alt != r"$^"
+        and re.search(
             rf"\b{set_action}\b"
-            r"[^.]{0,80}\b(?:result\s+sets?|queries|lists?)\b",
+            rf"[^.]{{0,80}}\b{result_noun_alt}\b",
             q,
             flags=re.I | re.S,
         )
     )
     has_set_labeling_shape = bool(
         len(quoted_literals) >= 2
-        and re.search(r"\bor\b", q, flags=re.I)
+        and (
+            any_phrase_in_text(q, branch_label_hints)
+            or any_phrase_in_text(q, set_operation_branch_label_connector_terms())
+        )
     )
     has_dedupe_request = _question_wants_union_distinct_set_operation(question)
     has_duplicate_preserve_request = _question_wants_union_all_set_operation(question)
@@ -34797,27 +34872,13 @@ def _question_has_set_operation_intent(question: str) -> bool:
 
 def _question_wants_missing_value(question: str) -> bool:
     q = (question or "").lower()
-    return any(s in q for s in [
-        "missing", "is missing", "missing information",
-        "empty", "blank", "not provided", "unknown",
-        "null or empty", "null/empty",
-        "kosong", "tidak ada", "belum diisi"
-    ])
+    return any_phrase_in_text(q, missing_value_phrases())
 
 def _question_wants_present_value(question: str) -> bool:
     q = (question or "").lower()
     if not q or _question_wants_missing_value(q):
         return False
-    return any(s in q for s in [
-        "not empty", "non-empty", "filled", "provided",
-        "has value", "have value", "with value",
-        "has text", "have text", "with text",
-        "has comments", "have comments", "with comments",
-        "has comment", "have comment", "with comment",
-        "has description", "have description", "with description",
-        "has note", "have note", "with note",
-        "has notes", "have notes", "with notes",
-    ])
+    return any_phrase_in_text(q, present_value_phrases())
 
 def _expand_missing_null_to_null_or_empty(sql: str, question: str) -> str:
     """

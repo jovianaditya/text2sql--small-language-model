@@ -231,6 +231,163 @@ retrieval_intent:
     - for each
     - "per "
     - setiap
+  probe:
+    id_like_terms:
+      - id
+      - identifier
+      - nomor
+      - no
+      - code
+      - kode
+    semantic_stopwords:
+      - a
+      - an
+      - the
+      - of
+      - for
+      - to
+      - in
+      - on
+      - at
+      - by
+      - with
+      - and
+      - or
+      - from
+      - per
+      - each
+      - every
+      - all
+      - any
+      - this
+      - that
+      - these
+      - those
+      - show
+      - list
+      - return
+      - display
+      - give
+      - find
+      - fetch
+      - get
+      - table
+      - column
+      - data
+      - value
+      - values
+    count_terms:
+      - count
+      - berapa banyak
+      - how many
+    temporal_terms:
+      - today
+      - yesterday
+      - last
+      - this
+      - bulan
+      - minggu
+      - tahun
+      - quarter
+      - month
+      - week
+      - year
+      - tanggal
+      - hari
+      - mingguan
+      - bulanan
+    metric_fallback_terms:
+      - amount
+      - price
+    aggregate_temporal_fallback_terms:
+      - date
+      - year
+      - month
+    generic_temporal_fallback_terms:
+      - date
+    short_query_fallback_terms:
+      - amount
+      - date
+    geo_keywords:
+      country:
+        - country
+        - negara
+      city:
+        - city
+        - kota
+      region:
+        - region
+        - wilayah
+        - territory
+        - territories
+    geo_variant_targets:
+      country:
+        - country
+        - nation
+      city:
+        - city
+        - municipality
+        - town
+    name_request_terms:
+      - name
+      - nama
+
+query_classification:
+  ordinal_terms:
+    - second
+    - third
+    - fourth
+    - fifth
+    - 2nd
+    - 3rd
+    - 4th
+    - 5th
+    - kedua
+    - ketiga
+    - keempat
+    - kelima
+  ordinal_superlative_terms:
+    - highest
+    - lowest
+    - largest
+    - smallest
+    - biggest
+    - top
+    - bottom
+    - best
+    - worst
+    - most
+    - least
+    - terbesar
+    - terkecil
+    - tertinggi
+    - terendah
+  row_container_terms:
+    - row
+    - record
+    - entry
+  sort_terms:
+    - sorted
+    - ordered
+  group_terms:
+    - per
+    - each
+    - every
+    - within
+    - partition
+  aggregate_terms:
+    - count
+    - sum
+    - total
+    - average
+    - avg
+    - number of
+  aggregate_shape_terms:
+    - classify
+    - band
+    - bands
+    - grouping
+    - distribution
 
 heuristic_repairs:
   count_metric_alias:
@@ -372,7 +529,6 @@ heuristic_repairs:
       - filter
       - sort
       - order
-
 ordering_intent:
   explicit_sort_keywords:
     - order by
@@ -518,6 +674,29 @@ heuristic_repairs:
       - difference between
       - gap from average
       - difference from average
+  aggregate_threshold_intent:
+    aggregate_terms:
+      - count
+      - sum
+      - total
+      - avg
+      - average
+      - mean
+      - number of
+    comparison_terms:
+      - more than
+      - over
+      - greater than
+      - at least
+      - less than
+      - under
+      - below
+      - exceeds
+    clause_terms:
+      - where
+      - whose
+      - having
+      - with
 
 grouping_intent:
   for_each_keywords:
@@ -654,6 +833,50 @@ prompt_intent:
       - order by
 
 set_operation_intent:
+  explicit_union_terms:
+    - union
+    - union all
+  union_all_terms:
+    - union all
+  forbid_union_phrases:
+    - do not use union
+    - don't use union
+    - dont use union
+  action_terms:
+    - combine
+    - combined
+    - combining
+    - merge
+    - merged
+    - merging
+    - append
+    - appended
+    - appending
+    - stack
+    - stacked
+    - stacking
+    - concatenate
+    - concatenated
+    - concatenating
+    - put
+    - putting
+  combined_result_phrases:
+    - in one result
+    - into one result
+    - in one result set
+    - into one result set
+    - as a single result set
+    - in a single result set
+    - into a single result set
+    - one combined result
+    - one combined list
+  result_noun_terms:
+    - result set
+    - result sets
+    - query
+    - queries
+    - list
+    - lists
   set_op_keywords:
     - union
     - union all
@@ -661,13 +884,50 @@ set_operation_intent:
     - gabungkan hasil
   distinct_union_cues:
     - remove duplicate rows
+    - remove duplicates
+    - remove duplicate
     - without duplicates
     - no duplicate
     - distinct
+    - deduplicate
+    - deduplicated
+    - deduped
+    - dedup
+    - de-duplicate
+    - de-duplicated
+    - de-duped
+    - de-dup
+    - de duplicate
+    - de duplicated
+    - de duped
+    - de dup
+  duplicate_object_terms:
+    - duplicate
+    - duplicates
+    - duplicate rows
+    - duplicated rows
+  duplicate_preserve_verbs:
+    - keep
+    - preserve
+    - allow
+    - include
+    - including
+  duplicate_passive_verbs:
+    - allowed
+    - kept
+    - preserved
+    - included
+  duplicate_no_remove_phrases:
+    - do not remove
+    - don't remove
+    - dont remove
+    - without removing
   branch_label_hints:
     - label
     - year label
     - category label
+  branch_label_connector_terms:
+    - or
 
 regex_intent:
   boundary_cues:
@@ -728,6 +988,73 @@ exclusion_intent:
     - except
     - selain
     - tanpa
+
+existence_intent:
+  anti_phrases:
+    - with no
+    - without any
+    - who have no
+    - who has no
+    - that have no
+    - that has no
+    - never
+    - have never
+    - has never
+    - without
+    - tanpa
+  positive_phrases:
+    - who have
+    - who has
+    - that have
+    - that has
+    - with at least one
+    - having at least one
+    - have at least one
+    - has at least one
+    - with any
+    - have any
+    - has any
+
+missing_value_intent:
+  missing_phrases:
+    - missing
+    - is missing
+    - missing information
+    - empty
+    - blank
+    - not provided
+    - unknown
+    - null or empty
+    - null/empty
+    - kosong
+    - tidak ada
+    - belum diisi
+  present_phrases:
+    - not empty
+    - non-empty
+    - filled
+    - provided
+    - has value
+    - have value
+    - with value
+    - has text
+    - have text
+    - with text
+    - has comments
+    - have comments
+    - with comments
+    - has comment
+    - have comment
+    - with comment
+    - has description
+    - have description
+    - with description
+    - has note
+    - have note
+    - with note
+    - has notes
+    - have notes
+    - with notes
 
 include_zero_intent:
   include_zero_keywords:

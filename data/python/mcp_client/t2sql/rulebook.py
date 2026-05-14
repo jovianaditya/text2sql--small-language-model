@@ -167,6 +167,34 @@ def config_default_dict(key: str, default: Optional[Dict[str, Any]] = None) -> D
     return rule_dict(("config", "dicts", k), rule_dict(("config_defaults", "dicts", k), default))
 
 
+def config_default_scalar(key: str, default: Any = None) -> Any:
+    """
+    Read config scalar defaults from rulebook path:
+      config.scalars.<key>
+    """
+    k = str(key or "").strip()
+    if not k:
+        return default
+    from_overlay = rule_value(("config", "scalars", k), None)
+    if from_overlay is None:
+        # Backward compatibility for older rulebook structure
+        from_overlay = rule_value(("config_defaults", "scalars", k), None)
+    if from_overlay is not None and not isinstance(from_overlay, (list, dict)):
+        return from_overlay
+    if from_overlay is None:
+        overlay_root = _load_config()
+        for root_key in ("config", "config_defaults"):
+            cur: Any = overlay_root
+            for part in (root_key, "scalars", k):
+                if not isinstance(cur, dict) or part not in cur:
+                    cur = None
+                    break
+                cur = cur.get(part)
+            if cur is not None and not isinstance(cur, (list, dict)):
+                return cur
+    return default
+
+
 def normalized_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
@@ -355,6 +383,141 @@ def retrieval_join_signals() -> list[str]:
 
 
 @lru_cache(maxsize=1)
+def retrieval_probe_id_like_terms() -> list[str]:
+    defaults = ["id", "identifier", "nomor", "no", "code", "kode"]
+    return rule_list(("retrieval_intent", "probe", "id_like_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_semantic_stopwords() -> Set[str]:
+    defaults = [
+        "a", "an", "the", "of", "for", "to", "in", "on", "at", "by", "with",
+        "and", "or", "from", "per", "each", "every", "all", "any", "this",
+        "that", "these", "those", "show", "list", "return", "display", "give",
+        "find", "fetch", "get", "table", "column", "data", "value", "values",
+    ]
+    vals = rule_list(("retrieval_intent", "probe", "semantic_stopwords"), defaults)
+    return {normalized_text(v) for v in vals if normalized_text(v)}
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_count_terms() -> list[str]:
+    defaults = ["count", "berapa banyak", "how many"]
+    return rule_list(("retrieval_intent", "probe", "count_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_temporal_terms() -> list[str]:
+    defaults = [
+        "today", "yesterday", "last", "this", "bulan", "minggu", "tahun",
+        "quarter", "month", "week", "year", "tanggal", "hari",
+        "mingguan", "bulanan",
+    ]
+    return rule_list(("retrieval_intent", "probe", "temporal_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_metric_fallback_terms() -> list[str]:
+    defaults = ["amount", "price"]
+    return rule_list(("retrieval_intent", "probe", "metric_fallback_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_aggregate_temporal_fallback_terms() -> list[str]:
+    defaults = ["date", "year", "month"]
+    return rule_list(("retrieval_intent", "probe", "aggregate_temporal_fallback_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_generic_temporal_fallback_terms() -> list[str]:
+    defaults = ["date"]
+    return rule_list(("retrieval_intent", "probe", "generic_temporal_fallback_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_short_query_fallback_terms() -> list[str]:
+    defaults = ["amount", "date"]
+    return rule_list(("retrieval_intent", "probe", "short_query_fallback_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_geo_country_terms() -> list[str]:
+    defaults = ["country", "negara"]
+    return rule_list(("retrieval_intent", "probe", "geo_keywords", "country"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_geo_city_terms() -> list[str]:
+    defaults = ["city", "kota"]
+    return rule_list(("retrieval_intent", "probe", "geo_keywords", "city"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_geo_region_terms() -> list[str]:
+    defaults = ["region", "wilayah", "territory", "territories"]
+    return rule_list(("retrieval_intent", "probe", "geo_keywords", "region"), defaults)
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_geo_country_targets() -> Set[str]:
+    defaults = ["country", "nation"]
+    vals = rule_list(("retrieval_intent", "probe", "geo_variant_targets", "country"), defaults)
+    return {normalized_text(v) for v in vals if normalized_text(v)}
+
+
+@lru_cache(maxsize=1)
+def retrieval_probe_geo_city_targets() -> Set[str]:
+    defaults = ["city", "municipality", "town"]
+    vals = rule_list(("retrieval_intent", "probe", "geo_variant_targets", "city"), defaults)
+    return {normalized_text(v) for v in vals if normalized_text(v)}
+
+
+@lru_cache(maxsize=1)
+def query_classification_ordinal_terms() -> list[str]:
+    defaults = ["second", "third", "fourth", "fifth", "2nd", "3rd", "4th", "5th", "kedua", "ketiga", "keempat", "kelima"]
+    return rule_list(("query_classification", "ordinal_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def query_classification_ordinal_superlative_terms() -> list[str]:
+    defaults = [
+        "highest", "lowest", "largest", "smallest", "biggest", "top", "bottom",
+        "best", "worst", "most", "least", "terbesar", "terkecil", "tertinggi", "terendah",
+    ]
+    return rule_list(("query_classification", "ordinal_superlative_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def query_classification_row_container_terms() -> list[str]:
+    defaults = ["row", "record", "entry"]
+    return rule_list(("query_classification", "row_container_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def query_classification_sort_terms() -> list[str]:
+    defaults = ["sorted", "ordered"]
+    return rule_list(("query_classification", "sort_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def query_classification_group_terms() -> list[str]:
+    defaults = ["per", "each", "every", "within", "partition"]
+    return rule_list(("query_classification", "group_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def query_classification_aggregate_terms() -> list[str]:
+    defaults = ["count", "sum", "total", "average", "avg", "number of"]
+    return rule_list(("query_classification", "aggregate_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def query_classification_aggregate_shape_terms() -> list[str]:
+    defaults = ["classify", "band", "bands", "grouping", "distribution"]
+    return rule_list(("query_classification", "aggregate_shape_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
 def aggregation_count_distinct_keywords() -> list[str]:
     defaults = ["distinct", "unique", "different", "unik", "berbeda"]
     return rule_list(("aggregation_intent", "count_distinct_keywords"), defaults)
@@ -489,6 +652,24 @@ def threshold_count_object_stop_terms() -> list[str]:
 
 
 @lru_cache(maxsize=1)
+def aggregate_threshold_intent_aggregate_terms() -> list[str]:
+    defaults = ["count", "sum", "total", "avg", "average", "mean", "number of"]
+    return rule_list(("heuristic_repairs", "aggregate_threshold_intent", "aggregate_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def aggregate_threshold_intent_comparison_terms() -> list[str]:
+    defaults = ["more than", "over", "greater than", "at least", "less than", "under", "below", "exceeds"]
+    return rule_list(("heuristic_repairs", "aggregate_threshold_intent", "comparison_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def aggregate_threshold_intent_clause_terms() -> list[str]:
+    defaults = ["where", "whose", "having", "with"]
+    return rule_list(("heuristic_repairs", "aggregate_threshold_intent", "clause_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
 def ordered_quantity_repair_order_terms() -> list[str]:
     defaults = ["order", "ordered"]
     return rule_list(("heuristic_repairs", "ordered_quantity_stock_aggregate", "order_terms"), defaults)
@@ -558,6 +739,170 @@ def order_term_token_stopwords() -> Set[str]:
     ]
     vals = rule_list(("agent_semantics", "order_term_stopwords"), defaults)
     return {normalized_text(v) for v in vals if normalized_text(v)}
+
+
+@lru_cache(maxsize=1)
+def existence_anti_phrases() -> list[str]:
+    defaults = [
+        "with no", "without any", "who have no", "who has no",
+        "that have no", "that has no", "never", "have never",
+        "has never", "without", "tanpa",
+    ]
+    return rule_list(("existence_intent", "anti_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def existence_positive_phrases() -> list[str]:
+    defaults = [
+        "who have", "who has", "that have", "that has",
+        "with at least one", "having at least one",
+        "have at least one", "has at least one",
+        "with any", "have any", "has any",
+    ]
+    return rule_list(("existence_intent", "positive_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_explicit_union_terms() -> list[str]:
+    defaults = ["union", "union all"]
+    return rule_list(("set_operation_intent", "explicit_union_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_union_all_terms() -> list[str]:
+    defaults = ["union all"]
+    return rule_list(("set_operation_intent", "union_all_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_forbid_union_phrases() -> list[str]:
+    defaults = ["do not use union", "don't use union", "dont use union"]
+    return rule_list(("set_operation_intent", "forbid_union_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_action_terms() -> list[str]:
+    defaults = [
+        "combine", "combined", "combining", "merge", "merged", "merging",
+        "append", "appended", "appending", "stack", "stacked", "stacking",
+        "concatenate", "concatenated", "concatenating",
+        "put", "putting",
+    ]
+    return rule_list(("set_operation_intent", "action_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_combined_result_phrases() -> list[str]:
+    defaults = [
+        "in one result",
+        "into one result",
+        "in one result set",
+        "into one result set",
+        "as a single result set",
+        "in a single result set",
+        "into a single result set",
+        "one combined result",
+        "one combined list",
+    ]
+    return rule_list(("set_operation_intent", "combined_result_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_result_noun_terms() -> list[str]:
+    defaults = ["result set", "result sets", "query", "queries", "list", "lists"]
+    return rule_list(("set_operation_intent", "result_noun_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_keywords() -> list[str]:
+    defaults = ["union", "union all", "combine results", "gabungkan hasil"]
+    return rule_list(("set_operation_intent", "set_op_keywords"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_distinct_union_cues() -> list[str]:
+    defaults = [
+        "remove duplicate rows",
+        "remove duplicates",
+        "remove duplicate",
+        "without duplicates",
+        "no duplicate",
+        "distinct",
+        "deduplicate",
+        "deduplicated",
+        "deduped",
+        "dedup",
+        "de-duplicate",
+        "de-duplicated",
+        "de-duped",
+        "de-dup",
+        "de duplicate",
+        "de duplicated",
+        "de duped",
+        "de dup",
+    ]
+    return rule_list(("set_operation_intent", "distinct_union_cues"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_duplicate_object_terms() -> list[str]:
+    defaults = ["duplicate", "duplicates", "duplicate rows", "duplicated rows"]
+    return rule_list(("set_operation_intent", "duplicate_object_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_duplicate_preserve_verbs() -> list[str]:
+    defaults = ["keep", "preserve", "allow", "include", "including"]
+    return rule_list(("set_operation_intent", "duplicate_preserve_verbs"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_duplicate_passive_verbs() -> list[str]:
+    defaults = ["allowed", "kept", "preserved", "included"]
+    return rule_list(("set_operation_intent", "duplicate_passive_verbs"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_duplicate_no_remove_phrases() -> list[str]:
+    defaults = ["do not remove", "don't remove", "dont remove", "without removing"]
+    return rule_list(("set_operation_intent", "duplicate_no_remove_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_branch_label_hints() -> list[str]:
+    defaults = ["label", "year label", "category label"]
+    return rule_list(("set_operation_intent", "branch_label_hints"), defaults)
+
+
+@lru_cache(maxsize=1)
+def set_operation_branch_label_connector_terms() -> list[str]:
+    defaults = ["or"]
+    return rule_list(("set_operation_intent", "branch_label_connector_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def missing_value_phrases() -> list[str]:
+    defaults = [
+        "missing", "is missing", "missing information", "empty", "blank",
+        "not provided", "unknown", "null or empty", "null/empty",
+        "kosong", "tidak ada", "belum diisi",
+    ]
+    return rule_list(("missing_value_intent", "missing_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def present_value_phrases() -> list[str]:
+    defaults = [
+        "not empty", "non-empty", "filled", "provided",
+        "has value", "have value", "with value",
+        "has text", "have text", "with text",
+        "has comments", "have comments", "with comments",
+        "has comment", "have comment", "with comment",
+        "has description", "have description", "with description",
+        "has note", "have note", "with note",
+        "has notes", "have notes", "with notes",
+    ]
+    return rule_list(("missing_value_intent", "present_phrases"), defaults)
 
 
 def question_wants_split_name_components(question: str) -> bool:
