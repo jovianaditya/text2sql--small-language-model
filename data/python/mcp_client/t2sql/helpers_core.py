@@ -985,6 +985,101 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
                     parent_terms.update(_self_fk_role_terms(right_t, right_c))
         return roles, parent_terms
 
+    def _role_terms_alt(role_terms: Set[str]) -> str:
+        return "|".join(
+            re.escape(term).replace(r"\ ", r"\s+")
+            for term in sorted((t for t in role_terms if t), key=len, reverse=True)
+        )
+
+    def _title_like_cols_for_table(table_name: str) -> List[str]:
+        t_l = str(table_name or "").strip("`").lower()
+        cols = _table_cols_lower(t_l)
+        if not t_l or not cols:
+            return []
+        ordered_cols: List[str] = []
+        if analyzer is not None:
+            try:
+                ordered_cols = [
+                    str(c).strip("`").lower()
+                    for c in analyzer.get_table_columns(t_l)
+                    if str(c).strip()
+                ]
+            except Exception:
+                ordered_cols = []
+        if not ordered_cols:
+            ordered_cols = sorted(cols)
+
+        candidates: List[str] = []
+        seen: Set[str] = set()
+        for col_l in ordered_cols:
+            if col_l not in cols or col_l in seen:
+                continue
+            seen.add(col_l)
+            col_case = _original_case_col(t_l, col_l)
+            terms = _identifier_terms(col_case or col_l)
+            norm = re.sub(r"[^a-z0-9]+", "", str(col_case or col_l).lower())
+            try:
+                role_l = str(get_column_role(t_l, col_l) or "").strip().lower()
+            except Exception:
+                role_l = ""
+            if role_l in {"title", "position", "role"}:
+                candidates.append(col_l)
+                continue
+            if (
+                "title" in terms
+                or "position" in terms
+                or "designation" in terms
+                or ("role" in terms and role_l not in {"fk", "pk", "id", "identifier"})
+                or "jobtitle" in norm
+            ):
+                candidates.append(col_l)
+        return candidates
+
+    def _requested_role_attribute(role_terms: Set[str], attr_terms: Set[str], *, window: int = 64) -> bool:
+        scope = requested_output_segment or q
+        role_alt = _role_terms_alt(role_terms)
+        attr_alt = "|".join(
+            re.escape(term).replace(r"\ ", r"\s+")
+            for term in sorted((t for t in attr_terms if t), key=len, reverse=True)
+        )
+        if not scope or not role_alt or not attr_alt:
+            return False
+        return bool(
+            re.search(
+                rf"\b(?:{role_alt})\b.{{0,{window}}}\b(?:{attr_alt})\b|\b(?:{attr_alt})\b.{{0,{window}}}\b(?:{role_alt})\b",
+                scope,
+                flags=re.I | re.S,
+            )
+        )
+
+    def _role_label_terms_from_projection(role_alias: str, table_name: str) -> Set[str]:
+        role_alias_l = str(role_alias or "").strip().lower()
+        table_l = str(table_name or "").strip("`").lower()
+        if not role_alias_l or not table_l:
+            return set()
+
+        table_terms = _identifier_terms(table_l)
+        stop_terms = table_terms | {
+            "id", "code", "number", "name", "full", "job", "title",
+            "role", "position", "city", "office", "employee", "employees",
+            "firstname", "lastname", "first", "last",
+        }
+        out: Set[str] = set()
+        for item in rebuilt_select_items:
+            if not re.search(rf"(?is)\b{re.escape(role_alias_l)}\s*\.", item):
+                continue
+            m_alias = re.search(r"(?is)\bAS\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$", item)
+            if not m_alias:
+                continue
+            alias_txt = str(m_alias.group(1) or "").strip().lower()
+            parts = [p for p in re.split(r"[_\s]+", alias_txt) if p]
+            if not parts:
+                continue
+            lead = parts[0]
+            if len(lead) >= 4 and lead not in stop_terms:
+                out.add(lead)
+        return out
+
     select_items = _split_top_level_csv(select_part)
     select_low = select_part.lower()
     rebuilt_select_items = list(select_items)
@@ -993,6 +1088,8 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
     changed = False
 
     role_aliases, parent_role_terms = _self_join_role_aliases()
+    child_alias = role_aliases.get("child", "")
+    child_role_terms = _role_label_terms_from_projection(child_alias, alias_to_table.get(str(child_alias or "").strip().lower(), ""))
 
     def _needs_role_full_name(role_alias: str, role_terms: Set[str]) -> bool:
         role_alias_l = str(role_alias or "").strip().lower()
@@ -1038,6 +1135,136 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
             rebuilt_select_items.insert(insert_idx, f"{name_expr} AS manager_name")
             select_low += " manager_name"
             changed = True
+
+    def _ensure_parent_role_scalar_projection() -> None:
+        nonlocal select_low, changed, rebuilt_select_items
+        parent_alias_l = str(parent_alias or "").strip().lower()
+        child_alias_l = str(child_alias or "").strip().lower()
+        if not parent_alias_l or not child_alias_l:
+            return
+        parent_table = alias_to_table.get(parent_alias_l, "")
+        child_table = alias_to_table.get(child_alias_l, "")
+        if not parent_table or not child_table or parent_table.lower() != child_table.lower():
+            return
+
+        title_cols = _title_like_cols_for_table(child_table)
+        if not title_cols:
+            return
+
+        requested_title_terms = {"job title", "title", "position", "designation", "role"}
+        if not _requested_role_attribute(parent_role_terms, requested_title_terms):
+            return
+
+        child_title_col = ""
+        for item in rebuilt_select_items:
+            for title_col in title_cols:
+                if re.search(
+                    rf"(?is)\b{re.escape(child_alias_l)}\s*\.\s*`?{re.escape(title_col)}`?\b",
+                    item,
+                ):
+                    child_title_col = title_col
+                    break
+            if child_title_col:
+                break
+        if not child_title_col:
+            child_title_col = title_cols[0]
+
+        if re.search(
+            rf"(?is)\b{re.escape(parent_alias_l)}\s*\.\s*`?{re.escape(child_title_col)}`?\b",
+            ", ".join(rebuilt_select_items),
+        ):
+            return
+
+        parent_title_case = _original_case_col(parent_table, child_title_col)
+        insert_idx = len(rebuilt_select_items)
+        for idx, item in enumerate(rebuilt_select_items):
+            if re.search(rf"(?is)\b{re.escape(parent_alias_l)}\s*\.", item):
+                insert_idx = idx + 1
+        rebuilt_select_items.insert(insert_idx, f"{parent_alias}.{parent_title_case} AS parent_{parent_title_case}")
+        select_low += f" {parent_title_case.lower()} parent_{parent_title_case.lower()}"
+        changed = True
+
+    def _prefer_child_anchor_for_self_fk_lookup_joins() -> None:
+        nonlocal rebuilt_from, changed
+        parent_alias_l = str(parent_alias or "").strip().lower()
+        child_alias_l = str(child_alias or "").strip().lower()
+        if not parent_alias_l or not child_alias_l:
+            return
+        parent_table = alias_to_table.get(parent_alias_l, "")
+        child_table = alias_to_table.get(child_alias_l, "")
+        if not parent_table or not child_table or parent_table.lower() != child_table.lower():
+            return
+
+        child_cols = _table_cols_lower(child_table)
+        if not child_cols:
+            return
+
+        lookup_requested_cols: Dict[str, Set[str]] = {}
+        for segment in list(rebuilt_select_items) + [order_segment]:
+            for m_ref in re.finditer(
+                r"(?is)\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\b",
+                segment,
+            ):
+                alias_l = str(m_ref.group(1) or "").strip().lower()
+                col_l = str(m_ref.group(2) or "").strip().lower()
+                if alias_l and col_l:
+                    lookup_requested_cols.setdefault(alias_l, set()).add(col_l)
+
+        for lookup_alias, lookup_table in list(source_pairs):
+            lookup_alias_l = str(lookup_alias or "").strip().lower()
+            lookup_table_l = str(lookup_table or "").strip().lower()
+            if not lookup_alias_l or lookup_table_l in {parent_table.lower(), child_table.lower()}:
+                continue
+            requested_cols = lookup_requested_cols.get(lookup_alias_l, set())
+            if not requested_cols:
+                continue
+
+            attr_terms = set(_identifier_terms(lookup_table_l))
+            for req_col in requested_cols:
+                attr_terms.update(_identifier_terms(req_col))
+            if not attr_terms:
+                continue
+            child_role_requested = _requested_role_attribute(child_role_terms, attr_terms, window=48)
+            if not child_role_requested and _requested_role_attribute(parent_role_terms, attr_terms, window=24):
+                continue
+
+            join_pat = re.compile(
+                rf"(?is)(\b(?:INNER|LEFT|RIGHT|CROSS)?\s*JOIN\s+`?{re.escape(lookup_table_l)}`?"
+                rf"(?:\s+(?:AS\s+)?{re.escape(lookup_alias_l)})?\s+ON\s+)(.+?)(?=\b(?:INNER|LEFT|RIGHT|CROSS)?\s*JOIN\b|$)"
+            )
+            m_join = join_pat.search(rebuilt_from)
+            if not m_join:
+                continue
+
+            join_prefix = m_join.group(1) or ""
+            on_txt = m_join.group(2) or ""
+            rewritten_on = on_txt
+            local_changed = False
+            for m_eq in re.finditer(
+                r"""(?is)`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?""",
+                on_txt,
+            ):
+                left_a, left_c = str(m_eq.group(1) or "").strip().lower(), str(m_eq.group(2) or "").strip().lower()
+                right_a, right_c = str(m_eq.group(3) or "").strip().lower(), str(m_eq.group(4) or "").strip().lower()
+                replace_col = ""
+                if left_a == parent_alias_l and right_a == lookup_alias_l and left_c in child_cols:
+                    replace_col = left_c
+                elif right_a == parent_alias_l and left_a == lookup_alias_l and right_c in child_cols:
+                    replace_col = right_c
+                if not replace_col:
+                    continue
+                rewritten_on = re.sub(
+                    rf"(?is)\b{re.escape(parent_alias_l)}\s*\.\s*`?{re.escape(replace_col)}`?\b",
+                    f"{child_alias}.{_original_case_col(child_table, replace_col)}",
+                    rewritten_on,
+                )
+                local_changed = True
+            if local_changed and rewritten_on != on_txt:
+                rebuilt_from = f"{rebuilt_from[:m_join.start()]}{join_prefix}{rewritten_on}{rebuilt_from[m_join.end():]}"
+                changed = True
+
+    _ensure_parent_role_scalar_projection()
+    _prefer_child_anchor_for_self_fk_lookup_joins()
 
     if (
         "manager_name" not in select_low

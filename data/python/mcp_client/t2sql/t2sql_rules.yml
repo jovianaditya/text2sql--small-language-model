@@ -797,6 +797,213 @@ agent_semantics:
     - count
     - itself
     - themselves
+  semantic_contract:
+    count_how_many_phrases:
+      - how many
+    count_terms:
+      - count
+      - count of
+    count_number_of_prefixes:
+      - number of
+      - total number of
+    ordinal_terms:
+      - first
+      - second
+      - third
+      - fourth
+      - fifth
+      - 1st
+      - 2nd
+      - 3rd
+      - 4th
+      - 5th
+    per_group_terms:
+      - for each
+      - per
+      - within each
+      - for every
+    identifier_like_targets:
+      - id
+      - ids
+      - identifier
+      - identifiers
+      - number
+      - numbers
+      - code
+      - codes
+      - name
+      - names
+      - date
+      - dates
+      - status
+      - statuses
+    average_terms:
+      - average
+      - avg
+      - mean
+    ratio_definition_terms:
+      - defined as
+      - where
+    ratio_count_reference_phrases:
+      - number of
+      - count of
+      - total number of
+    ratio_operator_terms:
+      - divided by
+      - over
+      - per
+    sum_terms:
+      - sum
+      - sum of
+    sum_total_prefix_terms:
+      - total
+    sum_total_count_phrases:
+      - total number
+      - total count
+      - total number of
+  projection_null_fill:
+    missing_terms:
+      - missing
+      - null
+      - empty
+      - blank
+    conditional_terms:
+      - if
+      - when
+      - whenever
+    action_terms:
+      - display
+      - show
+      - return
+      - use
+    fallback_terms:
+      - n/a
+      - none
+      - unknown
+      - zero
+  numeric_threshold:
+    comparison_terms:
+      - greater than
+      - more than
+      - over
+      - above
+      - less than
+      - under
+      - below
+      - at least
+      - at most
+      - minimum
+      - minimum of
+      - maximum
+      - maximum of
+    number_words:
+      - one
+      - two
+      - three
+      - four
+      - five
+      - six
+      - seven
+      - eight
+      - nine
+      - ten
+      - eleven
+      - twelve
+  global_avg_baseline_compare:
+    average_terms:
+      - avg
+      - average
+      - mean
+    baseline_terms:
+      - overall
+      - global
+      - across all
+      - entire
+      - across the whole
+      - across the entire
+    comparison_terms:
+      - higher
+      - greater
+      - more
+      - above
+      - over
+      - lower
+      - less
+      - below
+      - under
+    baseline_reference_terms:
+      - overall
+      - global
+      - average
+      - mean
+  offset_window_sequence:
+    offset_terms:
+      - previous
+      - prior
+      - next
+      - following
+    ordering_context_regex:
+      - "\\bordered\\s+by\\b"
+      - "\\bbased\\s+on\\b[^.]{0,80}\\border\\b"
+      - "\\b(?:date|time|timestamp)[-\\s]+order\\b"
+  case_bucketing:
+    bucket_language_regex:
+      - "\\b(?:bucket|classify|categori[sz]e|group(?:ed|ing)?\\s+into|bands?|ranges?|distribution)\\b"
+      - "\\bgroup(?:ed|ing)?\\b[^.]{0,80}\\bby\\s+whether\\b"
+      - "\\bby\\s+whether\\b"
+    numeric_threshold_regex:
+      - "[<>]=?\\s*\\d"
+      - "\\bbetween\\s+\\d+(?:\\.\\d+)?\\s+(?:and|-|to)\\s+\\d+(?:\\.\\d+)?\\b"
+    numeric_bucket_terms:
+      - low
+      - mid
+      - medium
+      - high
+    conditional_terms:
+      - if
+      - when
+      - whenever
+      - otherwise
+      - else
+      - remaining
+      - rest
+    missing_terms:
+      - null
+      - missing
+      - blank
+      - empty
+      - not available
+      - n/a
+    comparison_terms:
+      - later
+      - earlier
+      - before
+      - after
+      - greater than
+      - less than
+      - above
+      - below
+    temporal_terms:
+      - date
+      - time
+      - timestamp
+    pattern_terms:
+      - match
+      - matches
+      - matching
+      - pattern
+      - regex
+      - regexp
+      - followed by
+      - digit
+      - digits
+      - letter
+      - letters
+    aggregate_request_terms:
+      - how many
+      - distribution
+    aggregate_request_regex:
+      - "\\b(?:count|counts|number\\s+of|total\\s+(?:number\\s+of)?|sum|average|avg|mean|min(?:imum)?|max(?:imum)?|distinct)\\b"
   order_term_stopwords:
     - the
     - a

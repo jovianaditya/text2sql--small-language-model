@@ -2486,7 +2486,7 @@ def _infer_tables_from_question_columns(
     """
     q_lower = question.lower()
 
-    def _question_mentions_column(q_text: str, column: str) -> bool:
+    def _question_mentions_column(q_text: str, table: str, column: str) -> bool:
         """
         Robust column mention check:
         - direct column name
@@ -2496,6 +2496,7 @@ def _infer_tables_from_question_columns(
         if not column:
             return False
 
+        table_l = str(table or "").strip().lower()
         col_lower = column.lower()
         spaced = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', column).replace("_", " ").lower()
 
@@ -2514,8 +2515,27 @@ def _infer_tables_from_question_columns(
             "type", "types", "status", "each", "table", "order",
             "quantity", "price", "amount", "total", "average", "value"
         }
+        name_col = str(get_name_column(table_l) or "").strip().lower() if table_l else ""
+        id_col = str(get_id_column(table_l) or "").strip().lower() if table_l else ""
+        role = str(get_column_role(table_l, column) or "").strip().lower() if table_l else ""
+        entity_tokens: Set[str] = set()
+        if table_l:
+            for cand in _table_mention_candidates(table_l, include_synonyms=True):
+                entity_tokens.update(_guidance_semantic_tokens(cand))
+        col_tokens = [tok for tok in re.findall(r"[a-z0-9]+", spaced) if tok]
+        last_token = col_tokens[-1] if col_tokens else ""
+        entity_only_token_match_disallowed = bool(
+            table_l
+            and (
+                col_lower in {name_col, id_col}
+                or role in {"pk", "fk", "id", "identifier", "name", "label", "title"}
+                or last_token in {"id", "code", "number", "name"}
+            )
+        )
         for token in re.findall(r"[a-z0-9]+", spaced):
             if len(token) < 4 or token in stop_tokens:
+                continue
+            if entity_only_token_match_disallowed and token in entity_tokens:
                 continue
             # "ordered by ..." usually indicates sorting intent, not orderdetails semantics
             if (
@@ -2532,7 +2552,7 @@ def _infer_tables_from_question_columns(
     table_matches = defaultdict(list)
 
     for tbl, col in ranked_cols:
-        if _question_mentions_column(q_lower, col):
+        if _question_mentions_column(q_lower, tbl, col):
             table_matches[tbl.lower()].append(col)
 
     # Always include tables explicitly mentioned in router_tables
@@ -2897,6 +2917,40 @@ def _guidance_has_direct_table_mention(question: str, table: str) -> bool:
         if re.search(rf"\b{pattern}\b", q, flags=re.I):
             return True
     return False
+
+
+def _question_has_entity_cardinality_reference(question: str, table: str) -> bool:
+    q = str(question or "").lower()
+    table_l = str(table or "").strip().lower()
+    if not q or not table_l:
+        return False
+
+    mention_pats = []
+    for cand in _table_mention_candidates(table_l, include_synonyms=True):
+        cand_text = str(cand or "").strip().lower()
+        if not cand_text:
+            continue
+        mention_pats.append(re.escape(cand_text).replace(r"\ ", r"\s+"))
+    if not mention_pats:
+        return False
+    entity_alt = "|".join(sorted(set(mention_pats), key=len, reverse=True))
+
+    cardinality_cue = (
+        r"(?:count|counts|number\s+of|how\s+many|distinct|unique|different)"
+    )
+    quantity_threshold = (
+        r"(?:more\s+than|less\s+than|fewer\s+than|at\s+least|at\s+most|over|under)\s+\d+"
+    )
+
+    return bool(
+        re.search(rf"\b(?:{cardinality_cue})\b.*\b(?:{entity_alt})\b", q, flags=re.I)
+        or re.search(rf"\b(?:{entity_alt})\b.*\b(?:{cardinality_cue})\b", q, flags=re.I)
+        or re.search(
+            rf"\b(?:{quantity_threshold})\s+(?:{cardinality_cue}\s+)?(?:{entity_alt})\b",
+            q,
+            flags=re.I,
+        )
+    )
 
 
 def _should_emit_parent_entity_grain_guidance(
@@ -3305,6 +3359,45 @@ def _prune_guidance_tables_for_prompt(
             for col in anchor_matches
         )
 
+    def _direct_table_mention_is_redundant_cardinality_reference(table_name: str) -> bool:
+        table_l = str(table_name or "").strip().lower()
+        if not table_l or table_l == primary:
+            return False
+        try:
+            txn_tables = {
+                str(t or "").strip().lower()
+                for t in (get_transaction_tables() or [])
+                if str(t or "").strip()
+            }
+        except Exception:
+            txn_tables = set()
+        if table_l in txn_tables:
+            return False
+        if not _guidance_has_direct_table_mention(question, table_l):
+            return False
+        if not _question_has_entity_cardinality_reference(question, table_l):
+            return False
+
+        id_col = str(get_id_column(table_l) or "").strip()
+        if not id_col:
+            return False
+
+        cover_tables = {
+            str(t or "").strip().lower()
+            for t in tables
+            if str(t or "").strip() and str(t or "").strip().lower() != table_l
+        }
+        if not cover_tables:
+            return False
+
+        return _guidance_column_is_covered_by_tables(
+            table_l,
+            id_col,
+            cover_tables,
+            allowed_identifiers,
+            ranked_cols,
+        )
+
     _keep(primary)
 
     for table in tables:
@@ -3320,13 +3413,20 @@ def _prune_guidance_tables_for_prompt(
         if table_l in support_set:
             _keep(table_l)
             continue
-        if _question_targets_table_exclusion(question, table_l) or _question_targets_table_existence(question, table_l):
+        if _question_targets_table_exclusion(question, table_l):
+            _keep(table_l)
+            continue
+        if _question_targets_table_existence(question, table_l):
+            if _direct_table_mention_is_redundant_cardinality_reference(table_l):
+                continue
             _keep(table_l)
             continue
 
         matched_cols = matched_cols_by_table.get(table_l, set())
         if not matched_cols:
             if _guidance_has_direct_table_mention(question, table_l):
+                if _direct_table_mention_is_redundant_cardinality_reference(table_l):
+                    continue
                 _keep(table_l)
             continue
 
@@ -5804,6 +5904,32 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             parts.append(f"Output shape: {output_shape_hint}")
             has_structural = True
 
+    metrics = [m for m in (intent_ir.get("metrics") or []) if isinstance(m, dict)]
+    aggregate_metric_target_keys = {
+        (
+            str(m.get("table") or "").strip().lower(),
+            str(m.get("column") or "").strip().lower(),
+        )
+        for m in metrics
+        if str(m.get("agg") or "").strip().upper() in {"SUM", "AVG", "MIN", "MAX"}
+        and str(m.get("table") or "").strip()
+        and str(m.get("column") or "").strip()
+        and str(m.get("column") or "").strip() != "*"
+    }
+    explicit_projection_dim_keys: Set[Tuple[str, str]] = set()
+    projection_segments = _extract_projection_segments_local(str(state.get("question") or ""))
+    projection_candidates = _structural_column_candidates()
+    for seg in projection_segments:
+        seg_l = re.sub(r"\s+", " ", str(seg or "").strip().lower())
+        if not seg_l or _metric_like_projection_segment(seg_l):
+            continue
+        for table, column in projection_candidates:
+            for variant_norm in _column_variant_texts(table, column):
+                variant_pat = re.escape(variant_norm).replace(r"\ ", r"\s+")
+                if re.search(rf"\b{variant_pat}\b", seg_l, flags=re.I):
+                    explicit_projection_dim_keys.add((table.lower(), str(column).strip().lower()))
+                    break
+
     if dims:
         dim_strs = []
         seen_dim_keys = set()
@@ -5816,6 +5942,12 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 dim_key = (t.lower(), c.lower())
                 if dim_key in seen_dim_keys:
                     continue
+                if (
+                    qtype.lower() == "aggregate"
+                    and dim_key in aggregate_metric_target_keys
+                    and dim_key not in explicit_projection_dim_keys
+                ):
+                    continue
                 seen_dim_keys.add(dim_key)
                 dim_strs.append(f"{t}.{c}")
         if dim_strs:
@@ -5823,7 +5955,6 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             has_structural = True
 
     # Metrics
-    metrics = intent_ir.get("metrics") or []
     met_strs = []
     for m in metrics:
         metric_hint = _safe_metric_hint_str(m)

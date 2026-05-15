@@ -2033,11 +2033,6 @@ AGENT_DRAFT_LIMIT_REMOVE_PATTERN = os.getenv(
     r"LIMIT\s+\d+\s*;?",
 ).strip()
 
-AGENT_CASE_BUCKET_AGGREGATE_REQUEST_PATTERN = os.getenv(
-    "AGENT_CASE_BUCKET_AGGREGATE_REQUEST_PATTERN",
-    r"\b(?:count|counts|number\s+of|total\s+(?:number\s+of)?|sum|average|avg|mean|min(?:imum)?|max(?:imum)?|distinct)\b",
-).strip()
-
 AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS = _env_json_list(
     "AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS",
     [

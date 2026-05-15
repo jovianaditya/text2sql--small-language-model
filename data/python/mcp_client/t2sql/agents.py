@@ -154,7 +154,6 @@ from .config import (
     AGENT_DRAFT_LIMIT_NULL_ZERO_PATTERN,
     AGENT_DRAFT_LIMIT_CAPTURE_PATTERN,
     AGENT_DRAFT_LIMIT_REMOVE_PATTERN,
-    AGENT_CASE_BUCKET_AGGREGATE_REQUEST_PATTERN,
     AGENT_DRAFT_LIMIT_INTENT_TERMS,
     AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS,
     AGENT_KEEP_ALIVE_PARSE_PATTERN,
@@ -507,7 +506,23 @@ from .helpers_core import (
 )
 from .rulebook import (
     any_phrase_in_text,
+    case_bucket_aggregate_request_regex_patterns,
+    case_bucket_aggregate_request_terms,
+    case_bucket_comparison_terms,
+    case_bucket_conditional_terms,
+    case_bucket_language_regex_patterns,
+    case_bucket_missing_terms,
+    case_bucket_numeric_terms,
+    case_bucket_numeric_threshold_regex_patterns,
+    case_bucket_pattern_terms,
+    case_bucket_temporal_terms,
+    global_avg_baseline_average_terms,
+    global_avg_baseline_reference_terms,
+    global_avg_baseline_terms,
+    global_avg_comparison_terms,
     group_average_difference_window_phrases,
+    numeric_threshold_comparison_terms,
+    numeric_threshold_number_words,
     order_term_token_stopwords,
     ordering_direction_asc_terms,
     ordering_direction_desc_terms,
@@ -515,8 +530,27 @@ from .rulebook import (
     ordering_temporal_asc_terms,
     ordering_temporal_desc_terms,
     ordering_temporal_intent_terms,
+    offset_window_ordering_context_regex_patterns,
+    offset_window_sequence_terms,
+    projection_null_fill_action_terms,
+    projection_null_fill_conditional_terms,
+    projection_null_fill_fallback_terms,
+    projection_null_fill_missing_terms,
     rule_list,
     semantic_phrase_token_stopwords,
+    semantic_contract_average_terms,
+    semantic_contract_count_how_many_phrases,
+    semantic_contract_count_number_of_prefixes,
+    semantic_contract_ordinal_terms,
+    semantic_contract_per_group_terms,
+    semantic_contract_count_terms,
+    semantic_contract_identifier_like_targets,
+    semantic_contract_ratio_count_reference_phrases,
+    semantic_contract_ratio_definition_terms,
+    semantic_contract_ratio_operator_terms,
+    semantic_contract_sum_terms,
+    semantic_contract_sum_total_count_phrases,
+    semantic_contract_sum_total_prefix_terms,
     temporal_year_column_terms,
 )
 
@@ -5974,16 +6008,20 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     superlative_alt = _phrase_alt_pattern(
         ordering_superlative_keywords()
     )
+    ordinal_alt = _phrase_alt_pattern(
+        semantic_contract_ordinal_terms()
+    )
     # Ordinal per-group winner pattern (e.g. "second highest per customer")
     # naturally relies on window ranking + rn filter, and does not require
     # top-level ORDER BY unless user explicitly asks sorting.
     ordinal_per_group_pattern = bool(
-        re.search(
-            rf"\b(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+"
-            rf"(?:{superlative_alt})\b" if superlative_alt else r"$^",
+        superlative_alt
+        and ordinal_alt
+        and re.search(
+            rf"\b(?:{ordinal_alt})\s+(?:{superlative_alt})\b",
             q,
         )
-        and re.search(r"\b(for\s+each|per|within\s+each|for\s+every)\b", q)
+        and any_phrase_in_text(q, semantic_contract_per_group_terms())
     )
     if ordinal_per_group_pattern and not explicit_sort_phrase:
         contract["requires_order_by"] = False
@@ -5997,71 +6035,91 @@ def _extract_semantic_contract(question: str) -> Dict[str, Any]:
     # - strong cues: "how many", "count"
     # - phrase cue: "number of <entity>", excluding identifier-like projections
     #   such as "employee numbers", "office codes", "customer ids".
-    has_how_many = bool(re.search(r"\bhow\s+many\b", q))
-    has_count_word = bool(re.search(r"\bcount(?:\s+of)?\b", q))
+    has_how_many = any_phrase_in_text(q, semantic_contract_count_how_many_phrases())
+    has_count_word = any_phrase_in_text(q, semantic_contract_count_terms())
 
     number_of_target = ""
-    m_number_of = re.search(r"\bnumber\s+of\s+([a-z][a-z0-9_]*)\b", q)
-    if m_number_of:
-        number_of_target = str(m_number_of.group(1) or "").strip().lower()
+    number_of_prefix_terms = [
+        str(term).strip().lower()
+        for term in semantic_contract_count_number_of_prefixes()
+        if str(term).strip()
+    ]
+    prefix_patterns = [
+        re.escape(term).replace(r"\ ", r"\s+")
+        for term in number_of_prefix_terms
+    ]
+    if prefix_patterns:
+        m_number_of = re.search(
+            rf"\b(?:{'|'.join(sorted(prefix_patterns, key=len, reverse=True))})\s+([a-z][a-z0-9_]*)\b",
+            q,
+            flags=re.I,
+        )
+        if m_number_of:
+            number_of_target = str(m_number_of.group(1) or "").strip().lower()
 
-    identifier_like_targets = {
-        "id",
-        "ids",
-        "identifier",
-        "identifiers",
-        "number",
-        "numbers",
-        "code",
-        "codes",
-        "name",
-        "names",
-        "date",
-        "dates",
-        "status",
-        "statuses",
-    }
+    identifier_like_targets = semantic_contract_identifier_like_targets()
     has_number_of_entity = bool(
         number_of_target and number_of_target not in identifier_like_targets
     )
-    has_total_number_of_entity = bool(
-        re.search(r"\btotal\s+number\s+of\s+([a-z][a-z0-9_]*)\b", q)
-    )
-    if has_how_many or has_count_word or has_number_of_entity or has_total_number_of_entity:
+    if has_how_many or has_count_word or has_number_of_entity:
         required_aggs.add("COUNT")
 
+    avg_terms = semantic_contract_average_terms()
+    avg_alt = _phrase_alt_pattern(avg_terms)
+    ratio_definition_alt = _phrase_alt_pattern(semantic_contract_ratio_definition_terms())
+    ratio_count_reference_alt = _phrase_alt_pattern(
+        semantic_contract_ratio_count_reference_phrases()
+    )
+    ratio_operator_alt = _phrase_alt_pattern(semantic_contract_ratio_operator_terms())
     defines_average_as_ratio = bool(
-        re.search(r"\b(?:average|avg|mean)\b", q)
-        and re.search(r"\b(?:number|count|total\s+number)\s+of\b", q)
+        (avg_alt and re.search(rf"\b(?:{avg_alt})\b", q))
+        and ratio_count_reference_alt
+        and re.search(rf"\b(?:{ratio_count_reference_alt})\b", q)
         and (
-            re.search(r"\b(?:defined\s+as|where)\b[^.]{0,140}\b(?:divided\s+by|over|per)\b", q)
-            or re.search(
-                r"\b(?:divided\s+by|over|per)\s+(?:the\s+)?(?:number|count|total\s+number)\s+of\b",
+            (ratio_definition_alt and ratio_operator_alt and re.search(rf"\b(?:{ratio_definition_alt})\b[^.]{{0,140}}\b(?:{ratio_operator_alt})\b", q))
+            or (
+                ratio_operator_alt
+                and re.search(
+                rf"\b(?:{ratio_operator_alt})\s+(?:the\s+)?(?:{ratio_count_reference_alt})\b",
                 q,
+                )
             )
         )
     )
 
     # AVG intent.
-    if re.search(r"\b(average|avg|mean)\b", q) and not defines_average_as_ratio:
+    if avg_alt and re.search(rf"\b(?:{avg_alt})\b", q) and not defines_average_as_ratio:
         required_aggs.add("AVG")
 
     # SUM intent:
     # - explicit "sum"/"sum of"
     # - "total" only when attached to quantity/value-like metrics.
-    has_explicit_sum = bool(re.search(r"\bsum(?:\s+of)?\b", q))
+    has_explicit_sum = any_phrase_in_text(q, semantic_contract_sum_terms())
     q_tokens = _contract_tokenize(q)
     metric_terms = _contract_metric_terms(q_tokens)
     entity_terms = _contract_entity_terms()
+    total_prefix_alt = _phrase_alt_pattern(
+        semantic_contract_sum_total_prefix_terms()
+    )
     total_phrases = [
         str(m.group(1) or "").strip()
-        for m in re.finditer(r"\btotal\s+([a-z][a-z0-9_ ]{0,48})\b", q)
+        for m in (
+            re.finditer(
+                rf"\b(?:{total_prefix_alt})\s+([a-z][a-z0-9_ ]{{0,48}})\b",
+                q,
+            )
+            if total_prefix_alt
+            else []
+        )
     ]
     has_total_metric = any(
         _contract_tokenize(phrase).intersection(metric_terms)
         for phrase in total_phrases
     )
-    looks_like_count_phrase = bool(re.search(r"\btotal\s+(?:number|count)\b", q) or re.search(r"\btotal\s+number\s+of\b", q))
+    looks_like_count_phrase = any_phrase_in_text(
+        q,
+        semantic_contract_sum_total_count_phrases(),
+    )
     if not looks_like_count_phrase:
         for phrase in total_phrases:
             phrase_tokens = _contract_tokenize(phrase)
@@ -7364,6 +7422,7 @@ def _is_simple_having_shape(
     metrics = [m for m in (intent_ir.get("metrics") or []) if isinstance(m, dict)]
     dims = [d for d in (intent_ir.get("dimensions") or []) if isinstance(d, dict)]
     existence = [e for e in (intent_ir.get("existence") or []) if isinstance(e, dict)]
+    filters = [f for f in (intent_ir.get("filters") or []) if isinstance(f, dict)]
 
     if str(intent_ir.get("qtype") or "").strip().lower() != AGENT_ROUTER_QTYPE_AGGREGATE:
         return False, "simple_having_requires_aggregate_qtype"
@@ -7379,6 +7438,24 @@ def _is_simple_having_shape(
     max_filters = max(1, int(AGENT_IR_SIMPLE_HAVING_MAX_FILTERS))
     if len(threshold_pairs) > max_filters:
         return False, f"simple_having_too_many_threshold_filters:{len(threshold_pairs)}>{max_filters}"
+
+    referenced_tables: Set[str] = set()
+
+    def _add_table_refs(items: List[Dict[str, Any]]) -> None:
+        for item in items:
+            table = str(item.get("table") or "").strip().lower()
+            if table:
+                referenced_tables.add(table)
+
+    _add_table_refs(metrics)
+    _add_table_refs(dims)
+    _add_table_refs(filters)
+    _add_table_refs(existence)
+    subject_table = str(intent_ir.get("subject_entity") or "").strip().lower()
+    if subject_table:
+        referenced_tables.add(subject_table)
+    if len(referenced_tables) > 1:
+        return False, "simple_having_multi_table_scope"
 
     m0 = metrics[0]
     m0_sig = (
@@ -7508,30 +7585,30 @@ def _ir_regex_family_status(intent_ir: Dict[str, Any], question: str) -> Tuple[b
 def _question_requests_projection_null_fill(question: str) -> bool:
     q_raw = str(question or "")
     q_low = q_raw.lower()
-    if not re.search(r"\b(?:missing|null|empty|blank)\b", q_low, flags=re.I):
+    if not any_phrase_in_text(q_low, projection_null_fill_missing_terms()):
         return False
-    if not re.search(r"\b(?:if|when|whenever)\b", q_low, flags=re.I):
+    if not any_phrase_in_text(q_low, projection_null_fill_conditional_terms()):
         return False
-    if not re.search(r"\b(?:display|show|return|use)\b", q_low, flags=re.I):
+    if not any_phrase_in_text(q_low, projection_null_fill_action_terms()):
         return False
     if re.search(r"""["'“”][^"'“”]{1,40}["'“”]""", q_raw):
         return True
-    return bool(re.search(r"\b(?:n/?a|none|unknown|zero)\b", q_low, flags=re.I))
+    return any_phrase_in_text(q_low, projection_null_fill_fallback_terms())
 
 
 def _question_has_numeric_threshold(question: str) -> bool:
     q = str(question or "").strip().lower()
     if not q:
         return False
-    number_pat = (
-        r"(?:\d[\d,]*(?:\.\d+)?|"
-        r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
-    )
+    comparison_alt = _phrase_alt_pattern(numeric_threshold_comparison_terms())
+    number_words_alt = _phrase_alt_pattern(numeric_threshold_number_words())
+    if number_words_alt:
+        number_pat = rf"(?:\d[\d,]*(?:\.\d+)?|{number_words_alt})"
+    else:
+        number_pat = r"(?:\d[\d,]*(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
     return bool(
-        re.search(
-            rf"\b(?:greater\s+than|more\s+than|over|above|"
-            rf"less\s+than|under|below|"
-            rf"at\s+least|at\s+most|minimum(?:\s+of)?|maximum(?:\s+of)?)\s+{number_pat}\b",
+        comparison_alt and re.search(
+            rf"\b(?:{comparison_alt})\s+{number_pat}\b",
             q,
             flags=re.I,
         )
@@ -7542,24 +7619,29 @@ def _question_has_global_avg_baseline_compare(question: str) -> bool:
     q = str(question or "").strip().lower()
     if not q:
         return False
-    has_avg = bool(re.search(r"\b(?:avg|average|mean)\b", q, flags=re.I))
-    has_baseline = bool(
-        re.search(
-            r"\b(?:overall|global|across\s+all|entire)\b|\bacross\s+the\s+(?:whole|entire)\b",
-            q,
-            flags=re.I,
-        )
-    )
+    avg_alt = _phrase_alt_pattern(global_avg_baseline_average_terms())
+    baseline_alt = _phrase_alt_pattern(global_avg_baseline_terms())
+    comparison_alt = _phrase_alt_pattern(global_avg_comparison_terms())
+    baseline_ref_alt = _phrase_alt_pattern(global_avg_baseline_reference_terms())
+    has_avg = bool(avg_alt and re.search(rf"\b(?:{avg_alt})\b", q, flags=re.I))
+    has_baseline = bool(baseline_alt and re.search(rf"\b(?:{baseline_alt})\b", q, flags=re.I))
     has_cmp = bool(
-        re.search(
-            r"\b(?:higher|greater|more|above|over|lower|less|below|under)\s+than\b",
-            q,
-            flags=re.I,
+        (
+            comparison_alt
+            and re.search(
+                rf"\b(?:{comparison_alt})\s+than\b",
+                q,
+                flags=re.I,
+            )
         )
-        or re.search(
-            r"\b(?:above|over|below|under)\b[^.]{0,32}\b(?:overall|global|average|mean)\b",
-            q,
-            flags=re.I,
+        or (
+            comparison_alt
+            and baseline_ref_alt
+            and re.search(
+                rf"\b(?:{comparison_alt})\b[^.]{{0,32}}\b(?:{baseline_ref_alt})\b",
+                q,
+                flags=re.I,
+            )
         )
     )
     return has_avg and has_baseline and has_cmp
@@ -7569,13 +7651,14 @@ def _question_has_offset_window_sequence_intent(question: str) -> bool:
     q = str(question or "").strip().lower()
     if not q:
         return False
-    if not re.search(r"\b(?:previous|prior|next|following)\b", q, flags=re.I):
+    if not any_phrase_in_text(q, offset_window_sequence_terms()):
         return False
-    return bool(
-        re.search(r"\bordered\s+by\b", q, flags=re.I)
-        or re.search(r"\bbased\s+on\b[^.]{0,80}\border\b", q, flags=re.I)
-        or re.search(r"\b(?:date|time|timestamp)[-\s]+order\b", q, flags=re.I)
-    )
+    ordering_context_patterns = [
+        str(p).strip()
+        for p in offset_window_ordering_context_regex_patterns()
+        if str(p).strip()
+    ]
+    return any(re.search(pat, q, flags=re.I) for pat in ordering_context_patterns)
 
 
 def _question_has_case_bucketing_intent(question: str) -> bool:
@@ -7583,44 +7666,49 @@ def _question_has_case_bucketing_intent(question: str) -> bool:
     if not q:
         return False
 
-    has_bucket_language = bool(
-        re.search(r"\b(?:bucket|classify|categori[sz]e|group(?:ed|ing)?\s+into|bands?|ranges?|distribution)\b", q, flags=re.I)
-        or re.search(r"\bgroup(?:ed|ing)?\b[^.]{0,80}\bby\s+whether\b", q, flags=re.I)
-        or re.search(r"\bby\s+whether\b", q, flags=re.I)
-    )
+    bucket_language_patterns = [
+        str(p).strip()
+        for p in case_bucket_language_regex_patterns()
+        if str(p).strip()
+    ]
+    has_bucket_language = any(re.search(pat, q, flags=re.I) for pat in bucket_language_patterns)
     if not has_bucket_language:
         return False
 
+    numeric_threshold_patterns = [
+        str(p).strip()
+        for p in case_bucket_numeric_threshold_regex_patterns()
+        if str(p).strip()
+    ]
+    numeric_term_alt = _phrase_alt_pattern(case_bucket_numeric_terms())
     has_numeric_threshold_shape = bool(
-        re.search(r"[<>]=?\s*\d", q)
-        or re.search(r"\bbetween\s+\d+(?:\.\d+)?\s+(?:and|-|to)\s+\d+(?:\.\d+)?\b", q, flags=re.I)
-        or re.search(r"\b(?:low|mid|medium|high)\b", q, flags=re.I)
+        any(re.search(pat, q, flags=re.I) for pat in numeric_threshold_patterns)
+        or (numeric_term_alt and re.search(rf"\b(?:{numeric_term_alt})\b", q, flags=re.I))
     )
 
+    comparison_alt = _phrase_alt_pattern(case_bucket_comparison_terms())
+    temporal_alt = _phrase_alt_pattern(case_bucket_temporal_terms())
+    pattern_alt = _phrase_alt_pattern(case_bucket_pattern_terms())
     has_conditional_bucket_shape = bool(
-        re.search(r"\b(?:if|when|whenever|otherwise|else|remaining|rest)\b", q, flags=re.I)
+        any_phrase_in_text(q, case_bucket_conditional_terms())
         and (
-            re.search(r"\b(?:null|missing|blank|empty|not\s+available|n/?a)\b", q, flags=re.I)
-            or re.search(
-                r"\b(?:later|earlier|before|after|greater\s+than|less\s+than|above|below)\b",
-                q,
-                flags=re.I,
-            )
-            or re.search(r"\b(?:date|time|timestamp)\b", q, flags=re.I)
-            or re.search(
-                r"\b(?:match(?:es|ing)?|pattern|regex|regexp|followed\s+by|digits?|letters?)\b",
-                q,
-                flags=re.I,
-            )
+            any_phrase_in_text(q, case_bucket_missing_terms())
+            or (comparison_alt and re.search(rf"\b(?:{comparison_alt})\b", q, flags=re.I))
+            or (temporal_alt and re.search(rf"\b(?:{temporal_alt})\b", q, flags=re.I))
+            or (pattern_alt and re.search(rf"\b(?:{pattern_alt})\b", q, flags=re.I))
         )
     )
     if not (has_numeric_threshold_shape or has_conditional_bucket_shape):
         return False
 
+    aggregate_request_patterns = [
+        str(p).strip()
+        for p in case_bucket_aggregate_request_regex_patterns()
+        if str(p).strip()
+    ]
     return bool(
-        re.search(AGENT_CASE_BUCKET_AGGREGATE_REQUEST_PATTERN, q, flags=re.I)
-        or re.search(r"\bhow\s+many\b", q, flags=re.I)
-        or re.search(r"\bdistribution\b", q, flags=re.I)
+        any(re.search(pat, q, flags=re.I) for pat in aggregate_request_patterns)
+        or any_phrase_in_text(q, case_bucket_aggregate_request_terms())
     )
 
 

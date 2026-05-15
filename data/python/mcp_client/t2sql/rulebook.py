@@ -859,6 +859,88 @@ def semantic_question_token_stopwords() -> Set[str]:
 
 
 @lru_cache(maxsize=1)
+def semantic_contract_count_how_many_phrases() -> list[str]:
+    defaults = ["how many"]
+    return rule_list(("agent_semantics", "semantic_contract", "count_how_many_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_count_terms() -> list[str]:
+    defaults = ["count", "count of"]
+    return rule_list(("agent_semantics", "semantic_contract", "count_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_count_number_of_prefixes() -> list[str]:
+    defaults = ["number of", "total number of"]
+    return rule_list(("agent_semantics", "semantic_contract", "count_number_of_prefixes"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_ordinal_terms() -> list[str]:
+    defaults = ["first", "second", "third", "fourth", "fifth", "1st", "2nd", "3rd", "4th", "5th"]
+    return rule_list(("agent_semantics", "semantic_contract", "ordinal_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_per_group_terms() -> list[str]:
+    defaults = ["for each", "per", "within each", "for every"]
+    return rule_list(("agent_semantics", "semantic_contract", "per_group_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_identifier_like_targets() -> Set[str]:
+    defaults = [
+        "id", "ids", "identifier", "identifiers", "number", "numbers",
+        "code", "codes", "name", "names", "date", "dates", "status", "statuses",
+    ]
+    vals = rule_list(("agent_semantics", "semantic_contract", "identifier_like_targets"), defaults)
+    return {normalized_text(v) for v in vals if normalized_text(v)}
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_average_terms() -> list[str]:
+    defaults = ["average", "avg", "mean"]
+    return rule_list(("agent_semantics", "semantic_contract", "average_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_ratio_definition_terms() -> list[str]:
+    defaults = ["defined as", "where"]
+    return rule_list(("agent_semantics", "semantic_contract", "ratio_definition_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_ratio_count_reference_phrases() -> list[str]:
+    defaults = ["number of", "count of", "total number of"]
+    return rule_list(("agent_semantics", "semantic_contract", "ratio_count_reference_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_ratio_operator_terms() -> list[str]:
+    defaults = ["divided by", "over", "per"]
+    return rule_list(("agent_semantics", "semantic_contract", "ratio_operator_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_sum_terms() -> list[str]:
+    defaults = ["sum", "sum of"]
+    return rule_list(("agent_semantics", "semantic_contract", "sum_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_sum_total_prefix_terms() -> list[str]:
+    defaults = ["total"]
+    return rule_list(("agent_semantics", "semantic_contract", "sum_total_prefix_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def semantic_contract_sum_total_count_phrases() -> list[str]:
+    defaults = ["total number", "total count", "total number of"]
+    return rule_list(("agent_semantics", "semantic_contract", "sum_total_count_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
 def semantic_phrase_token_stopwords() -> Set[str]:
     defaults = [
         "a", "an", "the", "that", "this", "those", "these", "same",
@@ -868,6 +950,154 @@ def semantic_phrase_token_stopwords() -> Set[str]:
     ]
     vals = rule_list(("agent_semantics", "phrase_token_stopwords"), defaults)
     return {normalized_text(v) for v in vals if normalized_text(v)}
+
+
+@lru_cache(maxsize=1)
+def projection_null_fill_missing_terms() -> list[str]:
+    defaults = ["missing", "null", "empty", "blank"]
+    return rule_list(("agent_semantics", "projection_null_fill", "missing_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def projection_null_fill_conditional_terms() -> list[str]:
+    defaults = ["if", "when", "whenever"]
+    return rule_list(("agent_semantics", "projection_null_fill", "conditional_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def projection_null_fill_action_terms() -> list[str]:
+    defaults = ["display", "show", "return", "use"]
+    return rule_list(("agent_semantics", "projection_null_fill", "action_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def projection_null_fill_fallback_terms() -> list[str]:
+    defaults = ["n/a", "none", "unknown", "zero"]
+    return rule_list(("agent_semantics", "projection_null_fill", "fallback_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def numeric_threshold_comparison_terms() -> list[str]:
+    defaults = [
+        "greater than", "more than", "over", "above", "less than", "under", "below",
+        "at least", "at most", "minimum", "minimum of", "maximum", "maximum of",
+    ]
+    return rule_list(("agent_semantics", "numeric_threshold", "comparison_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def numeric_threshold_number_words() -> list[str]:
+    defaults = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"]
+    return rule_list(("agent_semantics", "numeric_threshold", "number_words"), defaults)
+
+
+@lru_cache(maxsize=1)
+def global_avg_baseline_average_terms() -> list[str]:
+    defaults = ["avg", "average", "mean"]
+    return rule_list(("agent_semantics", "global_avg_baseline_compare", "average_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def global_avg_baseline_terms() -> list[str]:
+    defaults = ["overall", "global", "across all", "entire", "across the whole", "across the entire"]
+    return rule_list(("agent_semantics", "global_avg_baseline_compare", "baseline_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def global_avg_comparison_terms() -> list[str]:
+    defaults = ["higher", "greater", "more", "above", "over", "lower", "less", "below", "under"]
+    return rule_list(("agent_semantics", "global_avg_baseline_compare", "comparison_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def global_avg_baseline_reference_terms() -> list[str]:
+    defaults = ["overall", "global", "average", "mean"]
+    return rule_list(("agent_semantics", "global_avg_baseline_compare", "baseline_reference_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def offset_window_sequence_terms() -> list[str]:
+    defaults = ["previous", "prior", "next", "following"]
+    return rule_list(("agent_semantics", "offset_window_sequence", "offset_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def offset_window_ordering_context_regex_patterns() -> list[str]:
+    defaults = [
+        r"\bordered\s+by\b",
+        r"\bbased\s+on\b[^.]{0,80}\border\b",
+        r"\b(?:date|time|timestamp)[-\s]+order\b",
+    ]
+    return rule_list(("agent_semantics", "offset_window_sequence", "ordering_context_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_language_regex_patterns() -> list[str]:
+    defaults = [
+        r"\b(?:bucket|classify|categori[sz]e|group(?:ed|ing)?\s+into|bands?|ranges?|distribution)\b",
+        r"\bgroup(?:ed|ing)?\b[^.]{0,80}\bby\s+whether\b",
+        r"\bby\s+whether\b",
+    ]
+    return rule_list(("agent_semantics", "case_bucketing", "bucket_language_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_numeric_threshold_regex_patterns() -> list[str]:
+    defaults = [
+        r"[<>]=?\s*\d",
+        r"\bbetween\s+\d+(?:\.\d+)?\s+(?:and|-|to)\s+\d+(?:\.\d+)?\b",
+    ]
+    return rule_list(("agent_semantics", "case_bucketing", "numeric_threshold_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_numeric_terms() -> list[str]:
+    defaults = ["low", "mid", "medium", "high"]
+    return rule_list(("agent_semantics", "case_bucketing", "numeric_bucket_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_conditional_terms() -> list[str]:
+    defaults = ["if", "when", "whenever", "otherwise", "else", "remaining", "rest"]
+    return rule_list(("agent_semantics", "case_bucketing", "conditional_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_missing_terms() -> list[str]:
+    defaults = ["null", "missing", "blank", "empty", "not available", "n/a"]
+    return rule_list(("agent_semantics", "case_bucketing", "missing_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_comparison_terms() -> list[str]:
+    defaults = ["later", "earlier", "before", "after", "greater than", "less than", "above", "below"]
+    return rule_list(("agent_semantics", "case_bucketing", "comparison_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_temporal_terms() -> list[str]:
+    defaults = ["date", "time", "timestamp"]
+    return rule_list(("agent_semantics", "case_bucketing", "temporal_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_pattern_terms() -> list[str]:
+    defaults = ["match", "matches", "matching", "pattern", "regex", "regexp", "followed by", "digit", "digits", "letter", "letters"]
+    return rule_list(("agent_semantics", "case_bucketing", "pattern_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_aggregate_request_terms() -> list[str]:
+    defaults = ["how many", "distribution"]
+    return rule_list(("agent_semantics", "case_bucketing", "aggregate_request_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def case_bucket_aggregate_request_regex_patterns() -> list[str]:
+    defaults = [
+        r"\b(?:count|counts|number\s+of|total\s+(?:number\s+of)?|sum|average|avg|mean|min(?:imum)?|max(?:imum)?|distinct)\b",
+    ]
+    return rule_list(("agent_semantics", "case_bucketing", "aggregate_request_regex"), defaults)
 
 
 @lru_cache(maxsize=1)
