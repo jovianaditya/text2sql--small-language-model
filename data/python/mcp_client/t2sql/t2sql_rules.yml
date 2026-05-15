@@ -1306,7 +1306,7 @@ winner_row_intent:
     - tied
     - choose the one
     - pick the one
-  benchmark_metric_terms:
+  aggregate_metric_terms:
     - total
     - sum
     - average
@@ -1314,6 +1314,28 @@ winner_row_intent:
     - count
     - number of
     - quantity
+  aggregate_guard_terms:
+    - total
+    - sum of
+    - count
+    - berapa banyak
+    - jumlah total
+  grouped_report_metric_terms:
+    - how many
+    - count
+    - number of
+    - total
+    - average
+    - avg
+    - sum
+    - highest
+    - lowest
+    - largest
+    - smallest
+    - maximum
+    - minimum
+    - max
+    - min
 
 exclusion_intent:
   negative_keywords:

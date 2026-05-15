@@ -782,9 +782,26 @@ def winner_row_tie_terms() -> list[str]:
 
 
 @lru_cache(maxsize=1)
-def winner_row_benchmark_metric_terms() -> list[str]:
+def winner_row_aggregate_metric_terms() -> list[str]:
     defaults = ["total", "sum", "average", "avg", "count", "number of", "quantity"]
-    return rule_list(("winner_row_intent", "benchmark_metric_terms"), defaults)
+    return rule_list(("winner_row_intent", "aggregate_metric_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_aggregate_guard_terms() -> list[str]:
+    defaults = ["total", "sum of", "count", "berapa banyak", "jumlah total"]
+    return rule_list(("winner_row_intent", "aggregate_guard_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def winner_row_grouped_report_metric_terms() -> list[str]:
+    defaults = [
+        "how many", "count", "number of", "total",
+        "average", "avg", "sum",
+        "highest", "lowest", "largest", "smallest",
+        "maximum", "minimum", "max", "min",
+    ]
+    return rule_list(("winner_row_intent", "grouped_report_metric_terms"), defaults)
 
 
 @lru_cache(maxsize=1)

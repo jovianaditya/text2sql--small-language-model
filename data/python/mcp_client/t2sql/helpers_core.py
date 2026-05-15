@@ -121,8 +121,10 @@ from .rulebook import (
     set_operation_union_all_terms,
     temporal_year_column_terms,
     threshold_count_object_stop_terms,
-    winner_row_benchmark_metric_terms,
+    winner_row_aggregate_guard_terms,
+    winner_row_aggregate_metric_terms,
     winner_row_context_terms,
+    winner_row_grouped_report_metric_terms,
     winner_row_grouped_report_terms,
     winner_row_multi_attr_connectors,
     winner_row_rank_terms,
@@ -10356,15 +10358,15 @@ def _question_wants_winner_row(question: str) -> bool:
 
     tie_sig = any_phrase_in_text(q_rank_scope, winner_row_tie_terms())
 
-    # Guard: comparative benchmark phrasing like
+    # Guard: comparative grouped-aggregate phrasing like
     # "for every X ... highest ... within the same Y" is usually a full-population
     # report (window/baseline comparison), not winner-row filtering.
-    comparative_group_benchmark_sig = bool(
+    comparative_group_aggregate_sig = bool(
         re.search(r"\bfor\s+(?:every|each)\b", q_rank_scope, flags=re.I)
         and re.search(r"\bwithin\s+the\s+same\b", q_rank_scope, flags=re.I)
-        and any_phrase_in_text(q_rank_scope, winner_row_benchmark_metric_terms())
+        and any_phrase_in_text(q_rank_scope, winner_row_aggregate_metric_terms())
     )
-    if comparative_group_benchmark_sig and not explicit_single_pick_sig and not tie_sig:
+    if comparative_group_aggregate_sig and not explicit_single_pick_sig and not tie_sig:
         return False
 
     per_group_sig = bool(
@@ -10410,7 +10412,10 @@ def _question_wants_winner_row(question: str) -> bool:
     # Guard: "total"/"count" usually means pure aggregation, but do not suppress
     # clear winner-row asks like "best-selling product for each product line"
     # or tie-break questions.
-    if any(k in q_rank_scope for k in ["total", "sum of", "count", "berapa banyak", "jumlah total"]) and not strong_winner_sig:
+    if (
+        any(str(k).strip().lower() in q_rank_scope for k in winner_row_aggregate_guard_terms())
+        and not strong_winner_sig
+    ):
         return False
 
     # Guard: group-by reports listing multiple aggregate metrics (COUNT, MAX, MIN, AVG …)
@@ -10419,12 +10424,7 @@ def _question_wants_winner_row(question: str) -> bool:
     # A genuine winner-row ask typically names one superlative metric + row attributes,
     # not a full report with 3+ aggregate keywords.
     if per_group_sig and not tie_sig and not explicit_single_pick_sig:
-        _metric_keys = [
-            "how many", "count", "number of", "total",
-            "average", "avg", "sum",
-            "highest", "lowest", "largest", "smallest",
-            "maximum", "minimum", "max", "min",
-        ]
+        _metric_keys = winner_row_grouped_report_metric_terms()
         _metric_count = sum(1 for k in _metric_keys if k in q_rank_scope)
         if _metric_count >= 3:
             return False
