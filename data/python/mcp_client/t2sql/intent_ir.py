@@ -87,6 +87,14 @@ _LEXICAL_MATCH_STOP_TOKENS = _FUNCTION_WORD_TOKENS.union(
     }
 )
 _NUMERIC_HINT_TERMS_CACHE: Optional[Set[str]] = None
+_SCHEMA_ENTITY_HEAD_TOKEN_CACHE: Optional[Set[str]] = None
+_SCHEMA_GROUPABLE_TERM_CACHE: Optional[Set[str]] = None
+_GENERIC_IDENTIFIER_TOKENS = {"id", "ids", "number", "numbers", "code", "codes", "key", "keys"}
+_GENERIC_GROUPING_TERMS = {
+    "status", "type", "category",
+    "month", "year", "quarter",
+    "country", "city", "state", "territory",
+}
 
 
 def _fallback_singular(table: str) -> str:
@@ -693,6 +701,71 @@ def _tokenize_for_match(text: str, stop_tokens: Optional[Set[str]] = None) -> Li
     return out
 
 
+def _regex_alt_from_terms(terms: Set[str]) -> str:
+    pieces = []
+    for term in sorted((str(t or "").strip().lower() for t in terms), key=len, reverse=True):
+        if not term:
+            continue
+        pieces.append(re.escape(term).replace(r"\ ", r"\s+"))
+    return "|".join(dict.fromkeys(pieces))
+
+
+def _schema_entity_head_tokens() -> Set[str]:
+    global _SCHEMA_ENTITY_HEAD_TOKEN_CACHE
+    if _SCHEMA_ENTITY_HEAD_TOKEN_CACHE is not None:
+        return set(_SCHEMA_ENTITY_HEAD_TOKEN_CACHE)
+
+    tokens: Set[str] = set()
+    try:
+        tables = list(get_all_tables() or [])
+    except Exception:
+        tables = []
+
+    for table in tables:
+        table_l = str(table or "").strip().lower()
+        if not table_l:
+            continue
+        candidates = {table_l, _safe_get_singular_form(table_l)}
+        candidates.update(_safe_get_table_synonyms(table_l))
+        for candidate in candidates:
+            head_tokens = _tokenize_for_match(_camel_to_words(str(candidate or "")), stop_tokens=_FUNCTION_WORD_TOKENS)
+            if head_tokens and len(head_tokens[0]) >= 3:
+                tokens.add(head_tokens[0])
+
+    _SCHEMA_ENTITY_HEAD_TOKEN_CACHE = tokens
+    return set(tokens)
+
+
+def _schema_groupable_terms() -> Set[str]:
+    global _SCHEMA_GROUPABLE_TERM_CACHE
+    if _SCHEMA_GROUPABLE_TERM_CACHE is not None:
+        return set(_SCHEMA_GROUPABLE_TERM_CACHE)
+
+    terms: Set[str] = set(_GENERIC_GROUPING_TERMS)
+    try:
+        tables = list(get_all_tables() or [])
+    except Exception:
+        tables = []
+
+    for table in tables:
+        table_l = str(table or "").strip().lower()
+        if not table_l:
+            continue
+        candidates = set(_table_variants(table_l) or {table_l})
+        candidates.add(_safe_get_singular_form(table_l))
+        candidates.update(_safe_get_table_synonyms(table_l))
+        for candidate in candidates:
+            phrase_tokens = _tokenize_for_match(_camel_to_words(str(candidate or "")), stop_tokens=_FUNCTION_WORD_TOKENS)
+            if not phrase_tokens or len(phrase_tokens) > 3:
+                continue
+            phrase = " ".join(phrase_tokens).strip()
+            if phrase and len(phrase) >= 3:
+                terms.add(phrase)
+
+    _SCHEMA_GROUPABLE_TERM_CACHE = terms
+    return set(terms)
+
+
 def _column_semantic_tokens(table: str, column: str) -> Set[str]:
     c = str(column or "").strip()
     if not c:
@@ -937,7 +1010,7 @@ def _prefer_specific_identifier_match(
         query_tokens = set(_tokenize_for_match(text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
         descriptor_tokens = _column_semantic_tokens(table, descriptor).union(_column_descriptor_tokens(table, descriptor))
         primary_tokens = _column_semantic_tokens(table, semantic).union(_column_descriptor_tokens(table, semantic))
-        generic_identifier_tokens = {"id", "ids", "number", "numbers", "code", "codes", "key", "keys", "employee", "customer", "order", "product"}
+        generic_identifier_tokens = _GENERIC_IDENTIFIER_TOKENS | _schema_entity_head_tokens()
         specific_relational_tokens = (descriptor_tokens - primary_tokens) - generic_identifier_tokens
         if query_tokens.intersection(specific_relational_tokens):
             return descriptor
@@ -5302,12 +5375,16 @@ def _should_reclassify_pseudo_aggregate_lookup(
     if not has_row_return_language:
         return False
 
+    grouping_terms_alt = _regex_alt_from_terms(_schema_groupable_terms())
     has_grouping_language = bool(
         re.search(
-            r"\b(?:for\s+each|group(?:ed)?\s+by|group\s+by|summari[sz]e|break\s+.*\s+down|"
-            r"per\s+(?:status|type|category|month|year|quarter|customer|product|office|country|city|state|territory))\b",
+            r"\b(?:for\s+each|group(?:ed)?\s+by|group\s+by|summari[sz]e|break\s+.*\s+down)\b",
             q,
             flags=re.I,
+        )
+        or (
+            grouping_terms_alt
+            and re.search(rf"\bper\s+(?:{grouping_terms_alt})\b", q, flags=re.I)
         )
     )
     if has_grouping_language:

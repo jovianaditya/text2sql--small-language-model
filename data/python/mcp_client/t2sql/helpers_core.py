@@ -24005,6 +24005,20 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
         if re.search(rf"\b{re.escape(sum_fact_alias)}\s*\.", g0):
             return sql
 
+    entity_words = _entity_words_for_table(base_table)
+    if not entity_words:
+        entity_words = [base_table, (base_table[:-1] if base_table.endswith("s") else base_table)]
+    base_entity_terms = {
+        tok
+        for word in entity_words
+        for tok in re.findall(
+            r"[a-z0-9]+",
+            re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(word or "")).replace("_", " ").lower(),
+        )
+        if len(tok) >= 3
+    }
+    base_id_for_score = str(get_id_column(base_table) or "").strip("`").lower()
+
     def _pick_pair(pairs: List[tuple]) -> Optional[tuple]:
         if not pairs:
             return None
@@ -24015,7 +24029,21 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
             for name in (base_col, fact_col):
                 if name.endswith(("id", "number", "code", "key")):
                     score += 4
-                if "customer" in name:
+                name_terms = {
+                    tok
+                    for tok in re.findall(
+                        r"[a-z0-9]+",
+                        re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(name or "")).replace("_", " ").lower(),
+                    )
+                    if tok
+                }
+                name_compact = re.sub(r"[^a-z0-9]+", "", name)
+                if base_entity_terms and (
+                    name_terms.intersection(base_entity_terms)
+                    or any(term in name_compact for term in base_entity_terms)
+                ):
+                    score += 3
+                if base_id_for_score and name == base_id_for_score:
                     score += 3
             if base_col == fact_col:
                 score += 2
@@ -24033,10 +24061,6 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
 
     q_low = (question or "").lower()
     q_low_output = re.split(r"\b(?:sort(?:ed)?\s+by|order\s+by)\b", q_low, maxsplit=1, flags=re.I)[0]
-    entity_words = _entity_words_for_table(base_table)
-    if not entity_words:
-        entity_words = [base_table, (base_table[:-1] if base_table.endswith("s") else base_table)]
-
     def _mentions_entity_attr(attr: str) -> bool:
         for word in entity_words:
             ww = (word or "").strip().lower()
