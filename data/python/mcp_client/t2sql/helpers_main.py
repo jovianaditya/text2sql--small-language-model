@@ -2509,12 +2509,7 @@ def _infer_tables_from_question_columns(
             return True
 
         # 3) Informative token boundary match (avoid weak generic tokens)
-        stop_tokens = {
-            "id", "ids", "code", "codes", "number", "numbers",
-            "name", "names", "date", "dates", "line", "lines",
-            "type", "types", "status", "each", "table", "order",
-            "quantity", "price", "amount", "total", "average", "value"
-        }
+        stop_tokens = set(AGENT_COLUMN_STOP_TOKENS)
         name_col = str(get_name_column(table_l) or "").strip().lower() if table_l else ""
         id_col = str(get_id_column(table_l) or "").strip().lower() if table_l else ""
         role = str(get_column_role(table_l, column) or "").strip().lower() if table_l else ""
@@ -6835,7 +6830,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         constraints.append(
             "RANK FUNCTION RULE (CRITICAL): The question asks for a 'rank' of items. "
             "You MUST use the RANK() or DENSE_RANK() window function. "
-            "CORRECT PATTERN: `SELECT col1, col2, RANK() OVER (PARTITION BY groupCol ORDER BY orderCol DESC) AS employee_rank FROM table` "
+            "CORRECT PATTERN: `SELECT col1, col2, RANK() OVER (PARTITION BY group_col ORDER BY order_col DESC) AS entity_rank FROM table_name` "
             "WRONG: Using COUNT(*) - that gives a total count, NOT a rank. "
             "WRONG: Using ROW_NUMBER() - use RANK() for tied values. "
             "IMPORTANT: RANK() assigns the same rank to equal values and skips ranks for ties."
@@ -6979,8 +6974,8 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             constraints.append(
                 f"REDUNDANT PATTERN WARNING: When you use `WHERE rn = {rank_n}`, each group already has exactly ONE row. "
                 f"THEREFORE: (1) NO GROUP BY needed - it's redundant! (2) NO MAX(CASE WHEN rn = {rank_n}...) needed - just select the column directly! "
-                f"WRONG: `SELECT t.customer, MAX(CASE WHEN rn = {rank_n} THEN amount END) FROM (...) t WHERE t.rn = {rank_n} GROUP BY t.customer` "
-                f"CORRECT: `SELECT t.customer, t.amount FROM (...) t WHERE t.rn = {rank_n}`"
+                f"WRONG: `SELECT t.entity_col, MAX(CASE WHEN rn = {rank_n} THEN metric_col END) FROM (...) t WHERE t.rn = {rank_n} GROUP BY t.entity_col` "
+                f"CORRECT: `SELECT t.entity_col, t.metric_col FROM (...) t WHERE t.rn = {rank_n}`"
             )
             constraints.append(
                 f"ALIAS CONSISTENCY (CRITICAL): Use the SAME alias everywhere! "

@@ -9697,7 +9697,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             extra_instruction = (
                 "STRICT REQUIREMENT: The question asks for all rows on the latest or earliest date, not just one row. "
                 "You MUST filter with a scalar subquery such as "
-                "`WHERE orderDate = (SELECT MAX(orderDate) FROM orders)` "
+                "`WHERE date_col = (SELECT MAX(date_col) FROM base_table)` "
                 "or the MIN(...) equivalent, then apply any requested final ORDER BY."
             )
         elif "missing_required_window_partition" in contract_violations:
