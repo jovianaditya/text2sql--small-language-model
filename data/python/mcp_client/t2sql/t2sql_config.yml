@@ -520,14 +520,12 @@ config:
     - selling price
     - deal price
     helpers_semantic_alias_listprice_include_terms:
-    - msrp
     - list price
     helpers_semantic_alias_price_exclude_terms:
     - buy price
     - purchase price
     - cost
     - cogs
-    - msrp
     - list price
     - retail price
     - catalog price
@@ -716,7 +714,6 @@ config:
     - key
     retrieval_numeric_pattern_keywords:
     - quantity
-    - stock
     - amount
     - price
     - cost
@@ -774,5 +771,17 @@ config:
       h: '3600'
     helpers_existence_irregular_base_forms:
       paid: pay
-    retrieval_column_variant_replacements:
-      instock: in stock
+    retrieval_column_variant_replacements: {}
+profiles:
+  business:
+    config:
+      lists:
+        helpers_semantic_alias_listprice_include_terms:
+        - msrp
+        helpers_semantic_alias_price_exclude_terms:
+        - msrp
+        retrieval_numeric_pattern_keywords:
+        - stock
+      dicts:
+        retrieval_column_variant_replacements:
+          instock: in stock

@@ -24,6 +24,88 @@ def _coerce_non_empty_list(val: Any) -> list[str]:
     return out
 
 
+def _dedupe_list(items: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: Set[str] = set()
+    for item in items or []:
+        s = str(item or "").strip()
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def _merge_lists(*lists: Iterable[str]) -> list[str]:
+    merged: list[str] = []
+    for items in lists:
+        merged.extend(str(item or "").strip() for item in (items or []))
+    return _dedupe_list(merged)
+
+
+def _merge_dicts(*dicts: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for item in dicts:
+        if isinstance(item, dict):
+            out.update(item)
+    return out
+
+
+def _get_nested(root: Dict[str, Any], path: Sequence[str], default: Any = None) -> Any:
+    cur: Any = root
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        if key not in cur:
+            return default
+        cur = cur.get(key)
+    return cur
+
+
+def _active_profile_keys() -> list[str]:
+    raw = str(os.getenv("DOMAIN_HEURISTICS_PROFILE", "agnostic") or "agnostic").strip().lower()
+    aliases = {
+        "business_compat": "business",
+        "legacy": "business",
+        "compat": "business",
+    }
+    keys = [raw]
+    alias = aliases.get(raw)
+    if alias:
+        keys.append(alias)
+    return _dedupe_list(keys)
+
+
+def _profile_overlay_values(root: Dict[str, Any], path: Sequence[str]) -> list[Any]:
+    overlays: list[Any] = []
+    if not isinstance(root, dict):
+        return overlays
+    for profile in _active_profile_keys():
+        val = _get_nested(root, ("profiles", profile, *path), None)
+        if val is not None:
+            overlays.append(val)
+    return overlays
+
+
+def _profile_overlay_list(root: Dict[str, Any], path: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    for val in _profile_overlay_values(root, path):
+        if isinstance(val, list):
+            out.extend(_coerce_non_empty_list(val))
+    return _dedupe_list(out)
+
+
+def _profile_overlay_dict(root: Dict[str, Any], path: Sequence[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for val in _profile_overlay_values(root, path):
+        if isinstance(val, dict):
+            out.update(val)
+    return out
+
+
 @lru_cache(maxsize=1)
 def _load_rules() -> Dict[str, Any]:
     path_raw = os.getenv("T2SQL_RULES_PATH", "").strip()
@@ -84,31 +166,23 @@ def _load_config() -> Dict[str, Any]:
 
 
 def rule_value(path: Sequence[str], default: Any = None) -> Any:
-    cur: Any = _load_rules()
-    for key in path:
-        if not isinstance(cur, dict):
-            return default
-        if key not in cur:
-            return default
-        cur = cur.get(key)
-    return cur
+    return _get_nested(_load_rules(), path, default)
 
 
 def rule_list(path: Sequence[str], default: Optional[Iterable[str]] = None) -> list[str]:
     val = rule_value(path, None)
     if val is None:
-        return [str(x).strip() for x in (default or []) if str(x).strip()]
-    out = _coerce_non_empty_list(val)
-    if out:
-        return out
-    return [str(x).strip() for x in (default or []) if str(x).strip()]
+        base = [str(x).strip() for x in (default or []) if str(x).strip()]
+    else:
+        out = _coerce_non_empty_list(val)
+        base = out if out else [str(x).strip() for x in (default or []) if str(x).strip()]
+    return _merge_lists(base, _profile_overlay_list(_load_rules(), path))
 
 
 def rule_dict(path: Sequence[str], default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     val = rule_value(path, None)
-    if isinstance(val, dict):
-        return val
-    return dict(default or {})
+    base = dict(val) if isinstance(val, dict) else dict(default or {})
+    return _merge_dicts(base, _profile_overlay_dict(_load_rules(), path))
 
 
 def config_default_list(key: str, default: Optional[Iterable[str]] = None) -> list[str]:
@@ -119,12 +193,22 @@ def config_default_list(key: str, default: Optional[Iterable[str]] = None) -> li
     k = str(key or "").strip()
     if not k:
         return [str(x).strip() for x in (default or []) if str(x).strip()]
+
+    def _with_profile_overlays(base: Iterable[str]) -> list[str]:
+        return _merge_lists(
+            base,
+            _profile_overlay_list(_load_rules(), ("config", "lists", k)),
+            _profile_overlay_list(_load_rules(), ("config_defaults", "lists", k)),
+            _profile_overlay_list(_load_config(), ("config", "lists", k)),
+            _profile_overlay_list(_load_config(), ("config_defaults", "lists", k)),
+        )
+
     from_overlay = rule_value(("config", "lists", k), None)
     if from_overlay is None:
         # Backward compatibility for older rulebook structure
         from_overlay = rule_value(("config_defaults", "lists", k), None)
     if isinstance(from_overlay, list):
-        return _coerce_non_empty_list(from_overlay)
+        return _with_profile_overlays(_coerce_non_empty_list(from_overlay))
     if from_overlay is None:
         overlay_root = _load_config()
         for root_key in ("config", "config_defaults"):
@@ -135,8 +219,10 @@ def config_default_list(key: str, default: Optional[Iterable[str]] = None) -> li
                     break
                 cur = cur.get(part)
             if isinstance(cur, list):
-                return _coerce_non_empty_list(cur)
-    return rule_list(("config", "lists", k), rule_list(("config_defaults", "lists", k), default))
+                return _with_profile_overlays(_coerce_non_empty_list(cur))
+    return _with_profile_overlays(
+        rule_list(("config", "lists", k), rule_list(("config_defaults", "lists", k), default))
+    )
 
 
 def config_default_dict(key: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -147,12 +233,22 @@ def config_default_dict(key: str, default: Optional[Dict[str, Any]] = None) -> D
     k = str(key or "").strip()
     if not k:
         return dict(default or {})
+
+    def _with_profile_overlays(base: Dict[str, Any]) -> Dict[str, Any]:
+        return _merge_dicts(
+            base,
+            _profile_overlay_dict(_load_rules(), ("config", "dicts", k)),
+            _profile_overlay_dict(_load_rules(), ("config_defaults", "dicts", k)),
+            _profile_overlay_dict(_load_config(), ("config", "dicts", k)),
+            _profile_overlay_dict(_load_config(), ("config_defaults", "dicts", k)),
+        )
+
     from_overlay = rule_value(("config", "dicts", k), None)
     if from_overlay is None:
         # Backward compatibility for older rulebook structure
         from_overlay = rule_value(("config_defaults", "dicts", k), None)
     if isinstance(from_overlay, dict):
-        return dict(from_overlay)
+        return _with_profile_overlays(dict(from_overlay))
     if from_overlay is None:
         overlay_root = _load_config()
         for root_key in ("config", "config_defaults"):
@@ -163,8 +259,10 @@ def config_default_dict(key: str, default: Optional[Dict[str, Any]] = None) -> D
                     break
                 cur = cur.get(part)
             if isinstance(cur, dict):
-                return dict(cur)
-    return rule_dict(("config", "dicts", k), rule_dict(("config_defaults", "dicts", k), default))
+                return _with_profile_overlays(dict(cur))
+    return _with_profile_overlays(
+        rule_dict(("config", "dicts", k), rule_dict(("config_defaults", "dicts", k), default))
+    )
 
 
 def config_default_scalar(key: str, default: Any = None) -> Any:
@@ -614,13 +712,7 @@ def existence_count_metric_phrases() -> list[str]:
 
 @lru_cache(maxsize=1)
 def guidance_fact_support_phrases() -> list[str]:
-    defaults = [
-        "order line",
-        "order lines",
-        "ordered products",
-        "total quantity",
-        "total revenue",
-    ]
+    defaults: list[str] = []
     return rule_list(("prompt_guidance", "fact_support", "phrases"), defaults)
 
 
@@ -842,31 +934,19 @@ def ordered_quantity_repair_quantity_terms() -> list[str]:
 
 @lru_cache(maxsize=1)
 def ordered_quantity_repair_inventory_terms() -> list[str]:
-    defaults = ["stock", "stocked", "inventory", "in stock", "on hand"]
+    defaults: list[str] = []
     return rule_list(("heuristic_repairs", "ordered_quantity_stock_aggregate", "inventory_terms"), defaults)
 
 
 @lru_cache(maxsize=1)
 def ordered_quantity_repair_non_quantity_metric_terms() -> list[str]:
-    defaults = ["price", "cost", "amount", "value", "rate"]
+    defaults: list[str] = []
     return rule_list(("heuristic_repairs", "ordered_quantity_stock_aggregate", "non_quantity_metric_terms"), defaults)
 
 
 @lru_cache(maxsize=1)
 def positive_row_filter_keep_phrases() -> list[str]:
-    defaults = [
-        "in stock",
-        "available",
-        "availability",
-        "with stock",
-        "stocked",
-        "non-zero",
-        "positive",
-        "greater than 0",
-        "more than 0",
-        "at least 1",
-        "minimum 1",
-    ]
+    defaults: list[str] = []
     return rule_list(("heuristic_repairs", "unrequested_positive_row_filters", "keep_phrases"), defaults)
 
 

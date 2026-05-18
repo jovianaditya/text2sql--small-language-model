@@ -76,7 +76,7 @@ def _env_json_dict(name: str, default: dict[str, str]) -> dict[str, str]:
             val = str(v).strip()
             if key and val:
                 out_default[key] = val
-        return out_default or default
+        return out_default
 
     try:
         parsed = json.loads(raw)

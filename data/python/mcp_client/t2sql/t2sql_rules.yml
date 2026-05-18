@@ -660,11 +660,7 @@ ordering_intent:
 prompt_guidance:
   fact_support:
     phrases:
-      - order line
-      - order lines
-      - ordered products
       - total quantity
-      - total revenue
 
 heuristic_repairs:
   ordered_quantity_stock_aggregate:
@@ -1462,6 +1458,16 @@ aggregation_intent:
     - how many distinct
     - number of unique
     - jumlah unik
+
+profiles:
+  business:
+    prompt_guidance:
+      fact_support:
+        phrases:
+          - order line
+          - order lines
+          - ordered products
+          - total revenue
 
 precedence:
   - name_intent.combined_full_name

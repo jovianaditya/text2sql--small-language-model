@@ -218,6 +218,16 @@ from .rulebook import (
     retrieval_probe_short_query_fallback_terms,
     retrieval_probe_temporal_terms,
     rule_list,
+    semantic_contract_average_terms,
+    semantic_contract_count_how_many_phrases,
+    semantic_contract_count_number_of_prefixes,
+    semantic_contract_count_terms,
+    semantic_contract_per_group_terms,
+    semantic_contract_ratio_count_reference_phrases,
+    semantic_contract_ratio_operator_terms,
+    semantic_contract_sum_terms,
+    semantic_contract_sum_total_count_phrases,
+    semantic_contract_sum_total_prefix_terms,
     winner_row_rank_terms,
 )
 # ======================================================================
@@ -3161,6 +3171,88 @@ def _question_has_guidance_support_intent(question: str, qtype: str) -> bool:
     return False
 
 
+def _question_has_metric_support_fallback_intent(question: str) -> bool:
+    """
+    Gate retrieval-backed support-table expansion to questions that explicitly
+    describe a derived metric or fact-support phrase. Plain aggregate/cardinality
+    questions should not pull in extra FK-neighbor tables.
+    """
+    q = str(question or "").strip().lower()
+    if not q:
+        return False
+
+    cardinality_terms = {
+        str(term or "").strip().lower()
+        for term in (
+            semantic_contract_count_terms()
+            + semantic_contract_count_number_of_prefixes()
+            + semantic_contract_count_how_many_phrases()
+        )
+        if str(term or "").strip()
+    }
+    total_prefix_terms = {
+        str(term or "").strip().lower()
+        for term in semantic_contract_sum_total_prefix_terms()
+        if str(term or "").strip()
+    }
+    total_count_phrases = [
+        str(term or "").strip().lower()
+        for term in semantic_contract_sum_total_count_phrases()
+        if str(term or "").strip()
+    ]
+    metric_terms = {
+        str(term or "").strip().lower()
+        for term in (
+            HELPERS_METRIC_AGG_INTENT_TERMS
+            | HELPERS_PROBE_GENERIC_METRIC_TERMS
+            | HELPERS_PROBE_LOCALIZED_METRIC_TERMS
+        )
+        if str(term or "").strip()
+    }
+
+    non_cardinality_metric_terms = metric_terms.difference(cardinality_terms)
+    has_non_cardinality_metric = False
+    for term in sorted(non_cardinality_metric_terms, key=len, reverse=True):
+        if term in total_prefix_terms and any_phrase_in_text(q, total_count_phrases):
+            continue
+        if term in total_prefix_terms:
+            if not re.search(rf"\b{re.escape(term)}\s+[a-z0-9]+", q, flags=re.I):
+                continue
+        if phrase_in_text(q, term):
+            has_non_cardinality_metric = True
+            break
+
+    has_average = any_phrase_in_text(q, semantic_contract_average_terms())
+    has_sum = any_phrase_in_text(q, semantic_contract_sum_terms()) or has_non_cardinality_metric
+    has_fact_support_phrase = any(
+        phrase_in_text(q, phrase)
+        for phrase in guidance_fact_support_phrases()
+    )
+
+    ratio_terms = [str(term or "").strip().lower() for term in semantic_contract_ratio_operator_terms() if str(term or "").strip()]
+    weak_ratio_terms = {
+        term
+        for term in (
+            str(val or "").strip().lower()
+            for val in semantic_contract_per_group_terms()
+        )
+        if term and term in ratio_terms
+    }
+    strong_ratio_terms = [term for term in ratio_terms if term not in weak_ratio_terms]
+    has_strong_ratio_operator = any_phrase_in_text(q, strong_ratio_terms)
+    has_per_ratio_operator = any_phrase_in_text(q, weak_ratio_terms)
+    has_ratio_count_reference = any_phrase_in_text(q, semantic_contract_ratio_count_reference_phrases())
+
+    if has_strong_ratio_operator and (has_average or has_sum or has_ratio_count_reference):
+        return True
+    if has_per_ratio_operator and has_average and has_sum and has_ratio_count_reference:
+        return True
+    if has_fact_support_phrase and has_sum:
+        return True
+
+    return False
+
+
 def _find_schema_support_tables_for_guidance(
     question: str,
     ranked_cols: list,
@@ -3213,6 +3305,15 @@ def _find_schema_support_tables_for_guidance(
         for tbl, col in (ranked_cols or [])
         if str(tbl or "").strip() and str(col or "").strip()
     }
+    ranked_table_cols: Dict[str, Set[str]] = defaultdict(set)
+    ranked_table_first_rank: Dict[str, int] = {}
+    for idx, (tbl, col) in enumerate(ranked_cols or []):
+        tbl_l = str(tbl or "").strip().lower()
+        col_l = str(col or "").strip().lower()
+        if not tbl_l or not col_l:
+            continue
+        ranked_table_cols[tbl_l].add(col_l)
+        ranked_table_first_rank.setdefault(tbl_l, idx)
     allowed_identifiers = _parse_allowed_identifiers(ctx)
     allowed_tables = {
         str(t or "").strip().lower()
@@ -3237,6 +3338,13 @@ def _find_schema_support_tables_for_guidance(
             continue
         if allowed_tables and table_l not in allowed_tables:
             continue
+        allowed_cols_for_table = {
+            str(col or "").strip().lower()
+            for col in ((allowed_identifiers or {}).get(table_l) or set())
+            if str(col or "").strip()
+        }
+        prompt_visible_cols = set(allowed_cols_for_table).union(ranked_table_cols.get(table_l) or set())
+        table_explicitly_mentioned = _guidance_has_direct_table_mention(question, table_l)
 
         path = _shortest_fk_table_path(primary, table_l)
         if len(path) < 2:
@@ -3253,6 +3361,13 @@ def _find_schema_support_tables_for_guidance(
         non_temporal_support_seen = False
         for col in candidate_cols:
             role = get_column_role(table_l, col)
+            col_l = str(col or "").strip().lower()
+            if (
+                prompt_visible_cols
+                and col_l not in prompt_visible_cols
+                and not table_explicitly_mentioned
+            ):
+                continue
             col_terms = _guidance_column_cover_terms(table_l, col)
             if matched_fact_support_phrases:
                 try:
@@ -3288,10 +3403,10 @@ def _find_schema_support_tables_for_guidance(
                     col_score += 2
                 if novel_overlap:
                     col_score += 2
-                if _guidance_has_direct_table_mention(question, table_l):
+                if table_explicitly_mentioned:
                     col_score += 1
                 col_scores.append(col_score)
-            if (table_l, col.lower()) in ranked_pairs:
+            if (table_l, col_l) in ranked_pairs:
                 if col_scores:
                     col_scores[-1] += 1
 
@@ -3304,7 +3419,7 @@ def _find_schema_support_tables_for_guidance(
         if (
             not novel_overlap_seen
             and not fact_support_seen
-            and not _guidance_has_direct_table_mention(question, table_l)
+            and not table_explicitly_mentioned
         ):
             continue
 
@@ -3316,7 +3431,97 @@ def _find_schema_support_tables_for_guidance(
 
     support_scores.sort(key=lambda item: (-item[0], item[1], item[2]))
     max_support_tables = 2 if _question_wants_dual_fact_rollup(question) else 1
-    return [table for score, _, table in support_scores if score > 0][:max_support_tables]
+    selected = [table for score, _, table in support_scores if score > 0][:max_support_tables]
+    remaining_slots = max_support_tables - len(selected)
+    if (
+        remaining_slots <= 0
+        or not _question_has_aggregate_threshold_intent(question)
+        or not _question_has_metric_support_fallback_intent(question)
+    ):
+        return selected
+
+    # Retrieval-backed fallback: aggregate-threshold questions can describe a
+    # derived metric without naming its component columns. If retrieval already
+    # exposed an allowed FK-connected table with novel non-key metric columns,
+    # keep that table in prompt guidance rather than forcing the LLM to infer a
+    # missing support join from a partial path.
+    selected_set = set(selected)
+    base_table_set = set(base_tables)
+    fallback_scores: List[Tuple[int, int, int, str]] = []
+    for table in sorted(get_all_tables()):
+        table_l = str(table or "").strip().lower()
+        if not table_l or table_l in seen_tables or table_l in selected_set:
+            continue
+        if allowed_tables and table_l not in allowed_tables:
+            continue
+
+        ranked_cols_for_table = ranked_table_cols.get(table_l) or set()
+        if not ranked_cols_for_table:
+            continue
+        allowed_cols_for_table = {
+            str(col or "").strip().lower()
+            for col in ((allowed_identifiers or {}).get(table_l) or set())
+            if str(col or "").strip()
+        }
+
+        path = _shortest_fk_table_path(primary, table_l)
+        if len(path) < 2:
+            continue
+
+        candidate_cols = {
+            str(col or "").strip().lower(): str(col or "").strip()
+            for col in _guidance_support_candidate_columns(table_l)
+            if str(col or "").strip()
+        }
+        if not candidate_cols:
+            continue
+
+        date_cols = {
+            str(col or "").strip().lower()
+            for col in (get_filterable_date_columns(table_l) or [])
+            if str(col or "").strip()
+        }
+        novel_metric_cols = []
+        for col_l in ranked_cols_for_table:
+            if col_l not in candidate_cols or col_l in date_cols:
+                continue
+            if allowed_cols_for_table and col_l not in allowed_cols_for_table:
+                continue
+            col_name = candidate_cols[col_l]
+            if _guidance_column_is_covered_by_tables(
+                table_l,
+                col_name,
+                base_table_set,
+                allowed_identifiers,
+                ranked_cols,
+            ):
+                continue
+            novel_metric_cols.append(col_name)
+
+        if not novel_metric_cols:
+            continue
+
+        score = min(len(novel_metric_cols), 3) * 3
+        role_bonus = 0
+        for col_name in novel_metric_cols:
+            role = str(get_column_role(table_l, col_name) or "").strip().lower()
+            if role in {"metric", "measure", "amount", "quantity"}:
+                role_bonus += 1
+        score += min(role_bonus, 2)
+        fallback_scores.append(
+            (
+                score,
+                ranked_table_first_rank.get(table_l, 10**9),
+                len(path),
+                table_l,
+            )
+        )
+
+    fallback_scores.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+    selected.extend(
+        table for score, _, _, table in fallback_scores if score > 0
+    )
+    return selected[:max_support_tables]
 
 
 def _prune_guidance_tables_for_prompt(

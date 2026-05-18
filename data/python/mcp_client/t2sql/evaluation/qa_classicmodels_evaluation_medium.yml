@@ -297,7 +297,7 @@ cases:
           AVG(MSRP) AS average_msrp
         FROM products
         GROUP BY productVendor
-        HAVING COUNT(*) >= 2
+        HAVING COUNT(DISTINCT productLine) >= 2
         ORDER BY average_msrp DESC, productVendor ASC;
     - id: M23
       difficulty: medium
