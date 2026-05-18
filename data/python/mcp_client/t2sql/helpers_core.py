@@ -92,6 +92,8 @@ from .rulebook import (
     name_component_priority_groups,
     name_request_terms,
     name_component_synonym_hints,
+    ordered_quantity_repair_inventory_terms,
+    ordered_quantity_repair_non_quantity_metric_terms,
     ordered_quantity_repair_order_terms,
     ordered_quantity_repair_quantity_terms,
     ordering_explicit_sort_command_regex_patterns,
@@ -102,6 +104,7 @@ from .rulebook import (
     ordering_window_context_regex_patterns,
     question_wants_combined_full_name,
     question_wants_split_name_components,
+    positive_row_filter_keep_phrases,
     rule_list,
     rule_value,
     semantic_question_token_stopwords,
@@ -18453,8 +18456,6 @@ def _rewrite_ordered_quantity_stock_aggregate(
     )
     if not has_ordered_quantity_intent:
         return sql
-    if not re.search(r"(?is)\bSUM\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*stock[A-Za-z0-9_]*`?\s*\)", s):
-        return sql
 
     parsed = _parse_select_from_groupby(s)
     if not parsed:
@@ -18533,8 +18534,84 @@ def _rewrite_ordered_quantity_stock_aggregate(
     def _case_col(table_l: str, col_l: str) -> str:
         return str(getattr(analyzer, "_column_original_case", {}).get(f"{table_l}.{col_l}", col_l))
 
+    def _normalize_terms_text(text: str) -> str:
+        return re.sub(
+            r"([a-z0-9])([A-Z])",
+            r"\1 \2",
+            str(text or "").replace("_", " "),
+        ).lower()
+
     def _terms(text: str) -> Set[str]:
-        return {tok for tok in re.split(r"[^a-z0-9]+", str(text or "").lower()) if tok}
+        return {tok for tok in re.split(r"[^a-z0-9]+", _normalize_terms_text(text)) if tok}
+
+    def _configured_signal(raw_terms: Sequence[str]) -> Tuple[Set[str], Set[str]]:
+        stop = {"a", "an", "the", "of", "for", "with", "in", "on", "at", "by"}
+        tokens: Set[str] = set()
+        compacts: Set[str] = set()
+        for raw in raw_terms or []:
+            raw_s = str(raw or "").strip()
+            if not raw_s:
+                continue
+            normalized = _normalize_terms_text(raw_s)
+            toks = {tok for tok in re.split(r"[^a-z0-9]+", normalized) if tok and tok not in stop}
+            tokens.update(toks)
+            compact = re.sub(r"[^a-z0-9]+", "", normalized)
+            if compact:
+                compacts.add(compact)
+        return tokens, compacts
+
+    quantity_tokens, quantity_compacts = _configured_signal(ordered_quantity_repair_quantity_terms())
+    order_tokens, order_compacts = _configured_signal(ordered_quantity_repair_order_terms())
+    inventory_tokens, inventory_compacts = _configured_signal(ordered_quantity_repair_inventory_terms())
+    non_quantity_tokens, non_quantity_compacts = _configured_signal(
+        ordered_quantity_repair_non_quantity_metric_terms()
+    )
+
+    def _column_semantics(table_l: str, col_l: str) -> Tuple[Set[str], str]:
+        texts = [col_l, _case_col(table_l, col_l)]
+        try:
+            texts.append(str(get_column_description(table_l, col_l) or ""))
+        except Exception:
+            pass
+        try:
+            texts.append(str(get_column_role(table_l, col_l) or ""))
+        except Exception:
+            pass
+        try:
+            texts.extend(str(syn or "") for syn in analyzer.get_column_synonyms(table_l, col_l) or [])
+        except Exception:
+            pass
+        normalized = " ".join(_normalize_terms_text(text) for text in texts if str(text or "").strip())
+        return _terms(normalized), re.sub(r"[^a-z0-9]+", "", normalized)
+
+    def _has_signal(terms: Set[str], compact: str, tokens: Set[str], compacts: Set[str]) -> bool:
+        return bool(
+            (terms & tokens)
+            or any(signal and signal in compact for signal in compacts)
+        )
+
+    sum_col_pat = re.compile(
+        r"""(?is)\bSUM\s*\(\s*
+            (?:(?P<qual>`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\.\s*)?
+            (?P<col>`?[A-Za-z_][A-Za-z0-9_]*`?)
+            \s*\)""",
+        flags=re.X,
+    )
+    base_cols = _table_cols(base_table)
+    inventory_sum_sql = ""
+    for m_sum in sum_col_pat.finditer(s):
+        qualifier = str(m_sum.group("qual") or "").strip("`").lower()
+        col_l = str(m_sum.group("col") or "").strip("`").lower()
+        if qualifier and qualifier not in {base_alias.lower(), base_table}:
+            continue
+        if base_cols and col_l not in base_cols:
+            continue
+        col_terms, col_compact = _column_semantics(base_table, col_l)
+        if _has_signal(col_terms, col_compact, inventory_tokens, inventory_compacts):
+            inventory_sum_sql = m_sum.group(0)
+            break
+    if not inventory_sum_sql:
+        return sql
 
     child_candidates: List[Tuple[int, str, str, str]] = []
     for child_table_raw, mapping in (fk_raw or {}).items():
@@ -18545,28 +18622,23 @@ def _rewrite_ordered_quantity_stock_aggregate(
             if target != base_table or not fk_col:
                 continue
             for col_l in _table_cols(child_table):
-                col_terms = _terms(col_l)
-                try:
-                    col_terms.update(_terms(get_column_description(child_table, col_l)))
-                except Exception:
-                    pass
-                has_quantity_signal = (
-                    "quantity" in col_terms
-                    or "qty" in col_terms
-                    or "unit" in col_terms
-                    or "units" in col_terms
-                    or "quantity" in col_l
+                col_terms, col_compact = _column_semantics(child_table, col_l)
+                has_quantity_signal = _has_signal(
+                    col_terms,
+                    col_compact,
+                    quantity_tokens,
+                    quantity_compacts,
                 )
                 if not has_quantity_signal:
                     continue
                 score = 10
-                if "quantity" in col_l or "qty" in col_l:
+                if _has_signal(col_terms, col_compact, quantity_tokens, quantity_compacts):
                     score += 12
-                if "ordered" in col_terms or "order" in col_terms:
+                if _has_signal(col_terms, col_compact, order_tokens, order_compacts):
                     score += 8
-                if "price" in col_l or "price" in col_terms or "cost" in col_terms:
+                if _has_signal(col_terms, col_compact, non_quantity_tokens, non_quantity_compacts):
                     score -= 10
-                if "stock" in col_terms or "inventory" in col_terms:
+                if _has_signal(col_terms, col_compact, inventory_tokens, inventory_compacts):
                     score -= 6
                 child_candidates.append((score, child_table, fk_col, col_l))
     if not child_candidates:
@@ -18591,11 +18663,10 @@ def _rewrite_ordered_quantity_stock_aggregate(
         s,
         count=1,
     )
-    rebuilt = re.sub(
-        r"(?is)\bSUM\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\.)?`?[A-Za-z_][A-Za-z0-9_]*stock[A-Za-z0-9_]*`?\s*\)",
+    rebuilt = rebuilt.replace(
+        inventory_sum_sql,
         f"SUM({child_alias}.{_case_col(child_table, qty_col)})",
-        rebuilt,
-        count=1,
+        1,
     )
     rebuilt = re.sub(
         rf"(?is)\bCOUNT\s*\(\s*DISTINCT\s+`?{re.escape(base_id)}`?\s*\)",
@@ -32505,13 +32576,7 @@ def _drop_unrequested_positive_row_filters(sql: str, question: str, ctx: str = "
         return sql
 
     # Do not touch questions that explicitly ask for positive/availability semantics.
-    if re.search(
-        r"\b(?:in\s+stock|available|availability|with\s+stock|stocked|"
-        r"non[-\s]?zero|positive|greater\s+than\s+0|more\s+than\s+0|"
-        r"at\s+least\s+1|minimum\s+1)\b",
-        q,
-        flags=re.I,
-    ):
+    if any_phrase_in_text(q, positive_row_filter_keep_phrases()):
         return sql
 
     group_items = _split_top_level_commas(parsed.get("groupby") or "")

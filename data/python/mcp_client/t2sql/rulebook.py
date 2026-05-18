@@ -841,6 +841,36 @@ def ordered_quantity_repair_quantity_terms() -> list[str]:
 
 
 @lru_cache(maxsize=1)
+def ordered_quantity_repair_inventory_terms() -> list[str]:
+    defaults = ["stock", "stocked", "inventory", "in stock", "on hand"]
+    return rule_list(("heuristic_repairs", "ordered_quantity_stock_aggregate", "inventory_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def ordered_quantity_repair_non_quantity_metric_terms() -> list[str]:
+    defaults = ["price", "cost", "amount", "value", "rate"]
+    return rule_list(("heuristic_repairs", "ordered_quantity_stock_aggregate", "non_quantity_metric_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def positive_row_filter_keep_phrases() -> list[str]:
+    defaults = [
+        "in stock",
+        "available",
+        "availability",
+        "with stock",
+        "stocked",
+        "non-zero",
+        "positive",
+        "greater than 0",
+        "more than 0",
+        "at least 1",
+        "minimum 1",
+    ]
+    return rule_list(("heuristic_repairs", "unrequested_positive_row_filters", "keep_phrases"), defaults)
+
+
+@lru_cache(maxsize=1)
 def latest_year_scope_aggregate_terms() -> list[str]:
     defaults = [
         "sum",

@@ -676,6 +676,31 @@ heuristic_repairs:
       - qty
       - unit
       - units
+    inventory_terms:
+      - stock
+      - stocked
+      - inventory
+      - in stock
+      - on hand
+    non_quantity_metric_terms:
+      - price
+      - cost
+      - amount
+      - value
+      - rate
+  unrequested_positive_row_filters:
+    keep_phrases:
+      - in stock
+      - available
+      - availability
+      - with stock
+      - stocked
+      - non-zero
+      - positive
+      - greater than 0
+      - more than 0
+      - at least 1
+      - minimum 1
   latest_year_same_year_aggregate:
     aggregate_terms:
       - sum
