@@ -1903,6 +1903,41 @@ def _regex_alt_from_terms(terms: Set[str], default: str) -> str:
     return f"(?:{'|'.join(escaped)})" if escaped else default
 
 
+def _configured_metric_terms(*term_sets: Any) -> Set[str]:
+    terms: Set[str] = set()
+    for term_set in term_sets:
+        for term in term_set or []:
+            normalized = str(term or "").strip().lower()
+            if normalized:
+                terms.add(normalized)
+    return terms
+
+
+def _configured_metric_alt(*term_sets: Any, default: str = r"$^") -> str:
+    return _regex_alt_from_terms(_configured_metric_terms(*term_sets), default)
+
+
+def _winner_row_metric_terms() -> Set[str]:
+    temporal_terms = _configured_metric_terms(
+        HELPERS_TEMPORAL_EVENT_COLUMN_TERMS,
+        HELPERS_TEMPORAL_FALLBACK_META_TOKENS,
+    )
+    terms = _configured_metric_terms(
+        HELPERS_CTX_GENERIC_METRIC_FALLBACK_TERMS,
+        HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS,
+        HELPERS_METRIC_AGG_INTENT_TERMS,
+        HELPERS_ROLLUP_LEGACY_METRIC_TERMS,
+        HELPERS_WINNER_ROW_RANKING_SIGNAL_TERMS,
+        winner_row_aggregate_metric_terms(),
+        winner_row_grouped_report_metric_terms(),
+    )
+    return {term for term in terms if term not in temporal_terms}
+
+
+def _winner_row_metric_alt(default: str = r"$^") -> str:
+    return _regex_alt_from_terms(_winner_row_metric_terms(), default)
+
+
 def _verb_stem_pattern(stem: str) -> str:
     s = str(stem or "").strip().lower()
     if not s:
@@ -10174,10 +10209,11 @@ def _looks_like_max_date_tiebreaker(sql: str) -> bool:
     # e.g., MAX(amount), MAX(paymentDate) - clearly trying to get row attributes
     if max_count >= 2:
         # Check if we have value-like and date-like columns
-        has_value = bool(re.search(
-            r"max\s*\([^)]*(?:amount|price|total|revenue|sales|quantity)[^)]*\)",
-            s, flags=re.I
-        ))
+        metric_alt = _winner_row_metric_alt()
+        has_value = bool(
+            metric_alt != r"$^"
+            and re.search(rf"max\s*\([^)]*{metric_alt}[^)]*\)", s, flags=re.I)
+        )
         has_date = bool(re.search(
             r"max\s*\([^)]*date[^)]*\)",
             s, flags=re.I
@@ -10525,10 +10561,16 @@ def _rewrite_explicit_rank_aggregate_window(sql: str, question: str) -> str:
         agg_order_expr = f"AVG({bare_order_expr})"
     elif re.search(r"\b(?:count|how many|number of)\b", q, flags=re.I):
         agg_order_expr = f"COUNT({bare_order_expr})"
-    elif re.search(r"\b(?:total|sum|sales value|revenue|amount|quantity)\b", q, flags=re.I):
-        agg_order_expr = f"SUM({bare_order_expr})"
     else:
-        return sql
+        sum_metric_alt = _configured_metric_alt(
+            HELPERS_METRIC_AGG_INTENT_TERMS,
+            HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS,
+            HELPERS_ROLLUP_LEGACY_METRIC_TERMS,
+        )
+        if sum_metric_alt != r"$^" and re.search(rf"\b{sum_metric_alt}\b", q, flags=re.I):
+            agg_order_expr = f"SUM({bare_order_expr})"
+        else:
+            return sql
 
     rank_alias_sql = re.search(r"\bAS\s+(.+)$", rank_match.group(0) or "", flags=re.I)
     rank_alias_sql = (rank_alias_sql.group(1).strip() if rank_alias_sql else f"`{rank_alias}`")
@@ -10584,10 +10626,11 @@ def _fix_grouped_aggregate_rank_direction(sql: str, question: str) -> str:
     )
     wants_low_rank = bool(
         low_side_cue
-        and re.search(
-            r"\b(?:revenue|sales|amount|value|price|quantity|count|total|sum|average|avg|metric)\b",
-            q_metric,
-            flags=re.I,
+        and (
+            (
+                metric_alt := _winner_row_metric_alt()
+            ) != r"$^"
+            and re.search(rf"\b{metric_alt}\b", q_metric, flags=re.I)
         )
     )
     target_dir = "ASC" if wants_low_rank else "DESC"
@@ -13277,9 +13320,10 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
             return sql
 
         # pilih metric = aggregate yang paling "nilai"
+        metric_terms = _winner_row_metric_terms()
         metric_candidates = [
             x for x in all_aggs
-            if any(tok in x.lower() for tok in ["amount","price","total","score","quantity","revenue","sales"])
+            if any(tok in x.lower() for tok in metric_terms)
         ]
 
         agg_expr = metric_candidates[0] if metric_candidates else all_aggs[0]
@@ -13298,9 +13342,10 @@ def _rewrite_winner_row_guardrail(sql: str, question: str, force: bool = False) 
                 return sql
 
         # pilih metric yang paling masuk akal
+        metric_terms = _winner_row_metric_terms()
         metric_candidates = [
             x for x in all_aggs
-            if any(tok in x.lower() for tok in ["amount","price","total","score","quantity","revenue","sales"])
+            if any(tok in x.lower() for tok in metric_terms)
         ]
         if metric_candidates:
             agg_expr = metric_candidates[0]
@@ -13770,10 +13815,8 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
         return sql
 
     q_low = (question or "").lower()
-    metric_terms = (
-        "amount", "price", "quantity", "qty", "value",
-        "sales", "revenue", "score", "total", "metric",
-    )
+    metric_terms = _winner_row_metric_terms()
+    metric_alt = _regex_alt_from_terms(metric_terms, r"$^")
 
     def _candidate_score(expr_raw: str) -> int:
         parsed = _parse_qualified_col(expr_raw)
@@ -13803,7 +13846,8 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
     )
     metric_primary = bool(
         re.search(r"\b(?:largest|highest|biggest|greatest|max(?:imum)?|top|best|smallest|lowest|least|min(?:imum)?)\b", q_low)
-        and re.search(r"\b(?:amount|price|quantity|qty|value|sales|revenue|score|total)\b", q_low)
+        and metric_alt != r"$^"
+        and re.search(rf"\b{metric_alt}\b", q_low)
     )
     if latest_date_primary and not metric_primary:
         rank_items = [
@@ -14347,13 +14391,31 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
     def _alias_terms(alias_name: str) -> Set[str]:
         return _text_terms(alias_name) | _text_terms(alias_expr_sql.get(alias_name, ""))
 
+    def _term_tokens(terms: Sequence[str]) -> Set[str]:
+        out: Set[str] = set()
+        for term in terms or []:
+            out.update(_text_terms(str(term or "")))
+        return out
+
+    quantity_alias_terms = _term_tokens(ordered_quantity_repair_quantity_terms())
+    quantity_question_terms = quantity_alias_terms | _term_tokens(ordered_quantity_repair_order_terms())
+    count_family_terms = (
+        _term_tokens(HELPERS_COUNT_INTENT_TERMS)
+        - _term_tokens(HELPERS_METRIC_AGG_INTENT_TERMS)
+        - set(semantic_question_token_stopwords())
+    )
+    value_family_terms = _winner_row_metric_terms() - quantity_alias_terms - count_family_terms
+    quantity_question_alt = _regex_alt_from_terms(quantity_question_terms, r"$^")
+    value_question_alt = _regex_alt_from_terms(value_family_terms, r"$^")
+    count_question_alt = _regex_alt_from_terms(count_family_terms, r"$^")
+
     def _alias_family(alias_name: str) -> Optional[str]:
         terms = _alias_terms(alias_name)
-        if terms & {"quantity", "qty", "unit", "units", "volume", "ordered"}:
+        if terms & quantity_alias_terms:
             return "quantity"
-        if terms & {"sales", "sale", "revenue", "amount", "value", "price", "cost"}:
+        if terms & value_family_terms:
             return "value"
-        if terms & {"count", "number", "numbers", "num", "frequency"}:
+        if terms & count_family_terms:
             return "count"
         return None
 
@@ -14438,36 +14500,51 @@ def _rewrite_grouped_winner_row_ranked_aggregate(sql: str, question: str) -> str
             if alias != partition_alias and (_alias_terms(alias) & {"id", "identifier", "code", "number", "key"})
         ]
         primary_family: Optional[str] = None
-        if re.search(
-            r"\b(?:greatest|largest|highest|most|best[-\s]?selling|top)\b.{0,80}\b(?:quantity|qty|unit|units|ordered)\b",
-            q_low,
-            flags=re.I | re.S,
+        if (
+            quantity_question_alt != r"$^"
+            and re.search(
+                rf"\b(?:greatest|largest|highest|most|best[-\s]?selling|top)\b.{{0,80}}\b{quantity_question_alt}\b",
+                q_low,
+                flags=re.I | re.S,
+            )
         ):
             primary_family = "quantity"
-        elif re.search(
-            r"\b(?:greatest|largest|highest|most|best|top)\b.{0,80}\b(?:sales|sale|revenue|amount|value|price|cost)\b",
-            q_low,
-            flags=re.I | re.S,
+        elif (
+            value_question_alt != r"$^"
+            and re.search(
+                rf"\b(?:greatest|largest|highest|most|best|top)\b.{{0,80}}\b{value_question_alt}\b",
+                q_low,
+                flags=re.I | re.S,
+            )
         ):
             primary_family = "value"
-        elif re.search(
-            r"\b(?:greatest|largest|highest|most)\b.{0,80}\b(?:count|number|frequency)\b",
-            q_low,
-            flags=re.I | re.S,
+        elif (
+            count_question_alt != r"$^"
+            and re.search(
+                rf"\b(?:greatest|largest|highest|most)\b.{{0,80}}\b{count_question_alt}\b",
+                q_low,
+                flags=re.I | re.S,
+            )
         ):
             primary_family = "count"
 
         tie_family: Optional[str] = None
-        if re.search(
-            r"\b(?:if\s+(?:there\s+are\s+)?multiple|if\s+multiple|tie|ties|tied|break)\b.{0,120}\b(?:sales|sale|revenue|amount|value|price|cost)\b",
-            q_low,
-            flags=re.I | re.S,
+        if (
+            value_question_alt != r"$^"
+            and re.search(
+                rf"\b(?:if\s+(?:there\s+are\s+)?multiple|if\s+multiple|tie|ties|tied|break)\b.{{0,120}}\b{value_question_alt}\b",
+                q_low,
+                flags=re.I | re.S,
+            )
         ):
             tie_family = "value"
-        elif re.search(
-            r"\b(?:if\s+(?:there\s+are\s+)?multiple|if\s+multiple|tie|ties|tied|break)\b.{0,120}\b(?:quantity|qty|unit|units|ordered)\b",
-            q_low,
-            flags=re.I | re.S,
+        elif (
+            quantity_question_alt != r"$^"
+            and re.search(
+                rf"\b(?:if\s+(?:there\s+are\s+)?multiple|if\s+multiple|tie|ties|tied|break)\b.{{0,120}}\b{quantity_question_alt}\b",
+                q_low,
+                flags=re.I | re.S,
+            )
         ):
             tie_family = "quantity"
 
@@ -15181,7 +15258,7 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
 
     metric_query_alt = _regex_alt_from_terms(
         metric_candidate_terms,
-        r"(?:amount|total|quantity|qty|price|cost|value|score|metric)",
+        _winner_row_metric_alt(),
     )
     date_semantic_terms = {
         "date", "dates", "time", "times", "timestamp", "timestamps",
@@ -15611,14 +15688,22 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
                 terms.add("identifier")
         return {term for term in terms if term}
 
+    def _term_tokens(terms: Sequence[str]) -> Set[str]:
+        out: Set[str] = set()
+        for term in terms or []:
+            out.update(_text_semantic_terms(str(term or "")))
+        return out
+
+    quantity_family_terms = _term_tokens(ordered_quantity_repair_quantity_terms())
+    count_family_terms = (
+        _term_tokens(HELPERS_COUNT_INTENT_TERMS)
+        - _term_tokens(HELPERS_METRIC_AGG_INTENT_TERMS)
+        - set(semantic_question_token_stopwords())
+    )
     family_terms: Dict[str, Set[str]] = {
-        "quantity": {"quantity", "quantities", "qty", "unit", "units", "volume", "stock", "stocked"},
-        "value": {
-            "amount", "amounts", "value", "values", "price", "prices",
-            "cost", "costs", "gross", "net",
-            "metric", "metrics", "score", "scores",
-        },
-        "count": {"count", "counts", "num", "number", "numbers", "frequency", "frequencies"},
+        "quantity": set(quantity_family_terms),
+        "value": _winner_row_metric_terms() - quantity_family_terms - count_family_terms,
+        "count": set(count_family_terms),
     }
     metric_term_universe = _dual_fact_metric_term_universe(
         table_universe,
@@ -15694,18 +15779,9 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
     def _family_pattern(term_set: Set[str], default: str) -> str:
         return _regex_alt_from_terms(term_set, default)
 
-    quantity_alt = _family_pattern(
-        family_terms["quantity"],
-        r"(?:quantity|qty|unit|units|volume|stock)",
-    )
-    value_alt = _family_pattern(
-        family_terms["value"],
-        r"(?:amount|value|price|cost|metric|score)",
-    )
-    count_alt = _family_pattern(
-        family_terms["count"],
-        r"(?:count|number(?:\s+of)?|num|frequency)",
-    )
+    quantity_alt = _family_pattern(family_terms["quantity"], r"$^")
+    value_alt = _family_pattern(family_terms["value"], r"$^")
+    count_alt = _family_pattern(family_terms["count"], r"$^")
 
     def _qualified_refs() -> List[str]:
         return list(dict.fromkeys(re.findall(
@@ -15746,8 +15822,9 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
 
     explicit_primary_family: Optional[str] = None
     explicit_quantity_primary = bool(
-        re.search(
-            r"\b(?:based\s+on|according\s+to)\b.{0,96}\b(?:quantity|qty|volume|unit|units|stock)\b",
+        quantity_alt != r"$^"
+        and re.search(
+            rf"\b(?:based\s+on|according\s+to)\b.{{0,96}}\b{quantity_alt}\b",
             q_primary_scope,
             flags=re.I | re.S,
         )
@@ -17552,7 +17629,20 @@ def _rewrite_conditional_sum_value_to_count(sql: str, question: str) -> str:
     def _alias_blocks_count_rewrite(alias: Optional[str]) -> bool:
         a = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(alias or ""))
         a = a.replace("_", " ").lower()
-        return bool(re.search(r"\b(?:amount|sum|total\s+(?:amount|value|sales|price)|sales|value|revenue|price)\b", a, flags=re.I))
+        value_alias_terms = _configured_metric_terms(
+            HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS,
+            HELPERS_ROLLUP_LEGACY_METRIC_TERMS,
+        )
+        value_alias_terms.update(
+            term
+            for term in HELPERS_METRIC_AGG_INTENT_TERMS
+            if str(term or "").strip().lower() in {"sum", "total"}
+        )
+        value_alias_alt = _regex_alt_from_terms(value_alias_terms, r"$^")
+        return bool(
+            value_alias_alt != r"$^"
+            and re.search(rf"\b{value_alias_alt}\b", a, flags=re.I)
+        )
 
     changed = False
     rebuilt_items: List[str] = []
@@ -21024,10 +21114,13 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
     # Winner-row tie-break questions sometimes produce malformed window MAX/MIN SQL
     # (no ROW_NUMBER filter), returning all rows. Rewrite to canonical rn=1 shape.
     q_low = (question or "").lower()
+    metric_terms = _winner_row_metric_terms()
+    metric_alt = _regex_alt_from_terms(metric_terms, r"$^")
     has_tie_phrase = bool(re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|tie|tied|same)\b", q_low))
     same_metric_tie = bool(
         has_tie_phrase
-        and re.search(r"\b(?:same|equal)\s+(?:payment\s+)?(?:amount|price|quantity|value)\b", q_low)
+        and metric_alt != r"$^"
+        and re.search(rf"\b(?:same|equal)\s+(?:[a-z0-9_]+\s+)?{metric_alt}\b", q_low)
     )
     wants_latest_date = bool(
         re.search(r"\b(?:latest|most\s+recent|newest)\b", q_low)
@@ -21035,7 +21128,8 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
     )
     wants_metric_superlative = bool(
         re.search(r"\b(?:largest|highest|max(?:imum)?|top)\b", q_low)
-        and re.search(r"\b(?:amount|payment|price|quantity|value|total)\b", q_low)
+        and metric_alt != r"$^"
+        and re.search(rf"\b{metric_alt}\b", q_low)
     )
     if wants_latest_date and wants_metric_superlative and not sel.args.get("group"):
         def _base_expr(it: exp.Expression) -> exp.Expression:
@@ -21099,9 +21193,27 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
             if date_expr is None and window_entries:
                 date_expr = window_entries[0][3].this.copy()
 
-            # Metric expression from non-window simple columns (amount/price/qty/value).
+            # Metric expression from non-date MAX/MIN window inputs.  Prefer the
+            # aggregate input over projected identifiers so hallucinated/id-like
+            # columns cannot outrank the actual measured value.
             metric_expr = None
+            for _item, _base, _w, agg in window_entries:
+                inner = agg.this
+                inner_sql = (inner.sql(dialect="mysql") if inner is not None else "").lower()
+                if (
+                    inner is not None
+                    and metric_alt != r"$^"
+                    and re.search(rf"\b{metric_alt}\b", inner_sql)
+                    and not any(k in inner_sql for k in ("date", "time", "timestamp"))
+                ):
+                    metric_expr = inner.copy()
+                    break
+
+            # Fallback to non-window simple columns only when no aggregate metric
+            # input is available.
             for item in sel.expressions:
+                if metric_expr is not None:
+                    break
                 base = _base_expr(item)
                 if base.find(exp.Window):
                     continue
@@ -21109,7 +21221,7 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
                 if not isinstance(col, exp.Column):
                     continue
                 col_sql = col.sql(dialect="mysql").lower()
-                if any(k in col_sql for k in ("amount", "price", "quantity", "qty", "value", "total")):
+                if any(k in col_sql for k in metric_terms):
                     metric_expr = col.copy()
                     break
 
@@ -21118,7 +21230,7 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
                 for _item, _base, _w, agg in window_entries:
                     inner = agg.this
                     inner_sql = (inner.sql(dialect="mysql") if inner is not None else "").lower()
-                    if any(k in inner_sql for k in ("amount", "price", "quantity", "qty", "value", "total", "score", "revenue", "sales")):
+                    if any(k in inner_sql for k in metric_terms):
                         metric_expr = inner.copy()
                         break
             if metric_expr is None and window_entries:
@@ -21326,7 +21438,8 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
         re.search(r"\b(?:if\s+there\s+are\s+multiple|if\s+multiple|same|tie)\b", q_low, flags=re.I)
         and re.search(r"\bdate\b", q_low, flags=re.I)
         and re.search(r"\b(?:largest|highest|max(?:imum)?)\b", q_low, flags=re.I)
-        and re.search(r"\b(?:amount|payment)\b", q_low, flags=re.I)
+        and metric_alt != r"$^"
+        and re.search(rf"\b{metric_alt}\b", q_low, flags=re.I)
     )
 
     order_exprs = []
@@ -27993,10 +28106,8 @@ def _rewrite_latest_year_tuple_in_filter(sql: str, question: str, ctx: str = "")
         if not candidates:
             return ""
 
-        aggregate_words = {
-            "total", "sum", "count", "average", "avg", "minimum", "maximum",
-            "min", "max", "quantity", "amount", "sales", "revenue", "value",
-            "price", "cost",
+        aggregate_words = _winner_row_metric_terms() | {
+            "minimum", "maximum", "min", "max",
         }
 
         chosen: List[str] = []

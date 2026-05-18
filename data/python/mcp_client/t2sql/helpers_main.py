@@ -37,17 +37,23 @@ from .config import (
     HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC,
     HELPERS_EXISTENCE_COMPAT_VERBS,
     HELPERS_EXISTENCE_IRREGULAR_BASE_FORMS,
+    HELPERS_DUAL_FACT_DOMAIN_METRIC_TERMS,
+    HELPERS_METRIC_AGG_INTENT_TERMS,
     HELPERS_PROBE_GENERIC_METRIC_TERMS,
     HELPERS_PROBE_LOCALIZED_METRIC_TERMS,
     HELPERS_SEMANTIC_ALIAS_LISTPRICE_INCLUDE_TERMS,
     HELPERS_SEMANTIC_ALIAS_LISTPRICE_EXCLUDE_TERMS,
     HELPERS_SEMANTIC_ALIAS_PRICE_INCLUDE_TERMS,
     HELPERS_SEMANTIC_ALIAS_PRICE_EXCLUDE_TERMS,
+    HELPERS_TEMPORAL_EVENT_COLUMN_TERMS,
     HELPERS_WINNER_ROW_GENERIC_OBJECT_TERMS,
     AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS,
     AGENT_PROMPT_V2_ENABLED,
     AGENT_PROMPT_ABSTAIN_ENABLED,
     AGENT_PROMPT_ABSTAIN_NOTES_PREFIX,
+    AGENT_ROUTER_EXPLICIT_RANK_PATTERNS,
+    AGENT_ROUTER_VALUE_RANK_TERMS,
+    AGENT_ROUTER_TIME_RANK_TERMS,
     AGENT_ROUTER_QTYPE_SET_OPERATION,
     SQL_PARSE_DIALECT,
 )
@@ -188,6 +194,8 @@ from .rulebook import (
     any_phrase_in_text,
     guidance_fact_support_phrases,
     name_request_terms,
+    ordering_temporal_asc_terms,
+    ordering_temporal_desc_terms,
     phrase_in_text,
     query_classification_aggregate_shape_terms,
     query_classification_aggregate_terms,
@@ -210,6 +218,7 @@ from .rulebook import (
     retrieval_probe_short_query_fallback_terms,
     retrieval_probe_temporal_terms,
     rule_list,
+    winner_row_rank_terms,
 )
 # ======================================================================
 # ===================== SQL ALIAS & KEYWORD CONSTANTS ==================
@@ -3123,13 +3132,33 @@ def _question_has_guidance_support_intent(question: str, qtype: str) -> bool:
     if not q:
         return False
 
-    return bool(
-        re.search(
-            r"\b(sum|total|avg|average|mean|min|max|count|rank|top|bottom|latest|earliest|recent|quantity|amount|price|revenue|sales|ordered)\b",
-            q,
-            flags=re.I,
-        )
-    )
+    if any(re.search(pat, q, flags=re.I) for pat in AGENT_ROUTER_EXPLICIT_RANK_PATTERNS):
+        return True
+
+    support_terms = {
+        *query_classification_aggregate_terms(),
+        *query_classification_ordinal_superlative_terms(),
+        *winner_row_rank_terms(),
+        *ordering_temporal_desc_terms(),
+        *ordering_temporal_asc_terms(),
+        *HELPERS_METRIC_AGG_INTENT_TERMS,
+        *HELPERS_PROBE_GENERIC_METRIC_TERMS,
+        *HELPERS_PROBE_LOCALIZED_METRIC_TERMS,
+        *HELPERS_TEMPORAL_EVENT_COLUMN_TERMS,
+        *AGENT_ROUTER_VALUE_RANK_TERMS,
+        *AGENT_ROUTER_TIME_RANK_TERMS,
+    }
+    if DOMAIN_HEURISTICS_ENABLED:
+        support_terms.update(HELPERS_DUAL_FACT_DOMAIN_METRIC_TERMS)
+
+    for term in support_terms:
+        term_l = str(term or "").strip().lower()
+        if not term_l:
+            continue
+        pat = re.escape(term_l).replace(r"\ ", r"\s+")
+        if re.search(rf"\b{pat}\b", q, flags=re.I):
+            return True
+    return False
 
 
 def _find_schema_support_tables_for_guidance(
