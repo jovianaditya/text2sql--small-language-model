@@ -7,8 +7,8 @@ from typing import Dict, List, Any, Optional, Tuple
 from dotenv import load_dotenv, find_dotenv
 from urllib.parse import quote
 
-# Load .env
-load_dotenv(find_dotenv(), override=True)
+# Load .env without overriding runtime/container env vars.
+load_dotenv(find_dotenv(), override=False)
 
 # =========================
 # 1. CONFIGURATION
@@ -18,7 +18,7 @@ GRAPHQL_URL = os.getenv("DATAHUB_GRAPHQL_URL", f"{GMS_BASE}/api/graphql")
 TOKEN = os.getenv("DATAHUB_TOKEN")
 PAGE_SIZE = int(os.getenv("DATAHUB_PAGE_SIZE", "100"))
 TIMEOUT = 60
-ACTOR = os.getenv("DATAHUB_ACTOR")
+ACTOR = os.getenv("DATAHUB_ACTOR", "urn:li:corpuser:admin")
 
 # OUTPUT KHUSUS SPARSE
 # Prefer dedicated sparse output env var, then fallback to generic export env.
@@ -29,9 +29,6 @@ SPARSE_SAMPLE_VALUE_MAX_CHARS = int(os.getenv("SPARSE_SAMPLE_VALUE_MAX_CHARS", "
 SPARSE_STRING_SAMPLE_DISTINCT_MAX = int(os.getenv("SPARSE_STRING_SAMPLE_DISTINCT_MAX", "200"))
 SPARSE_METADATA_SAMPLE_MAX_CHARS = int(os.getenv("SPARSE_METADATA_SAMPLE_MAX_CHARS", "220"))
 SPARSE_INCLUDE_SAMPLES_IN_KEYWORDS = os.getenv("SPARSE_INCLUDE_SAMPLES_IN_KEYWORDS", "0").strip().lower() in {"1", "true", "yes", "on"}
-
-if not TOKEN:
-    raise RuntimeError("DATAHUB_TOKEN is not set.")
 
 RELATIONAL_3LEVEL = {"postgres", "snowflake", "redshift", "bigquery", "mssql", "mysql"}
 
@@ -115,8 +112,11 @@ query datasetProfile($urn: String!) {
 # 3. HELPER FUNCTIONS
 # =========================
 def _headers_json() -> Dict[str, str]:
-    h = {"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"}
-    if ACTOR: h["X-DataHub-Actor"] = ACTOR
+    h = {"Content-Type": "application/json"}
+    if TOKEN:
+        h["Authorization"] = f"Bearer {TOKEN}"
+    elif ACTOR:
+        h["X-DataHub-Actor"] = ACTOR
     return h
 
 def _graphql(query: str, variables: dict) -> dict:
@@ -248,12 +248,20 @@ def split_alias_and_role(raw_tags: List[str]) -> Tuple[List[str], List[str]]:
 
 ROLE_CANONICAL = {
     "pk": "pk",
+    "primary_key": "primary_key",
+    "primary key": "primary_key",
     "fk": "fk",
+    "foreign_key": "foreign_key",
+    "foreign key": "foreign_key",
     "id": "id",
+    "identifier": "identifier",
     "measure": "measure",
     "metric": "measure",
     "dimension": "dimension",
     "date": "date",
+    "datetime": "date",
+    "time": "date",
+    "temporal": "temporal",
     "geo": "geo",
     "contact": "contact",
     "address": "address",
@@ -263,7 +271,7 @@ ROLE_CANONICAL = {
 
 
 def normalize_role(role: str) -> str:
-    key = str(role or "").strip().lower()
+    key = str(role or "").strip().lower().replace("-", "_").replace(" ", "_")
     return ROLE_CANONICAL.get(key, key)
 
 
@@ -307,8 +315,8 @@ def transform_to_sparse_schema(raw_row: Dict[str, Any], table_desc: str = "") ->
     tbl = raw_row.get("table") or ""
     col = raw_row.get("column") or ""
     desc = _sanitize_fragment(raw_row.get("description"))
-    aliases = raw_row.get("tags_alias", [])
-    roles = [normalize_role(r) for r in raw_row.get("tags_role", []) if str(r or "").strip()]
+    aliases = _dedupe_keep_order([_sanitize_fragment(a) for a in raw_row.get("tags_alias", []) if _sanitize_fragment(a)])
+    roles = _dedupe_keep_order([normalize_role(r) for r in raw_row.get("tags_role", []) if str(r or "").strip()])
     
     # --- KEYWORD CONSTRUCTION (Untuk Search BM25) ---
     keywords_list: List[str] = []
@@ -371,6 +379,8 @@ def transform_to_sparse_schema(raw_row: Dict[str, Any], table_desc: str = "") ->
         "table": tbl,
         "column": col,
         "datatype": raw_row.get("datatype"),
+        "tags_alias": aliases,
+        "tags_role": roles,
         # >>> INI PERUBAHANNYA: Masukkan description eksplisit <<<
         "description": desc,
         "stats": stats

@@ -479,6 +479,7 @@ from .helpers_core import (
     _question_wants_winner_row,
     _question_wants_anti_existence,
     _question_wants_dual_fact_rollup,
+    _question_has_grouping_intent,
     _question_has_set_operation_intent,
     _enforce_set_operation_operator_from_question,
     _wants_distinct_from_question,
@@ -655,6 +656,7 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
     # families. True winner-row questions should be governed by their
     # ROW_NUMBER / ORDER BY shape instead of an inferred PARTITION BY contract.
     required_window_partition_col = ""
+    repair_same_group_avg_partition_col = ""
     # "all other ... average ... same <group>" questions are validly solved
     # with correlated subqueries that exclude the current row, so forcing a
     # PARTITION BY contract here would cause unnecessary regeneration.
@@ -674,6 +676,8 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
             flags=re.I,
         )
     )
+    if same_group_avg_comparison_filter:
+        repair_same_group_avg_partition_col = _resolve_required_window_partition_column(question, ctx)
     if not wants_winner_row and not all_other_same_group_avg and not same_group_avg_comparison_filter:
         required_window_partition_col = _resolve_required_window_partition_column(question, ctx)
     return {
@@ -691,6 +695,7 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         "requires_scalar_extrema_date_filter": wants_scalar_extrema_date_filter,
         "requires_window_partition": bool(required_window_partition_col),
         "required_window_partition_col": required_window_partition_col,
+        "repair_same_group_avg_partition_col": repair_same_group_avg_partition_col,
     }
 
 
@@ -1884,7 +1889,8 @@ def _repair_near_miss_output_alias_references(sql: str, ctx: str = "") -> str:
     Repair bare references that are near-miss typos of SELECT output aliases.
 
     Guardrails:
-    - only touches WHERE/HAVING/ORDER BY clauses
+    - only touches WHERE/HAVING/ORDER BY clause bodies
+    - never rewrites qualified identifiers such as alias.column
     - never rewrites real schema columns from the active context
     - requires a unique close alias candidate
     """
@@ -1921,20 +1927,20 @@ def _repair_near_miss_output_alias_references(sql: str, ctx: str = "") -> str:
     except Exception:
         schema_cols = set()
 
-    clause_positions = [
-        pos for pos in (
-            _find_top_level_kw(s, "where"),
-            _find_top_level_kw(s, "having"),
-            _find_top_level_kw(s, "order by"),
-        )
-        if pos >= 0
-    ]
-    if not clause_positions:
+    clause_specs = sorted(
+        (
+            (kw, pos)
+            for kw in ("where", "having", "order by")
+            for pos in (_find_top_level_kw(s, kw),)
+            if pos >= 0
+        ),
+        key=lambda item: item[1],
+    )
+    if not clause_specs:
         return sql
-    start = min(clause_positions)
-    head, tail = s[:start], s[start:]
 
     protected = {a.lower() for a in alias_names}
+    protected.update(a.lower() for a in relation_aliases)
     protected.update(c.lower() for c in schema_cols)
     protected.update(str(k or "").lower() for k in _SQL_KEYWORDS)
 
@@ -1942,6 +1948,10 @@ def _repair_near_miss_output_alias_references(sql: str, ctx: str = "") -> str:
         token = str(match.group(0) or "")
         token_l = token.lower()
         if token_l in protected or len(token_l) < 4:
+            return token
+        left = match.string[:match.start()]
+        right = match.string[match.end():]
+        if re.search(r"\.\s*$", left) or re.match(r"^\s*\.", right):
             return token
         candidates = [
             alias for alias in alias_names
@@ -1951,8 +1961,32 @@ def _repair_near_miss_output_alias_references(sql: str, ctx: str = "") -> str:
             return token
         return candidates[0]
 
-    repaired_tail = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", _replace_token, tail)
-    return head + repaired_tail
+    def _clause_end(start_idx: int) -> int:
+        end = len(s)
+        for kw in ("group by", "having", "order by", "limit", "union", "intersect", "except"):
+            pos = _find_top_level_kw(s, kw, start_idx)
+            if pos >= start_idx:
+                end = min(end, pos)
+        return end
+
+    rebuilt: List[str] = []
+    cursor = 0
+    changed = False
+    for clause_kw, clause_pos in clause_specs:
+        clause_body_start = clause_pos + len(clause_kw)
+        clause_body_end = _clause_end(clause_body_start)
+        rebuilt.append(s[cursor:clause_body_start])
+        clause_body = s[clause_body_start:clause_body_end]
+        repaired_clause_body = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", _replace_token, clause_body)
+        if repaired_clause_body != clause_body:
+            changed = True
+        rebuilt.append(repaired_clause_body)
+        cursor = clause_body_end
+
+    rebuilt.append(s[cursor:])
+    if not changed:
+        return sql
+    return "".join(rebuilt)
 
 
 def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") -> str:
@@ -2763,29 +2797,96 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
     from the semantic contract.
     """
     s = (sql or "").strip()
-    if not s or not partition_col or re.search(r"\bJOIN\b", s, flags=re.I):
+    if not s or not partition_col:
         return sql
 
     trailing_semicolon = ";" if s.endswith(";") else ""
     if trailing_semicolon:
         s = s[:-1].rstrip()
 
-    pattern = re.compile(
-        r"""(?is)^\s*SELECT\s+(?P<select>.+?)\s+
-            FROM\s+\(?\s*`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)?(?:\s+(?:AS\s+)?(?P<outer_alias>[A-Za-z_][A-Za-z0-9_]*))?\s+
-            WHERE\s+(?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
-            (?P<op>>=|<=|<>|!=|=|>|<)\s*
-            \(\s*SELECT\s+(?P<agg>AVG|MIN|MAX|SUM)\s*\(\s*(?P<inner_metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)
-            \s+FROM\s+\(?\s*`?(?P=table)`?\s*\)?(?:\s+(?:AS\s+)?(?P<inner_alias>[A-Za-z_][A-Za-z0-9_]*))?
-            (?:\s+WHERE\s+(?P<inner_where>.*?))?
-            \s*\)\s*(?P<tail>.*)$""",
-        re.X,
-    )
-    m = pattern.match(s)
-    if not m:
+    select_match = re.match(r"(?is)^\s*SELECT\b", s)
+    from_pos = _find_top_level_kw(s, "from")
+    where_pos = _find_top_level_kw(s, "where", from_pos + len("from")) if from_pos >= 0 else -1
+    if not select_match or from_pos < 0 or where_pos < 0 or where_pos <= from_pos:
         return sql
 
-    select_items = _split_top_level_csv(m.group("select") or "")
+    select_clause = s[select_match.end():from_pos].strip()
+    from_clause = s[from_pos + len("from"):where_pos].strip()
+    where_clause = s[where_pos + len("where"):].strip()
+
+    from_match = re.fullmatch(
+        r"""\(?\s*`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)?
+            (?:\s+(?:AS\s+)?(?P<outer_alias>[A-Za-z_][A-Za-z0-9_]*))?\s*""",
+        from_clause,
+        flags=re.I | re.X,
+    )
+    if not from_match:
+        return sql
+
+    metric_match = re.match(
+        r"""(?is)^\s*
+            (?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)
+            \s*(?P<op>>=|<=|<>|!=|=|>|<)\s*\(""",
+        where_clause,
+        flags=re.I | re.X,
+    )
+    if not metric_match:
+        return sql
+
+    def _find_matching_paren(text: str, open_idx: int) -> int:
+        depth = 0
+        in_sq = False
+        in_dq = False
+        in_bt = False
+        i = open_idx
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq and not in_bt:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+            elif ch == '"' and not in_sq and not in_bt:
+                in_dq = not in_dq
+            elif ch == "`" and not in_sq and not in_dq:
+                in_bt = not in_bt
+            elif not in_sq and not in_dq and not in_bt:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+            i += 1
+        return -1
+
+    subquery_open = metric_match.end() - 1
+    subquery_close = _find_matching_paren(where_clause, subquery_open)
+    if subquery_close >= 0:
+        subquery_sql = where_clause[subquery_open + 1:subquery_close].strip()
+        tail = where_clause[subquery_close + 1:].strip()
+    else:
+        # Malformed drafts often miss the closing parenthesis around the scalar
+        # subquery. When the rest of the predicate is clearly a SELECT-based
+        # aggregate, rebuild from the outer query shape and let semantic-order
+        # repair reconstruct any requested final ORDER BY.
+        subquery_sql = where_clause[subquery_open + 1:].strip()
+        tail = ""
+
+    if not re.match(r"(?is)^SELECT\b", subquery_sql):
+        return sql
+
+    agg_match = re.search(
+        r"""(?is)\b(?P<agg>AVG|MIN|MAX|SUM)\s*\(\s*
+            (?P<inner_metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)
+            \s*\)""",
+        subquery_sql,
+        flags=re.I | re.X,
+    )
+    if not agg_match:
+        return sql
+
+    select_items = _split_top_level_csv(select_clause)
     if not select_items:
         return sql
 
@@ -2795,8 +2896,8 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
             ref = ref.split(".")[-1].strip("`")
         return ref
 
-    metric_col = _strip_qual(m.group("metric"))
-    inner_metric_col = _strip_qual(m.group("inner_metric")) or metric_col
+    metric_col = _strip_qual(metric_match.group("metric"))
+    inner_metric_col = _strip_qual(agg_match.group("inner_metric")) or metric_col
     metric_col = metric_col or inner_metric_col
     partition_col = str(partition_col or "").strip("`")
     if not metric_col or not partition_col:
@@ -2819,7 +2920,6 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
         if col not in needed_cols:
             needed_cols.append(col)
 
-    tail = str(m.group("tail") or "").strip()
     order_pos = _find_top_level_kw(tail, "order by")
     if order_pos >= 0:
         order_clause = tail[order_pos + len("order by"):].strip()
@@ -2834,16 +2934,16 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
         if col not in needed_cols:
             needed_cols.append(col)
 
-    agg = str(m.group("agg") or "AVG").upper()
+    agg = str(agg_match.group("agg") or "AVG").upper()
     avg_alias = re.sub(r"[^A-Za-z0-9_]+", "_", f"{agg.lower()}_{metric_col}_by_{partition_col}").strip("_")
     derived_alias = "base_rows"
     inner_select = ", ".join(needed_cols)
     outer_select = ", ".join(output_items)
-    op = m.group("op")
+    op = metric_match.group("op")
     rebuilt = (
         f"SELECT {outer_select} FROM ("
         f"SELECT {inner_select}, {agg}({inner_metric_col}) OVER (PARTITION BY {partition_col}) AS {avg_alias} "
-        f"FROM {m.group('table')}"
+        f"FROM {from_match.group('table')}"
         f") AS {derived_alias} "
         f"WHERE {metric_col} {op} {avg_alias}"
     )
@@ -2877,6 +2977,10 @@ def _rewrite_same_group_avg_projection_to_difference(sql: str, question: str) ->
     If the draft already has a row-preserving AVG(...) OVER (PARTITION BY ...)
     projection but forgets the subtraction, rewrite only that projected window
     metric into `base_metric - AVG(base_metric) OVER (...)`.
+
+    Also repairs an offset-window near miss such as LAG/LEAD(base_metric) OVER
+    (PARTITION BY group_key ORDER BY seq) when the question asks for
+    same-group average difference, not previous/next-row comparison.
     """
     s = str(sql or "").strip()
     q = str(question or "").strip().lower()
@@ -2892,7 +2996,11 @@ def _rewrite_same_group_avg_projection_to_difference(sql: str, question: str) ->
         return sql
     if re.search(r"\bJOIN\b", s, flags=re.I):
         return sql
-    if not re.search(r"\bAVG\s*\([^)]*\)\s*OVER\s*\(\s*PARTITION\s+BY\b", s, flags=re.I):
+    if not re.search(
+        r"\b(?:AVG\s*\([^)]*\)|LAG\s*\([^)]*\)|LEAD\s*\([^)]*\))\s*OVER\s*\(\s*PARTITION\s+BY\b",
+        s,
+        flags=re.I,
+    ):
         return sql
 
     from_pos = _find_top_level_kw(s, "from")
@@ -2943,6 +3051,14 @@ def _rewrite_same_group_avg_projection_to_difference(sql: str, question: str) ->
         """,
         re.X,
     )
+    offset_item_pattern = re.compile(
+        r"""(?is)^\s*
+        (?P<func>LAG|LEAD)\s*\(\s*(?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<metric_col>[A-Za-z_][A-Za-z0-9_]*)`?)\s*\)
+        \s*OVER\s*\(\s*PARTITION\s+BY\s+(?P<partition>.+?)\s+ORDER\s+BY\s+.+?\)
+        \s*$
+        """,
+        re.X,
+    )
 
     changed = False
     rewritten_items: List[str] = []
@@ -2953,17 +3069,26 @@ def _rewrite_same_group_avg_projection_to_difference(sql: str, question: str) ->
             rewritten_items.append(raw)
             continue
         m_avg = avg_item_pattern.match(expr)
-        if not m_avg:
-            rewritten_items.append(raw)
-            continue
+        partition_expr = ""
+        metric_col = ""
+        if m_avg:
+            metric_col = (m_avg.group("metric_col") or "").strip("`").lower()
+            partition_expr = (m_avg.group("partition") or "").strip()
+        else:
+            m_offset = offset_item_pattern.match(expr)
+            if not m_offset:
+                rewritten_items.append(raw)
+                continue
+            metric_col = (m_offset.group("metric_col") or "").strip("`").lower()
+            partition_expr = (m_offset.group("partition") or "").strip()
 
-        metric_col = (m_avg.group("metric_col") or "").strip("`").lower()
         base_metric_ref = plain_metric_refs.get(metric_col, "")
-        if not base_metric_ref:
+        if not base_metric_ref or not partition_expr:
             rewritten_items.append(raw)
             continue
 
-        diff_expr = f"{base_metric_ref} - {expr.strip()}"
+        avg_window_expr = f"AVG({base_metric_ref}) OVER (PARTITION BY {partition_expr})"
+        diff_expr = f"{base_metric_ref} - {avg_window_expr}"
         rewritten_items.append(f"{diff_expr} AS {alias}" if alias else diff_expr)
         changed = True
 
@@ -2985,6 +3110,21 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
     out_sql = sql
     corrections: List[str] = []
     violations: List[str] = []
+    required_window_partition_col = str(contract.get("required_window_partition_col") or "").strip()
+    repair_same_group_avg_partition_col = str(
+        contract.get("repair_same_group_avg_partition_col") or ""
+    ).strip()
+
+    if repair_same_group_avg_partition_col:
+        fixed = _rewrite_same_table_correlated_aggregate_comparison(
+            out_sql,
+            repair_same_group_avg_partition_col,
+        )
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append(
+                f"Semantic contract: repaired same-group aggregate comparison by {repair_same_group_avg_partition_col}"
+            )
 
     fixed = _repair_near_miss_output_alias_references(out_sql, ctx)
     if fixed != out_sql:
@@ -3079,7 +3219,6 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         if not _has_scalar_extrema_date_filter_shape(out_sql):
             violations.append("missing_scalar_extrema_date_filter")
 
-    required_window_partition_col = str(contract.get("required_window_partition_col") or "").strip()
     if required_window_partition_col:
         fixed = _rewrite_same_table_correlated_aggregate_comparison(
             out_sql,
@@ -3815,7 +3954,7 @@ def question_guard_node(state: RAGState) -> RAGState:
     }
 
 
-def _question_mentions_column(question_lower: str, column: str) -> bool:
+def _question_mentions_column(question_lower: str, column: str, table: str = "") -> bool:
     """
     Robust column mention detector:
     - direct full column name
@@ -3827,6 +3966,7 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
 
     col_lower = column.lower()
     spaced = re.sub(AGENT_COLUMN_CAMEL_SPLIT_PATTERN, r'\1 \2', column).replace("_", " ").lower()
+    table_l = str(table or "").strip().lower()
 
     # Full-form matches
     if col_lower in question_lower:
@@ -3839,6 +3979,17 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
     semantic_suffix_keywords = AGENT_COLUMN_SEMANTIC_SUFFIX_KEYWORDS
     stop_tokens = AGENT_COLUMN_STOP_TOKENS
     col_tokens = re.findall(AGENT_COLUMN_TOKEN_PATTERN, spaced)
+    entity_tokens: Set[str] = set()
+    if table_l:
+        for variant in _table_name_variants(table_l):
+            entity_tokens.update(
+                tok for tok in re.findall(AGENT_COLUMN_TOKEN_PATTERN, str(variant).lower()) if tok
+            )
+    informative_non_entity_tokens = {
+        tok
+        for tok in col_tokens
+        if len(tok) >= 4 and tok not in stop_tokens and tok not in entity_tokens
+    }
     if len(col_tokens) >= 2:
         suffix = col_tokens[-1]
         suffix_terms = semantic_suffix_keywords.get(suffix)
@@ -3892,6 +4043,7 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
             return False
 
     # Token-level fallback (skip weak generic tokens)
+    matched_tokens: Set[str] = set()
     for token in re.findall(AGENT_COLUMN_TOKEN_PATTERN, spaced):
         if len(token) < 4 or token in stop_tokens:
             continue
@@ -3913,7 +4065,12 @@ def _question_mentions_column(question_lower: str, column: str) -> bool:
             token_forms.add(token + AGENT_COLUMN_TOKEN_SUFFIX_S)
 
         if any(re.search(rf"\b{re.escape(tok)}\b", question_lower) for tok in token_forms if tok):
-            return True
+            matched_tokens.add(token)
+
+    if matched_tokens:
+        if informative_non_entity_tokens and not matched_tokens.intersection(informative_non_entity_tokens):
+            return False
+        return True
 
     return False
 
@@ -4233,7 +4390,7 @@ def router_agent(state: RAGState) -> RAGState:
         strong_col = None
         for col in tbl_cols:
             col_lower = col.lower()
-            if not _question_mentions_column(question_lower, col):
+            if not _question_mentions_column(question_lower, col, tbl_lower):
                 continue
 
             # Check if this is an FK/bridge-like key reference:
@@ -4451,7 +4608,7 @@ def router_agent(state: RAGState) -> RAGState:
                 col_low = str(col).lower()
                 if col_low in fk_cols:
                     continue
-                if _question_mentions_column(question_lower, str(col)):
+                if _question_mentions_column(question_lower, str(col), tbl_lower):
                     non_fk_mentioned = True
                     break
 
@@ -4691,7 +4848,7 @@ def router_agent(state: RAGState) -> RAGState:
     )
     has_temporal_col_mention = False
     for _tbl, cols in temporal_cols_by_table.items():
-        if any(_question_mentions_column(question_lower, c) for c in cols):
+        if any(_question_mentions_column(question_lower, c, _tbl) for c in cols):
             has_temporal_col_mention = True
             break
     has_four_digit_year = bool(re.search(r"\b(?:19|20)\d{2}\b", question_lower))
@@ -4736,7 +4893,7 @@ def router_agent(state: RAGState) -> RAGState:
         for c in temporal_cols_by_table.get(tbl_l, _get_table_cols(tbl_name)):
             if not _is_temporal_col_name(c):
                 continue
-            if _question_mentions_column(question_text, str(c)):
+            if _question_mentions_column(question_text, str(c), tbl_l):
                 return True
         return False
 
@@ -5316,7 +5473,7 @@ def router_agent(state: RAGState) -> RAGState:
                 col_lower = str(col).lower()
                 if col_lower in fk_cols:
                     continue
-                if _question_mentions_column(question_lower, str(col)):
+                if _question_mentions_column(question_lower, str(col), tbl_lower):
                     non_fk_mentioned = True
                     break
 
@@ -5368,7 +5525,7 @@ def router_agent(state: RAGState) -> RAGState:
                 col_lower = str(col or "").strip().lower()
                 if not col_lower or col_lower in fk_like_cols:
                     continue
-                if _question_mentions_column(question_lower, str(col)):
+                if _question_mentions_column(question_lower, str(col), tbl_lower):
                     non_primary_semantic_mention = True
                     break
             if non_primary_semantic_mention:
@@ -7753,6 +7910,331 @@ def _make_sql_only_draft_prompt(base_prompt: str) -> str:
     )
 
 
+def _make_schema_identifier_recovery_prompt(base_prompt: str, bad_sql: str = "") -> str:
+    p = str(base_prompt or "").rstrip()
+    previous = str(bad_sql or "").strip()
+    previous_block = f"\nPrevious invalid SQL:\n{previous}" if previous else ""
+    return (
+        f"{p}\n\n"
+        "STRICT SCHEMA IDENTIFIER RECOVERY:\n"
+        "The previous draft used natural-language labels as SQL identifiers.\n"
+        "Rewrite it using only real table.column identifiers from the allowed schema context.\n"
+        "Do not put multi-word natural-language phrases inside SELECT, ORDER BY, GROUP BY, HAVING, or aggregate functions.\n"
+        "Every aggregate argument must be a real column reference or *.\n"
+        "If the prompt includes a CANDIDATE INTENT SUMMARY, preserve its visible Dimensions in SELECT and GROUP BY, "
+        "preserve its Metrics as aggregate SELECT expressions, and preserve its Group Filters as HAVING conditions.\n"
+        "If the question asks to sort by one of those aggregate metrics, ORDER BY that metric's alias or exact aggregate expression; "
+        "do not replace it with another aggregate.\n"
+        "Use output aliases only after AS.\n"
+        "Return JSON only with keys sql and notes."
+        f"{previous_block}"
+    )
+
+
+def _extract_draft_sql(obj: Any) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    return str(obj.get("sql") or "").strip()
+
+
+def _is_vacuous_draft_sql(sql: str) -> bool:
+    s = str(sql or "").strip()
+    if not s:
+        return True
+    s = s.rstrip(";").strip()
+    return bool(
+        re.match(
+            r"""(?is)^SELECT\s+(?:1|0|NULL|'[^']*'|"[^"]*")\s*$""",
+            s,
+        )
+    )
+
+
+_DRAFT_FREE_TEXT_SUMMARY_TOKENS = {
+    "avg",
+    "average",
+    "count",
+    "counts",
+    "earliest",
+    "highest",
+    "latest",
+    "lowest",
+    "max",
+    "maximum",
+    "mean",
+    "min",
+    "minimum",
+    "newest",
+    "oldest",
+    "sum",
+    "total",
+    "totals",
+}
+
+
+def _has_unresolved_free_text_summary_draft(
+    sql: str,
+    *,
+    question: str = "",
+    ctx: str = "",
+) -> bool:
+    """
+    Detect single-table aggregate drafts that still contain natural-language
+    summary phrases like "total amount" or "latest payment date" as bare SELECT
+    / ORDER BY items. These drafts tend to be mangled by identifier repair and
+    are better handled by an immediate LLM retry before normalization.
+
+    Guardrails:
+    - single-table only
+    - no JOIN / subquery / window / set-op shapes
+    - only bare multi-word phrases (keeps snake_case repair untouched)
+    """
+    s = str(sql or "").strip()
+    if not s or _is_vacuous_draft_sql(s):
+        return False
+    if not re.match(r"(?is)^\s*SELECT\b", s):
+        return False
+    if has_join(s):
+        return False
+    if re.search(r"(?is)\bFROM\s*\(", s):
+        return False
+    if re.search(r"(?is)\b(?:UNION|INTERSECT|EXCEPT)\b", s):
+        return False
+    if re.search(r"(?is)\bOVER\s*\(", s):
+        return False
+    if re.search(r"(?is)\(\s*SELECT\b", s):
+        return False
+
+    select_pos = _find_top_level_kw(s, "select")
+    from_pos = _find_top_level_kw(s, "from", 0)
+    if select_pos != 0 or from_pos < 0:
+        return False
+
+    clause_points = [
+        p for p in [
+            _find_top_level_kw(s, "where", from_pos + len("from")),
+            _find_top_level_kw(s, "group by", from_pos + len("from")),
+            _find_top_level_kw(s, "having", from_pos + len("from")),
+            _find_top_level_kw(s, "order by", from_pos + len("from")),
+            _find_top_level_kw(s, "limit", from_pos + len("from")),
+        ]
+        if p >= 0
+    ]
+    from_end = min(clause_points) if clause_points else len(s)
+    from_core = s[from_pos + len("from"):from_end].strip().rstrip(";")
+    if not from_core:
+        return False
+
+    from_sources = [part for part in _split_top_level_csv(from_core) if part.strip()]
+    if len(from_sources) != 1:
+        return False
+
+    m_from = re.match(
+        r"""(?is)^\s*`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s*$""",
+        from_sources[0],
+    )
+    if not m_from:
+        return False
+
+    table_l = str(m_from.group("table") or "").strip().lower()
+    if not table_l:
+        return False
+
+    allowed_map = _parse_allowed_identifiers(ctx or "")
+    allowed_cols = {
+        str(col or "").strip().lower()
+        for col in (allowed_map.get(table_l, set()) or set())
+        if str(col or "").strip()
+    }
+    if not allowed_cols:
+        return False
+
+    allowed_compact = {
+        re.sub(r"[^a-z0-9]+", "", col)
+        for col in allowed_cols
+        if col
+    }
+    has_aggregate_shape = bool(
+        _find_top_level_kw(s, "group by", from_pos + len("from")) >= 0
+        or _find_top_level_kw(s, "having", from_pos + len("from")) >= 0
+        or re.search(r"(?is)\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", s)
+        or re.search(
+            r"\b(?:for\s+each|per|count|total|sum|average|avg|latest|earliest|max|min)\b",
+            str(question or "").lower(),
+            flags=re.I,
+        )
+    )
+    if not has_aggregate_shape:
+        return False
+
+    def _is_unresolved_phrase(text: str, *, require_summary_token: bool) -> bool:
+        raw = re.sub(r"\s+\b(?:ASC|DESC)\b\s*$", "", str(text or "").strip(), flags=re.I).strip()
+        if not raw or " " not in raw:
+            return False
+        if "_" in raw or "-" in raw:
+            return False
+        if re.search(r"[+*/<>=]", raw):
+            return False
+        if any(ch in raw for ch in ".`'\""):
+            return False
+        if re.search(r"(?is)\b(?:AS|CASE|WHEN|OVER|DISTINCT|SELECT|FROM|WHERE|GROUP|HAVING|ORDER|LIMIT)\b", raw):
+            return False
+        tokens = [tok.lower() for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", raw)]
+        if len(tokens) < 2:
+            return False
+        if require_summary_token and not any(tok in _DRAFT_FREE_TEXT_SUMMARY_TOKENS for tok in tokens):
+            return False
+        compact = re.sub(r"[^a-z0-9]+", "", raw.lower())
+        if compact in allowed_compact:
+            return False
+        return True
+
+    def _is_unresolved_bare_summary_item(item: str) -> bool:
+        raw = str(item or "").strip()
+        if not raw:
+            return False
+        agg_match = re.fullmatch(
+            r"(?is)\s*(?:COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(?P<arg>[^()]+?)\s*\)\s*",
+            raw,
+        )
+        if agg_match:
+            arg = str(agg_match.group("arg") or "").strip()
+            if arg == "*":
+                return False
+            return _is_unresolved_phrase(arg, require_summary_token=False)
+        if any(ch in raw for ch in "()"):
+            return False
+        return _is_unresolved_phrase(raw, require_summary_token=True)
+
+    select_items = _split_top_level_csv(s[select_pos + len("select"):from_pos].strip())
+    if any(_is_unresolved_bare_summary_item(item) for item in select_items):
+        return True
+
+    order_pos = _find_top_level_kw(s, "order by", from_pos + len("from"))
+    if order_pos >= 0:
+        limit_pos = _find_top_level_kw(s, "limit", order_pos + len("order by"))
+        order_end = limit_pos if limit_pos >= 0 else len(s)
+        order_items = _split_top_level_csv(s[order_pos + len("order by"):order_end].strip())
+        if any(_is_unresolved_bare_summary_item(item) for item in order_items):
+            return True
+
+    return False
+
+
+def _draft_sql_needs_retry(
+    sql: str,
+    *,
+    question: str = "",
+    ctx: str = "",
+) -> Tuple[bool, str]:
+    if _is_vacuous_draft_sql(sql):
+        return True, "vacuous"
+    if _has_unresolved_free_text_summary_draft(sql, question=question, ctx=ctx):
+        return True, "unresolved_free_text_summary"
+    return False, ""
+
+
+def _build_allowed_block_from_map(allowed_map: Dict[str, Set[str]]) -> str:
+    lines = []
+    for table_name, cols in allowed_map.items():
+        uniq = sorted({str(col or "").strip() for col in (cols or set()) if str(col or "").strip()})
+        lines.append(f"- {table_name}: {', '.join(uniq)}")
+    body = "\n".join(lines) if lines else "- (none)"
+    return "### ALLOWED IDENTIFIERS\n" + body
+
+
+def _narrow_context_to_tables(ctx: str, keep_tables: List[str]) -> str:
+    text = str(ctx or "")
+    keep_lower = {
+        str(table or "").strip().lower()
+        for table in (keep_tables or [])
+        if str(table or "").strip()
+    }
+    if not text or not keep_lower:
+        return text
+
+    allowed_raw = _parse_allowed_identifiers(text or "")
+    if len(allowed_raw) <= 1:
+        return text
+
+    filtered_allowed: Dict[str, Set[str]] = {
+        str(table_name): set(cols or set())
+        for table_name, cols in (allowed_raw or {}).items()
+        if str(table_name or "").strip().lower() in keep_lower
+    }
+    if not filtered_allowed:
+        return text
+
+    cards_text = ""
+    hint_text = ""
+    cards_marker = "\n\n### CARDS\n"
+    hint_marker = "\n\n### _INTERNAL_HINT\n"
+    cards_idx = text.find(cards_marker)
+    hint_idx = text.find(hint_marker)
+
+    if cards_idx >= 0:
+        cards_start = cards_idx + len(cards_marker)
+        if hint_idx > cards_start:
+            cards_text = text[cards_start:hint_idx].strip()
+        else:
+            cards_text = text[cards_start:].strip()
+
+    if hint_idx >= 0:
+        hint_start = hint_idx + len(hint_marker)
+        hint_text = text[hint_start:].strip()
+
+    filtered_card_lines: List[str] = []
+    for raw in cards_text.splitlines():
+        line = str(raw or "").strip()
+        if not line.startswith("- table:"):
+            continue
+        m = re.match(r"(?is)^-\s*table:\s*([^|]+?)\s*\|", line)
+        if not m:
+            continue
+        table_name = str(m.group(1) or "").strip().lower()
+        if table_name in keep_lower:
+            filtered_card_lines.append(line)
+
+    narrowed = _build_allowed_block_from_map(filtered_allowed)
+    if filtered_card_lines:
+        narrowed += "\n\n### CARDS\n" + "\n".join(filtered_card_lines)
+    if hint_text:
+        narrowed += "\n\n### _INTERNAL_HINT\n" + hint_text
+    return narrowed.strip()
+
+
+def _should_use_router_scoped_draft_context(
+    ctx: str,
+    decision: Dict[str, Any],
+    primary_table: str = "",
+    router_tables: Optional[List[str]] = None,
+) -> bool:
+    allowed_raw = _parse_allowed_identifiers(ctx or "")
+    if len(allowed_raw) <= 1:
+        return False
+
+    routed = [
+        str(table or "").strip().lower()
+        for table in (router_tables or [])
+        if str(table or "").strip()
+    ]
+    routed = list(dict.fromkeys(routed))
+    if len(routed) != 1:
+        return False
+
+    primary_lower = str(primary_table or "").strip().lower()
+    if primary_lower and routed[0] != primary_lower:
+        return False
+
+    return bool(
+        (decision.get("is_explicit_rank_function", False) or decision.get("is_window_aggregate", False))
+        and not decision.get("is_ordinal_ranking", False)
+        and not decision.get("is_winner_row", False)
+        and not decision.get("has_exclusion", False)
+        and not decision.get("is_subquery_intent", False)
+    )
+
+
 def _make_case_bucketing_ultra_minimal_prompt(question: str, ctx: str) -> str:
     prompt_lines = [
         "Return exactly one valid MySQL SELECT query on a single line.",
@@ -8616,6 +9098,188 @@ def _repair_single_table_winner_row_projection(sql: str, question: str, ctx: str
     return fixed
 
 
+def _repair_grouped_summary_outer_projection(sql: str, question: str, ctx: str = "") -> Optional[str]:
+    """
+    Recover a requested grouping key when an aggregate subquery wrapper drops it
+    from the outer SELECT list.
+
+    Scope is intentionally narrow:
+    - outer SELECT over an inner grouped summary subquery
+    - no winner-row/window shapes
+    - only add a grouping key that is explicitly requested or uniquely implied
+      by grouping language
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q:
+        return None
+    if "group by" not in s.lower() or not re.search(r"(?is)\bfrom\s*\(\s*select\b", s):
+        return None
+    if re.search(r"\b(?:row_number|rank|dense_rank)\s*\(", s, flags=re.I):
+        return None
+
+    pattern = re.compile(
+        r"(?is)^\s*SELECT\s+(?P<outer>.*?)\s+FROM\s*\(\s*SELECT\s+(?P<inner>.*?)\s+FROM\s+(?P<rest>.+?)\)\s*(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<tail>.*?);?\s*$"
+    )
+    m = pattern.match(s)
+    if not m:
+        return None
+
+    inner_rest = str(m.group("rest") or "").strip()
+    if "group by" not in inner_rest.lower():
+        return None
+
+    outer_select = str(m.group("outer") or "").strip()
+    inner_select = str(m.group("inner") or "").strip()
+    sub_alias = str(m.group("alias") or "").strip()
+    if not outer_select or not inner_select or not sub_alias:
+        return None
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    buf.append(ch)
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                buf.append(ch)
+                i += 1
+                continue
+            if not in_sq and not in_dq:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif ch == "," and depth == 0:
+                    item = "".join(buf).strip()
+                    if item:
+                        items.append(item)
+                    buf = []
+                    i += 1
+                    continue
+            buf.append(ch)
+            i += 1
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _extract_alias(item: str) -> str:
+        raw = str(item or "").strip()
+        if not raw:
+            return ""
+        alias_match = re.search(
+            r"""(?is)\bAS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            raw,
+        )
+        if alias_match:
+            return alias_match.group(1).strip("`'\"")
+        simple_match = re.match(
+            r"(?is)^\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+            raw,
+        )
+        return simple_match.group(1).strip("`") if simple_match else ""
+
+    def _is_aggregate_like(item: str) -> bool:
+        return bool(re.search(r"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", str(item or ""), flags=re.I))
+
+    outer_items = _split_top_level_csv(outer_select)
+    inner_items = _split_top_level_csv(inner_select)
+    outer_labels = {
+        lbl.lower()
+        for lbl in (_extract_alias(item) for item in outer_items)
+        if lbl
+    }
+
+    allowed_map = _parse_allowed_identifiers(ctx or "")
+    candidate_tables = {
+        str(tbl or "").strip().lower(): {
+            str(col or "").strip("`").lower(): str(col or "").strip("`")
+            for col in (cols or set())
+            if str(col or "").strip("`")
+        }
+        for tbl, cols in (allowed_map or {}).items()
+        if str(tbl or "").strip()
+    }
+
+    candidates: List[Tuple[str, str, bool]] = []
+    seen_candidate_keys: Set[Tuple[str, str]] = set()
+    for item in inner_items:
+        if _is_aggregate_like(item):
+            continue
+        alias_name = _extract_alias(item)
+        if not alias_name:
+            continue
+        base_name = alias_name
+        if alias_name.lower().startswith("grouping_") and len(alias_name) > len("grouping_"):
+            base_name = alias_name[len("grouping_"):]
+        base_lower = base_name.strip("`").lower()
+        if not base_lower:
+            continue
+        key = (alias_name.lower(), base_lower)
+        if key in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(key)
+
+        requested = False
+        for table_name, cols_by_lower in candidate_tables.items():
+            canonical_col = cols_by_lower.get(base_lower)
+            if canonical_col and _question_mentions_column(q, canonical_col, table_name):
+                requested = True
+                break
+        if not requested and not _question_has_grouping_intent(question):
+            continue
+        candidates.append((alias_name, base_name, requested))
+
+    if not candidates:
+        return None
+
+    requested_candidates = [cand for cand in candidates if cand[2]]
+    if len(requested_candidates) == 1:
+        chosen = requested_candidates[0]
+    elif len(requested_candidates) > 1:
+        return None
+    elif len(candidates) == 1:
+        chosen = candidates[0]
+    else:
+        return None
+
+    alias_name, base_name, _ = chosen
+    alias_lower = alias_name.lower()
+    base_lower = base_name.lower()
+    if alias_lower in outer_labels or base_lower in outer_labels:
+        return None
+
+    prepend_expr = f"{sub_alias}.{alias_name}"
+    if alias_lower != base_lower:
+        prepend_expr += f" AS {base_name}"
+
+    rebuilt_outer = ", ".join([prepend_expr] + outer_items)
+    fixed = re.sub(
+        r"(?is)^\s*SELECT\s+.*?\s+FROM\s*\(",
+        f"SELECT {rebuilt_outer} FROM (",
+        s,
+        count=1,
+    ).strip()
+    if sql.rstrip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _has_required_offset_window(sql: str, question: str) -> bool:
     s = str(sql or "")
     q = str(question or "").lower()
@@ -8789,17 +9453,30 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             "col_lt",
             "col_lte",
         }
+        router_qtype = str(decision.get("qtype") or "").strip().lower()
+        ir_lookup_shape_is_low_risk = _is_ir_low_risk_single_table_lookup(
+            intent_ir=intent_ir,
+            qtype=ir_qtype,
+            safe_filter_ops=safe_filter_ops,
+        )
         prefer_ir_lookup_qtype = (
             ir_qtype == AGENT_ROUTER_QTYPE_LOOKUP
             and bool(intent_ir.get("select_distinct"))
             and bool(ir_dims)
             and not ir_metrics
             and not ir_existence
+        ) or (
+            ir_lookup_shape_is_low_risk
+            and router_qtype in {
+                "",
+                AGENT_ROUTER_QTYPE_LOOKUP,
+                AGENT_ROUTER_QTYPE_AGGREGATE,
+            }
         )
         qtype = (
             ir_qtype
             if prefer_ir_lookup_qtype
-            else str(decision.get("qtype") or ir_qtype or "").strip().lower()
+            else (router_qtype or ir_qtype)
         )
         lookup_subject_focused = (
             qtype == AGENT_ROUTER_QTYPE_LOOKUP
@@ -9045,6 +9722,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         if not (
             intent_ir.get("dimensions")
             or intent_ir.get("metrics")
+            or intent_ir.get("computed_projections")
             or intent_ir.get("filters")
             or intent_ir.get("existence")
         ):
@@ -9113,6 +9791,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             fallback_model = LARGE_MODEL if (decision.get("escalation_reasons") or []) else SMALL_MODEL
         else:
             fallback_model = LARGE_MODEL
+
     fallback_complexity = str(decision.get("complexity") or "").strip().lower()
     if not fallback_complexity:
         fallback_complexity = (
@@ -9160,7 +9839,30 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # Panggil Dynamic Prompt Builder (helpers_main.py)
     # Segala aturan heuristik (Anti-MAX, Anti-1055, Anti-Inner Join) sudah diurus di sana.
     # Pass state for dynamic join context from retrieval results
-    prompt = make_generation_prompt(ctx, question, decision, state)
+    draft_ctx = ctx
+    prompt_state: Dict[str, Any] = dict(state)
+    if _should_use_router_scoped_draft_context(
+        ctx=ctx,
+        decision=decision,
+        primary_table=str(state.get("primary_table") or "").strip(),
+        router_tables=state.get("router_tables") or [],
+    ):
+        narrowed_ctx = _narrow_context_to_tables(ctx, state.get("router_tables") or [])
+        if narrowed_ctx and narrowed_ctx != ctx:
+            orig_table_count = len(_parse_allowed_identifiers(ctx or ""))
+            narrowed_table_count = len(_parse_allowed_identifiers(narrowed_ctx))
+            draft_ctx = narrowed_ctx
+            prompt_state["context"] = draft_ctx
+            print(
+                "[DRAFTER] Router-scoped context applied: "
+                f"{narrowed_table_count}/{orig_table_count} tables kept for draft prompt"
+            )
+
+    prompt = make_generation_prompt(draft_ctx, question, decision, prompt_state)
+    if prompt_state is not state:
+        for sync_key in ("ir_hint_passed", "ir_hint_group_filters_present"):
+            if sync_key in prompt_state:
+                state[sync_key] = prompt_state[sync_key]
 
     if state.get("ir_hint_passed"):
         print("[DRAFTER] IR-informed LLM: intent IR hint injected into prompt")
@@ -9183,7 +9885,13 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             else None
         )
     else:
-        obj = try_llm_json(llm, prompt, max_attempts=AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS, oom_retry_wait=OOM_WAIT_TIME)
+        obj = try_llm_json(
+            llm,
+            prompt,
+            max_attempts=AGENT_DRAFT_TRY_JSON_MAX_ATTEMPTS,
+            oom_retry_wait=OOM_WAIT_TIME,
+            expected_key="sql",
+        )
     _inference_time = _time.perf_counter() - _t0
 
     # Refresh warmup heartbeat after real inference.
@@ -9251,8 +9959,83 @@ def draft_sql_agent(state: RAGState) -> RAGState:
                         obj = {"sql": text_sql_micro, "notes": "No reasoning provided."}
                         print("[DRAFTER] CASE-bucketing micro prompt retry succeeded with 3B")
 
-    if obj is None and target_model != LARGE_MODEL and not forced_model:
-        recovery_model = LARGE_MODEL
+    raw_draft_sql = _extract_draft_sql(obj)
+    draft_retry_needed, draft_retry_reason = _draft_sql_needs_retry(
+        raw_draft_sql,
+        question=question,
+        ctx=draft_ctx,
+    )
+    schema_identifier_recovery_attempted = False
+    if obj is not None and draft_retry_needed:
+        print(f"\n[DRAFTER] Raw from LLM ({draft_retry_reason}): {raw_draft_sql or '<missing sql>'}")
+        print("[DRAFTER] Draft precheck failed -> retry same model in SQL-only text mode")
+        text_llm = build_llm_repair(model=target_model)
+        text_ready = _prewarm_model_with_oom_retry(text_llm, target_model)
+        if text_ready:
+            _t_text_retry = _time.perf_counter()
+            text_sql_retry = try_llm_sql_text(
+                text_llm,
+                _make_sql_only_draft_prompt(prompt),
+                max_attempts=1,
+                oom_retry_wait=OOM_WAIT_TIME,
+            )
+            text_retry_inference_time = _time.perf_counter() - _t_text_retry
+            _last_model_warmup[target_model] = _time.time()
+            _inference_time += text_retry_inference_time
+            state["draft_inference_time"] = _inference_time
+            print(f"[DEBUG] Draft SQL-only retry inference time: {text_retry_inference_time:.2f}s")
+            text_retry_needed, _ = _draft_sql_needs_retry(
+                text_sql_retry,
+                question=question,
+                ctx=draft_ctx,
+            )
+            if text_sql_retry and not text_retry_needed:
+                obj = {"sql": text_sql_retry, "notes": "No reasoning provided."}
+                print(f"[DRAFTER] SQL-only retry succeeded with {target_model}")
+            else:
+                print("[DRAFTER] SQL-only retry still failed draft precheck")
+                if draft_retry_reason == "unresolved_free_text_summary":
+                    schema_identifier_recovery_attempted = True
+                    print(f"[DRAFTER] Schema-identifier recovery retry -> {target_model}")
+                    strict_llm = build_llm_json(model=target_model)
+                    strict_ready = _prewarm_model_with_oom_retry(strict_llm, target_model)
+                    if strict_ready:
+                        _t_schema_retry = _time.perf_counter()
+                        strict_obj = try_llm_json(
+                            strict_llm,
+                            _make_schema_identifier_recovery_prompt(
+                                prompt,
+                                text_sql_retry or raw_draft_sql,
+                            ),
+                            max_attempts=1,
+                            oom_retry_wait=OOM_WAIT_TIME,
+                            expected_key="sql",
+                        )
+                        schema_retry_time = _time.perf_counter() - _t_schema_retry
+                        _last_model_warmup[target_model] = _time.time()
+                        _inference_time += schema_retry_time
+                        state["draft_inference_time"] = _inference_time
+                        print(f"[DEBUG] Draft schema-identifier retry inference time: {schema_retry_time:.2f}s")
+                        strict_retry_needed = True
+                        if strict_obj is not None:
+                            strict_retry_needed = _draft_sql_needs_retry(
+                                _extract_draft_sql(strict_obj),
+                                question=question,
+                                ctx=draft_ctx,
+                            )[0]
+                        if strict_obj is not None and not strict_retry_needed:
+                            obj = strict_obj
+                            print(f"[DRAFTER] Schema-identifier recovery succeeded with {target_model}")
+                        else:
+                            print("[DRAFTER] Schema-identifier recovery still failed draft precheck")
+
+    recovery_needed, _ = _draft_sql_needs_retry(
+        _extract_draft_sql(obj),
+        question=question,
+        ctx=draft_ctx,
+    ) if obj is not None else (True, "missing")
+    if (obj is None or recovery_needed) and target_model != LARGE_MODEL and not forced_model:
+        recovery_model = target_model if schema_identifier_recovery_attempted else LARGE_MODEL
         print(f"[DRAFTER] JSON recovery fallback -> {recovery_model}")
         recovery_llm = build_llm_json(model=recovery_model)
         recovery_ready = _prewarm_model_with_oom_retry(recovery_llm, recovery_model)
@@ -9263,24 +10046,39 @@ def draft_sql_agent(state: RAGState) -> RAGState:
                 prompt,
                 max_attempts=1,
                 oom_retry_wait=OOM_WAIT_TIME,
+                expected_key="sql",
             )
             recovery_inference_time = _time.perf_counter() - _t1
             _last_model_warmup[recovery_model] = _time.time()
             _inference_time += recovery_inference_time
             state["draft_inference_time"] = _inference_time
             print(f"[DEBUG] Draft recovery inference time: {recovery_inference_time:.2f}s")
+            recovery_passed = False
             if recovery_obj is not None:
+                recovery_passed = not _draft_sql_needs_retry(
+                    _extract_draft_sql(recovery_obj),
+                    question=question,
+                    ctx=draft_ctx,
+                )[0]
+            if recovery_passed:
                 obj = recovery_obj
                 target_model = recovery_model
                 state["target_model"] = target_model
                 print(f"[DRAFTER] JSON recovery succeeded with {recovery_model}")
 
-    if obj is None:
+    final_retry_needed = True
+    if obj is not None:
+        final_retry_needed = _draft_sql_needs_retry(
+            _extract_draft_sql(obj),
+            question=question,
+            ctx=draft_ctx,
+        )[0]
+    if obj is None or final_retry_needed:
         return {
             **state,
             "target_model": target_model,
             "draft_source": "llm",
-            "draft_sql": "SELECT 'Error: LLM failed';",
+            "draft_sql": "SELECT 'Error: LLM failed or returned vacuous SQL';",
         }
 
     if _llm_output_is_cannot_answer(obj):
@@ -9300,7 +10098,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
             "cannot_answer_reason": reason,
         }
         
-    draft_sql = (obj.get("sql") or "SELECT 1;").strip()
+    draft_sql = (obj.get("sql") or "").strip()
     reasoning = (obj.get("notes") or "No reasoning provided.").strip()
     print(f"\n[DRAFTER] Raw from LLM: {draft_sql}")
     print(f"[DRAFTER] LLM Reasoning: {reasoning}")
@@ -9495,6 +10293,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if repaired_winner_projection and repaired_winner_projection != final_sql:
         final_sql = str(repaired_winner_projection).strip()
         corrections.append("Applied single-table winner-row projection repair")
+    repaired_grouped_projection = _repair_grouped_summary_outer_projection(final_sql, question, ctx)
+    if repaired_grouped_projection and repaired_grouped_projection != final_sql:
+        final_sql = str(repaired_grouped_projection).strip()
+        corrections.append("Applied grouped-summary projection repair")
 
     sql_up = final_sql.upper()
 
@@ -9828,7 +10630,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     "3. Do NOT change the casing style (e.g., do NOT convert camelCase to snake_case)."
                 )
                 needs_regeneration = True
-                regeneration_model = LARGE_MODEL
+                if (
+                    draft_model == SMALL_MODEL
+                    and complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE
+                    and qtype == AGENT_ROUTER_QTYPE_AGGREGATE
+                    and not has_join(final_sql)
+                ):
+                    regeneration_model = SMALL_MODEL
+                else:
+                    regeneration_model = LARGE_MODEL
 
     # --- KASUS B: Winner-Row Leak Check (HARD ERROR) ---
     is_winner_row = decision.get("is_winner_row", False)

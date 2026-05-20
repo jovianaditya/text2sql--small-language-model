@@ -967,6 +967,28 @@ agent_semantics:
       - "\\bordered\\s+by\\b"
       - "\\bbased\\s+on\\b[^.]{0,80}\\border\\b"
       - "\\b(?:date|time|timestamp)[-\\s]+order\\b"
+  running_window_sequence:
+    running_terms:
+      - running
+      - cumulative
+      - kumulatif
+      - akumulatif
+    partition_reference_regex:
+      - "\\bfor\\s+that\\s+(?P<entity>[a-z][a-z0-9_ ]{1,40}?)(?=\\s+(?:in|by|on|ordered|sorted|order|date|time|when|where|and|then|,|\\.|$))"
+      - "\\bfor\\s+(?:each|every)\\s+(?P<entity>[a-z][a-z0-9_ ]{1,40}?)(?=\\s+(?:in|by|on|with|ordered|sorted|order|date|time|when|where|and|then|,|\\.|$))"
+      - "\\bper\\s+(?P<entity>[a-z][a-z0-9_ ]{1,40}?)(?=\\s+(?:in|by|on|with|ordered|sorted|order|date|time|when|where|and|then|,|\\.|$))"
+      - "\\bwithin\\s+(?:each|the\\s+same)\\s+(?P<entity>[a-z][a-z0-9_ ]{1,40}?)(?=\\s+(?:in|by|on|with|ordered|sorted|order|date|time|when|where|and|then|,|\\.|$))"
+    partition_entity_stop_terms:
+      - record
+      - records
+      - row
+      - rows
+      - entry
+      - entries
+      - item
+      - items
+      - result
+      - results
   case_bucketing:
     bucket_language_regex:
       - "\\b(?:bucket|classify|categori[sz]e|group(?:ed|ing)?\\s+into|bands?|ranges?|distribution)\\b"

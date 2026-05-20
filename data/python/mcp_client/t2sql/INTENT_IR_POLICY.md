@@ -149,11 +149,11 @@ Important note:
 
 ### Practical matrix
 
-| Layer | Main purpose | Allowed / intended values |
-|---|---|---|
-| Router qtype | retrieval + routing + coarse family control | `lookup`, `aggregate`, `rank` |
-| Raw Intent IR qtype | IR parsing + confidence + plannability | `lookup`, `aggregate`, `rank` |
-| IR-HINT displayed qtype | LLM-facing explanation | `lookup`, `aggregate`, `window_aggregate`, `set_operation` |
+|          Layer          |                Main purpose                 |                Allowed / intended values                  |
+|-------------------------|---------------------------------------------|                                                           |
+| Router qtype            | retrieval + routing + coarse family control | `lookup`, `aggregate`, `rank`                             |
+| Raw Intent IR qtype     | IR parsing + confidence + plannability      | `lookup`, `aggregate`, `rank`                             |
+| IR-HINT displayed qtype | LLM-facing explanation                      | `lookup`, `aggregate`, `window_aggregate` `set_operation` |
 
 ### Policy summary
 
@@ -674,3 +674,9 @@ Intent IR should be:
 - minimal when detail would overfit
 
 If a detail cannot be expressed generically, prefer not to show it in the hint.
+
+## Questions on Development Set that supposed getting Intent IR HINT based on current threshold rules:
+Easy:
+E1-E50
+Medium:
+E1-E2 ; E5-E8 ; E10

@@ -527,6 +527,30 @@ def _extract_jsonish_sql_field(text: str) -> Optional[str]:
     return recovered
 
 
+def _normalize_expected_json_object(
+    obj: Optional[Dict[str, Any]],
+    expected_key: str = "",
+    max_depth: int = 3,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(obj, dict) or not expected_key:
+        return obj
+
+    current: Dict[str, Any] = obj
+    for _ in range(max(1, int(max_depth or 1))):
+        if str(current.get(expected_key) or "").strip():
+            return current
+        if len(current) != 1:
+            return obj
+        wrapper_key, inner = next(iter(current.items()))
+        if not isinstance(inner, dict):
+            return obj
+        current = inner
+
+    if str(current.get(expected_key) or "").strip():
+        return current
+    return obj
+
+
 def _trim_plain_sql_statement_candidate(text: str) -> str:
     """
     Keep only the SQL statement portion from a plain-text LLM response.
@@ -699,7 +723,8 @@ def try_llm_json(
     llm: Any,  # ChatOllama atau tipe LLM lain
     prompt: str,
     max_attempts: int = 1,
-    oom_retry_wait: int = 0  # Seconds to wait if OOM detected (0 = no retry)
+    oom_retry_wait: int = 0,  # Seconds to wait if OOM detected (0 = no retry)
+    expected_key: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
     Generic function untuk memanggil LLM dan mengharapkan return JSON.
@@ -725,6 +750,10 @@ def try_llm_json(
             content = getattr(resp, "content", None)
 
             if isinstance(content, dict):
+                content = _normalize_expected_json_object(
+                    content,
+                    expected_key=expected_key,
+                )
                 return content
 
             content = _coerce_llm_content_text(content if content is not None else resp)
@@ -733,11 +762,19 @@ def try_llm_json(
             # 2. Extract JSON (Gunakan regex yang kuat)
             obj = _extract_json_object(content)
             if obj:
+                obj = _normalize_expected_json_object(
+                    obj,
+                    expected_key=expected_key,
+                )
                 return obj
 
             salvaged = _extract_loose_json_object(content)
             if salvaged:
                 print("[LLM Warning] JSON malformed; salvaged SQL payload heuristically.")
+                salvaged = _normalize_expected_json_object(
+                    salvaged,
+                    expected_key=expected_key,
+                )
                 return salvaged
 
             print(f"[LLM Warning] Gagal extract JSON dari response:\n{content[:100]}...")
@@ -759,6 +796,10 @@ def try_llm_json(
         final_salvaged = _extract_loose_json_object(last_content)
         if final_salvaged:
             print("[LLM Warning] Final raw-response SQL salvage succeeded after JSON failure.")
+            final_salvaged = _normalize_expected_json_object(
+                final_salvaged,
+                expected_key=expected_key,
+            )
             return final_salvaged
 
     return None

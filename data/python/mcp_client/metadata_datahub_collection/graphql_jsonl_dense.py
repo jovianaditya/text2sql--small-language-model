@@ -7,8 +7,8 @@ from typing import Dict, List, Any, Optional, Tuple
 from dotenv import load_dotenv, find_dotenv
 from urllib.parse import quote
 
-# Load .env
-load_dotenv(find_dotenv(), override=True)
+# Load .env without overriding runtime/container env vars.
+load_dotenv(find_dotenv(), override=False)
 
 # =========================
 # 1. CONFIGURATION
@@ -18,15 +18,12 @@ GRAPHQL_URL = os.getenv("DATAHUB_GRAPHQL_URL", f"{GMS_BASE}/api/graphql")
 TOKEN = os.getenv("DATAHUB_TOKEN")
 PAGE_SIZE = int(os.getenv("DATAHUB_PAGE_SIZE", "100"))
 TIMEOUT = 60
-ACTOR = os.getenv("DATAHUB_ACTOR")
+ACTOR = os.getenv("DATAHUB_ACTOR", "urn:li:corpuser:admin")
 # Prefer dedicated dense output env var, then fallback to generic export env.
 OUTPUT_DIR = os.getenv("EXPORT_DENSE_JSONL_OUTPUT", os.getenv("EXPORT_JSONL_OUTPUT", "./exports_dense_final"))
 TABLE_CONTEXT_MAX_CHARS = int(os.getenv("DATAHUB_TABLE_CONTEXT_MAX_CHARS", "280"))
 SAMPLE_TEXT_MAX_CHARS = int(os.getenv("DATAHUB_SAMPLE_TEXT_MAX_CHARS", "64"))
 SAMPLE_DISTINCT_MAX = int(os.getenv("DATAHUB_SAMPLE_DISTINCT_MAX", "10"))
-
-if not TOKEN:
-    raise RuntimeError("DATAHUB_TOKEN is not set.")
 
 RELATIONAL_3LEVEL = {"postgres", "snowflake", "redshift", "bigquery", "mssql", "mysql"}
 
@@ -111,8 +108,11 @@ query datasetProfile($urn: String!) {
 # 3. HELPER FUNCTIONS
 # =========================
 def _headers_json() -> Dict[str, str]:
-    h = {"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"}
-    if ACTOR: h["X-DataHub-Actor"] = ACTOR
+    h = {"Content-Type": "application/json"}
+    if TOKEN:
+        h["Authorization"] = f"Bearer {TOKEN}"
+    elif ACTOR:
+        h["X-DataHub-Actor"] = ACTOR
     return h
 
 def _graphql(query: str, variables: dict) -> dict:
@@ -250,28 +250,62 @@ def split_alias_and_role(raw_tags: List[str]) -> Tuple[List[str], List[str]]:
 
 ROLE_CANONICAL = {
     "pk": "pk",
-    "primary_key": "pk",
+    "primary_key": "primary_key",
     "primary key": "pk",
     "fk": "fk",
-    "foreign_key": "fk",
+    "foreign_key": "foreign_key",
     "foreign key": "fk",
     "id": "id",
-    "identifier": "id",
+    "identifier": "identifier",
     "measure": "measure",
     "metric": "measure",
-    "amount": "measure",
-    "quantity": "measure",
     "dimension": "dimension",
     "date": "date",
     "time": "date",
     "datetime": "date",
-    "temporal": "date",
+    "temporal": "temporal",
     "geo": "geo",
     "location": "geo",
     "contact": "contact",
     "address": "address",
     "text": "text",
     "binary": "binary",
+}
+
+PRIMARY_ROLE_CANONICAL = {
+    "pk": "pk",
+    "primary_key": "pk",
+    "fk": "fk",
+    "foreign_key": "fk",
+    "id": "id",
+    "identifier": "id",
+    "measure": "measure",
+    "metric": "measure",
+    "amount": "measure",
+    "quantity": "measure",
+    "inventory": "measure",
+    "price": "measure",
+    "monetary": "measure",
+    "threshold": "measure",
+    "transaction_amount": "measure",
+    "transaction_quantity": "measure",
+    "date": "date",
+    "time": "date",
+    "datetime": "date",
+    "temporal": "date",
+    "transaction_date": "date",
+    "due_date": "date",
+    "fulfillment_date": "date",
+    "geo": "geo",
+    "contact": "contact",
+    "address": "address",
+    "text": "text",
+    "binary": "binary",
+    "dimension": "dimension",
+    "name": "dimension",
+    "entity_name": "dimension",
+    "status": "dimension",
+    "classification": "dimension",
 }
 
 ROLE_PRIORITY = [
@@ -290,11 +324,40 @@ ROLE_PRIORITY = [
 
 
 def _normalize_role_label(role: str) -> str:
-    raw = str(role or "").strip().lower()
+    raw = str(role or "").strip().lower().replace("-", "_").replace(" ", "_")
     if not raw:
         return ""
-    base = raw.split(":", 1)[0].replace(".", "_").replace("-", "_").strip()
+    base = raw.split(":", 1)[0].replace(".", "_").strip("_")
     return ROLE_CANONICAL.get(base, ROLE_CANONICAL.get(raw, raw))
+
+
+def _normalize_roles(roles: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for role in roles or []:
+        norm = _normalize_role_label(role)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return out
+
+
+def _normalize_aliases(aliases: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for alias in aliases or []:
+        clean = str(alias or "").strip()
+        key = clean.lower()
+        if not clean or key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+    return out
+
+
+def _primary_role_bucket(role: str) -> str:
+    return PRIMARY_ROLE_CANONICAL.get(str(role or "").strip().lower(), "")
 
 
 def _infer_fallback_role(raw_row: Dict[str, Any], fk_target: Optional[str]) -> str:
@@ -320,7 +383,7 @@ def _infer_fallback_role(raw_row: Dict[str, Any], fk_target: Optional[str]) -> s
 
     is_numeric = any(k in dt for k in ("int", "double", "float", "decimal", "numeric", "real", "number", "money"))
     if is_numeric and re.search(
-        r"\b(amount|price|cost|total|quantity|qty|stock|sales|revenue|profit|credit|debit|payment|msrp)\b",
+        r"\b(amount|price|cost|total|quantity|qty|stock|inventory|volume|balance|rate|ratio|score|limit|percent)\b",
         joined,
     ):
         return "measure"
@@ -329,20 +392,22 @@ def _infer_fallback_role(raw_row: Dict[str, Any], fk_target: Optional[str]) -> s
 
 
 def _select_primary_role(raw_row: Dict[str, Any], roles: List[str], fk_target: Optional[str]) -> str:
-    normalized = []
-    seen = set()
-    for role in roles or []:
-        norm = _normalize_role_label(role)
-        if not norm or norm in seen:
+    normalized = _normalize_roles(roles)
+
+    primary_candidates = []
+    seen_primary = set()
+    for role in normalized:
+        primary = _primary_role_bucket(role)
+        if not primary or primary in seen_primary:
             continue
-        seen.add(norm)
-        normalized.append(norm)
+        seen_primary.add(primary)
+        primary_candidates.append(primary)
 
     for preferred in ROLE_PRIORITY:
-        if preferred in normalized:
+        if preferred in primary_candidates:
             return preferred
     if normalized:
-        return normalized[0]
+        return _primary_role_bucket(normalized[0]) or normalized[0]
     return _infer_fallback_role(raw_row, fk_target)
 
 
@@ -388,10 +453,11 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     col = raw_row.get("column")
     desc = str(raw_row.get("description") or "")
     desc_clean = re.sub(r"\s+", " ", desc).strip().rstrip(" .")
-    aliases = raw_row.get("tags_alias", [])
+    aliases = _normalize_aliases(raw_row.get("tags_alias", []))
     roles = raw_row.get("tags_role", [])
+    normalized_roles = _normalize_roles(roles)
     fk_target = _extract_fk_target(desc_clean)
-    primary_role = _select_primary_role(raw_row, roles, fk_target)
+    primary_role = _select_primary_role(raw_row, normalized_roles, fk_target)
     
     # 3. Sample Value Logic (For Text Embedding)
     # Only inject sample into text if it's categorical (distinct < 20)
@@ -406,6 +472,11 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
         and sample_raw.lower() not in ["", "unknown", "none", "null"]
     ):
         sample_sentence = f"Example value: {sample_raw}."
+
+    role_tags_sentence = ""
+    visible_role_tags = [role for role in normalized_roles if role and role != primary_role]
+    if visible_role_tags:
+        role_tags_sentence = f"Role tags: {', '.join(visible_role_tags)}."
 
     # 4. Context Injection (Table Description)
     # Jika DataHub punya deskripsi tabel, masukkan ke embedding kolom
@@ -423,6 +494,7 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
         f"Column: {col}.",
         f"Description: {desc_clean}." if desc_clean else "",
         f"Role: {primary_role}." if primary_role else "",
+        role_tags_sentence,
         f"FK to {fk_target}." if (fk_target and not _has_fk_literal(desc_clean, fk_target)) else "",
         f"Synonyms: {', '.join(aliases)}." if aliases else "",
         sample_sentence
@@ -447,6 +519,10 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
         "table": tbl,
         "column": col,
         "datatype": raw_row.get("datatype"),
+        "description": desc_clean,
+        "primary_role": primary_role,
+        "tags_role": normalized_roles,
+        "tags_alias": aliases,
         "stats": stats
     }
 

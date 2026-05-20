@@ -220,10 +220,22 @@ class IROrder:
 
 
 @dataclass
+class IRComputedProjection:
+    kind: str  # arithmetic
+    op: str  # sub|add|mul|div
+    left_table: str
+    left_column: str
+    right_table: str
+    right_column: str
+    alias: str = ""
+
+
+@dataclass
 class IntentIR:
     subject_entity: str = ""
     dimensions: List[IRDimension] = field(default_factory=list)
     metrics: List[IRMetric] = field(default_factory=list)
+    computed_projections: List[IRComputedProjection] = field(default_factory=list)
     filters: List[IRFilter] = field(default_factory=list)
     filter_logic: str = ""
     existence: List[IRExistence] = field(default_factory=list)
@@ -476,6 +488,125 @@ def _phrase_pos(text: str, phrase: str) -> int:
     pat = re.escape(phrase).replace(r"\ ", r"\s+")
     m = re.search(rf"\b{pat}\b", text, flags=re.I)
     return m.start() if m else -1
+
+
+def _original_schema_column_case(table: str, column: str) -> str:
+    t = str(table or "").strip().lower()
+    c = str(column or "").strip()
+    if not t or not c:
+        return c
+    c_low = c.lower()
+    try:
+        analyzer = get_schema_analyzer()
+        return str(
+            analyzer._column_original_case.get(f"{t}.{c_low}", c)  # type: ignore[attr-defined]
+            or c
+        )
+    except Exception:
+        return c
+
+
+def _augment_subject_allowed_columns_from_schema(
+    question: str,
+    subject: str,
+    allowed: Dict[str, Set[str]],
+) -> Dict[str, Set[str]]:
+    """
+    Add explicitly mentioned subject columns that retrieval omitted but schema
+    metadata knows. This keeps IR column resolution stable when retrieval surfaces
+    a parent/lookup table column while the executable subject table has the same
+    field.
+    """
+    table_l = str(subject or "").strip().lower()
+    if not table_l or not allowed:
+        return allowed
+
+    q_l = str(question or "").strip().lower()
+    if not q_l:
+        return allowed
+
+    schema_cols = _load_schema_columns(table_l)
+    if not schema_cols:
+        return allowed
+
+    def _has_structural_column_intent(col: str) -> bool:
+        variants = [
+            str(variant or "").strip().lower()
+            for variant in _column_variants(table_l, col)
+            if str(variant or "").strip()
+        ]
+        if not variants:
+            return False
+
+        for seg in _extract_projection_segments(question):
+            seg_l = str(seg or "").strip().lower()
+            if any(_phrase_pos(seg_l, variant) >= 0 for variant in variants):
+                return True
+
+        for variant in variants:
+            pat = re.escape(variant).replace(r"\ ", r"\s+")
+            if not pat:
+                continue
+            if re.search(
+                rf"\b(?:for\s+each|per|by|group(?:ed)?\s+by|in\s+each)\s+(?:the\s+)?{pat}\b",
+                q_l,
+                flags=re.I,
+            ):
+                return True
+            if re.search(
+                rf"\b(?:same|within\s+(?:the\s+)?same)\s+(?:the\s+)?{pat}\b",
+                q_l,
+                flags=re.I,
+            ):
+                return True
+            if re.search(
+                rf"\b(?:sort(?:ed)?|order(?:ed)?)\s+by\b[^.]*\b{pat}\b",
+                q_l,
+                flags=re.I,
+            ):
+                return True
+            if re.search(
+                rf"\b(?:sum|total|avg|average|mean|min(?:imum)?|max(?:imum)?|lowest|smallest|highest|largest|latest|earliest)\s+(?:the\s+)?{pat}\b",
+                q_l,
+                flags=re.I,
+            ):
+                return True
+
+        return False
+
+    out: Dict[str, Set[str]] = {
+        str(t or "").strip().lower(): {
+            str(c or "").strip()
+            for c in (cols or set())
+            if str(c or "").strip()
+        }
+        for t, cols in allowed.items()
+        if str(t or "").strip()
+    }
+    current_lowers = {
+        str(c or "").strip().lower()
+        for c in out.get(table_l, set())
+        if str(c or "").strip()
+    }
+
+    for col in schema_cols:
+        col_s = str(col or "").strip()
+        col_l = col_s.lower()
+        if not col_s or col_l in current_lowers:
+            continue
+        explicit_mention = any(
+            _phrase_pos(q_l, str(variant or "").strip().lower()) >= 0
+            for variant in _column_variants(table_l, col_s)
+            if str(variant or "").strip()
+        )
+        if not explicit_mention:
+            continue
+        if not _has_structural_column_intent(col_s):
+            continue
+        out.setdefault(table_l, set()).add(_original_schema_column_case(table_l, col_s))
+        current_lowers.add(col_l)
+
+    return out
 
 
 def _is_numeric_column(col: str) -> bool:
@@ -1010,7 +1141,12 @@ def _prefer_specific_identifier_match(
         query_tokens = set(_tokenize_for_match(text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
         descriptor_tokens = _column_semantic_tokens(table, descriptor).union(_column_descriptor_tokens(table, descriptor))
         primary_tokens = _column_semantic_tokens(table, semantic).union(_column_descriptor_tokens(table, semantic))
-        generic_identifier_tokens = _GENERIC_IDENTIFIER_TOKENS | _schema_entity_head_tokens()
+        # Keep only truly generic identifier words here. Schema-wide head tokens
+        # can include relationship cues extracted from metadata-driven table
+        # synonyms (e.g. "manager"), which are exactly the words we need to
+        # preserve when preferring a specific FK-like identifier over the
+        # subject table's primary ID column.
+        generic_identifier_tokens = set(_GENERIC_IDENTIFIER_TOKENS)
         specific_relational_tokens = (descriptor_tokens - primary_tokens) - generic_identifier_tokens
         if query_tokens.intersection(specific_relational_tokens):
             return descriptor
@@ -1705,6 +1841,41 @@ def _detect_metrics(
     if total_row_count_table:
         wants_count = True
 
+    def _question_requests_subject_row_count() -> bool:
+        if not subject:
+            return False
+
+        row_unit_terms = {
+            "row", "rows", "record", "records", "entry", "entries",
+            "item", "items", "line", "lines", "detail", "details",
+        }
+
+        phrase_patterns = (
+            r"(?:^|[,.]|\b(?:show|return|include|display|list|and)\b)\s*"
+            r"(?:the\s+)?([a-z][a-z0-9_ ]{0,48}?)\s+counts?\b",
+            r"\bcounts?\s+(?:of\s+)?([a-z][a-z0-9_ ]{1,48}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bfor\b|\bby\b|$))",
+        )
+        for pat in phrase_patterns:
+            for match in re.finditer(pat, q, flags=re.I):
+                phrase = re.sub(r"\s+", " ", str(match.group(1) or "").strip().lower())
+                phrase = re.sub(r"^(?:the|a|an|total)\s+", "", phrase, flags=re.I).strip()
+                if not phrase:
+                    continue
+
+                tokens = [tok for tok in re.findall(r"[a-z0-9_'-]+", phrase) if tok]
+                if tokens and all(tok in row_unit_terms for tok in tokens):
+                    return True
+
+                resolved_table = _resolve_table_from_phrase(phrase)
+                if resolved_table and resolved_table.lower() == subject.lower():
+                    return True
+
+        return False
+
+    subject_row_count_requested = _question_requests_subject_row_count()
+    if subject_row_count_requested:
+        wants_count = True
+
     wants_sum = bool(has_explicit_sum_signal or _question_requests_total_metric())
 
     def _count_distinct_container_terms() -> Set[str]:
@@ -1955,14 +2126,14 @@ def _detect_metrics(
                 )
             )
         else:
-            count_table = total_row_count_table or first_mentioned or subject
+            count_table = subject if subject_row_count_requested else (total_row_count_table or first_mentioned or subject)
             m_count_of = re.search(
                 r"\b(?:number|count|total\s+number)\s+of\s+([a-z][a-z0-9_ ]{1,40})\b",
                 q,
                 flags=re.I,
             )
             count_col = ""
-            if total_row_count_table:
+            if total_row_count_table or subject_row_count_requested:
                 count_col = "*"
             if m_count_of:
                 count_phrase = re.sub(r"\s+", " ", str(m_count_of.group(1) or "").strip())
@@ -2746,6 +2917,47 @@ def _detect_filters(
             window_start = max(0, anchor_pos - 80)
             window_end = min(len(q), anchor_pos + 24)
             anchor_window = q[window_start:window_end]
+            before_anchor = q[window_start:anchor_pos]
+            best_exact: Optional[Tuple[str, str]] = None
+            best_exact_score: Tuple[bool, bool, int, int, int] = (False, False, -1, -1, -1)
+            for t, cols in allowed.items():
+                table_l = str(t or "").strip().lower()
+                if not table_l:
+                    continue
+                for c in cols:
+                    if _is_date_column(c):
+                        continue
+                    for variant in sorted(_column_variants(table_l, c), key=len, reverse=True):
+                        variant_l = str(variant or "").strip().lower()
+                        if not variant_l:
+                            continue
+                        pos = _phrase_pos(before_anchor, variant_l)
+                        if pos < 0:
+                            continue
+                        variant_tokens = _tokenize_for_match(
+                            variant_l,
+                            stop_tokens=_LEXICAL_MATCH_STOP_TOKENS,
+                        )
+                        if not variant_tokens:
+                            continue
+                        identifier_variant = bool(
+                            _is_identifier_like_column(table_l, c)
+                            and set(variant_tokens).intersection(_GENERIC_IDENTIFIER_TOKENS)
+                        )
+                        score_tuple = (
+                            table_l == subject,
+                            identifier_variant,
+                            pos,
+                            len(variant_l),
+                            -len(str(c or "")),
+                        )
+                        if score_tuple > best_exact_score:
+                            best_exact = (table_l, c)
+                            best_exact_score = score_tuple
+                            break
+            if best_exact is not None:
+                return best_exact
+
             anchor_tokens = set(
                 _tokenize_for_match(
                     anchor_window,
@@ -5348,6 +5560,185 @@ def _compute_confidence(
     return score, planner_compatible, notes
 
 
+def _detect_row_level_computed_projections(
+    question: str,
+    subject: str,
+    allowed: Dict[str, Set[str]],
+    column_mentions: List[Tuple[str, str, int]],
+) -> List[IRComputedProjection]:
+    q_raw = str(question or "").strip()
+    q = q_raw.lower()
+    subject_l = str(subject or "").strip().lower()
+    if not q or not subject_l:
+        return []
+
+    if not re.search(r"\b(?:show|return|list|display|find|get|include|give)\b", q, flags=re.I):
+        return []
+    if re.search(r"\b(?:group(?:ed)?\s+by|group\s+by|summari[sz]e|break\s+.*\s+down)\b", q, flags=re.I):
+        return []
+    if re.search(
+        r"\b(?:count|sum|avg|average|mean|min(?:imum)?|max(?:imum)?|total\s+number|how\s+many|percentage|percent)\b",
+        q,
+        flags=re.I,
+    ):
+        return []
+
+    def _is_numeric_measure_column(col: str) -> bool:
+        return _is_numeric_column(col) and not _is_date_column(col)
+
+    numeric_subject_cols = [
+        str(col or "").strip()
+        for col in allowed.get(subject_l, set())
+        if str(col or "").strip() and _is_numeric_measure_column(str(col or "").strip())
+    ]
+    if len(numeric_subject_cols) < 2:
+        return []
+
+    def _clean_operand_phrase(text: str) -> str:
+        phrase = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        phrase = re.sub(r"^(?:the|a|an|their|its|our|your)\s+", "", phrase, flags=re.I)
+        phrase = phrase.strip(" ,;:.!?()[]{}'\"")
+        return phrase
+
+    def _resolve_operand(
+        phrase: str,
+        *,
+        exclude: Optional[Set[str]] = None,
+    ) -> Optional[str]:
+        phrase_norm = _clean_operand_phrase(phrase)
+        if not phrase_norm:
+            return None
+
+        best_exact: Optional[str] = None
+        best_exact_len = -1
+        for col in numeric_subject_cols:
+            if exclude and col.lower() in exclude:
+                continue
+            for variant in sorted(_column_variants(subject_l, col), key=len, reverse=True):
+                variant_norm = re.sub(r"\s+", " ", str(variant or "").strip().lower())
+                if not variant_norm:
+                    continue
+                variant_pat = re.escape(variant_norm).replace(r"\ ", r"\s+")
+                if re.search(rf"\b{variant_pat}\b", phrase_norm, flags=re.I) and len(variant_norm) > best_exact_len:
+                    best_exact = col
+                    best_exact_len = len(variant_norm)
+                    break
+        if best_exact:
+            return best_exact
+
+        narrowed_allowed = {subject_l: set(numeric_subject_cols)}
+        matched = _best_semantic_column_match(
+            text=phrase_norm,
+            table=subject_l,
+            allowed=narrowed_allowed,
+            numeric_only=True,
+            min_score=1.0,
+        )
+        if matched and not (exclude and matched.lower() in exclude):
+            return matched
+        return None
+
+    def _alias_for_projection(op: str, left_col: str, right_col: str) -> str:
+        q_low = q
+        if op == "sub":
+            if re.search(r"\bmarkup\b", q_low, flags=re.I):
+                return "markup"
+            if re.search(r"\bprofit\s+margins?\b", q_low, flags=re.I):
+                return "profit_margin"
+            if re.search(r"\bmargins?\b", q_low, flags=re.I):
+                return "margin"
+            if re.search(r"\bdifference\b", q_low, flags=re.I):
+                return "difference"
+        op_word = {
+            "sub": "minus",
+            "add": "plus",
+            "mul": "times",
+            "div": "divided_by",
+        }.get(op, "computed")
+        return _safe_alias(f"{left_col}_{op_word}_{right_col}", "computed_value")
+
+    boundary_terms = (
+        "for\\s+each|per|return|show|display|list|include|give|sort|order|ordered|sorted|where|having"
+    )
+    patterns = [
+        (
+            "sub",
+            re.compile(
+                rf"\bdifference\s+between\s+"
+                rf"(?P<left>[a-z][a-z0-9_ ]{{1,60}}?)\s+and\s+"
+                rf"(?P<right>[a-z][a-z0-9_ ]{{1,60}}?)(?=[.,;!?]|$|\s+(?:{boundary_terms})\b)",
+                flags=re.I,
+            ),
+        ),
+        (
+            "sub",
+            re.compile(
+                rf"\b(?P<left>[a-z][a-z0-9_ ]{{1,60}}?)\s+minus\s+"
+                rf"(?P<right>[a-z][a-z0-9_ ]{{1,60}}?)(?=[.,;!?]|$|\s+(?:{boundary_terms})\b)",
+                flags=re.I,
+            ),
+        ),
+        (
+            "add",
+            re.compile(
+                rf"\b(?P<left>[a-z][a-z0-9_ ]{{1,60}}?)\s+plus\s+"
+                rf"(?P<right>[a-z][a-z0-9_ ]{{1,60}}?)(?=[.,;!?]|$|\s+(?:{boundary_terms})\b)",
+                flags=re.I,
+            ),
+        ),
+        (
+            "mul",
+            re.compile(
+                rf"\b(?P<left>[a-z][a-z0-9_ ]{{1,60}}?)\s+"
+                rf"(?:multiplied\s+by|times)\s+"
+                rf"(?P<right>[a-z][a-z0-9_ ]{{1,60}}?)(?=[.,;!?]|$|\s+(?:{boundary_terms})\b)",
+                flags=re.I,
+            ),
+        ),
+        (
+            "div",
+            re.compile(
+                rf"\b(?P<left>[a-z][a-z0-9_ ]{{1,60}}?)\s+"
+                rf"(?:divided\s+by|over)\s+"
+                rf"(?P<right>[a-z][a-z0-9_ ]{{1,60}}?)(?=[.,;!?]|$|\s+(?:{boundary_terms})\b)",
+                flags=re.I,
+            ),
+        ),
+    ]
+
+    projections: List[IRComputedProjection] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    for op, pat in patterns:
+        for match in pat.finditer(q):
+            left_phrase = _clean_operand_phrase(match.group("left") or "")
+            right_phrase = _clean_operand_phrase(match.group("right") or "")
+            if not (left_phrase and right_phrase):
+                continue
+            left_col = _resolve_operand(left_phrase)
+            if not left_col:
+                continue
+            right_col = _resolve_operand(right_phrase, exclude={left_col.lower()})
+            if not right_col or left_col.lower() == right_col.lower():
+                continue
+            key = (op, left_col.lower(), right_col.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            projections.append(
+                IRComputedProjection(
+                    kind="arithmetic",
+                    op=op,
+                    left_table=subject,
+                    left_column=left_col,
+                    right_table=subject,
+                    right_column=right_col,
+                    alias=_alias_for_projection(op, left_col, right_col),
+                )
+            )
+
+    return projections
+
+
 def _should_reclassify_pseudo_aggregate_lookup(
     question: str,
     qtype: str,
@@ -5497,8 +5888,17 @@ def build_intent_ir(
         table_mentions=table_mentions,
         primary_table=primary_table,
     )
+    allowed = _augment_subject_allowed_columns_from_schema(question, subject, allowed)
 
     column_mentions = _detect_column_mentions(question, allowed)
+    computed_projections = _detect_row_level_computed_projections(
+        question=question,
+        subject=subject,
+        allowed=allowed,
+        column_mentions=column_mentions,
+    )
+    if computed_projections and (not qtype or qtype == "aggregate"):
+        qtype = "lookup"
     metrics = _detect_metrics(
         question=question,
         qtype=qtype,
@@ -5608,6 +6008,7 @@ def build_intent_ir(
         subject_entity=subject,
         dimensions=dimensions,
         metrics=metrics,
+        computed_projections=computed_projections,
         filters=filters,
         filter_logic=filter_logic,
         existence=existence,
@@ -5639,6 +6040,7 @@ def is_ir_plannable(intent_ir: Dict[str, Any], min_confidence: float = 0.65) -> 
     if not (
         intent_ir.get("dimensions")
         or intent_ir.get("metrics")
+        or intent_ir.get("computed_projections")
         or intent_ir.get("filters")
         or intent_ir.get("existence")
     ):

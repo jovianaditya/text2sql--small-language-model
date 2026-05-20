@@ -450,6 +450,9 @@ def _canonicalize_unsafe_output_aliases(sql: str) -> str:
         i = 0
         while i < len(item):
             ch = item[i]
+            if ch == "\\" and (in_sq or in_dq) and i + 1 < len(item):
+                i += 2
+                continue
             if ch == "`" and not in_sq and not in_dq:
                 in_bt = not in_bt
                 i += 1
@@ -489,6 +492,23 @@ def _canonicalize_unsafe_output_aliases(sql: str) -> str:
         alias = item[last_as + 4:].strip()
         return expr, alias or None
 
+    def _safe_identifier_alias(alias_text: str) -> str:
+        raw = re.sub(r"\\([`'\"])", r"\1", str(alias_text or ""))
+        raw = re.sub(r"\s+", " ", raw).strip()
+        if not raw:
+            return ""
+        normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw)
+        normalized = normalized.replace("&", " and ")
+        normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
+        normalized = re.sub(r"_+", "_", normalized)
+        if not normalized:
+            return ""
+        if normalized[0].isdigit():
+            normalized = f"col_{normalized}"
+        if normalized in _RESERVED_ALIASES:
+            normalized = f"{normalized}_value"
+        return normalized
+
     def _alias_sql(alias_text: str) -> Optional[str]:
         raw = str(alias_text or "").strip()
         if not raw:
@@ -508,6 +528,9 @@ def _canonicalize_unsafe_output_aliases(sql: str) -> str:
             return raw
         if raw.lower() in _RESERVED_ALIASES:
             return f"`{raw}`"
+        safe_alias = _safe_identifier_alias(raw)
+        if safe_alias:
+            return safe_alias
         return _smart_backtick(raw)
 
     new_items: List[str] = []
@@ -532,6 +555,524 @@ def _canonicalize_unsafe_output_aliases(sql: str) -> str:
     return f"{m.group('prefix')}{', '.join(new_items)}{m.group('suffix')}"
 
 
+def _rewrite_derived_self_join_lookup_subquery(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Flatten a malformed hierarchy lookup draft shaped like:
+
+      SELECT ...
+      FROM (
+        SELECT ...
+        FROM base child
+        JOIN base parent ON child.self_fk = parent.id
+      ) AS d
+      JOIN lookup l ON d.<wrong_col> = l.<key>
+
+    into a flat same-table self-join lookup query. This is intentionally narrow:
+    - lookup-style questions only
+    - exactly one same-table self-join inside the derived table
+    - no GROUP BY / HAVING / UNION / WINDOW shapes
+    - at most one outer lookup/reference table is reattached
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip()
+    q_l = q.lower()
+    if not s or not q:
+        return sql
+    if re.search(r"\b(?:group\s+by|having|union|intersect|except|with)\b", s, flags=re.I):
+        return sql
+    if re.search(r"\bOVER\s*\(", s, flags=re.I):
+        return sql
+    if "from (" not in s.lower():
+        return sql
+    if not any(tok in q_l for tok in ("manager", "supervisor", "reports to", "reporting", "subordinate", "boss", "parent")):
+        return sql
+
+    trailing_semicolon = ";" if s.endswith(";") else ""
+    s_core = s[:-1].rstrip() if trailing_semicolon else s
+    m_outer = re.match(r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+\bFROM\b\s+(?P<rest>.+)$", s_core)
+    if not m_outer:
+        return sql
+
+    outer_select = str(m_outer.group("select") or "").strip()
+    outer_rest = str(m_outer.group("rest") or "").strip()
+    if not outer_select or not outer_rest.startswith("("):
+        return sql
+
+    depth = 0
+    in_sq = False
+    in_dq = False
+    close_idx = -1
+    for i, ch in enumerate(outer_rest):
+        if ch == "'" and not in_dq:
+            if in_sq and i + 1 < len(outer_rest) and outer_rest[i + 1] == "'":
+                continue
+            in_sq = not in_sq
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            continue
+        if in_sq or in_dq:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_idx = i
+                break
+    if close_idx < 0:
+        return sql
+
+    inner_sql = outer_rest[1:close_idx].strip()
+    after_inner = outer_rest[close_idx + 1:].strip()
+    if not inner_sql or not after_inner:
+        return sql
+
+    m_after = re.match(r"(?is)^(?:AS\s+)?(?P<derived_alias>[A-Za-z_][A-Za-z0-9_]*)(?P<tail>.*)$", after_inner)
+    if not m_after:
+        return sql
+    derived_alias = str(m_after.group("derived_alias") or "").strip()
+    outer_tail = str(m_after.group("tail") or "").strip()
+    if not derived_alias:
+        return sql
+
+    m_inner = re.match(r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+\bFROM\b\s+(?P<rest>.+)$", inner_sql)
+    if not m_inner:
+        return sql
+    inner_select = str(m_inner.group("select") or "").strip()
+    inner_rest = str(m_inner.group("rest") or "").strip()
+    if not inner_select or not inner_rest:
+        return sql
+
+    def _find_kw(text: str, keyword: str, start: int = 0) -> int:
+        t = str(text or "")
+        kw = str(keyword or "").upper()
+        if not t or not kw:
+            return -1
+        up = t.upper()
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = max(0, int(start))
+        while i < len(t):
+            ch = t[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(t) and t[i + 1] == "'":
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                i += 1
+                continue
+            if in_sq or in_dq:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and up.startswith(kw, i):
+                left_ok = i == 0 or not (up[i - 1].isalnum() or up[i - 1] == "_")
+                right_idx = i + len(kw)
+                right_ok = right_idx >= len(up) or not (up[right_idx].isalnum() or up[right_idx] == "_")
+                if left_ok and right_ok:
+                    return i
+            i += 1
+        return -1
+
+    inner_where_pos = _find_kw(inner_rest, "WHERE")
+    inner_order_pos = _find_kw(inner_rest, "ORDER BY")
+    inner_group_pos = _find_kw(inner_rest, "GROUP BY")
+    if inner_where_pos >= 0 or inner_group_pos >= 0:
+        return sql
+    inner_from_core = inner_rest[:inner_order_pos].strip() if inner_order_pos >= 0 else inner_rest
+    if not inner_from_core:
+        return sql
+
+    inner_alias_map = _parse_from_join_aliases(f"SELECT 1 FROM {inner_from_core}")
+    if len(inner_alias_map) < 2:
+        return sql
+
+    source_pairs: List[Tuple[str, str]] = []
+    seen_aliases: Set[str] = set()
+    for m_tbl in re.finditer(
+        r"""(?is)\b(?:FROM|JOIN)\s+(`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?""",
+        f"FROM {inner_from_core}",
+    ):
+        raw_tbl = (m_tbl.group(1) or "").replace("`", "").strip()
+        table_l = raw_tbl.split(".")[-1].lower()
+        if not table_l:
+            continue
+        alias_raw = (m_tbl.group(2) or "").strip()
+        alias = (alias_raw or table_l).strip()
+        alias_l = alias.lower()
+        if not alias_l or alias_l in seen_aliases:
+            continue
+        seen_aliases.add(alias_l)
+        source_pairs.append((alias, table_l))
+    if len(source_pairs) < 2:
+        return sql
+
+    base_table = source_pairs[0][1]
+    if source_pairs[1][1] != base_table:
+        return sql
+
+    try:
+        base_id_col = str(get_id_column(base_table) or "").strip("`")
+    except Exception:
+        base_id_col = ""
+    if not base_id_col:
+        return sql
+    base_id_l = base_id_col.lower()
+
+    child_alias = ""
+    parent_alias = ""
+    self_fk_col = ""
+    self_join_on = ""
+    for m_eq in re.finditer(
+        r"""(?is)`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?""",
+        inner_from_core,
+    ):
+        left_a, left_c = str(m_eq.group(1) or "").strip(), str(m_eq.group(2) or "").strip()
+        right_a, right_c = str(m_eq.group(3) or "").strip(), str(m_eq.group(4) or "").strip()
+        left_t = str(inner_alias_map.get(left_a) or inner_alias_map.get(left_a.lower()) or "").strip().lower()
+        right_t = str(inner_alias_map.get(right_a) or inner_alias_map.get(right_a.lower()) or "").strip().lower()
+        if not left_t or left_t != right_t or left_t != base_table:
+            continue
+        if left_c.lower() != base_id_l and right_c.lower() == base_id_l:
+            child_alias, parent_alias, self_fk_col = left_a, right_a, left_c
+            self_join_on = m_eq.group(0)
+            break
+        if right_c.lower() != base_id_l and left_c.lower() == base_id_l:
+            child_alias, parent_alias, self_fk_col = right_a, left_a, right_c
+            self_join_on = m_eq.group(0)
+            break
+    if not child_alias or not parent_alias or not self_fk_col or not self_join_on:
+        return sql
+
+    def _split_top_level_csv(text: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    buf.append(ch)
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                buf.append(ch)
+                i += 1
+                continue
+            if not in_sq and not in_dq:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif ch == "," and depth == 0:
+                    item = "".join(buf).strip()
+                    if item:
+                        items.append(item)
+                    buf = []
+                    i += 1
+                    continue
+            buf.append(ch)
+            i += 1
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _split_expr_alias(item: str) -> Tuple[str, Optional[str]]:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            str(item or "").strip(),
+        )
+        if not m:
+            return str(item or "").strip(), None
+        return str(m.group(1) or "").strip(), str(m.group(2) or "").strip()
+
+    def _clean_alias(a: Optional[str]) -> str:
+        if not a:
+            return ""
+        out = str(a).strip()
+        if (out.startswith("`") and out.endswith("`")) or (out.startswith("'") and out.endswith("'")) or (out.startswith('"') and out.endswith('"')):
+            out = out[1:-1]
+        return out.strip()
+
+    def _identifier_terms(text: str) -> Set[str]:
+        split = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or ""))
+        return {
+            tok
+            for tok in re.findall(r"[a-z0-9]+", split.replace("_", " ").replace("-", " ").lower())
+            if tok
+        }
+
+    def _table_cols_lower(table_name: str) -> Set[str]:
+        t_l = str(table_name or "").strip("`").lower()
+        if not t_l:
+            return set()
+        try:
+            analyzer = get_schema_analyzer()
+            return {
+                str(c).strip("`").lower()
+                for c in analyzer.get_table_columns(t_l)
+                if str(c or "").strip()
+            }
+        except Exception:
+            return set()
+
+    def _original_case_col(table_name: str, col_name: str) -> str:
+        t_l = str(table_name or "").strip("`").lower()
+        c_l = str(col_name or "").strip("`").lower()
+        if not t_l or not c_l:
+            return str(col_name or "").strip("`")
+        try:
+            analyzer = get_schema_analyzer()
+            return str(getattr(analyzer, "_column_original_case", {}).get(f"{t_l}.{c_l}", col_name))
+        except Exception:
+            return str(col_name or "").strip("`")
+
+    def _question_requests_phrase(*phrases: str) -> bool:
+        for phrase in phrases:
+            p = str(phrase or "").strip().lower()
+            if not p:
+                continue
+            p_pat = re.escape(p).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{p_pat}\b", q_l, flags=re.I):
+                return True
+        return False
+
+    def _role_wants_full_name(role_terms: Sequence[str]) -> bool:
+        role_alt = "|".join(
+            re.escape(str(t)).replace(r"\ ", r"\s+")
+            for t in role_terms
+            if str(t or "").strip()
+        )
+        if not role_alt:
+            return False
+        return bool(
+            re.search(rf"\b(?:{role_alt})\b.{{0,48}}\b(?:full\s+name|name)\b", q_l, flags=re.I | re.S)
+        )
+
+    def _role_wants_title(role_terms: Sequence[str]) -> bool:
+        role_alt = "|".join(
+            re.escape(str(t)).replace(r"\ ", r"\s+")
+            for t in role_terms
+            if str(t or "").strip()
+        )
+        if not role_alt:
+            return False
+        return bool(
+            re.search(rf"\b(?:{role_alt})\b.{{0,48}}\b(?:job\s+title|title|position|role)\b", q_l, flags=re.I | re.S)
+        )
+
+    def _name_component_cols_for_table(table_name: str) -> List[str]:
+        cols = _table_cols_lower(table_name)
+        if not cols:
+            return []
+        ordered = [c for c in ("firstName", "lastName", "firstname", "lastname") if c.lower() in cols]
+        if len(ordered) >= 2:
+            return ordered[:2]
+        first_col = next((c for c in cols if "first" in c or "given" in c), "")
+        last_col = next((c for c in cols if "last" in c or "surname" in c or "family" in c), "")
+        out = [c for c in (first_col, last_col) if c]
+        return out[:2]
+
+    def _full_name_expr(table_name: str, alias: str) -> str:
+        cols = _name_component_cols_for_table(table_name)
+        if len(cols) >= 2:
+            return (
+                f"CONCAT({alias}.{_original_case_col(table_name, cols[0])}, "
+                f"' ', {alias}.{_original_case_col(table_name, cols[1])})"
+            )
+        name_col = str(get_name_column(table_name) or "").strip("`")
+        if name_col:
+            return f"{alias}.{_original_case_col(table_name, name_col)}"
+        return ""
+
+    def _title_col_for_table(table_name: str) -> str:
+        cols = _table_cols_lower(table_name)
+        if not cols:
+            return ""
+        for cand in ("jobTitle", "title", "position", "role"):
+            if cand.lower() in cols:
+                return cand
+        for col in cols:
+            if "title" in col or "position" in col or "role" in col:
+                return col
+        return ""
+
+    inner_alias_items: Dict[str, Tuple[str, str]] = {}
+    for item in _split_top_level_csv(inner_select):
+        expr, alias = _split_expr_alias(item)
+        alias_clean = _clean_alias(alias)
+        if alias_clean:
+            inner_alias_items[alias_clean.lower()] = (expr, alias_clean)
+
+    child_role_terms = ["subordinate", "employee", "child", "report"]
+    parent_role_terms = ["manager", "supervisor", "parent", "boss"]
+    rebuilt_items: List[str] = []
+    seen_norm: Set[str] = set()
+
+    def _append_item(expr: str, alias: Optional[str] = None) -> None:
+        expr_s = str(expr or "").strip()
+        alias_s = _clean_alias(alias)
+        if not expr_s:
+            return
+        item = f"{expr_s} AS {alias_s}" if alias_s else expr_s
+        norm = re.sub(r"\s+", " ", item).strip().lower()
+        if norm in seen_norm:
+            return
+        seen_norm.add(norm)
+        rebuilt_items.append(item)
+
+    # Child identifier
+    child_id_alias = next(
+        (alias for alias, (expr, _a) in inner_alias_items.items() if re.search(rf"(?is)\b{re.escape(child_alias)}\s*\.\s*`?{re.escape(base_id_col)}`?\b", expr)),
+        "",
+    )
+    if child_id_alias:
+        expr, alias = inner_alias_items[child_id_alias]
+        _append_item(expr, alias)
+    else:
+        _append_item(f"{child_alias}.{_original_case_col(base_table, base_id_col)}")
+
+    # Child full name
+    if _role_wants_full_name(child_role_terms):
+        child_name_alias = next((alias for alias in inner_alias_items if alias.startswith("subordinate_") and "name" in alias), "")
+        if child_name_alias:
+            expr, alias = inner_alias_items[child_name_alias]
+            _append_item(expr, alias)
+        else:
+            child_name_expr = _full_name_expr(base_table, child_alias)
+            if child_name_expr:
+                _append_item(child_name_expr, "employee_name")
+
+    # Child title
+    if _role_wants_title(child_role_terms):
+        child_title_alias = next((alias for alias in inner_alias_items if alias.startswith("subordinate_") and ("title" in alias or "role" in alias or "position" in alias)), "")
+        if child_title_alias:
+            expr, alias = inner_alias_items[child_title_alias]
+            _append_item(expr, alias)
+        else:
+            title_col = _title_col_for_table(base_table)
+            if title_col:
+                _append_item(f"{child_alias}.{_original_case_col(base_table, title_col)}")
+
+    # Parent full name
+    if _role_wants_full_name(parent_role_terms):
+        parent_name_expr = _full_name_expr(base_table, parent_alias)
+        if parent_name_expr:
+            _append_item(parent_name_expr, "manager_name")
+
+    # Parent title
+    if _role_wants_title(parent_role_terms):
+        parent_title_alias = next((alias for alias in inner_alias_items if alias.startswith("manager_") and ("title" in alias or "role" in alias or "position" in alias)), "")
+        if parent_title_alias:
+            expr, alias = inner_alias_items[parent_title_alias]
+            _append_item(expr, alias)
+        else:
+            title_col = _title_col_for_table(base_table)
+            if title_col:
+                _append_item(f"{parent_alias}.{_original_case_col(base_table, title_col)}", "manager_job_title")
+
+    fk_raw = get_fk_relationships() or {}
+    fk_map: Dict[str, Dict[str, str]] = {}
+    for src, mapping in (fk_raw or {}).items():
+        src_l = str(src or "").strip("`").lower()
+        if not src_l:
+            continue
+        fk_map[src_l] = {}
+        for fk_col, tgt in (mapping or {}).items():
+            fk_l = str(fk_col or "").strip("`").lower()
+            tgt_l = str(tgt or "").strip("`").lower()
+            if fk_l and tgt_l:
+                fk_map[src_l][fk_l] = tgt_l
+
+    outer_lookup_match = re.search(
+        r"""(?is)\b(?:INNER|LEFT|RIGHT|CROSS)?\s*JOIN\s+`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?\s+ON\b""",
+        outer_tail,
+    )
+    lookup_join_sql = ""
+    order_items: List[str] = []
+    if outer_lookup_match:
+        lookup_table = str(outer_lookup_match.group("table") or "").strip().lower()
+        lookup_alias = str(outer_lookup_match.group("alias") or "").strip() or lookup_table
+        child_fk_col = ""
+        for fk_col, tgt in (fk_map.get(base_table, {}) or {}).items():
+            if tgt == lookup_table:
+                child_fk_col = fk_col
+                break
+        if child_fk_col:
+            lookup_cols = _table_cols_lower(lookup_table)
+            requested_lookup_cols: List[str] = []
+            for col in sorted(lookup_cols):
+                col_terms = _identifier_terms(col)
+                if not col_terms:
+                    continue
+                if all(re.search(rf"\b{re.escape(term)}\b", q_l) for term in sorted(col_terms) if len(term) >= 3):
+                    requested_lookup_cols.append(col)
+            if not requested_lookup_cols:
+                for col in sorted(lookup_cols):
+                    if col in {"city", "country", "state", "territory", "name"} and re.search(rf"\b{re.escape(col)}\b", q_l):
+                        requested_lookup_cols.append(col)
+            lookup_join_sql = (
+                f" INNER JOIN {lookup_table} AS {lookup_alias}"
+                f" ON {child_alias}.{_original_case_col(base_table, child_fk_col)} = {lookup_alias}.{_original_case_col(lookup_table, get_id_column(lookup_table) or child_fk_col)}"
+            )
+            for col in requested_lookup_cols:
+                _append_item(
+                    f"{lookup_alias}.{_original_case_col(lookup_table, col)}",
+                    f"{lookup_table.rstrip('s')}_{col}",
+                )
+            sort_segment = ""
+            m_sort = re.search(r"(?is)\b(?:sort(?:ed)?|order(?:ed)?)\s+by\s+(.+)$", q_l)
+            if m_sort:
+                sort_segment = str(m_sort.group(1) or "").strip()
+            for col in requested_lookup_cols:
+                if col and col in sort_segment:
+                    direction = "DESC" if re.search(rf"\b{re.escape(col)}\b.{{0,24}}\bdesc", sort_segment, flags=re.I | re.S) else "ASC"
+                    order_items.append(f"{lookup_alias}.{_original_case_col(lookup_table, col)} {direction}")
+                    break
+            id_terms = _identifier_terms(base_id_col) | {"employee", "number", "id", "code"}
+            if sort_segment and any(term in sort_segment for term in id_terms):
+                direction = "DESC" if re.search(r"\b(?:employee\s+number|employee\s+id|id|number|code)\b.{0,24}\bdesc", sort_segment, flags=re.I | re.S) else "ASC"
+                order_items.append(f"{child_alias}.{_original_case_col(base_table, base_id_col)} {direction}")
+
+    if not rebuilt_items:
+        return sql
+
+    order_clause = f" ORDER BY {', '.join(order_items)}" if order_items else ""
+    rebuilt = (
+        f"SELECT {', '.join(rebuilt_items)} "
+        f"FROM {base_table} AS {child_alias} "
+        f"INNER JOIN {base_table} AS {parent_alias} ON {self_join_on}"
+        f"{lookup_join_sql}"
+        f"{order_clause}"
+    ).strip()
+    if trailing_semicolon and not rebuilt.endswith(";"):
+        rebuilt += ";"
+    return rebuilt
+
+
 def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "") -> str:
     """
     Deterministically add a one-hop lookup join when ORDER BY references a
@@ -549,6 +1090,9 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
     q = str(question or "").strip()
     if not s or not q or not has_join(s):
         return sql
+    flattened_self_join = _rewrite_derived_self_join_lookup_subquery(s, question, ctx)
+    if flattened_self_join != s:
+        return _rewrite_missing_ordered_lookup_join(flattened_self_join, question, ctx)
     if re.search(r"\b(?:group\s+by|having|union|intersect|except|with)\b", s, flags=re.I):
         return sql
     if re.search(r"\bOVER\s*\(", s, flags=re.I):
@@ -767,6 +1311,21 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
         pat = re.escape(clean).replace(r"\ ", r"\s+")
         return bool(re.search(rf"\b{pat}\b", requested_output_segment, flags=re.I))
 
+    def _preferred_output_alias(table_name: str, col_name: str) -> str:
+        table_l = str(table_name or "").strip().lower()
+        col_case = _original_case_col(table_l, col_name)
+        if not table_l:
+            return col_case
+        try:
+            singular = str(get_singular_form(table_l) or "").strip().lower()
+        except Exception:
+            singular = ""
+        base = singular or re.sub(r"s$", "", table_l)
+        base = re.sub(r"[^a-z0-9_]+", "_", base).strip("_")
+        if not base or base == str(col_name or "").strip().lower():
+            return col_case
+        return f"{base}_{col_case}"
+
     try:
         fk_map_raw = get_fk_relationships() or {}
     except Exception:
@@ -948,7 +1507,14 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
                 terms.update(_identifier_terms(get_column_description(table_name, fk_col)))
             except Exception:
                 pass
-        return {t for t in terms if len(t) >= 3}
+        filtered_terms = {t for t in terms if len(t) >= 3}
+        if not any(
+            term in {"manager", "supervisor", "parent", "leader", "mentor", "boss", "owner", "child", "subordinate"}
+            or term.startswith("report")
+            for term in filtered_terms
+        ):
+            filtered_terms.update({"manager", "supervisor", "parent", "leader", "report", "reports"})
+        return filtered_terms
 
     def _self_join_role_aliases() -> Tuple[Dict[str, str], Set[str]]:
         roles: Dict[str, str] = {}
@@ -1106,9 +1672,12 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
             return False
         if not re.search(rf"\b(?:{role_alt})\b.{0,48}\b(?:full\s+name|name)\b", scope, flags=re.I | re.S):
             return False
-        if re.search(rf"(?is)\bCONCAT\s*\([^)]*\b{re.escape(role_alias_l)}\s*\.", select_part):
+        if re.search(rf"(?is)\bCONCAT\s*\([\s\S]*?\b{re.escape(role_alias_l)}\s*\.", select_part):
             return False
-        if re.search(rf"(?is)\b{re.escape(role_alias_l)}_(?:full_)?name\b|\b(?:manager|supervisor|parent)_name\b", select_part):
+        if re.search(
+            rf"(?is)\b{re.escape(role_alias_l)}_(?:full_?name|name)\b|\b(?:{role_alt})_(?:full_?name|name)\b",
+            select_part,
+        ):
             return False
         return True
 
@@ -1290,7 +1859,14 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
                 flags=re.I | re.S,
             )
         )
-        if parent_name_requested:
+        has_parent_name_alias = bool(
+            parent_role_alt
+            and re.search(
+                rf"(?is)\b(?:{parent_role_alt})_(?:full_?name|name)\b",
+                select_low,
+            )
+        )
+        if parent_name_requested and not has_parent_name_alias:
             fallback_alias, fallback_table = source_pairs[1]
             cols = _table_cols_lower(fallback_table)
             first_col = next((c for c in cols if any(tok in c for tok in ("firstname", "first", "givenname", "given"))), "")
@@ -1352,6 +1928,45 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
                 rebuilt_tail,
             )
 
+        break
+
+    for m_ref in re.finditer(
+        r"(?is)\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+        order_segment,
+    ):
+        qual = str(m_ref.group(1) or "").strip().lower()
+        col = str(m_ref.group(2) or "").strip().lower()
+        if not qual or not col:
+            continue
+        source_table = alias_to_table.get(qual, "").lower()
+        if not source_table and qual in joined_tables:
+            source_table = qual
+        if not source_table or col not in _table_cols_lower(source_table):
+            continue
+        if not _question_requests_column(col):
+            continue
+        if re.search(rf"(?is)\b{re.escape(col)}\b", select_low):
+            continue
+
+        qual_out = qual
+        if qual_out not in alias_to_table:
+            qual_out = next(
+                (
+                    alias_name
+                    for alias_name, table_name in source_pairs
+                    if str(table_name or "").strip().lower() == source_table
+                ),
+                qual,
+            )
+        col_case = _original_case_col(source_table, col)
+        alias_out = _preferred_output_alias(source_table, col)
+        if alias_out and alias_out.lower() != col_case.lower():
+            rebuilt_select_items.append(f"{qual_out}.{col_case} AS {alias_out}")
+            select_low += f" {col} {alias_out.lower()}"
+        else:
+            rebuilt_select_items.append(f"{qual_out}.{col_case}")
+            select_low += f" {col}"
+        changed = True
         break
 
     for m_ref in re.finditer(
@@ -2210,6 +2825,41 @@ def _dual_fact_metric_term_universe(
     else:
         metric_words.update(active_compat_terms)
     return metric_words
+
+
+def _status_request_for_table_question(question: str, table_name: str) -> bool:
+    """
+    Detect generic "<entity> status" style requests from question text.
+
+    Kept module-level so dual-fact detectors and rewriters can share the same
+    schema-driven logic without relying on a nested helper scope.
+    """
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    entity_terms = [
+        str(term or "").strip().lower()
+        for term in _entity_words_for_table(table_name)
+        if str(term or "").strip()
+    ]
+    if not entity_terms:
+        return False
+
+    entity_alt = "|".join(
+        re.escape(term).replace(r"\ ", r"\s+")
+        for term in sorted(set(entity_terms), key=len, reverse=True)
+    )
+    if not entity_alt:
+        return False
+
+    return bool(
+        re.search(
+            rf"\b(?:{entity_alt})[_\s-]*status\b",
+            q,
+            flags=re.I,
+        )
+    )
 
 def _canonicalize_table_names(sql: str, ctx: str) -> str:
     """
@@ -4611,6 +5261,34 @@ def _repair_invalid_qualified_columns(sql: str, ctx: str = "") -> str:
     if not table_cols:
         return sql
 
+    projection_alias_cols_by_symbol: Dict[str, Dict[str, str]] = {}
+
+    m_select = re.match(r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+\bFROM\b\s+", sql)
+    if m_select:
+        for item in _split_top_level_commas(m_select.group("select") or ""):
+            expr, out_alias = _split_select_expr_alias(item)
+            if not expr or not out_alias:
+                continue
+            m_simple = re.match(
+                r"""(?is)^\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$""",
+                expr.strip(),
+            )
+            if not m_simple:
+                continue
+            expr_symbol = str(m_simple.group(1) or "").strip().lower()
+            expr_col = str(m_simple.group(2) or "").strip().lower()
+            symbol_entry = symbol_map.get(expr_symbol)
+            if not symbol_entry:
+                continue
+            src_tbl = symbol_entry[0]
+            if expr_col not in table_cols.get(src_tbl, set()):
+                continue
+            out_alias_norm = _norm_ident(str(out_alias or "").strip().strip("`'\""))
+            if not out_alias_norm:
+                continue
+            projection_alias_cols_by_symbol.setdefault(expr_symbol, {})
+            projection_alias_cols_by_symbol[expr_symbol].setdefault(out_alias_norm, expr_col)
+
     def _original_case_col(tbl_l: str, col_l: str) -> str:
         if analyzer is not None:
             try:
@@ -4750,13 +5428,19 @@ def _repair_invalid_qualified_columns(sql: str, ctx: str = "") -> str:
             return table_candidates[0]
         return None
 
-    def _resolve_same_table_column(src_tbl: str, raw_col: str) -> Optional[str]:
+    def _resolve_same_table_column(src_tbl: str, raw_col: str, symbol_l: str = "") -> Optional[str]:
         src_cols = table_cols.get(src_tbl, set())
         if not src_cols:
             return None
         target_norm = _norm_ident(raw_col)
         if not target_norm:
             return None
+
+        if symbol_l:
+            alias_projection_map = projection_alias_cols_by_symbol.get(symbol_l, {})
+            mapped_projection_col = alias_projection_map.get(target_norm)
+            if mapped_projection_col and mapped_projection_col in src_cols:
+                return mapped_projection_col
 
         normalized_candidates: List[str] = [target_norm]
         raw_col_txt = str(raw_col or "").strip().strip("`")
@@ -4878,7 +5562,7 @@ def _repair_invalid_qualified_columns(sql: str, ctx: str = "") -> str:
             if col_l in src_cols:
                 return m.group(0)
 
-            same_table_col = _resolve_same_table_column(src_tbl, col)
+            same_table_col = _resolve_same_table_column(src_tbl, col, alias_l)
             if same_table_col and same_table_col.lower() != col_l:
                 same_table_col_case = _original_case_col(src_tbl, same_table_col)
                 return f"{aq}{alias}{aq}.{cq}{same_table_col_case}{cq}"
@@ -5354,6 +6038,7 @@ def _prefer_name_over_id_generic(
     wants_name_fn,
     name_column: str,
     id_columns: List[str],
+    entity_words: Optional[List[str]] = None,
 ) -> str:
     """
     Ganti penggunaan kolom ID menjadi kolom nama yang lebih 'friendly'
@@ -5363,6 +6048,45 @@ def _prefer_name_over_id_generic(
       - productCode    -> productName
     """
     if not wants_name_fn(question):
+        return sql
+
+    q = str(question or "").strip().lower()
+
+    id_terms = [
+        str(term or "").strip().lower()
+        for term in identifier_id_like_terms()
+        if str(term or "").strip()
+    ] or ["id", "ids", "number", "numbers", "code", "codes", "key", "keys"]
+    entity_forms = [
+        str(word or "").strip().lower()
+        for word in (entity_words or [])
+        if str(word or "").strip()
+    ]
+
+    explicit_identifier_request = bool(
+        re.search(r"\b(?:ids?|identifiers?|numbers?|nomors?|nos?|codes?|kodes?|keys?)\b", q, flags=re.I)
+    )
+    if not explicit_identifier_request and entity_forms and id_terms:
+        id_alt = "|".join(
+            re.escape(term).replace(r"\ ", r"\s+")
+            for term in sorted(set(id_terms), key=len, reverse=True)
+        )
+        for entity in entity_forms:
+            entity_pat = re.escape(entity).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{entity_pat}\b\s+(?:{id_alt})\b", q, flags=re.I):
+                explicit_identifier_request = True
+                break
+            if re.search(rf"\b(?:{id_alt})\b\s+(?:of|for)\s+\b{entity_pat}\b", q, flags=re.I):
+                explicit_identifier_request = True
+                break
+            compact = re.sub(r"[^a-z0-9]+", "_", entity).strip("_")
+            if compact and any(f"{compact}_{term.replace(' ', '_')}" in q.replace("-", "_").replace(" ", "_") for term in id_terms):
+                explicit_identifier_request = True
+                break
+
+    # If the question explicitly asks for an identifier form, never rewrite it
+    # away into the friendly display-name column.
+    if explicit_identifier_request:
         return sql
 
     # contoh: "customerNumber|customer_id|..."
@@ -5747,6 +6471,7 @@ def _prefer_friendly_names(sql: str, question: str) -> str:
             wants_name_fn=lambda q, words=entity_words: _wants_name_only(q, words),
             name_column=display_name_col,
             id_columns=[id_col],
+            entity_words=entity_words,
         )
 
     return sql
@@ -8380,6 +9105,290 @@ def _prune_non_primary_dimensions_for_primary_aggregate(sql: str, question: str,
         fixed += ";"
     return fixed
 
+
+def _drop_unrequested_nonprimary_identifier_group_keys(
+    sql: str,
+    question: str,
+    ctx: str = "",
+) -> str:
+    """
+    Drop leaked child/support identifier dimensions from grouped JOIN queries
+    when the question clearly asks for one row per primary entity.
+
+    Conservative scope:
+    - grouped flat JOIN query only
+    - question expresses "for each/per/every <entity>" and aggregate intent
+    - only removes simple non-primary columns that look identifier-like
+    - only when that child/support identifier is not requested in the question
+    """
+    if not sql or not question:
+        return sql
+
+    q = str(question or "").strip().lower()
+    if not q:
+        return sql
+    has_for_each = bool(re.search(r"\b(?:for\s+each|each|per|every)\b", q, flags=re.I))
+    has_agg = bool(re.search(r"\b(?:sum|count|avg|average|min|max|total)\b", q, flags=re.I))
+    if not (has_for_each and has_agg):
+        return sql
+
+    parsed = _parse_flat_groupby_clauses(sql) or _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+
+    from_core = str(parsed.get("from_core") or "").strip()
+    if not from_core or not re.search(r"(?is)\bjoin\b", from_core):
+        return sql
+    if not str(parsed.get("groupby") or "").strip():
+        return sql
+
+    alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}") or {}
+    alias_to_table_l = {
+        str(alias or "").strip("`").lower(): str(table or "").strip("`").lower()
+        for alias, table in alias_to_table.items()
+        if str(alias or "").strip() and str(table or "").strip()
+    }
+    if not alias_to_table_l:
+        return sql
+
+    term_to_table: Dict[str, str] = {}
+    for table_name in get_all_tables():
+        table_l = str(table_name or "").strip().lower()
+        if not table_l:
+            continue
+        terms: Set[str] = {table_l}
+        singular = get_singular_form(table_l) if table_l else table_l
+        if singular:
+            terms.add(str(singular).lower())
+        if "_" in table_l:
+            terms.add(table_l.replace("_", " "))
+        if singular and "_" in str(singular):
+            terms.add(str(singular).replace("_", " ").lower())
+        try:
+            for syn in get_table_synonyms(table_l):
+                syn_l = str(syn or "").strip().lower()
+                if syn_l:
+                    terms.add(syn_l)
+        except Exception:
+            pass
+        for term in terms:
+            if term:
+                term_to_table[term] = table_l
+
+    primary_table = ""
+    best_primary_pos: Optional[int] = None
+    best_primary_span_len = -1
+    for term in sorted(term_to_table.keys(), key=len, reverse=True):
+        pattern = rf"\b(?:for\s+each|for\s+every|each|per|every)\s+(?:such\s+|the\s+|those\s+|these\s+)?{re.escape(term)}\b"
+        match = re.search(pattern, q, flags=re.I)
+        if not match:
+            continue
+        match_pos = match.start()
+        term_len = len(str(term or ""))
+        if (
+            best_primary_pos is None
+            or match_pos < best_primary_pos
+            or (match_pos == best_primary_pos and term_len > best_primary_span_len)
+        ):
+            primary_table = term_to_table[term]
+            best_primary_pos = match_pos
+            best_primary_span_len = term_len
+    if not primary_table:
+        return sql
+
+    primary_aliases: Set[str] = {
+        alias_l
+        for alias_l, table_l in alias_to_table_l.items()
+        if table_l == primary_table
+    }
+    primary_aliases.add(primary_table)
+    singular_primary = str(get_singular_form(primary_table) or "").strip().lower()
+    if singular_primary:
+        primary_aliases.add(singular_primary)
+
+    requested_output_segment = _extract_requested_output_segment(question) or q
+    whole_question = str(question or "").strip().lower()
+    scope_text = f"{requested_output_segment} {whole_question}".strip()
+    q_tokens = set(re.findall(r"[a-z0-9]+", scope_text))
+
+    try:
+        fk_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_raw = {}
+
+    simple_col_pat = re.compile(
+        r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$"""
+    )
+
+    def _simple_col_ref(expr: str) -> Tuple[str, str]:
+        m = simple_col_pat.match(str(expr or "").strip())
+        if not m:
+            return ("", "")
+        return (
+            str(m.group(1) or "").strip("`").lower(),
+            str(m.group(2) or "").strip("`").lower(),
+        )
+
+    def _column_mentioned(table_l: str, col_l: str, out_alias: Optional[str]) -> bool:
+        variants: Set[str] = set()
+
+        def _add_variant(text: str) -> None:
+            raw = str(text or "").strip()
+            if not raw:
+                return
+            spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw).replace("_", " ").strip().lower()
+            compact = re.sub(r"\s+", " ", spaced).strip()
+            if compact:
+                variants.add(compact)
+
+        _add_variant(col_l)
+        _add_variant(out_alias or "")
+        try:
+            for variant in get_column_entity_variants(table_l, col_l) or set():
+                _add_variant(str(variant or ""))
+        except Exception:
+            pass
+        try:
+            for variant in get_column_synonyms(table_l, col_l) or []:
+                _add_variant(str(variant or ""))
+        except Exception:
+            pass
+
+        for variant in variants:
+            pat = re.escape(variant).replace(r"\ ", r"\s+")
+            if pat and re.search(rf"\b{pat}\b", scope_text, flags=re.I):
+                return True
+
+        token_hints: Set[str] = set()
+        for variant in variants:
+            token_hints.update(
+                tok for tok in re.findall(r"[a-z0-9]+", variant)
+                if len(tok) >= 3 and tok not in {"the", "and", "with"}
+            )
+        return bool(token_hints) and token_hints.issubset(q_tokens)
+
+    def _looks_like_identifier_col(table_l: str, col_l: str) -> bool:
+        if not table_l or not col_l:
+            return False
+        try:
+            id_col = str(get_id_column(table_l) or "").strip("`").lower()
+        except Exception:
+            id_col = ""
+        if id_col and col_l == id_col:
+            return True
+        if col_l in {
+            str(fk_col or "").strip("`").lower()
+            for fk_col in (fk_raw.get(table_l, {}) or {})
+            if str(fk_col or "").strip()
+        }:
+            return True
+        try:
+            role_l = str(get_column_role(table_l, col_l) or "").strip().lower()
+        except Exception:
+            role_l = ""
+        if role_l in {"pk", "fk", "id", "identifier"}:
+            return True
+        tokens = re.findall(
+            r"[a-z0-9]+",
+            re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", col_l).replace("_", " ").lower(),
+        )
+        if any(tok in {"line", "sequence", "position", "reference"} for tok in tokens):
+            return True
+        return bool(tokens) and tokens[-1] in {"id", "number", "code", "key"}
+
+    having_text = str(parsed.get("having") or "").strip()
+    tail_text = str(parsed.get("tail") or "").strip()
+
+    def _referenced_elsewhere(alias_l: str, col_l: str, out_alias: Optional[str]) -> bool:
+        qual_pat = rf"(?is)\b{re.escape(alias_l)}\s*\.\s*`?{re.escape(col_l)}`?\b"
+        if re.search(qual_pat, having_text, flags=re.I) or re.search(qual_pat, tail_text, flags=re.I):
+            return True
+        alias_txt = str(out_alias or "").strip().strip("`'\"")
+        if alias_txt and (
+            re.search(rf"(?is)\b{re.escape(alias_txt)}\b", having_text)
+            or re.search(rf"(?is)\b{re.escape(alias_txt)}\b", tail_text)
+        ):
+            return True
+        return False
+
+    select_items = [str(it).strip() for it in _split_top_level_commas(parsed.get("select") or "") if str(it or "").strip()]
+    group_items = [str(it).strip() for it in _split_top_level_commas(parsed.get("groupby") or "") if str(it or "").strip()]
+    if not select_items or not group_items:
+        return sql
+
+    drop_keys: Set[Tuple[str, str]] = set()
+    new_select_items: List[str] = []
+    removed_any = False
+    for item in select_items:
+        expr, out_alias = _split_select_expr_alias(item)
+        expr_txt = str(expr or "").strip()
+        if not expr_txt:
+            continue
+        if re.search(r"(?is)\b(?:SUM|COUNT|AVG|MIN|MAX|GROUP_CONCAT|STDDEV|VARIANCE)\s*\(", expr_txt):
+            new_select_items.append(item)
+            continue
+        if re.search(r"(?is)\bOVER\s*\(", expr_txt):
+            new_select_items.append(item)
+            continue
+
+        alias_l, col_l = _simple_col_ref(expr_txt)
+        if not alias_l or not col_l:
+            new_select_items.append(item)
+            continue
+        if alias_l in primary_aliases:
+            new_select_items.append(item)
+            continue
+
+        table_l = alias_to_table_l.get(alias_l, "")
+        if not table_l or table_l == primary_table:
+            new_select_items.append(item)
+            continue
+        if _column_mentioned(table_l, col_l, out_alias):
+            new_select_items.append(item)
+            continue
+        if _referenced_elsewhere(alias_l, col_l, out_alias):
+            new_select_items.append(item)
+            continue
+        if not _looks_like_identifier_col(table_l, col_l):
+            new_select_items.append(item)
+            continue
+
+        drop_keys.add((alias_l, col_l))
+        removed_any = True
+
+    if not removed_any or not new_select_items:
+        return sql
+
+    new_group_items: List[str] = []
+    for item in group_items:
+        alias_l, col_l = _simple_col_ref(item)
+        if alias_l and col_l and (alias_l, col_l) in drop_keys:
+            continue
+        new_group_items.append(item)
+
+    if not new_group_items:
+        return sql
+
+    out_lines = [
+        "SELECT " + ", ".join(new_select_items),
+        "FROM " + from_core,
+    ]
+    if str(parsed.get("where") or "").strip():
+        out_lines.append(str(parsed.get("where") or "").strip())
+    out_lines.append("GROUP BY " + ", ".join(new_group_items))
+    if having_text:
+        if not having_text.lower().startswith("having "):
+            having_text = f"HAVING {having_text}"
+        out_lines.append(having_text)
+    if tail_text:
+        out_lines.append(tail_text)
+
+    fixed = "\n".join(out_lines).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str) -> str:
     """
     If SELECT already contains a composite-name expression (e.g., CONCAT of
@@ -8961,7 +9970,7 @@ def _ensure_unique_output_column_labels(sql: str) -> str:
     if re.search(r"(?is)\b(?:from|join)\s*\(\s*select\b", s):
         return sql
 
-    parsed = _parse_select_from_groupby(s)
+    parsed = _parse_flat_groupby_clauses(s) or _parse_select_from_groupby(s)
     if not parsed:
         # Fallback parser for flat non-grouped SELECT queries.
         m_sel = re.match(r"(?is)^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<after>.+)$", s.rstrip(";").strip())
@@ -9361,6 +10370,35 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
     group_clause = gb_match.group(1).strip()
     group_items = _split_top_level_commas(group_clause)
 
+    def _unquote_identifier(text: str) -> str:
+        raw = str(text or "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"`", "'", '"'}:
+            return raw[1:-1].strip()
+        return raw
+
+    def _normalize_alias_lookup_key(text: str) -> str:
+        raw = _unquote_identifier(text)
+        raw = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw)
+        raw = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_").lower()
+        raw = re.sub(r"_+", "_", raw)
+        return raw
+
+    select_alias_map: Dict[str, str] = {}
+    select_alias_ref_map: Dict[str, str] = {}
+    select_pos = _find_top_level_clause(sql, "select")
+    from_pos = _find_top_level_clause(sql, "from", max(0, select_pos + len("select")))
+    if select_pos == 0 and from_pos > 0:
+        select_part = sql[select_pos + len("select"):from_pos].strip()
+        for item in _split_top_level_commas(select_part):
+            expr, alias = _split_select_expr_alias(item)
+            alias_key = _unquote_identifier(alias or "").lower()
+            if alias_key and expr:
+                select_alias_map[alias_key] = str(expr).strip()
+                select_alias_ref_map[alias_key] = _unquote_identifier(alias or "").strip()
+                norm_key = _normalize_alias_lookup_key(alias or "")
+                if norm_key and norm_key not in select_alias_ref_map:
+                    select_alias_ref_map[norm_key] = _unquote_identifier(alias or "").strip()
+
     # Normalize GROUP BY items for comparison (strip whitespace, lowercase)
     group_items_normalized = [item.strip().lower() for item in group_items]
 
@@ -9408,6 +10446,20 @@ def _fix_order_by_group_by_consistency(sql: str) -> str:
         else:
             base = item.strip()
             direction = ""
+
+        base_alias_key = _unquote_identifier(base).lower()
+        base_alias_norm_key = _normalize_alias_lookup_key(base)
+        alias_ref = (
+            select_alias_ref_map.get(base_alias_key)
+            or select_alias_ref_map.get(base_alias_norm_key)
+        )
+        if alias_ref:
+            base = alias_ref
+            if direction:
+                new_order_items.append(f"{base} {direction}")
+            else:
+                new_order_items.append(base)
+            continue
 
         # Check if this is a simple column reference (not a function)
         is_simple_col = bool(re.match(r'^\w+(?:\.\w+)?$', base))
@@ -9871,6 +10923,8 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
             g_table = str(gexpr.table or "").strip("`").lower()
             g_name = str(gexpr.name or "").strip("`").lower()
             resolved_table = alias_to_table.get(g_table, g_table)
+            if not resolved_table and len(table_names) == 1:
+                resolved_table = next(iter(table_names))
             if _looks_like_entity_identifier(g_name, resolved_table):
                 if g_table:
                     entity_key_sources.add(g_table)
@@ -9880,6 +10934,29 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
         # Get GROUP BY columns
         group_sql = grp.sql(dialect="mysql")
         group_set = {g.strip().lower() for g in re.findall(r'(\w+(?:\.\w+)?)', group_sql, re.IGNORECASE)}
+
+        only_table = next(iter(table_names)) if len(table_names) == 1 else ""
+        has_join = any(True for _ in ast.find_all(exp.Join))
+        has_subquery = any(True for _ in sel.find_all(exp.Subquery))
+        if only_table and entity_key_sources and not has_join and not has_subquery and not sel.args.get("having"):
+            has_agg_or_window = False
+            same_row_projection = True
+            for item in sel.expressions:
+                base = item.this if isinstance(item, exp.Alias) else item
+                if base.find(exp.AggFunc) or base.find(exp.Window):
+                    has_agg_or_window = True
+                    break
+                for rc in base.find_all(exp.Column):
+                    rc_table = str(rc.table or "").strip("`").lower()
+                    resolved_rc_table = alias_to_table.get(rc_table, rc_table) if rc_table else only_table
+                    if resolved_rc_table and resolved_rc_table != only_table:
+                        same_row_projection = False
+                        break
+                if not same_row_projection:
+                    break
+            if not has_agg_or_window and same_row_projection:
+                sel.set("group", None)
+                return ast.sql(dialect="mysql")
 
         # Check SELECT expressions
         expressions_to_remove = []
@@ -9908,6 +10985,7 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
                 alias_in_groupby = alias_sql in group_set
 
             preserve_via_entity_key = False
+            ref_cols = [c for c in base.find_all(exp.Column)]
             if isinstance(base, exp.Column):
                 base_table = str(base.table or "").strip("`").lower()
                 resolved_base_table = alias_to_table.get(base_table, base_table)
@@ -9922,11 +11000,33 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
                 ):
                     # Conservative support for unqualified columns in single-table queries.
                     preserve_via_entity_key = True
+            elif ref_cols:
+                # Preserve deterministic same-row expressions when GROUP BY
+                # already uses the table's own entity key.
+                ref_source_tables: Set[str] = set()
+                unresolved_ref_scope = False
+                only_table = next(iter(table_names)) if len(table_names) == 1 else ""
+                for rc in ref_cols:
+                    rc_table = str(rc.table or "").strip("`").lower()
+                    if rc_table:
+                        resolved_rc_table = alias_to_table.get(rc_table, rc_table)
+                        if not resolved_rc_table:
+                            unresolved_ref_scope = True
+                            break
+                        ref_source_tables.add(resolved_rc_table)
+                    elif only_table:
+                        ref_source_tables.add(only_table)
+                    else:
+                        unresolved_ref_scope = True
+                        break
+                if not unresolved_ref_scope and len(ref_source_tables) == 1:
+                    only_ref_table = next(iter(ref_source_tables))
+                    if only_ref_table in entity_key_sources:
+                        preserve_via_entity_key = True
 
             # Preserve deterministic computed expressions when ALL referenced
             # columns are already covered by GROUP BY.
             refs_all_in_group = False
-            ref_cols = [c for c in base.find_all(exp.Column)]
             if ref_cols:
                 all_grouped = True
                 for rc in ref_cols:
@@ -10022,11 +11122,79 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
 
         select_clause = select_match.group(1).strip()
         select_items = split_top_level_commas(select_clause)
+        agg_funcs = {'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'DATEDIFF', 'DATE_ADD', 'TIMESTAMPDIFF',
+                     'DATE_FORMAT', 'YEAR', 'MONTH', 'DAY', 'CONCAT', 'IF', 'IFNULL', 'COALESCE'}
+
+        from_match = re.search(
+            r"\bFROM\s+(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?\s+GROUP\s+BY\b",
+            sql,
+            flags=re.I | re.S,
+        )
+        base_table = ""
+        base_alias = ""
+        entity_key_grouped = False
+        if from_match:
+            base_table = str(from_match.group("table") or "").strip("`").lower()
+            base_alias = str(from_match.group("alias") or "").strip("`").lower() or base_table
+            try:
+                id_col = str(get_id_column(base_table) or "").strip("`").lower()
+            except Exception:
+                id_col = ""
+            if id_col:
+                norm_group = {g.replace("`", "").replace(" ", "").lower() for g in group_set}
+                entity_key_grouped = any(
+                    cand in norm_group
+                            for cand in {
+                                id_col,
+                                f"{base_table}.{id_col}",
+                                f"{base_alias}.{id_col}",
+                            }
+                        )
+
+        if entity_key_grouped and base_table and "HAVING" not in sql.upper():
+            has_agg_or_window = False
+            same_row_projection = True
+            for item in select_items:
+                as_match = re.search(r'\s+AS\s+(?:[\w"]+|"[^"]*"|\'[^\']*\'|`[^`]*`)\s*$', item, re.IGNORECASE)
+                if as_match:
+                    base = item[:as_match.start()].strip()
+                else:
+                    base = item.strip()
+
+                func_match = re.match(r'(\w+)\s*\(', base)
+                if func_match and func_match.group(1).upper() in agg_funcs:
+                    has_agg_or_window = True
+                    break
+                if re.search(r'\bOVER\s*\(', base, re.IGNORECASE):
+                    has_agg_or_window = True
+                    break
+
+                ref_cols = [
+                    ref.lower()
+                    for ref in re.findall(
+                        r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?",
+                        base,
+                        flags=re.I,
+                    )
+                    if ref and not re.fullmatch(r"`?(?:as|case|when|then|else|end)`?", ref.strip(), flags=re.I)
+                ]
+                for ref in ref_cols:
+                    ref_n = ref.replace("`", "").replace(" ", "").lower()
+                    if "." in ref_n:
+                        ref_table = ref_n.split(".", 1)[0]
+                        if ref_table not in {base_table, base_alias}:
+                            same_row_projection = False
+                            break
+                if not same_row_projection:
+                    break
+
+            if not has_agg_or_window and same_row_projection:
+                fixed = (sql[:gb_match.start()] + sql[gb_match.end():]).strip()
+                fixed = re.sub(r"\s{2,}", " ", fixed)
+                return fixed
 
         # Rebuild SELECT, removing items that are NOT in GROUP BY (except aggregates/windows)
         new_select_parts = []
-        agg_funcs = {'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'DATEDIFF', 'DATE_ADD', 'TIMESTAMPDIFF',
-                     'DATE_FORMAT', 'YEAR', 'MONTH', 'DAY', 'CONCAT', 'IF', 'IFNULL', 'COALESCE'}
 
         for item in select_items:
             # Extract base expression (before AS)
@@ -10055,6 +11223,7 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
             # Preserve deterministic computed expressions when all referenced
             # columns are covered by GROUP BY.
             refs_all_in_group = False
+            preserve_via_entity_key = False
             ref_cols = [
                 ref.lower()
                 for ref in re.findall(
@@ -10077,6 +11246,16 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
                         all_grouped = False
                         break
                 refs_all_in_group = all_grouped
+                if not refs_all_in_group and entity_key_grouped:
+                    same_table_refs = True
+                    for ref in ref_cols:
+                        ref_n = ref.replace("`", "").replace(" ", "").lower()
+                        if "." in ref_n:
+                            ref_table = ref_n.split(".", 1)[0]
+                            if ref_table not in {base_table, base_alias}:
+                                same_table_refs = False
+                                break
+                    preserve_via_entity_key = same_table_refs
 
             # Keep if: aggregate, window, CASE, base in GROUP BY, alias in GROUP BY,
             # or all referenced columns are grouped.
@@ -10089,6 +11268,7 @@ def _remove_invalid_select_columns_with_group_by(sql: str) -> str:
                 or base_lower in group_set
                 or alias_in_groupby
                 or refs_all_in_group
+                or preserve_via_entity_key
             ):
                 new_select_parts.append(item)
             # Otherwise, remove it (hallucinated column)
@@ -10728,6 +11908,121 @@ def _repair_rank_window_partition_from_question(sql: str, question: str) -> str:
     )
 
 
+def _repair_rank_window_metric_from_question(sql: str, question: str) -> str:
+    """
+    Repair the metric used inside a non-winner-row RANK/DENSE_RANK window when
+    the question explicitly says to rank "by <metric>".
+
+    Conservative scope:
+    - only for RANK()/DENSE_RANK() windows
+    - only when the question explicitly contains a rank-by metric phrase
+    - only uses simple projected columns already visible in the SELECT list
+    - never changes the partition key itself
+    """
+    if not sql or not question:
+        return sql
+    if not re.search(r"\b(?:RANK|DENSE_RANK)\s*\(", sql, flags=re.I):
+        return sql
+
+    q = str(question or "").strip().lower()
+    if not q or not re.search(r"\b(?:rank|ranking|ranked)\b", q, flags=re.I):
+        return sql
+    if _question_wants_winner_row(question):
+        return sql
+
+    metric_terms: Set[str] = set()
+    metric_patterns = [
+        r"\b(?:rank|ranking|ranked)\b[\s\S]{0,120}?\bby\s+(?P<seg>[a-z0-9_\s-]{1,64}?)(?=\s+(?:from|highest|lowest|descending|ascending|if|where|when|return|show|list|final|output|result|sort|order)\b|[,.;]|$)",
+        r"\bby\s+(?P<seg>[a-z0-9_\s-]{1,64}?)\s+(?:from\s+highest\s+to\s+lowest|from\s+lowest\s+to\s+highest|descending|ascending)\b",
+    ]
+    for pat in metric_patterns:
+        m = re.search(pat, q, flags=re.I | re.S)
+        if not m:
+            continue
+        metric_terms = _rank_text_terms(m.group("seg") or "")
+        if metric_terms:
+            break
+    if not metric_terms:
+        return sql
+
+    select_part = _extract_top_level_select_list(sql)
+    if not select_part:
+        return sql
+    candidates = _rank_partition_candidates_from_select(select_part)
+    if not candidates:
+        return sql
+
+    partition_terms = _extract_rank_partition_terms_from_question(q)
+    partition_expr = _choose_rank_partition_expr(candidates, partition_terms) if partition_terms else ""
+    order_candidates = [
+        (expr, terms)
+        for expr, terms in candidates
+        if not partition_expr or _normalize_sql_expr_for_match(expr) != _normalize_sql_expr_for_match(partition_expr)
+    ]
+    if not order_candidates:
+        return sql
+
+    scored: List[Tuple[int, int, str]] = []
+    for expr, terms in order_candidates:
+        overlap = terms & metric_terms
+        if not overlap:
+            continue
+        extra_penalty = len(terms - metric_terms)
+        scored.append((len(overlap), -extra_penalty, expr))
+    if not scored:
+        return sql
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    target_expr = scored[0][2]
+
+    wants_desc = None
+    if re.search(r"\b(?:highest|largest|greatest|descending|high\s+to\s+low)\b", q, flags=re.I) or re.search(r"\bfrom\s+highest\s+to\s+lowest\b", q, flags=re.I):
+        wants_desc = True
+    if re.search(r"\b(?:lowest|smallest|least|ascending|low\s+to\s+high)\b", q, flags=re.I) or re.search(r"\bfrom\s+lowest\s+to\s+highest\b", q, flags=re.I):
+        wants_desc = False if wants_desc is None else wants_desc
+
+    window_pat = re.compile(
+        r"(?is)\b(?P<fn>RANK|DENSE_RANK)\s*\(\s*\)\s*OVER\s*\(\s*(?P<body>[^()]*)\)"
+    )
+
+    def _rewrite_window(match: re.Match[str]) -> str:
+        body = str(match.group("body") or "").strip()
+        if not body or not re.search(r"\bORDER\s+BY\b", body, flags=re.I):
+            return match.group(0)
+
+        part_match = re.search(r"(?is)\bPARTITION\s+BY\s+(?P<part>.+?)\s+ORDER\s+BY\s+(?P<order>.+?)\s*$", body)
+        if part_match:
+            part_expr = str(part_match.group("part") or "").strip()
+            order_expr = str(part_match.group("order") or "").strip()
+            head = f"PARTITION BY {part_expr} ORDER BY "
+        else:
+            order_match = re.search(r"(?is)\bORDER\s+BY\s+(?P<order>.+?)\s*$", body)
+            if not order_match:
+                return match.group(0)
+            order_expr = str(order_match.group("order") or "").strip()
+            head = "ORDER BY "
+
+        current_items = [x.strip() for x in _split_top_level_commas(order_expr) if x.strip()]
+        current_dir = ""
+        if current_items:
+            m_dir = re.search(r"\b(ASC|DESC)\b\s*$", current_items[0], flags=re.I)
+            if m_dir:
+                current_dir = m_dir.group(1).upper()
+        target_dir = "DESC" if wants_desc is True else "ASC" if wants_desc is False else current_dir
+
+        current_norms = {
+            _normalize_sql_expr_for_match(re.sub(r"\s+\b(?:ASC|DESC)\b\s*$", "", item, flags=re.I))
+            for item in current_items
+        }
+        target_norm = _normalize_sql_expr_for_match(target_expr)
+        if target_norm in current_norms and ((not target_dir) or any(re.search(rf"\b{target_dir}\b\s*$", item, flags=re.I) for item in current_items)):
+            return match.group(0)
+
+        rebuilt_order = target_expr + (f" {target_dir}" if target_dir else "")
+        return f"{match.group('fn').upper()}() OVER ({head}{rebuilt_order})"
+
+    return window_pat.sub(_rewrite_window, sql)
+
+
 def _add_rank_value_nonnull_filter_from_question(sql: str, question: str) -> str:
     """
     Add an IS NOT NULL filter for ranking questions phrased as
@@ -10745,10 +12040,13 @@ def _add_rank_value_nonnull_filter_from_question(sql: str, question: str) -> str
     if not phrase_terms:
         return sql
 
-    candidates = _rank_nonnull_candidates(sql)
-    if not candidates:
-        return sql
-    value_expr = _choose_rank_partition_expr(candidates, phrase_terms)
+    top_level_candidates = _rank_partition_candidates_from_select(_extract_top_level_select_list(sql))
+    value_expr = _choose_rank_partition_expr(top_level_candidates, phrase_terms)
+    if not value_expr:
+        candidates = _rank_nonnull_candidates(sql)
+        if not candidates:
+            return sql
+        value_expr = _choose_rank_partition_expr(candidates, phrase_terms)
     if not value_expr:
         return sql
 
@@ -11840,6 +13138,149 @@ def _drop_tuple_in_filter_from_include_zero_ranked_winner(sql: str, question: st
     if out and not out.endswith(";"):
         out += ";"
     return out or sql
+
+
+def _drop_tuple_in_filter_from_single_table_ranked_winner(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Drop a redundant tuple-IN latest-row prefilter inside a single-table
+    winner-row ranked subquery when ROW_NUMBER() already determines the winner.
+
+    Typical bad shape:
+      FROM (
+        SELECT ..., ROW_NUMBER() OVER (PARTITION BY key ORDER BY metric DESC, tiebreak DESC) AS rn
+        FROM base_table
+        WHERE (key, tiebreak) IN (
+          SELECT key, MAX(tiebreak) FROM base_table GROUP BY key
+        )
+      ) t
+      WHERE t.rn = 1
+
+    This prefilter is not needed and can change the semantics by forcing the
+    latest row before ranking by the primary metric.
+    """
+    if not sql or not question:
+        return sql
+    if "ROW_NUMBER" not in (sql or "").upper():
+        return sql
+    if not _question_wants_winner_row(question):
+        return sql
+
+    s = str(sql or "").strip()
+    if not re.search(r"\bWHERE\b[^;]*\brn\s*=\s*1\b", s, flags=re.I | re.S):
+        return sql
+
+    outer_pat = re.compile(
+        r"""(?is)
+        ^\s*SELECT\s+(?P<outer_select>.+?)\s+
+        FROM\s*\(\s*
+        SELECT\s+(?P<inner_select>.+?)\s+
+        FROM\s+`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<table_alias>[A-Za-z_][A-Za-z0-9_]*))?
+        (?:\s+WHERE\s+(?P<inner_where>.+?))?
+        \s*\)\s+AS\s+(?P<outer_alias>[A-Za-z_][A-Za-z0-9_]*)
+        \s+WHERE\s+(?P<outer_where>.+?)
+        (?P<tail>\s+ORDER\s+BY\b.*|\s+LIMIT\b.*|)\s*$
+        """,
+        flags=re.X,
+    )
+    m_outer = outer_pat.match(s.rstrip(";"))
+    if not m_outer:
+        return sql
+
+    inner_select = str(m_outer.group("inner_select") or "").strip()
+    inner_where = str(m_outer.group("inner_where") or "").strip()
+    table_name = str(m_outer.group("table") or "").strip("`")
+    table_alias = str(m_outer.group("table_alias") or "").strip() or table_name
+    outer_alias = str(m_outer.group("outer_alias") or "").strip()
+    outer_where = str(m_outer.group("outer_where") or "").strip()
+    tail = str(m_outer.group("tail") or "").strip()
+
+    if not inner_where or not table_name or not outer_alias:
+        return sql
+    if re.search(r"\bJOIN\b", inner_select, flags=re.I):
+        return sql
+
+    rownum_pat = re.compile(
+        r"""(?is)\bROW_NUMBER\s*\(\s*\)\s*OVER\s*\(
+        \s*PARTITION\s+BY\s+(?P<part>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)
+        \s+ORDER\s+BY\s+(?P<order>.+?)
+        \)\s+AS\s+`?rn`?\b""",
+        flags=re.X,
+    )
+    m_rownum = rownum_pat.search(inner_select)
+    if not m_rownum:
+        return sql
+
+    def _bare_col(expr: str) -> str:
+        return str(expr or "").strip().split(".")[-1].strip("`").lower()
+
+    partition_col = _bare_col(m_rownum.group("part") or "")
+    order_clause = str(m_rownum.group("order") or "")
+    if not partition_col or not order_clause:
+        return sql
+
+    tuple_pat = re.compile(
+        rf"""(?is)^\s*
+        \(\s*(?P<left1>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?{re.escape(partition_col)}`?)\s*,\s*
+              (?P<left2>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<tiebreak>[A-Za-z_][A-Za-z0-9_]*)`?)\s*\)
+        \s+IN\s*\(\s*
+        SELECT\s+(?P<right1>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?{re.escape(partition_col)}`?)\s*,\s*
+               MAX\s*\(\s*(?P<right2>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<tiebreak2>[A-Za-z_][A-Za-z0-9_]*)`?)\s*\)
+        \s+FROM\s+`?{re.escape(table_name)}`?(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?
+        \s+GROUP\s+BY\s+(?P<group_key>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?{re.escape(partition_col)}`?)
+        \s*\)\s*$
+        """,
+        flags=re.X,
+    )
+
+    conds = _split_top_level_and(inner_where)
+    if not conds:
+        return sql
+
+    kept_conds: List[str] = []
+    removed_any = False
+    for cond in conds:
+        cond_s = str(cond or "").strip()
+        if not cond_s:
+            continue
+        m_tuple = tuple_pat.match(cond_s)
+        if not m_tuple:
+            kept_conds.append(cond_s)
+            continue
+        tiebreak_col = _bare_col(m_tuple.group("tiebreak") or "")
+        tiebreak_col2 = _bare_col(m_tuple.group("tiebreak2") or "")
+        if not tiebreak_col or tiebreak_col != tiebreak_col2:
+            kept_conds.append(cond_s)
+            continue
+        if not re.search(
+            rf"\b(?:`?{re.escape(table_alias)}`?\.)?`?{re.escape(tiebreak_col)}`?\b\s+DESC\b",
+            order_clause,
+            flags=re.I,
+        ):
+            kept_conds.append(cond_s)
+            continue
+        removed_any = True
+
+    if not removed_any:
+        return sql
+
+    inner_lines = [
+        f"SELECT {inner_select}",
+        f"FROM {table_name}" + (f" AS {table_alias}" if table_alias and table_alias != table_name else ""),
+    ]
+    if kept_conds:
+        inner_lines.append("WHERE " + " AND ".join(kept_conds))
+    inner_sql = " ".join(part.strip() for part in inner_lines if part.strip())
+
+    rebuilt = (
+        f"SELECT {str(m_outer.group('outer_select') or '').strip()} "
+        f"FROM ({inner_sql}) AS {outer_alias} "
+        f"WHERE {outer_where}"
+    ).strip()
+    if tail:
+        rebuilt += f" {tail}"
+    if str(sql).strip().endswith(";") and not rebuilt.endswith(";"):
+        rebuilt += ";"
+    return rebuilt
 
 
 def _fix_inner_rn_filter_scope(sql: str) -> Optional[str]:
@@ -13777,17 +15218,17 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
     lhs_date_norm = _expr_norm(lhs_date_col)
     if lhs_key_norm not in group_norms and _expr_norm(tuple_match.group("rhs_key") or "") not in group_norms:
         return sql
-    if not any(x in group_norms for x in {lhs_date_norm, _expr_norm(tuple_match.group("rhs_date") or "")}):
-        return sql
 
     select_items = _split_top_level_commas(select_part)
     if not select_items:
         return sql
 
-    projected: List[Tuple[str, str]] = []
+    projected: List[Tuple[str, str, str]] = []
     used_aliases: Set[str] = set()
     key_expr = None
+    key_pair: Optional[Tuple[str, str]] = None
     date_expr = None
+    date_pair: Optional[Tuple[str, str]] = None
     metric_candidates: List[Tuple[str, str]] = []
 
     for idx, item in enumerate(select_items):
@@ -13803,18 +15244,31 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
         if alias_name.lower() in used_aliases:
             return sql
         used_aliases.add(alias_name.lower())
-        projected.append((expr_raw, alias_name))
 
         col_norm = _expr_norm(col)
+        projected.append((expr_raw, alias_name, col_norm))
         if col_norm == lhs_key_norm:
             key_expr = expr_raw
+            key_pair = (expr_raw, alias_name)
             continue
         if col_norm == lhs_date_norm:
             date_expr = expr_raw
+            date_pair = (expr_raw, alias_name)
             continue
         metric_candidates.append((expr_raw, alias_name))
 
-    if key_expr is None or date_expr is None or not metric_candidates:
+    if key_expr is None:
+        key_expr = (tuple_match.group("lhs_key") or lhs_key_col).strip()
+        key_pair = (key_expr, _safe_alias(lhs_key_col, "partition_key"))
+    if date_expr is None:
+        date_expr = (tuple_match.group("lhs_date") or lhs_date_col).strip()
+        date_pair = (date_expr, _safe_alias(lhs_date_col, "tie_value"))
+    if date_pair is None:
+        date_pair = (date_expr, _safe_alias(lhs_date_col, "tie_value"))
+    if key_pair is None:
+        key_pair = (key_expr, _safe_alias(lhs_key_col, "partition_key"))
+
+    if not metric_candidates:
         return sql
 
     q_low = (question or "").lower()
@@ -13839,6 +15293,7 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
         metric_candidates,
         key=lambda item: (_candidate_score(item[0]), -len(item[0])),
     )
+    metric_pair = (metric_expr, _metric_alias)
 
     metric_desc = not bool(re.search(r"\b(?:smallest|lowest|least|min(?:imum)?)\b", q_low))
     date_desc = not bool(re.search(r"\b(?:earliest|oldest|first)\b", q_low))
@@ -13863,14 +15318,66 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
             f"{date_expr} {'DESC' if date_desc else 'ASC'}",
         ]
 
-    inner_select = [f"{expr} AS {alias}" for expr, alias in projected]
+    requested_segment = _extract_requested_output_segment(question)
+
+    def _question_explicitly_requests_column(col_name: str) -> bool:
+        seg = str(requested_segment or "").strip().lower()
+        if not seg:
+            return False
+        variants: Set[str] = set()
+        clean = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(col_name or ""))
+        clean = clean.replace("_", " ").strip().lower()
+        if clean:
+            variants.add(clean)
+        try:
+            variants.update(
+                str(v or "").replace("_", " ").strip().lower()
+                for v in (get_column_entity_variants(base_table, col_name) or set())
+                if str(v or "").strip()
+            )
+        except Exception:
+            pass
+        for variant in variants:
+            pat = re.escape(variant).replace(r"\ ", r"\s+")
+            if pat and re.search(rf"\b{pat}\b", seg, flags=re.I):
+                return True
+        return False
+
+    output_pairs: List[Tuple[str, str]] = []
+    output_aliases: Set[str] = set()
+    output_exprs: Set[str] = set()
+
+    def _add_output(pair: Tuple[str, str]) -> None:
+        expr, alias = pair
+        expr_norm = _expr_norm(expr)
+        alias_norm = str(alias or "").strip().lower()
+        if not expr_norm or not alias_norm:
+            return
+        if expr_norm in output_exprs or alias_norm in output_aliases:
+            return
+        output_exprs.add(expr_norm)
+        output_aliases.add(alias_norm)
+        output_pairs.append((expr, alias))
+
+    _add_output(key_pair)
+    _add_output(metric_pair)
+    _add_output(date_pair)
+
+    core_exprs = {_expr_norm(key_pair[0]), _expr_norm(metric_pair[0]), _expr_norm(date_pair[0])}
+    for expr_raw, alias_name, col_norm in projected:
+        if _expr_norm(expr_raw) in core_exprs:
+            continue
+        if _question_explicitly_requests_column(col_norm):
+            _add_output((expr_raw, alias_name))
+
+    inner_select = [f"{expr} AS {alias}" for expr, alias in output_pairs]
     inner_select.append(
         f"ROW_NUMBER() OVER (PARTITION BY {key_expr} ORDER BY {', '.join(rank_items)}) AS rn"
     )
 
     remaining_conj = [c.strip() for i, c in enumerate(conjuncts) if i != tuple_idx and c.strip()]
     inner_where = f"\n  WHERE {' AND '.join(remaining_conj)}" if remaining_conj else ""
-    outer_select = ", ".join(f"t.{alias}" for _, alias in projected)
+    outer_select = ", ".join(f"t.{alias}" for _, alias in output_pairs)
     tail_clause = f"\n{tail_part}" if tail_part else ""
 
     return (
@@ -16401,6 +17908,324 @@ def _extract_numeric_aggregate_threshold(
     return None
 
 
+def _extract_question_threshold_matches(question: str) -> List[Tuple[int, int, str, float]]:
+    q = str(question or "").strip().lower()
+    if not q:
+        return []
+
+    num_pat = r"(\d[\d,]*(?:\.\d+)?|[a-z]+(?:[\s-]+[a-z]+){0,4})"
+    patterns = [
+        (r"\bmore\s+than\s+" + num_pat + r"\b", "gt"),
+        (r"\bover\s+" + num_pat + r"\b", "gt"),
+        (r"\bgreater\s+than\s+" + num_pat + r"\b", "gt"),
+        (r"\babove\s+" + num_pat + r"\b", "gt"),
+        (r"\bexceeds?\s+" + num_pat + r"\b", "gt"),
+        (r"\bat\s+least\s+" + num_pat + r"\b", "gte"),
+        (r"\bno\s+fewer\s+than\s+" + num_pat + r"\b", "gte"),
+        (r"\bless\s+than\s+" + num_pat + r"\b", "lt"),
+        (r"\bfewer\s+than\s+" + num_pat + r"\b", "lt"),
+        (r"\bunder\s+" + num_pat + r"\b", "lt"),
+        (r"\bbelow\s+" + num_pat + r"\b", "lt"),
+        (r"\bat\s+most\s+" + num_pat + r"\b", "lte"),
+        (r"\bno\s+more\s+than\s+" + num_pat + r"\b", "lte"),
+        (r"\bexactly\s+" + num_pat + r"\b", "eq"),
+    ]
+
+    seen: Set[Tuple[int, int, str, float]] = set()
+    matches: List[Tuple[int, int, str, float]] = []
+    for pat, op in patterns:
+        for m in re.finditer(pat, q, flags=re.I):
+            parsed = _parse_aggregate_threshold_number(m.group(1))
+            if parsed is None:
+                continue
+            key = (m.start(), m.end(), op, float(parsed))
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(key)
+    matches.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    return matches
+
+
+def _add_missing_grouped_metric_threshold_having(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Add missing HAVING predicates for grouped metrics when the question
+    explicitly states count/average thresholds but the grouped query forgets to
+    apply them.
+
+    Conservative scope:
+    - top-level grouped query only
+    - works from projected metric expressions already present in SELECT
+    - currently supports count-like and average-like grouped metrics
+    """
+    if not sql or not question:
+        return sql
+
+    q = str(question or "").strip().lower()
+    if not q or "group by" not in q and " for each " not in f" {q} " and " per " not in f" {q} ":
+        # Keep this focused on grouped-output questions.
+        if not re.search(r"\b(?:average|avg|mean|count|number\s+of|total\s+number\s+of)\b", q, flags=re.I):
+            return sql
+
+    parsed = _parse_flat_groupby_clauses(sql) or _parse_select_from_groupby(sql)
+    if not parsed:
+        return sql
+    if not str(parsed.get("groupby") or "").strip():
+        return sql
+
+    select_items = [
+        str(item).strip()
+        for item in _split_top_level_commas(parsed.get("select") or "")
+        if str(item or "").strip()
+    ]
+    if not select_items:
+        return sql
+
+    metric_exprs: Dict[str, List[Tuple[str, str]]] = {"count": [], "avg": []}
+    ratio_avg_question = _question_defines_average_as_total_over_count(question)
+    seen_metric_exprs: Dict[str, Set[str]] = {"count": set(), "avg": set()}
+
+    for item in select_items:
+        expr, alias = _split_select_expr_alias(item)
+        expr_txt = str(expr or "").strip()
+        alias_txt = str(alias or "").strip().strip("`'\"")
+        if not expr_txt:
+            continue
+        if re.search(r"\bOVER\s*\(", expr_txt, flags=re.I):
+            continue
+
+        expr_norm = _normalize_sql_expr_for_match(expr_txt)
+        alias_l = alias_txt.lower()
+        alias_tokens = set(re.findall(r"[a-z0-9]+", alias_l.replace("_", " ")))
+
+        count_alias_cue = bool(alias_tokens & {"count", "counts", "number", "numbers", "num", "total"})
+        count_expr_cue = bool(
+            re.match(r"(?is)^\s*COUNT\s*\(", expr_txt)
+            or (
+                count_alias_cue
+                and re.search(r"\bCOUNT\s*\(", expr_txt, flags=re.I)
+                and not re.search(r"[+\-/*]", expr_txt)
+            )
+        )
+        if count_expr_cue:
+            if expr_norm not in seen_metric_exprs["count"]:
+                seen_metric_exprs["count"].add(expr_norm)
+                metric_exprs["count"].append((expr_txt, alias_txt))
+
+        avg_alias_cue = bool(alias_tokens & {"avg", "average", "mean"})
+        avg_expr_cue = bool(re.match(r"(?is)^\s*AVG\s*\(", expr_txt))
+        avg_ratio_cue = bool(
+            ratio_avg_question
+            and "/" in expr_txt
+            and re.search(r"\bCOUNT\s*\(", expr_txt, flags=re.I)
+            and (avg_alias_cue or re.search(r"\bSUM\s*\(", expr_txt, flags=re.I))
+        )
+        if avg_alias_cue or avg_expr_cue or avg_ratio_cue:
+            if expr_norm not in seen_metric_exprs["avg"]:
+                seen_metric_exprs["avg"].add(expr_norm)
+                metric_exprs["avg"].append((expr_txt, alias_txt))
+
+    threshold_matches = _extract_question_threshold_matches(question)
+    if not threshold_matches:
+        return sql
+
+    select_text = " ".join(select_items)
+
+    def _threshold_literal_sql(value: float) -> str:
+        return str(int(value)) if float(value).is_integer() else str(value)
+
+    def _question_prefix_has_row_level_property_cue(prefix: str) -> bool:
+        prefix_tail = str(prefix or "")[-96:]
+        if not prefix_tail:
+            return False
+        return bool(
+            re.search(
+                r"\b(?:have|has|had|having|with)\s+(?:(?:a|an|the|their|its)\s+)?[a-z][a-z0-9_ ]{1,48}(?:\s+of)?\s*$",
+                prefix_tail,
+                flags=re.I,
+            )
+            or re.search(
+                r"\bwhose\s+[a-z][a-z0-9_ ]{1,48}(?:\s+(?:is|are))?(?:\s+of)?\s*$",
+                prefix_tail,
+                flags=re.I,
+            )
+        )
+
+    def _select_has_matching_case_threshold(value: float) -> bool:
+        value_sql = _threshold_literal_sql(value)
+        if not value_sql:
+            return False
+        value_pat = re.escape(value_sql)
+        return bool(
+            re.search(
+                rf"\bCASE\s+WHEN\b(?:(?!END).){{0,320}}(?:>=|<=|>|<|=)\s*{value_pat}\b",
+                select_text,
+                flags=re.I | re.S,
+            )
+            or re.search(
+                rf"\bCASE\s+WHEN\b(?:(?!END).){{0,320}}\b{value_pat}\s*(?:>=|<=|>|<|=)",
+                select_text,
+                flags=re.I | re.S,
+            )
+        )
+
+    count_object_terms: Set[str] = {
+        "row", "rows", "record", "records", "entry", "entries",
+        "item", "items", "line", "lines", "group", "groups",
+    }
+    try:
+        for table_name in get_all_tables() or []:
+            table_l = str(table_name or "").strip().lower()
+            if not table_l:
+                continue
+            count_object_terms.add(table_l)
+            singular = str(get_singular_form(table_l) or "").strip().lower()
+            if singular:
+                count_object_terms.add(singular)
+            for syn in get_table_synonyms(table_l) or []:
+                syn_l = str(syn or "").strip().lower()
+                if syn_l:
+                    count_object_terms.add(syn_l)
+    except Exception:
+        pass
+
+    count_term_alt = "|".join(
+        re.escape(term).replace(r"\ ", r"\s+")
+        for term in sorted((term for term in count_object_terms if term), key=len, reverse=True)
+    )
+    count_prefix_pat = re.compile(
+        r"\b(?:count|counts|number\s+of|total\s+number\s+of|how\s+many)\b",
+        flags=re.I,
+    )
+    count_verb_pat = re.compile(
+        r"\b(?:placed|place|made|make|have|has|had|with|received|bought|sold|ordered|contain|contains)\b",
+        flags=re.I,
+    )
+    avg_cue_pat = re.compile(r"\b(?:avg|average|mean)\b", flags=re.I)
+
+    count_threshold: Optional[Tuple[str, float]] = None
+    avg_threshold: Optional[Tuple[str, float]] = None
+    for start, end, op, val in threshold_matches:
+        prefix = q[max(0, start - 96):start]
+        suffix = q[end:end + 96]
+        if (
+            _question_prefix_has_row_level_property_cue(prefix)
+            and _select_has_matching_case_threshold(val)
+        ):
+            continue
+        suffix_has_count_object = bool(
+            count_term_alt
+            and re.search(
+                rf"^\s+(?:\w+\s+){{0,4}}?(?:{count_term_alt})\b",
+                suffix,
+                flags=re.I,
+            )
+        )
+        matched_count_here = bool(
+            count_prefix_pat.search(prefix)
+            or (suffix_has_count_object and count_verb_pat.search(prefix))
+        )
+        if count_threshold is None:
+            if matched_count_here:
+                count_threshold = (op, val)
+        if avg_threshold is None:
+            avg_prefix = prefix[-64:]
+            avg_suffix = suffix[:24]
+            if not matched_count_here and (
+                avg_cue_pat.search(avg_prefix) or avg_cue_pat.search(avg_suffix)
+            ):
+                avg_threshold = (op, val)
+        if count_threshold is not None and avg_threshold is not None:
+            break
+
+    def _cmp_symbol(op_key: str) -> str:
+        return {
+            "gt": ">",
+            "gte": ">=",
+            "lt": "<",
+            "lte": "<=",
+            "eq": "=",
+        }.get(op_key, "")
+
+    def _threshold_sql(value: float) -> str:
+        return str(int(value)) if float(value).is_integer() else str(value)
+
+    def _unique_metric(metric_key: str) -> Optional[Tuple[str, str]]:
+        candidates = metric_exprs.get(metric_key, [])
+        return candidates[0] if len(candidates) == 1 else None
+
+    existing_having = str(parsed.get("having") or "").strip()
+    if existing_having.lower().startswith("having "):
+        existing_having = existing_having[7:].strip()
+    existing_having_norm = _normalize_sql_expr_for_match(existing_having)
+
+    new_conditions: List[str] = []
+
+    count_metric = _unique_metric("count")
+    if count_metric and count_threshold is not None:
+        count_expr, count_alias = count_metric
+        cmp = _cmp_symbol(count_threshold[0])
+        value_sql = _threshold_sql(count_threshold[1])
+        if cmp and value_sql:
+            count_expr_norm = _normalize_sql_expr_for_match(count_expr)
+            count_alias_norm = _normalize_sql_expr_for_match(count_alias)
+            already_present = bool(
+                count_expr_norm and count_expr_norm in existing_having_norm and value_sql in existing_having
+            ) or bool(
+                count_alias_norm and count_alias_norm in existing_having_norm and value_sql in existing_having
+            )
+            if not already_present:
+                new_conditions.append(f"{count_expr} {cmp} {value_sql}")
+
+    avg_metric = _unique_metric("avg")
+    if avg_metric and avg_threshold is not None:
+        avg_expr, avg_alias = avg_metric
+        cmp = _cmp_symbol(avg_threshold[0])
+        value_sql = _threshold_sql(avg_threshold[1])
+        if cmp and value_sql:
+            avg_expr_norm = _normalize_sql_expr_for_match(avg_expr)
+            avg_alias_norm = _normalize_sql_expr_for_match(avg_alias)
+            already_present = bool(
+                avg_expr_norm and avg_expr_norm in existing_having_norm and value_sql in existing_having
+            ) or bool(
+                avg_alias_norm and avg_alias_norm in existing_having_norm and value_sql in existing_having
+            )
+            if not already_present:
+                new_conditions.append(f"{avg_expr} {cmp} {value_sql}")
+
+    if not new_conditions:
+        return sql
+
+    merged_having_parts: List[str] = []
+    if existing_having:
+        merged_having_parts.append(existing_having)
+    merged_having_parts.extend(new_conditions)
+
+    def _fmt_having_part(part: str) -> str:
+        text = str(part or "").strip()
+        if not text:
+            return ""
+        if re.search(r"\bOR\b", text, flags=re.I):
+            return f"({text})"
+        return text
+
+    out_lines = [
+        f"SELECT {str(parsed.get('select') or '').strip()}",
+        f"FROM {str(parsed.get('from_core') or '').strip()}",
+    ]
+    if str(parsed.get("where") or "").strip():
+        out_lines.append(str(parsed.get("where") or "").strip())
+    out_lines.append(f"GROUP BY {str(parsed.get('groupby') or '').strip()}")
+    out_lines.append("HAVING " + " AND ".join(_fmt_having_part(part) for part in merged_having_parts if _fmt_having_part(part)))
+    if str(parsed.get("tail") or "").strip():
+        out_lines.append(str(parsed.get("tail") or "").strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if str(sql).strip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _fix_misplaced_entity_count_threshold(sql: str, question: str) -> str:
     """Fix WHERE col >= N → HAVING COUNT(*) >= N when the LLM misinterprets
     'at least N entities' as a raw column filter instead of a group-count
@@ -17038,7 +18863,7 @@ def _rewrite_grouped_count_rank_to_window_rank(sql: str, question: str) -> str:
     if not re.search(r"\b(?:sorted|sort|ordered|order)\b", q, flags=re.I):
         return sql
 
-    parsed = _parse_select_from_groupby(s)
+    parsed = _parse_flat_groupby_clauses(s) or _parse_select_from_groupby(s)
     if not parsed:
         return sql
 
@@ -17064,7 +18889,14 @@ def _rewrite_grouped_count_rank_to_window_rank(sql: str, question: str) -> str:
         expr, alias = _split_select_expr_alias(item)
         expr_s = str(expr or "").strip()
         alias_s = str(alias or "").strip().strip("`").lower()
-        if alias_s == "rank" and re.match(r"(?is)^count\s*\(", expr_s):
+        if (
+            re.match(r"(?is)^count\s*\(", expr_s)
+            and (
+                alias_s == "rank"
+                or bool(re.search(r"(?:^|_)(?:rank|ranking|position)(?:$|_)", alias_s, flags=re.I))
+                or bool(re.search(r"(?:^|_)row_?number(?:$|_)", alias_s, flags=re.I))
+            )
+        ):
             rank_alias = str(alias or "rank").strip("`") or "rank"
             continue
         if re.search(r"\b(?:count|sum|avg|min|max)\s*\(", expr_s, flags=re.I):
@@ -17344,7 +19176,7 @@ def _drop_unrequested_fixed_year_filter_for_yearly_rollup(sql: str, question: st
     if not re.search(r"\bby\b[^.]{0,40}\byear\b|\border\s+year\b|\bpayment\s+year\b", q, flags=re.I):
         return sql
 
-    parsed = _parse_select_from_groupby(s)
+    parsed = _parse_flat_groupby_clauses(s) or _parse_select_from_groupby(s)
     if not parsed:
         return sql
     group_text = str(parsed.get("groupby") or "")
@@ -17356,6 +19188,27 @@ def _drop_unrequested_fixed_year_filter_for_yearly_rollup(sql: str, question: st
     if not where_clause:
         return sql
     where_body = re.sub(r"(?is)^\s*where\s+", "", where_clause).strip()
+    year_between_same_pat = re.compile(
+        r"(?is)^\s*YEAR\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?\s*\)\s*BETWEEN\s*(?P<y1>(?:19|20)\d{2})\s+AND\s+(?P<y2>(?:19|20)\d{2})\s*$"
+    )
+    if year_between_same_pat.match(where_body):
+        m_between = year_between_same_pat.match(where_body)
+        if m_between and str(m_between.group("y1") or "") == str(m_between.group("y2") or ""):
+            out_lines = [
+                f"SELECT {parsed['select'].strip()}",
+                f"FROM {parsed['from_core'].strip()}",
+                f"GROUP BY {parsed['groupby'].strip()}",
+            ]
+            having_clause = str(parsed.get("having") or "").strip()
+            if having_clause:
+                out_lines.append(having_clause)
+            tail = str(parsed.get("tail") or "").strip()
+            if tail:
+                out_lines.append(tail)
+            fixed = "\n".join(out_lines).strip()
+            if s.endswith(";") and not fixed.endswith(";"):
+                fixed += ";"
+            return fixed
     conjuncts = [c.strip() for c in _split_top_level_and(where_body) if c.strip()]
     if not conjuncts:
         return sql
@@ -17363,7 +19216,14 @@ def _drop_unrequested_fixed_year_filter_for_yearly_rollup(sql: str, question: st
     year_cmp_pat = re.compile(
         r"(?is)^\s*YEAR\s*\(\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?\s*\)\s*=\s*(?:19|20)\d{2}\s*$"
     )
-    kept = [c for c in conjuncts if not year_cmp_pat.match(c)]
+    kept: List[str] = []
+    for conjunct in conjuncts:
+        if year_cmp_pat.match(conjunct):
+            continue
+        m_between = year_between_same_pat.match(conjunct)
+        if m_between and str(m_between.group("y1") or "") == str(m_between.group("y2") or ""):
+            continue
+        kept.append(conjunct)
     if len(kept) == len(conjuncts):
         return sql
 
@@ -17374,9 +19234,303 @@ def _drop_unrequested_fixed_year_filter_for_yearly_rollup(sql: str, question: st
     if kept:
         out_lines.append("WHERE " + " AND ".join(kept))
     out_lines.append(f"GROUP BY {parsed['groupby'].strip()}")
+    having_clause = str(parsed.get("having") or "").strip()
+    if having_clause:
+        out_lines.append(having_clause)
     tail = str(parsed.get("tail") or "").strip()
     if tail:
         out_lines.append(tail)
+    fixed = "\n".join(out_lines).strip()
+    if s.endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _project_requested_comparison_count_from_having(
+    sql: str,
+    question: str,
+    ctx: str = "",
+) -> str:
+    """
+    Convert a misused HAVING conditional-count filter into a projected grouped
+    metric when the question asks to return that comparison count rather than
+    filter groups by it.
+    """
+    s = (sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q:
+        return sql
+    if "group by" not in s.lower() or "having" not in s.lower():
+        return sql
+    if not re.search(r"\b(?:how\s+many|number\s+of|count)\b", q, flags=re.I):
+        return sql
+    if not re.search(r"\b(?:rows?|records?|entries|items)\b[^.]{0,80}\bhave\b", q, flags=re.I):
+        return sql
+    if not re.search(r"\b(?:earlier|before|later|after|greater\s+than|less\s+than|above|below)\b", q, flags=re.I):
+        return sql
+    if re.search(r"\b(?:at\s+least|at\s+most|more\s+than|less\s+than)\s+\d+\b", q, flags=re.I):
+        return sql
+
+    parsed = _parse_flat_groupby_clauses(s) or _parse_select_from_groupby(s)
+    if not parsed:
+        return sql
+
+    having_clause = str(parsed.get("having") or "").strip()
+    if not having_clause.lower().startswith("having "):
+        return sql
+    having_body = having_clause[7:].strip()
+    if not having_body:
+        return sql
+
+    select_items = _split_top_level_commas(str(parsed.get("select") or "").strip())
+    if not select_items:
+        return sql
+
+    cond_pat = re.compile(
+        r"""(?is)^\s*
+        (?P<expr>
+            SUM\s*\(\s*CASE\s+WHEN\s+(?P<sum_cond>.+?)\s+THEN\s+1\s+ELSE\s+0\s+END\s*\)
+            |
+            COUNT\s*\(\s*CASE\s+WHEN\s+(?P<count_cond>.+?)\s+THEN\s+1(?:\s+ELSE\s+NULL)?\s+END\s*\)
+        )
+        \s*(?:>\s*0|>=\s*1)\s*$
+        """,
+        flags=re.X,
+    )
+
+    def _norm(text: str) -> str:
+        return re.sub(r"[\s`]+", "", str(text or "").lower())
+
+    existing_metric_norms: Set[str] = set()
+    for item in select_items:
+        expr, _alias = _split_select_expr_alias(item)
+        expr_s = str(expr or "").strip()
+        m = re.match(
+            r"""(?is)^\s*
+            (?:SUM\s*\(\s*CASE\s+WHEN\s+(?P<sum_cond>.+?)\s+THEN\s+1\s+ELSE\s+0\s+END\s*\)
+            |COUNT\s*\(\s*CASE\s+WHEN\s+(?P<count_cond>.+?)\s+THEN\s+1(?:\s+ELSE\s+NULL)?\s+END\s*\))
+            \s*$
+            """,
+            expr_s,
+            flags=re.X,
+        )
+        if not m:
+            continue
+        cond = (m.group("sum_cond") or m.group("count_cond") or "").strip()
+        if cond:
+            existing_metric_norms.add(_norm(cond))
+
+    kept_having: List[str] = []
+    projected_exprs: List[str] = []
+    removed = False
+    alias_idx = 1
+    existing_aliases = {
+        str((_split_select_expr_alias(item)[1] or _extract_alias_or_colname(_split_select_expr_alias(item)[0]) or "")).strip("`").lower()
+        for item in select_items
+        if str(item or "").strip()
+    }
+    for cond in _split_top_level_and(having_body):
+        cond_s = str(cond or "").strip()
+        if not cond_s:
+            continue
+        m = cond_pat.match(cond_s)
+        if not m:
+            kept_having.append(cond_s)
+            continue
+        inner_cond = (m.group("sum_cond") or m.group("count_cond") or "").strip()
+        if not inner_cond or _norm(inner_cond) in existing_metric_norms:
+            kept_having.append(cond_s)
+            continue
+        alias = "comparison_count"
+        while alias.lower() in existing_aliases:
+            alias_idx += 1
+            alias = f"comparison_count_{alias_idx}"
+        existing_aliases.add(alias.lower())
+        projected_exprs.append(f"SUM(CASE WHEN {inner_cond} THEN 1 ELSE 0 END) AS {alias}")
+        existing_metric_norms.add(_norm(inner_cond))
+        removed = True
+
+    if not removed or not projected_exprs:
+        return sql
+
+    rebuilt_select = list(select_items) + projected_exprs
+    out_lines = [
+        "SELECT " + ", ".join(str(item or "").strip() for item in rebuilt_select if str(item or "").strip()),
+        "FROM " + str(parsed.get("from_core") or "").strip(),
+    ]
+    if (parsed.get("where") or "").strip():
+        out_lines.append(str(parsed["where"]).strip())
+    out_lines.append("GROUP BY " + str(parsed.get("groupby") or "").strip())
+    if kept_having:
+        out_lines.append("HAVING " + " AND ".join(kept_having))
+    if (parsed.get("tail") or "").strip():
+        out_lines.append(str(parsed["tail"]).strip())
+    fixed = "\n".join(out_lines).strip()
+    if s.endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _repair_missing_fixed_year_filter_on_unique_temporal_alias(
+    sql: str,
+    question: str,
+    ctx: str = "",
+) -> str:
+    """
+    Add a missing fixed-year filter when the question clearly scopes the query
+    to one explicit year and the joined query exposes exactly one plausible
+    temporal alias for that scope.
+
+    Conservative scope:
+    - exactly one explicit year in the question,
+    - no existing YEAR/date-literal filter already present,
+    - no latest-year or multi-year intent,
+    - only when a unique visible alias has a unique preferred temporal column.
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q:
+        return sql
+
+    if re.search(r"\b(?:latest|most\s+recent|newest|earliest|oldest)\b", q, flags=re.I):
+        return sql
+
+    year_tokens = [m.group(0) for m in re.finditer(r"\b(?:19|20)\d{2}\b", q)]
+    ordered_years: List[str] = []
+    seen_years: Set[str] = set()
+    for token in year_tokens:
+        if token in seen_years:
+            continue
+        seen_years.add(token)
+        ordered_years.append(token)
+    if len(ordered_years) != 1:
+        return sql
+
+    target_year = ordered_years[0]
+    if not re.search(
+        rf"\b(?:in|during|for|within|throughout)\s+{re.escape(target_year)}\b",
+        q,
+        flags=re.I,
+    ):
+        return sql
+
+    if re.search(r"(?is)\bYEAR\s*\(", s) or re.search(r"'(?:19|20)\d{2}-\d{2}-\d{2}'", s):
+        return sql
+
+    parsed = _parse_select_from_groupby(s)
+    if not parsed:
+        return sql
+
+    from_core = str(parsed.get("from_core") or "").strip()
+    if not from_core:
+        return sql
+
+    alias_map = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}") or {}
+    if not alias_map:
+        return sql
+
+    analyzer = None
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    allowed_cols: Dict[str, Set[str]] = {}
+    if ctx:
+        try:
+            allowed = _parse_allowed_identifiers(ctx)
+            allowed_cols = {
+                str(t or "").strip().lower(): {
+                    str(c or "").strip().lower()
+                    for c in (cols or set())
+                    if str(c or "").strip()
+                }
+                for t, cols in (allowed or {}).items()
+                if str(t or "").strip()
+            }
+        except Exception:
+            allowed_cols = {}
+
+    def _table_cols(table_name: str) -> Set[str]:
+        table_l = str(table_name or "").strip("`").lower()
+        cols = set(allowed_cols.get(table_l, set()))
+        if analyzer is not None and table_l:
+            try:
+                cols.update(
+                    str(col or "").strip("`").lower()
+                    for col in analyzer.get_table_columns(table_l)
+                    if str(col or "").strip()
+                )
+            except Exception:
+                pass
+        return cols
+
+    candidate_rows: List[Tuple[str, str, str]] = []
+    seen_candidate_keys: Set[Tuple[str, str]] = set()
+    for alias_name, table_name in alias_map.items():
+        alias_l = str(alias_name or "").strip("`").lower()
+        table_l = str(table_name or "").strip("`").lower()
+        if not alias_l or not table_l:
+            continue
+
+        date_cols = {
+            str(col or "").strip("`")
+            for col in (get_filterable_date_columns(table_l) or [])
+            if str(col or "").strip()
+        }
+        if not date_cols:
+            cols = _table_cols(table_l)
+            date_cols = {
+                str(col or "").strip("`")
+                for col in cols
+                if any(token in str(col or "").lower() for token in ("date", "time", "timestamp"))
+            }
+        if not date_cols:
+            continue
+
+        preferred_col = _choose_preferred_temporal_column(
+            table_l,
+            sorted(date_cols),
+            hint_columns=sorted(date_cols),
+            question=question,
+        )
+        if not preferred_col:
+            continue
+
+        key = (alias_l, preferred_col.lower())
+        if key in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(key)
+        candidate_rows.append((alias_name, table_name, preferred_col))
+
+    if len(candidate_rows) != 1:
+        return sql
+
+    alias_name, _table_name, date_col = candidate_rows[0]
+    year_pred = f"YEAR({alias_name}.{date_col}) = {target_year}"
+
+    out_lines = [
+        f"SELECT {str(parsed.get('select') or '').strip()}",
+        f"FROM {from_core}",
+    ]
+    where_clause = str(parsed.get("where") or "").strip()
+    if where_clause:
+        where_body = re.sub(r"(?is)^\s*where\s+", "", where_clause).strip()
+        if where_body:
+            out_lines.append(f"WHERE {where_body} AND {year_pred}")
+        else:
+            out_lines.append(f"WHERE {year_pred}")
+    else:
+        out_lines.append(f"WHERE {year_pred}")
+    out_lines.append(f"GROUP BY {str(parsed.get('groupby') or '').strip()}")
+    having_clause = str(parsed.get("having") or "").strip()
+    if having_clause:
+        if not having_clause.lower().startswith("having "):
+            having_clause = f"HAVING {having_clause}"
+        out_lines.append(having_clause)
+    if str(parsed.get("tail") or "").strip():
+        out_lines.append(str(parsed.get("tail") or "").strip())
+
     fixed = "\n".join(out_lines).strip()
     if s.endswith(";") and not fixed.endswith(";"):
         fixed += ";"
@@ -17682,6 +19836,372 @@ def _rewrite_conditional_sum_value_to_count(sql: str, question: str) -> str:
     if not changed:
         return sql
     return "SELECT " + ", ".join(rebuilt_items) + " " + s0[from_pos:].lstrip() + trailing
+
+
+def _rewrite_conditional_avg_to_count_with_overall_avg(sql: str, question: str) -> str:
+    """
+    Repair a grouped near-miss where the SQL uses AVG(CASE WHEN cond THEN value
+    ELSE NULL END) even though the question asks for:
+    - how many rows satisfy the condition, and
+    - the overall average of that same value.
+
+    Conservative scope:
+    - flat grouped SELECT
+    - question has both count-like and average intent
+    - exactly one conditional AVG(value) projection
+    - no unconditional AVG(value) projection already present
+    """
+    s = (sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q:
+        return sql
+    if "group by" not in s.lower():
+        return sql
+    if not re.search(r"\b(?:how\s+many|number\s+of|count)\b", q, flags=re.I):
+        return sql
+    if not re.search(r"\b(?:avg|average|mean)\b", q, flags=re.I):
+        return sql
+
+    parsed = _parse_flat_groupby_clauses(s) or _parse_select_from_groupby(s)
+    if not parsed:
+        return sql
+
+    select_items = _split_top_level_commas(str(parsed.get("select") or "").strip())
+    if not select_items:
+        return sql
+
+    conditional_avg_pattern = re.compile(
+        r"""(?is)^\s*
+        AVG\s*\(\s*CASE\s+WHEN\s+(?P<cond>.+?)\s+
+        THEN\s+(?P<then>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<then_col>[A-Za-z_][A-Za-z0-9_]*)`?)\s+
+        ELSE\s+NULL\s+END\s*\)\s*$
+        """,
+        flags=re.X,
+    )
+    plain_avg_pattern = re.compile(
+        r"""(?is)^\s*AVG\s*\(\s*(?P<expr>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)\s*$"""
+    )
+
+    conditional_idx: Optional[int] = None
+    conditional_cond = ""
+    conditional_then = ""
+    conditional_then_col = ""
+    original_alias = ""
+    existing_aliases: Set[str] = set()
+
+    for idx, item in enumerate(select_items):
+        expr, alias = _split_select_expr_alias(item)
+        alias_name = str(alias or _extract_alias_or_colname(expr) or "").strip("`")
+        if alias_name:
+            existing_aliases.add(alias_name.lower())
+
+        m_cond_avg = conditional_avg_pattern.match(str(expr or "").strip())
+        if not m_cond_avg:
+            continue
+        if conditional_idx is not None:
+            return sql
+        conditional_idx = idx
+        conditional_cond = (m_cond_avg.group("cond") or "").strip()
+        conditional_then = (m_cond_avg.group("then") or "").strip()
+        conditional_then_col = (m_cond_avg.group("then_col") or "").strip("`").lower()
+        original_alias = alias_name
+
+    if conditional_idx is None or not conditional_cond or not conditional_then:
+        return sql
+
+    threshold_numbers = re.findall(r"\b\d+(?:\.\d+)?\b", conditional_cond)
+    if threshold_numbers and not all(num in q for num in threshold_numbers):
+        return sql
+
+    if conditional_then_col and conditional_then_col not in conditional_cond.lower():
+        return sql
+
+    for idx, item in enumerate(select_items):
+        if idx == conditional_idx:
+            continue
+        expr, _alias = _split_select_expr_alias(item)
+        m_plain_avg = plain_avg_pattern.match(str(expr or "").strip())
+        if not m_plain_avg:
+            continue
+        plain_expr = (m_plain_avg.group("expr") or "").strip()
+        if re.sub(r"[\s`]+", "", plain_expr).lower() == re.sub(r"[\s`]+", "", conditional_then).lower():
+            return sql
+
+    count_alias = "comparison_count"
+    alias_idx = 1
+    while count_alias.lower() in existing_aliases:
+        alias_idx += 1
+        count_alias = f"comparison_count_{alias_idx}"
+    existing_aliases.add(count_alias.lower())
+
+    avg_alias = original_alias or "average_value"
+    if avg_alias.lower() == count_alias.lower():
+        avg_alias = f"{avg_alias}_avg"
+    while avg_alias.lower() in {count_alias.lower()}:
+        alias_idx += 1
+        avg_alias = f"average_value_{alias_idx}"
+
+    rebuilt_items = list(select_items)
+    rebuilt_items[conditional_idx] = f"SUM(CASE WHEN {conditional_cond} THEN 1 ELSE 0 END) AS {count_alias}"
+    rebuilt_items.insert(conditional_idx + 1, f"AVG({conditional_then}) AS {avg_alias}")
+
+    out_lines = [
+        "SELECT " + ", ".join(str(item or "").strip() for item in rebuilt_items if str(item or "").strip()),
+        "FROM " + str(parsed.get("from_core") or "").strip(),
+    ]
+    if (parsed.get("where") or "").strip():
+        out_lines.append(str(parsed["where"]).strip())
+    if (parsed.get("groupby") or "").strip():
+        out_lines.append("GROUP BY " + str(parsed.get("groupby") or "").strip())
+    if (parsed.get("having") or "").strip():
+        out_lines.append(str(parsed["having"]).strip())
+    if (parsed.get("tail") or "").strip():
+        out_lines.append(str(parsed["tail"]).strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if s.endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _rewrite_conditional_null_breakdown_metrics(
+    sql: str,
+    question: str,
+    ctx: str = "",
+) -> str:
+    """
+    Normalize grouped present/missing breakdown metrics for a single target
+    column when the question explicitly asks for both sides.
+
+    Example family:
+      - "how many have comments filled in and how many have comments missing"
+
+    Conservative scope:
+    - grouped SELECT only
+    - question clearly asks both present and missing counts
+    - rewrites only CASE/count expressions whose aliases or conditions already
+      look like the paired present/missing metrics for the same column
+    """
+    s = (sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q:
+        return sql
+    if "group by" not in s.lower():
+        return sql
+    if not re.search(r"\b(?:filled(?:\s+in)?|present|non[-\s]?null|commented)\b", q, flags=re.I):
+        return sql
+    if not re.search(r"\b(?:missing|null|blank|empty)\b", q, flags=re.I):
+        return sql
+
+    has_count_shape = bool(
+        re.search(
+            r"\b(?:for\s+each|per|by|group|summari[sz]e|show|return|how\s+many|count)\b",
+            q,
+            flags=re.I,
+        )
+        and (
+            re.search(
+                r"\bhow\s+many\b.*\b(?:filled(?:\s+in)?|present|commented)\b.*\bhow\s+many\b.*\b(?:missing|null|blank|empty)\b",
+                q,
+                flags=re.I,
+            )
+            or re.search(
+                r"\b(?:filled(?:\s+in)?|present|commented)\b.*\b(?:and|as\s+well\s+as)\b.*\b(?:missing|null|blank|empty)\b",
+                q,
+                flags=re.I,
+            )
+        )
+    )
+    if not has_count_shape:
+        return sql
+
+    parsed = _parse_select_from_groupby(s)
+    if not parsed:
+        return sql
+
+    from_core = str(parsed.get("from_core") or "").strip()
+    if not from_core:
+        return sql
+    alias_map = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}") or {}
+    alias_to_table = {
+        str(alias or "").strip("`").lower(): str(table or "").strip("`").lower()
+        for alias, table in alias_map.items()
+        if str(alias or "").strip() and str(table or "").strip()
+    }
+    table_names = list(dict.fromkeys(table_l for table_l in alias_to_table.values() if table_l))
+    base_table = table_names[0] if len(table_names) == 1 else ""
+
+    select_items = _split_top_level_commas(str(parsed.get("select") or "").strip())
+    if not select_items:
+        return sql
+
+    def _expr_ref_norm(ref: str) -> str:
+        return re.sub(r"[\s`]+", "", str(ref or "").lower())
+
+    def _resolve_ref_table_col(ref: str) -> Tuple[str, str]:
+        raw = str(ref or "").strip().replace("`", "")
+        if not raw:
+            return "", ""
+        if "." in raw:
+            alias, col = [part.strip() for part in raw.split(".", 1)]
+            table_l = alias_to_table.get(alias.lower(), alias.lower())
+            return table_l, col
+        return base_table, raw
+
+    def _is_string_like_ref(ref: str) -> bool:
+        table_l, col = _resolve_ref_table_col(ref)
+        if not table_l or not col:
+            return True
+        try:
+            dtype = str(get_column_datatype(table_l, col) or "").upper()
+        except Exception:
+            dtype = ""
+        if any(tok in dtype for tok in ("CHAR", "TEXT", "CLOB", "ENUM", "SET")):
+            return True
+        try:
+            role = str(get_column_role(table_l, col) or "").strip().lower()
+        except Exception:
+            role = ""
+        return role in {"text", "name", "description", "status"}
+
+    simple_ref_pat = r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?"
+
+    def _build_missing_pred(ref: str) -> str:
+        if _is_string_like_ref(ref):
+            return f"({ref} IS NULL OR {ref} = '')"
+        return f"{ref} IS NULL"
+
+    def _build_present_pred(ref: str) -> str:
+        if _is_string_like_ref(ref):
+            return f"({ref} IS NOT NULL AND {ref} <> '')"
+        return f"{ref} IS NOT NULL"
+
+    def _extract_case_ref(expr: str) -> Optional[str]:
+        text = str(expr or "").strip()
+        if not text:
+            return None
+        patterns = [
+            rf"(?is)\bCASE\s+WHEN\s+(?P<ref>{simple_ref_pat})\s*=\s*''\s+THEN\s+0\s+ELSE\s+1\s+END\b",
+            rf"(?is)\bCASE\s+WHEN\s+(?P<ref>{simple_ref_pat})\s+IS\s+NULL\s+THEN\s+0\s+ELSE\s+1\s+END\b",
+            rf"(?is)\bCASE\s+WHEN\s+(?P<ref>{simple_ref_pat})\s+IS\s+NOT\s+NULL\s+THEN\s+1\s+ELSE\s+0\s+END\b",
+            rf"(?is)\bCASE\s+WHEN\s+(?P<ref>{simple_ref_pat})\s*=\s*''\s+THEN\s+1\s+ELSE\s+0\s+END\b",
+            rf"(?is)\bCASE\s+WHEN\s+(?P<ref>{simple_ref_pat})\s+IS\s+NULL\s+THEN\s+1\s+ELSE\s+0\s+END\b",
+            rf"(?is)\bCASE\s+WHEN\s+\(?\s*(?P<ref1>{simple_ref_pat})\s+IS\s+NULL\s*\)?\s+OR\s+\(?\s*(?P<ref2>{simple_ref_pat})\s*=\s*''\s*\)?\s+THEN\s+1\s+ELSE\s+0\s+END\b",
+            rf"(?is)\bCASE\s+WHEN\s+\(?\s*(?P<ref1>{simple_ref_pat})\s+IS\s+NOT\s+NULL\s*\)?\s+AND\s+\(?\s*(?P<ref2>{simple_ref_pat})\s*<>\s*''\s*\)?\s+THEN\s+1\s+ELSE\s+0\s+END\b",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.I)
+            if not m:
+                continue
+            ref = (m.groupdict().get("ref") or m.groupdict().get("ref1") or "").strip()
+            ref2 = (m.groupdict().get("ref2") or "").strip()
+            if ref and ref2 and _expr_ref_norm(ref) != _expr_ref_norm(ref2):
+                continue
+            if ref:
+                return ref
+        return None
+
+    def _alias_text(item_alias: Optional[str], expr: str) -> str:
+        alias_text = str(item_alias or "").strip("`")
+        if alias_text:
+            return re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", alias_text).replace("_", " ").lower()
+        return str(expr or "").lower()
+
+    def _looks_present_metric(alias_text: str, expr: str) -> bool:
+        text = f"{alias_text} {expr}".lower()
+        if re.search(r"\b(?:missing|null|blank|empty)\b", alias_text, flags=re.I):
+            return False
+        return bool(re.search(r"\b(?:filled(?:\s+in)?|present|non[-\s]?null|commented)\b", text, flags=re.I))
+
+    def _looks_missing_metric(alias_text: str, expr: str) -> bool:
+        text = f"{alias_text} {expr}".lower()
+        return bool(re.search(r"\b(?:missing|null|blank|empty)\b", text, flags=re.I))
+
+    def _simple_count_total_aliases() -> Set[str]:
+        totals: Set[str] = set()
+        for item in select_items:
+            expr, alias = _split_select_expr_alias(item)
+            if re.match(r"(?is)^\s*COUNT\s*\(", str(expr or "").strip()):
+                alias_name = str(alias or _extract_alias_or_colname(expr) or "").strip("`")
+                if alias_name:
+                    totals.add(alias_name.lower())
+        return totals
+
+    ref_candidates: Dict[str, int] = {}
+    for item in select_items:
+        expr, alias = _split_select_expr_alias(item)
+        ref = _extract_case_ref(expr)
+        if not ref:
+            continue
+        alias_text = _alias_text(alias, expr)
+        weight = 2 if (_looks_present_metric(alias_text, expr) or _looks_missing_metric(alias_text, expr)) else 1
+        key = _expr_ref_norm(ref)
+        ref_candidates[key] = ref_candidates.get(key, 0) + weight
+    if not ref_candidates:
+        return sql
+
+    target_ref_norm = max(ref_candidates.items(), key=lambda item: item[1])[0]
+    target_ref = ""
+    for item in select_items:
+        expr, _alias = _split_select_expr_alias(item)
+        ref = _extract_case_ref(expr)
+        if ref and _expr_ref_norm(ref) == target_ref_norm:
+            target_ref = ref
+            break
+    if not target_ref:
+        return sql
+
+    total_aliases = _simple_count_total_aliases()
+    present_expr = f"SUM(CASE WHEN {_build_present_pred(target_ref)} THEN 1 ELSE 0 END)"
+    missing_expr = f"SUM(CASE WHEN {_build_missing_pred(target_ref)} THEN 1 ELSE 0 END)"
+
+    changed = False
+    rebuilt_items: List[str] = []
+    for item in select_items:
+        expr, alias = _split_select_expr_alias(item)
+        expr_s = str(expr or "").strip()
+        alias_s = str(alias or "").strip()
+        alias_text = _alias_text(alias, expr_s)
+
+        if _expr_ref_norm(_extract_case_ref(expr_s) or "") == target_ref_norm:
+            if _looks_present_metric(alias_text, expr_s):
+                rebuilt_items.append(f"{present_expr} AS {alias_s}" if alias_s else present_expr)
+                changed = True
+                continue
+            if _looks_missing_metric(alias_text, expr_s):
+                rebuilt_items.append(f"{missing_expr} AS {alias_s}" if alias_s else missing_expr)
+                changed = True
+                continue
+
+        if alias_s and alias_s.strip("`").lower() in total_aliases:
+            rebuilt_items.append(item.strip())
+            continue
+
+        if _looks_missing_metric(alias_text, expr_s) and re.search(r"\bCOUNT\s*\(\s*\*\s*\)\s*-\s*", expr_s, flags=re.I):
+            rebuilt_items.append(f"{missing_expr} AS {alias_s}" if alias_s else missing_expr)
+            changed = True
+            continue
+
+        rebuilt_items.append(item.strip())
+
+    if not changed:
+        return sql
+
+    out_lines = [
+        "SELECT " + ", ".join(rebuilt_items),
+        "FROM " + from_core,
+    ]
+    if (parsed.get("where") or "").strip():
+        out_lines.append(str(parsed["where"]).strip())
+    out_lines.append("GROUP BY " + str(parsed.get("groupby") or "").strip())
+    if (parsed.get("having") or "").strip():
+        out_lines.append(str(parsed["having"]).strip())
+    if (parsed.get("tail") or "").strip():
+        out_lines.append(str(parsed["tail"]).strip())
+    fixed = "\n".join(out_lines).strip()
+    if s.endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
 
 
 def _coalesce_zero_fill_conditional_sums(sql: str, question: str, ctx: str = "") -> str:
@@ -22373,18 +24893,6 @@ def _question_wants_dual_fact_rollup(question: str) -> bool:
         has_specific_metric_hint = any(term != "total" for term in metric_terms)
         return has_total_phrase and (has_metric_phrase or has_specific_metric_hint)
 
-    def _status_request_for(table_name: str) -> bool:
-        alt = _entity_alt(table_name)
-        if not alt:
-            return False
-        return bool(
-            re.search(
-                rf"\b(?:{alt})[_\s-]*status\b",
-                q,
-                flags=re.I,
-            )
-        )
-
     for base_table in all_tables:
         if base_table in transaction_tables:
             continue
@@ -22404,7 +24912,7 @@ def _question_wants_dual_fact_rollup(question: str) -> bool:
         count_tables = [t for t in mentioned_child_txns if _count_request_for(t)]
         metric_tables = [
             t for t in mentioned_child_txns
-            if _metric_total_request_for(t) or _status_request_for(t)
+            if _metric_total_request_for(t) or _status_request_for_table_question(question, t)
         ]
         if any(ct != mt for ct in count_tables for mt in metric_tables):
             return True
@@ -24146,7 +26654,7 @@ def _rewrite_dual_fact_rollup_fanout(sql: str, question: str, ctx: str = "") -> 
     if not count_table or not sum_table:
         return sql
 
-    status_requested = bool(status_alias_out or _status_request_for(sum_table))
+    status_requested = bool(status_alias_out or _status_request_for_table_question(question, sum_table))
 
     if not count_alias_out:
         count_alias_out = f"total_{count_table}"
@@ -24939,6 +27447,159 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
     if already_has_latest_year_pattern:
         return sql
 
+    def _strip_tautological_same_table_latest_year_in_filter(sql_text: str) -> str:
+        """
+        Remove a malformed latest-year filter like:
+
+          outer_id IN (
+            SELECT id
+            FROM (
+              SELECT id, MAX(date_col) AS max_date
+              FROM same_table
+              GROUP BY id
+            ) sub
+            WHERE YEAR(max_date) = YEAR(outer_date)
+          )
+
+        This is tautological when the grouped key is the same table's unique ID.
+        Stripping it allows the generic latest-year canonicalizer below to rebuild
+        the correct "latest year per entity" join/filter shape.
+        """
+        s_text = (sql_text or "").strip()
+        if not s_text:
+            return sql_text
+
+        where_pos = _find_top_level_clause(s_text, "where")
+        group_pos = _find_top_level_clause(s_text, "group by", max(0, where_pos + len("where")))
+        if where_pos < 0 or group_pos < 0:
+            return sql_text
+
+        from_pos = _find_top_level_clause(s_text, "from")
+        if from_pos < 0 or from_pos > where_pos:
+            return sql_text
+
+        from_core_text = s_text[from_pos + len("from"):where_pos].strip()
+        alias_map_local = _parse_from_join_aliases(f"SELECT 1 FROM {from_core_text}")
+        where_body = s_text[where_pos + len("where"):group_pos].strip()
+        if not where_body or _has_top_level_or(where_body):
+            return sql_text
+
+        try:
+            analyzer_local = get_schema_analyzer()
+        except Exception:
+            analyzer_local = None
+
+        def _plain_table_name_local(table_expr: str) -> str:
+            return (table_expr or "").replace("`", "").split(".")[-1].strip()
+
+        def _table_cols_local(table_name: str) -> Set[str]:
+            t = _plain_table_name_local(table_name).lower()
+            if not t:
+                return set()
+            if analyzer_local:
+                try:
+                    return {str(c).strip().lower() for c in analyzer_local.get_table_columns(t)}
+                except Exception:
+                    return set()
+            return set()
+
+        pattern = re.compile(
+            r"""(?isx)^\s*
+                `?(?P<outer_key_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<outer_key_col>[A-Za-z_][A-Za-z0-9_]*)`?
+                \s+IN\s*\(\s*
+                SELECT\s+`?(?P<select_key_col>[A-Za-z_][A-Za-z0-9_]*)`?\s+
+                FROM\s*\(\s*
+                    SELECT\s+`?(?P<group_key_col>[A-Za-z_][A-Za-z0-9_]*)`?\s*,\s*
+                    MAX\s*\(\s*`?(?P<inner_date_col>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s+AS\s+`?(?P<max_date_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s+
+                    FROM\s+`?(?P<inner_table>[A-Za-z_][A-Za-z0-9_]*)`?
+                    \s+GROUP\s+BY\s+`?(?P<group_by_col>[A-Za-z_][A-Za-z0-9_]*)`?
+                \s*\)\s*(?:AS\s+)?`?(?P<sub_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s+
+                WHERE\s+YEAR\s*\(\s*`?(?P<filter_max_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*=\s*
+                      YEAR\s*\(\s*`?(?P<outer_date_alias>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<outer_date_col>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)
+                \s*\)\s*$""",
+        )
+
+        changed = False
+        kept_conjuncts: List[str] = []
+        for cond in _split_top_level_and(where_body):
+            cond_s = (cond or "").strip()
+            m = pattern.match(cond_s)
+            if not m:
+                kept_conjuncts.append(cond_s)
+                continue
+
+            outer_key_alias = str(m.group("outer_key_alias") or "").strip()
+            outer_key_col = str(m.group("outer_key_col") or "").strip().lower()
+            select_key_col = str(m.group("select_key_col") or "").strip().lower()
+            group_key_col = str(m.group("group_key_col") or "").strip().lower()
+            group_by_col = str(m.group("group_by_col") or "").strip().lower()
+            inner_date_col = str(m.group("inner_date_col") or "").strip().lower()
+            inner_table = str(m.group("inner_table") or "").strip()
+            max_date_alias = str(m.group("max_date_alias") or "").strip().lower()
+            filter_max_alias = str(m.group("filter_max_alias") or "").strip().lower()
+            outer_date_alias = str(m.group("outer_date_alias") or "").strip()
+            outer_date_col = str(m.group("outer_date_col") or "").strip().lower()
+
+            if not all([
+                outer_key_alias,
+                outer_key_col,
+                select_key_col,
+                group_key_col,
+                group_by_col,
+                inner_date_col,
+                inner_table,
+                max_date_alias,
+                filter_max_alias,
+                outer_date_alias,
+                outer_date_col,
+            ]):
+                kept_conjuncts.append(cond_s)
+                continue
+
+            if select_key_col != outer_key_col or group_key_col != outer_key_col or group_by_col != outer_key_col:
+                kept_conjuncts.append(cond_s)
+                continue
+            if max_date_alias != filter_max_alias:
+                kept_conjuncts.append(cond_s)
+                continue
+
+            outer_key_table = str(alias_map_local.get(outer_key_alias) or alias_map_local.get(outer_key_alias.lower()) or "").strip()
+            outer_date_table = str(alias_map_local.get(outer_date_alias) or alias_map_local.get(outer_date_alias.lower()) or "").strip()
+            inner_table_plain = _plain_table_name_local(inner_table)
+            if not outer_key_table or not outer_date_table or not inner_table_plain:
+                kept_conjuncts.append(cond_s)
+                continue
+            if _plain_table_name_local(outer_key_table).lower() != inner_table_plain.lower():
+                kept_conjuncts.append(cond_s)
+                continue
+            if _plain_table_name_local(outer_date_table).lower() != inner_table_plain.lower():
+                kept_conjuncts.append(cond_s)
+                continue
+
+            inner_cols = _table_cols_local(inner_table_plain)
+            if inner_cols and (outer_key_col not in inner_cols or inner_date_col not in inner_cols or outer_date_col not in inner_cols):
+                kept_conjuncts.append(cond_s)
+                continue
+
+            try:
+                id_col = str(get_id_column(inner_table_plain) or "").strip().lower()
+            except Exception:
+                id_col = ""
+            if not id_col or outer_key_col != id_col:
+                kept_conjuncts.append(cond_s)
+                continue
+
+            changed = True
+
+        if not changed:
+            return sql_text
+
+        prefix = s_text[:where_pos].rstrip()
+        suffix = s_text[group_pos:]
+        if kept_conjuncts:
+            return f"{prefix} WHERE {' AND '.join(kept_conjuncts)} {suffix}".strip()
+        return f"{prefix} {suffix}".strip()
+
     def _strip_tautological_latest_year_having(sql_text: str) -> str:
         """
         Remove tautological HAVING predicates like:
@@ -25025,6 +27686,11 @@ def _rewrite_latest_year_same_year_aggregate(sql: str, question: str, ctx: str =
         if kept_conjuncts:
             return f"{prefix} WHERE {' AND '.join(kept_conjuncts)} {suffix}".strip()
         return f"{prefix} {suffix}".strip()
+
+    sql_sanitized = _strip_tautological_same_table_latest_year_in_filter(sql)
+    if sql_sanitized != sql:
+        sql = sql_sanitized
+        low_sql = sql.lower()
 
     parsed = _parse_select_from_groupby(sql)
     if not parsed:
@@ -32354,6 +35020,140 @@ def _parse_flat_groupby_clauses(sql: str) -> Optional[dict]:
     }
 
 
+def _drop_unrequested_missing_value_subset_filters(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Drop row-level missing-value subset filters from grouped single-table
+    queries when the SELECT already computes both:
+    - a total row count, and
+    - a conditional missing-value count for the same column.
+
+    This prevents COUNT(*) totals from shrinking down to only the missing-value
+    subset when the draft leaks `WHERE col IS NULL OR col = ''`.
+    """
+    if not sql or not question:
+        return sql
+
+    parsed = _parse_select_from_groupby(sql) or _parse_flat_groupby_clauses(sql)
+    if not parsed:
+        return sql
+
+    from_core = str(parsed.get("from_core") or "").strip()
+    if not from_core or re.search(r"(?is)\bjoin\b", from_core) or "(" in from_core:
+        return sql
+
+    where_clause = str(parsed.get("where") or "").strip()
+    if not where_clause or not where_clause.lower().startswith("where "):
+        return sql
+    where_body = where_clause[6:].strip()
+    if not where_body:
+        return sql
+
+    select_items = _split_top_level_commas(parsed.get("select") or "")
+    if not select_items:
+        return sql
+
+    has_total_count = any(
+        re.match(
+            r"(?is)^\s*COUNT\s*\(\s*(?:\*|1)\s*\)\s*$",
+            (_split_select_expr_alias(item)[0] or "").strip(),
+        )
+        for item in select_items
+    )
+    if not has_total_count:
+        return sql
+
+    colref = r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?"
+    empty_lit = r"(?:''|\"\")"
+    null_or_empty_pat = re.compile(
+        rf"""(?is)^\s*\(?\s*
+            (?:
+                \(?\s*(?P<n1>{colref})\s+IS\s+NULL\s*\)?\s+OR\s+\(?\s*(?P<e1>{colref})\s*=\s*{empty_lit}\s*\)?
+                |
+                \(?\s*(?P<e2>{colref})\s*=\s*{empty_lit}\s*\)?\s+OR\s+\(?\s*(?P<n2>{colref})\s+IS\s+NULL\s*\)?
+            )
+            \s*\)?\s*$""",
+        flags=re.X,
+    )
+
+    def _norm_ref(ref: str) -> str:
+        return re.sub(r"[\s`]+", "", str(ref or "")).lower()
+
+    def _bare_col(ref: str) -> str:
+        cleaned = str(ref or "").replace("`", "")
+        if "." in cleaned:
+            cleaned = cleaned.split(".")[-1]
+        return cleaned.strip().lower()
+
+    def _select_has_missing_metric_for(ref: str) -> bool:
+        bare_col = _bare_col(ref)
+        if not bare_col:
+            return False
+        col_pat = re.escape(bare_col)
+        null_pat = re.compile(
+            rf"""(?is)(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?{col_pat}`?\s+IS\s+NULL"""
+        )
+        empty_pat = re.compile(
+            rf"""(?is)(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?{col_pat}`?\s*=\s*{empty_lit}"""
+        )
+        for item in select_items:
+            expr = (_split_select_expr_alias(item)[0] or "").strip()
+            if not re.search(r"\bCASE\s+WHEN\b", expr, flags=re.I):
+                continue
+            if null_pat.search(expr) or empty_pat.search(expr):
+                return True
+        return False
+
+    conds = _split_top_level_and(where_body)
+    if not conds:
+        conds = [where_body]
+
+    keep_conds: List[str] = []
+    removed_any = False
+    for cond in conds:
+        c0 = str(cond or "").strip()
+        if not c0:
+            continue
+
+        m_missing = null_or_empty_pat.match(c0)
+        if not m_missing:
+            keep_conds.append(c0)
+            continue
+
+        null_ref = (m_missing.group("n1") or m_missing.group("n2") or "").strip()
+        empty_ref = (m_missing.group("e1") or m_missing.group("e2") or "").strip()
+        if not null_ref or not empty_ref:
+            keep_conds.append(c0)
+            continue
+        if _norm_ref(null_ref) != _norm_ref(empty_ref):
+            keep_conds.append(c0)
+            continue
+        if not _select_has_missing_metric_for(null_ref):
+            keep_conds.append(c0)
+            continue
+
+        removed_any = True
+
+    if not removed_any:
+        return sql
+
+    out_lines = [
+        f"SELECT {parsed['select'].strip()}",
+        f"FROM {from_core}",
+    ]
+    if keep_conds:
+        out_lines.append(f"WHERE {' AND '.join(keep_conds)}")
+    out_lines.append(f"GROUP BY {parsed['groupby'].strip()}")
+    if parsed.get("having"):
+        out_lines.append(parsed["having"].strip())
+    if parsed.get("tail"):
+        out_lines.append(parsed["tail"].strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _drop_unrequested_group_key_filters(sql: str, question: str, ctx: str = "") -> str:
     """
     Drop hallucinated literal filters on the same column used as a GROUP BY key.
@@ -32545,6 +35345,312 @@ def _drop_unrequested_group_key_filters(sql: str, question: str, ctx: str = "") 
     return fixed
 
 
+def _drop_unrequested_group_key_having_filters(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Drop tautological HAVING non-null filters on the same grouped key when the
+    question never asked for null/missing filtering.
+
+    Conservative scope:
+    - flat grouped query only
+    - top-level AND-only HAVING
+    - only removes `expr IS NOT NULL` / `NOT expr IS NULL` when `expr` is also
+      a GROUP BY key expression
+    """
+    if not sql or not question:
+        return sql
+
+    q = str(question or "").strip().lower()
+    if not q:
+        return sql
+    if re.search(r"\b(?:non\s*null|not\s+null|null|missing|present|known|unknown|empty|blank)\b", q, flags=re.I):
+        return sql
+
+    parsed = _parse_select_from_groupby(sql) or _parse_flat_groupby_clauses(sql)
+    if not parsed:
+        return sql
+
+    having_clause = str(parsed.get("having") or "").strip()
+    if not having_clause or not having_clause.lower().startswith("having "):
+        return sql
+    having_body = having_clause[7:].strip()
+    if not having_body or _has_top_level_or(having_body):
+        return sql
+
+    group_items = [
+        str(item or "").strip()
+        for item in _split_top_level_commas(parsed.get("groupby") or "")
+        if str(item or "").strip()
+    ]
+    if not group_items:
+        return sql
+
+    def _norm_expr(text: str) -> str:
+        return re.sub(r"[\s`]+", "", str(text or "").lower())
+
+    grouped_exprs = {_norm_expr(item) for item in group_items if _norm_expr(item)}
+    if not grouped_exprs:
+        return sql
+
+    nonnull_pat = re.compile(
+        r"""(?is)^\s*(?:
+            (?P<expr1>.+?)\s+IS\s+NOT\s+NULL
+            |
+            NOT\s+(?P<expr2>.+?)\s+IS\s+NULL
+        )\s*$""",
+        flags=re.X,
+    )
+
+    full_match = nonnull_pat.match(having_body)
+    if full_match:
+        expr = str(full_match.group("expr1") or full_match.group("expr2") or "").strip()
+        if _norm_expr(expr) in grouped_exprs:
+            out_lines = [
+                f"SELECT {str(parsed.get('select') or '').strip()}",
+                f"FROM {str(parsed.get('from_core') or '').strip()}",
+            ]
+            if str(parsed.get("where") or "").strip():
+                out_lines.append(str(parsed.get("where") or "").strip())
+            out_lines.append(f"GROUP BY {str(parsed.get('groupby') or '').strip()}")
+            if str(parsed.get("tail") or "").strip():
+                out_lines.append(str(parsed.get("tail") or "").strip())
+            fixed = "\n".join(out_lines).strip()
+            if str(sql).strip().endswith(";") and not fixed.endswith(";"):
+                fixed += ";"
+            return fixed
+
+    kept_having: List[str] = []
+    removed_any = False
+    for cond in _split_top_level_and(having_body):
+        cond_s = str(cond or "").strip()
+        if not cond_s:
+            continue
+        m_nonnull = nonnull_pat.match(cond_s)
+        if not m_nonnull:
+            kept_having.append(cond_s)
+            continue
+        expr = str(m_nonnull.group("expr1") or m_nonnull.group("expr2") or "").strip()
+        if _norm_expr(expr) in grouped_exprs:
+            removed_any = True
+            continue
+        kept_having.append(cond_s)
+
+    if not removed_any:
+        return sql
+
+    out_lines = [
+        f"SELECT {str(parsed.get('select') or '').strip()}",
+        f"FROM {str(parsed.get('from_core') or '').strip()}",
+    ]
+    if str(parsed.get("where") or "").strip():
+        out_lines.append(str(parsed.get("where") or "").strip())
+    out_lines.append(f"GROUP BY {str(parsed.get('groupby') or '').strip()}")
+    if kept_having:
+        out_lines.append("HAVING " + " AND ".join(kept_having))
+    if str(parsed.get("tail") or "").strip():
+        out_lines.append(str(parsed.get("tail") or "").strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if str(sql).strip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _add_missing_grouped_extrema_date_metric(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Add a missing MIN/MAX date metric to a flat grouped single-table query when
+    the question explicitly asks to show the earliest/latest date per group.
+
+    Conservative scope:
+    - flat grouped single-table queries only
+    - question must explicitly ask to show/return/include an earliest/latest
+      date-like value
+    - only adds the metric when no date extrema aggregate is already projected
+    - picks a candidate date column from schema metadata using lexical overlap
+      with the question/alias text
+    """
+    if not sql or not question:
+        return sql
+
+    q = str(question or "").strip().lower()
+    if not q:
+        return sql
+    if not re.search(r"\b(?:show|return|include|display|give|list)\b", q, flags=re.I):
+        return sql
+
+    want_min = re.search(r"\b(?:earliest|oldest|first|minimum|min)\b", q, flags=re.I) is not None
+    want_max = re.search(r"\b(?:latest|newest|last|maximum|max|most\s+recent)\b", q, flags=re.I) is not None
+    if want_min == want_max:
+        return sql
+    if not re.search(r"\b(?:date|time|timestamp|datetime)\b", q, flags=re.I):
+        return sql
+    if re.search(
+        r"\b(?:on|for|from)\s+the\s+(?:latest|newest|most\s+recent|earliest|oldest|first)\b",
+        q,
+        flags=re.I,
+    ):
+        return sql
+
+    parsed = _parse_select_from_groupby(sql) or _parse_flat_groupby_clauses(sql)
+    if not parsed:
+        return sql
+
+    from_core = str(parsed.get("from_core") or "").strip()
+    if not from_core or re.search(r"[,(]|\bJOIN\b", from_core, flags=re.I):
+        return sql
+
+    m_from = re.match(
+        r"""(?is)^\s*`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?\s*$""",
+        from_core,
+    )
+    if not m_from:
+        return sql
+
+    table_name = str(m_from.group("table") or "").strip("`")
+    table_alias = str(m_from.group("alias") or "").strip()
+    qualifier = table_alias or table_name
+    if not table_name:
+        return sql
+
+    try:
+        analyzer = get_schema_analyzer()
+        table_cols = [str(c or "").strip("`") for c in analyzer.get_table_columns(table_name)]
+    except Exception:
+        table_cols = []
+    if not table_cols:
+        return sql
+
+    date_cols: List[str] = []
+    for col in table_cols:
+        dtype = str(get_column_datatype(table_name, col) or "").strip().lower()
+        if any(tok in dtype for tok in ("date", "time", "timestamp", "datetime")):
+            date_cols.append(col)
+    if not date_cols:
+        return sql
+
+    select_items = [
+        str(item or "").strip()
+        for item in _split_top_level_commas(parsed.get("select") or "")
+        if str(item or "").strip()
+    ]
+    if not select_items:
+        return sql
+
+    def _tokenize(text: str) -> Set[str]:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or ""))
+        text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+        return {
+            tok for tok in text.split()
+            if tok and tok not in {
+                "the", "a", "an", "by", "for", "of", "that", "this", "those",
+                "these", "show", "return", "include", "display", "give", "list",
+                "per", "each", "every", "status", "total", "number",
+            }
+        }
+
+    def _norm_expr(text: str) -> str:
+        return re.sub(r"[\s`]+", "", str(text or "").lower())
+
+    aggregate_pat = re.compile(r"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", flags=re.I)
+    target_func = "MIN" if want_min else "MAX"
+    metric_signal_tokens = _tokenize(q)
+
+    best_col = ""
+    best_score = -1
+    for col in date_cols:
+        col_tokens = _tokenize(col)
+        desc_tokens = _tokenize(get_column_description(table_name, col) or "")
+        score = 0
+        score += 5 * len(metric_signal_tokens & col_tokens)
+        score += 2 * len(metric_signal_tokens & desc_tokens)
+        if "date" in col_tokens and "date" in metric_signal_tokens:
+            score += 3
+        if "time" in col_tokens and "time" in metric_signal_tokens:
+            score += 3
+        if score > best_score:
+            best_score = score
+            best_col = col
+    if not best_col:
+        return sql
+    if len(date_cols) > 1 and best_score <= 0:
+        return sql
+
+    best_col_l = best_col.lower()
+    target_present = False
+    for item in select_items:
+        expr_part, alias_part = _split_select_expr_alias(item)
+        expr_l = str(expr_part or "").lower()
+        if re.search(rf"\b{target_func}\s*\(", expr_l, flags=re.I):
+            if re.search(rf"\b{re.escape(best_col_l)}\b", expr_l, flags=re.I):
+                target_present = True
+                break
+        if aggregate_pat.search(expr_l) and re.search(rf"\b{re.escape(best_col_l)}\b", expr_l, flags=re.I):
+            target_present = True
+            break
+        alias_l = str(alias_part or "").strip().lower()
+        if alias_l and re.search(r"\b(?:earliest|oldest|latest|newest|most\s+recent|minimum|maximum)\b", alias_l, flags=re.I):
+            if re.search(r"\b(?:date|time|timestamp|datetime)\b", alias_l, flags=re.I):
+                target_present = True
+                break
+    if target_present:
+        return sql
+
+    group_items = [
+        str(item or "").strip()
+        for item in _split_top_level_commas(parsed.get("groupby") or "")
+        if str(item or "").strip()
+    ]
+    if not group_items:
+        return sql
+    group_norms = {_norm_expr(item) for item in group_items if _norm_expr(item)}
+
+    simple_group_projection_count = 0
+    aggregate_projection_count = 0
+    for item in select_items:
+        expr_part, _alias_part = _split_select_expr_alias(item)
+        expr_norm = _norm_expr(expr_part)
+        if expr_norm in group_norms:
+            simple_group_projection_count += 1
+            continue
+        if aggregate_pat.search(expr_part or ""):
+            aggregate_projection_count += 1
+    if simple_group_projection_count == 0 or aggregate_projection_count == 0:
+        return sql
+
+    projected_date_raw = any(
+        re.search(rf"\b{re.escape(best_col_l)}\b", str(_split_select_expr_alias(item)[0] or ""), flags=re.I)
+        and not aggregate_pat.search(str(_split_select_expr_alias(item)[0] or ""))
+        for item in select_items
+    )
+    if projected_date_raw:
+        return sql
+
+    metric_expr = f"{target_func}({qualifier}.{best_col})"
+    rebuilt_select = ", ".join(select_items + [metric_expr])
+
+    out_lines = [
+        f"SELECT {rebuilt_select}",
+        f"FROM {from_core}",
+    ]
+    where_clause = str(parsed.get("where") or "").strip()
+    if where_clause:
+        out_lines.append(where_clause)
+    out_lines.append(f"GROUP BY {str(parsed.get('groupby') or '').strip()}")
+    having_clause = str(parsed.get("having") or "").strip()
+    if having_clause:
+        if having_clause.lower().startswith("having "):
+            out_lines.append(having_clause)
+        else:
+            out_lines.append(f"HAVING {having_clause}")
+    tail = str(parsed.get("tail") or "").strip()
+    if tail:
+        out_lines.append(tail)
+
+    fixed = "\n".join(part for part in out_lines if part).strip()
+    if str(sql).strip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
 def _drop_unrequested_positive_row_filters(sql: str, question: str, ctx: str = "") -> str:
     """
     Drop hallucinated row-level positive numeric filters in grouped queries.
@@ -32616,7 +35722,36 @@ def _drop_unrequested_positive_row_filters(sql: str, question: str, ctx: str = "
         if re.search(rf"\b{phrase_pat}\b", q, flags=re.I):
             return True
         col_tokens = [t for t in re.findall(r"[a-z0-9]+", col_phrase) if len(t) >= 3]
-        return bool(col_tokens) and any(t in q_tokens for t in col_tokens)
+        if not col_tokens:
+            return False
+        overlap = {t for t in col_tokens if t in q_tokens}
+        if len(col_tokens) == 1:
+            return bool(overlap)
+        return len(overlap) >= 2
+
+    def _strip_outer_parens(text: str) -> str:
+        s0 = str(text or "").strip()
+        while s0.startswith("(") and s0.endswith(")"):
+            inner = s0[1:-1].strip()
+            if not inner:
+                break
+            depth = 0
+            balanced = True
+            for idx, ch in enumerate(s0):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth < 0:
+                        balanced = False
+                        break
+                    if depth == 0 and idx != len(s0) - 1:
+                        balanced = False
+                        break
+            if not balanced or depth != 0:
+                break
+            s0 = inner
+        return s0
 
     conds = _split_top_level_and(where_body)
     if not conds:
@@ -32628,7 +35763,8 @@ def _drop_unrequested_positive_row_filters(sql: str, question: str, ctx: str = "
         c0 = str(cond or "").strip()
         if not c0:
             continue
-        m_pos = positive_pat.match(c0)
+        c_norm = _strip_outer_parens(c0)
+        m_pos = positive_pat.match(c_norm)
         if not m_pos:
             keep_conds.append(c0)
             continue
@@ -32761,7 +35897,12 @@ def _drop_unrequested_literal_row_filters(sql: str, question: str, ctx: str = ""
         if re.search(rf"\b{phrase_pat}\b", q, flags=re.I):
             return True
         col_tokens = [t for t in re.findall(r"[a-z0-9]+", col_phrase) if len(t) >= 3]
-        return bool(col_tokens) and any(t in q_tokens for t in col_tokens)
+        if not col_tokens:
+            return False
+        overlap = {t for t in col_tokens if t in q_tokens}
+        if len(col_tokens) == 1:
+            return bool(overlap)
+        return len(overlap) >= 2
 
     def _literal_text(token: str) -> str:
         raw = str(token or "").strip()
@@ -32776,6 +35917,30 @@ def _drop_unrequested_literal_row_filters(sql: str, question: str, ctx: str = ""
         lit_pat = re.escape(lit).replace(r"\ ", r"\s+")
         return re.search(rf"\b{lit_pat}\b", q, flags=re.I) is not None
 
+    def _strip_outer_parens(text: str) -> str:
+        s0 = str(text or "").strip()
+        while s0.startswith("(") and s0.endswith(")"):
+            inner = s0[1:-1].strip()
+            if not inner:
+                break
+            depth = 0
+            balanced = True
+            for idx, ch in enumerate(s0):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth < 0:
+                        balanced = False
+                        break
+                    if depth == 0 and idx != len(s0) - 1:
+                        balanced = False
+                        break
+            if not balanced or depth != 0:
+                break
+            s0 = inner
+        return s0
+
     conds = _split_top_level_and(where_body)
     if not conds:
         return sql
@@ -32786,8 +35951,9 @@ def _drop_unrequested_literal_row_filters(sql: str, question: str, ctx: str = ""
         c0 = str(cond or "").strip()
         if not c0:
             continue
+        c_norm = _strip_outer_parens(c0)
 
-        match = eq_pat.match(c0) or eq_rev_pat.match(c0) or neq_pat.match(c0) or neq_rev_pat.match(c0)
+        match = eq_pat.match(c_norm) or eq_rev_pat.match(c_norm) or neq_pat.match(c_norm) or neq_rev_pat.match(c_norm)
         if match:
             col_l = _col_name(match.group("col") or "")
             lit = match.group("lit") or ""
@@ -32802,7 +35968,7 @@ def _drop_unrequested_literal_row_filters(sql: str, question: str, ctx: str = ""
             keep_conds.append(c0)
             continue
 
-        in_match = in_pat.match(c0) or not_in_pat.match(c0)
+        in_match = in_pat.match(c_norm) or not_in_pat.match(c_norm)
         if in_match:
             col_l = _col_name(in_match.group("col") or "")
             lit_tokens = [
@@ -32838,6 +36004,293 @@ def _drop_unrequested_literal_row_filters(sql: str, question: str, ctx: str = ""
         out_lines.append(parsed["having"].strip())
     if parsed.get("tail"):
         out_lines.append(parsed["tail"].strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _drop_unrequested_joined_identifier_literal_filters(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Drop hallucinated identifier-like literal row filters in grouped JOIN queries.
+
+    Conservative scope:
+    - top-level grouped query
+    - at least one visible JOIN in FROM
+    - top-level AND-only WHERE
+    - only simple equality predicates to a literal
+    - only when the filtered column looks like a PK/FK/sequence identifier,
+      is not projected/grouped/ordered, and is not mentioned in the question
+    """
+    if not sql or not question:
+        return sql
+
+    q = str(question or "").strip().lower()
+    if not q:
+        return sql
+
+    def _parse_grouped_query_clauses_allowing_derived(text: str) -> Optional[dict]:
+        s0 = str(text or "").strip().rstrip(";").strip()
+        if not s0:
+            return None
+        if re.match(r"(?is)^\s*WITH\b", s0):
+            return None
+
+        sel_pos = _find_top_level_clause(s0, "select")
+        from_pos = _find_top_level_clause(s0, "from", max(0, sel_pos + len("select")))
+        group_pos = _find_top_level_clause(s0, "group by", max(0, from_pos + len("from")))
+        if sel_pos != 0 or from_pos < 0 or group_pos < 0:
+            return None
+
+        where_pos = _find_top_level_clause(s0, "where", from_pos + len("from"))
+        having_pos = _find_top_level_clause(s0, "having", group_pos + len("group by"))
+        order_pos = _find_top_level_clause(s0, "order by", group_pos + len("group by"))
+        limit_pos = _find_top_level_clause(s0, "limit", group_pos + len("group by"))
+
+        from_end_candidates = [group_pos]
+        if where_pos >= 0 and where_pos < group_pos:
+            from_end_candidates.append(where_pos)
+        from_end = min(from_end_candidates)
+        where_clause = s0[where_pos:group_pos].strip() if where_pos >= 0 and where_pos < group_pos else ""
+
+        group_end_candidates = [
+            pos for pos in (having_pos, order_pos, limit_pos)
+            if pos >= 0 and pos > group_pos
+        ]
+        group_end = min(group_end_candidates) if group_end_candidates else len(s0)
+
+        having_clause = ""
+        if having_pos >= 0:
+            having_end_candidates = [
+                pos for pos in (order_pos, limit_pos)
+                if pos >= 0 and pos > having_pos
+            ]
+            having_end = min(having_end_candidates) if having_end_candidates else len(s0)
+            having_clause = s0[having_pos:having_end].strip()
+
+        tail_start_candidates = [
+            pos for pos in (order_pos, limit_pos)
+            if pos >= 0 and pos > group_pos
+        ]
+        tail_start = min(tail_start_candidates) if tail_start_candidates else -1
+        tail = s0[tail_start:].strip() if tail_start >= 0 else ""
+
+        return {
+            "select": s0[sel_pos + len("select"):from_pos].strip(),
+            "from_core": s0[from_pos + len("from"):from_end].strip(),
+            "where": where_clause,
+            "groupby": s0[group_pos + len("group by"):group_end].strip(),
+            "having": having_clause,
+            "tail": tail,
+        }
+
+    parsed = _parse_select_from_groupby(sql) or _parse_flat_groupby_clauses(sql)
+    if not parsed:
+        parsed = _parse_grouped_query_clauses_allowing_derived(sql)
+    if not parsed:
+        return sql
+
+    from_core = str(parsed.get("from_core") or "").strip()
+    if not from_core or not re.search(r"(?is)\bjoin\b", from_core):
+        return sql
+
+    where_clause = str(parsed.get("where") or "").strip()
+    if not where_clause or not where_clause.lower().startswith("where "):
+        return sql
+    where_body = where_clause[6:].strip()
+    if not where_body or _has_top_level_or(where_body):
+        return sql
+
+    alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}") or {}
+    alias_to_table_l = {
+        str(alias or "").strip("`").lower(): str(table or "").strip("`").lower()
+        for alias, table in alias_to_table.items()
+        if str(alias or "").strip() and str(table or "").strip()
+    }
+    if not alias_to_table_l:
+        return sql
+
+    simple_col_pat = re.compile(
+        r"""(?is)^\s*(?:`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$"""
+    )
+    literal_pat = r"""(?:'[^']*'|"[^"]*"|-?\d+(?:\.\d+)?)"""
+    eq_pat = re.compile(
+        rf"""(?is)^\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*=\s*(?P<lit>{literal_pat})\s*$"""
+    )
+    eq_rev_pat = re.compile(
+        rf"""(?is)^\s*(?P<lit>{literal_pat})\s*=\s*(?P<col>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$"""
+    )
+
+    select_text = " ".join(
+        part
+        for part in (
+            str(parsed.get("select") or "").strip(),
+            str(parsed.get("groupby") or "").strip(),
+            str(parsed.get("having") or "").strip(),
+            str(parsed.get("tail") or "").strip(),
+        )
+        if part
+    ).lower()
+    q_tokens = set(re.findall(r"[a-z0-9]+", q))
+
+    try:
+        analyzer = get_schema_analyzer()
+    except Exception:
+        analyzer = None
+
+    try:
+        fk_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_raw = {}
+
+    def _split_col_ref(expr: str) -> Tuple[str, str]:
+        m = simple_col_pat.match(str(expr or "").strip())
+        if not m:
+            return ("", "")
+        return (
+            str(m.group(1) or "").strip("`").lower(),
+            str(m.group(2) or "").strip("`"),
+        )
+
+    def _column_mentioned(col_name: str) -> bool:
+        col_phrase = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(col_name or ""))
+        col_phrase = re.sub(r"[_\W]+", " ", col_phrase).strip().lower()
+        if not col_phrase:
+            return False
+        phrase_pat = re.escape(col_phrase).replace(r"\ ", r"\s+")
+        if re.search(rf"\b{phrase_pat}\b", q, flags=re.I):
+            return True
+        col_tokens = [tok for tok in re.findall(r"[a-z0-9]+", col_phrase) if len(tok) >= 3]
+        if not col_tokens:
+            return False
+        overlap = {tok for tok in col_tokens if tok in q_tokens}
+        if len(col_tokens) == 1:
+            return bool(overlap)
+        return len(overlap) >= 2
+
+    def _literal_mentioned(token: str) -> bool:
+        raw = str(token or "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1]
+        lit = raw.strip().lower()
+        if not lit:
+            return False
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", lit):
+            return re.search(rf"\b{re.escape(lit)}\b", q, flags=re.I) is not None
+        lit_pat = re.escape(lit).replace(r"\ ", r"\s+")
+        return re.search(rf"\b{lit_pat}\b", q, flags=re.I) is not None
+
+    def _looks_like_identifier_filter(alias_l: str, col_l: str) -> bool:
+        table_l = alias_to_table_l.get(alias_l, "")
+        col_raw = str(col_l or "").strip("`")
+        col_norm = col_raw.lower()
+        if not table_l or not col_norm:
+            return False
+        try:
+            id_col = str(get_id_column(table_l) or "").strip("`").lower()
+        except Exception:
+            id_col = ""
+        if id_col and col_norm == id_col:
+            return True
+
+        if col_norm in {
+            str(fk_col or "").strip("`").lower()
+            for fk_col in (fk_raw.get(table_l, {}) or {})
+            if str(fk_col or "").strip()
+        }:
+            return True
+
+        try:
+            role_l = str(get_column_role(table_l, col_raw) or get_column_role(table_l, col_norm) or "").strip().lower()
+        except Exception:
+            role_l = ""
+        if role_l in {"pk", "fk", "id", "identifier"}:
+            return True
+
+        tokens = re.findall(
+            r"[a-z0-9]+",
+            re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", col_raw).replace("_", " ").lower(),
+        )
+        if any(tok in {"line", "sequence", "position", "row"} for tok in tokens):
+            return True
+        return bool(tokens) and tokens[-1] in {"id", "code", "number", "key"}
+
+    def _strip_outer_parens(text: str) -> str:
+        s0 = str(text or "").strip()
+        while s0.startswith("(") and s0.endswith(")"):
+            inner = s0[1:-1].strip()
+            if not inner:
+                break
+            depth = 0
+            balanced = True
+            for idx, ch in enumerate(s0):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth < 0:
+                        balanced = False
+                        break
+                    if depth == 0 and idx != len(s0) - 1:
+                        balanced = False
+                        break
+            if not balanced or depth != 0:
+                break
+            s0 = inner
+        return s0
+
+    conds = _split_top_level_and(where_body)
+    if not conds:
+        return sql
+
+    keep_conds: List[str] = []
+    removed_any = False
+    for cond in conds:
+        c0 = str(cond or "").strip()
+        if not c0:
+            continue
+        c_norm = _strip_outer_parens(c0)
+
+        match = eq_pat.match(c_norm) or eq_rev_pat.match(c_norm)
+        if not match:
+            keep_conds.append(c0)
+            continue
+
+        alias_l, col_l = _split_col_ref(match.group("col") or "")
+        lit = match.group("lit") or ""
+        if not alias_l or not col_l:
+            keep_conds.append(c0)
+            continue
+        if _column_mentioned(col_l) or _literal_mentioned(lit):
+            keep_conds.append(c0)
+            continue
+        if re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(alias_l)}\s*\.\s*`?{re.escape(col_l)}(?![A-Za-z0-9_])",
+            select_text,
+            flags=re.I,
+        ):
+            keep_conds.append(c0)
+            continue
+        if not _looks_like_identifier_filter(alias_l, col_l):
+            keep_conds.append(c0)
+            continue
+        removed_any = True
+
+    if not removed_any:
+        return sql
+
+    out_lines = [
+        f"SELECT {str(parsed.get('select') or '').strip()}",
+        f"FROM {from_core}",
+    ]
+    if keep_conds:
+        out_lines.append(f"WHERE {' AND '.join(keep_conds)}")
+    out_lines.append(f"GROUP BY {str(parsed.get('groupby') or '').strip()}")
+    if str(parsed.get("having") or "").strip():
+        out_lines.append(str(parsed.get("having") or "").strip())
+    if str(parsed.get("tail") or "").strip():
+        out_lines.append(str(parsed.get("tail") or "").strip())
 
     fixed = "\n".join(out_lines).strip()
     if not fixed.endswith(";"):
@@ -33821,6 +37274,157 @@ def _prefer_not_exists_for_simple_exclusion(sql: str, question: str, ctx: str = 
 
     fixed = rewritten.sql(dialect="mysql")
     if sql.strip().endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _repair_exclusion_subject_fk_correlation(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Repair simple exclusion anti-joins that correlate an excluded child table
+    through another child/support table's identifier instead of the subject FK.
+
+    Example family:
+      FROM customers c
+      JOIN payments p ...
+      WHERE NOT EXISTS (
+        SELECT 1 FROM orders o WHERE o.orderNumber = p.checkNumber
+      )
+
+    becomes:
+      WHERE NOT EXISTS (
+        SELECT 1 FROM orders o WHERE o.customerNumber = c.customerNumber
+      )
+
+    Safety:
+    - only flat top-level WHERE filters,
+    - only simple NOT EXISTS subqueries over one real table,
+    - only when the excluded table has exactly one FK to the outer subject table,
+    - only when the question expresses exclusion intent.
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not re.search(r"\bNOT\s+EXISTS\b", s, flags=re.I):
+        return sql
+    if not re.search(r"\b(?:no|without(?:\s+any)?|never|have\s+never|has\s+never|exclude|excluding|not)\b", q, flags=re.I):
+        return sql
+
+    parsed = _parse_select_from_groupby(s) or _parse_flat_groupby_clauses(s)
+    if not parsed:
+        return sql
+
+    from_core = str(parsed.get("from_core") or "").strip()
+    where_clause = str(parsed.get("where") or "").strip()
+    if not from_core or not where_clause.lower().startswith("where "):
+        return sql
+
+    outer_from_match = re.match(
+        r"""(?is)^\s*`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?""",
+        from_core,
+    )
+    if not outer_from_match:
+        return sql
+
+    subject_table = str(outer_from_match.group("table") or "").strip("`").lower()
+    subject_alias = str(outer_from_match.group("alias") or "").strip() or subject_table
+    if not subject_table or not subject_alias:
+        return sql
+
+    alias_to_table = _parse_from_join_aliases(f"SELECT 1 FROM {from_core}") or {}
+    alias_to_table_l = {
+        str(alias or "").strip("`").lower(): str(table or "").strip("`").lower()
+        for alias, table in alias_to_table.items()
+        if str(alias or "").strip() and str(table or "").strip()
+    }
+    if subject_alias.lower() not in alias_to_table_l:
+        alias_to_table_l[subject_alias.lower()] = subject_table
+
+    try:
+        fk_raw = get_fk_relationships() or {}
+    except Exception:
+        fk_raw = {}
+
+    not_exists_pat = re.compile(
+        r"""(?is)NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?\s+WHERE\s+(?P<body>.+?)\s*\)"""
+    )
+    corr_eq_pat = re.compile(
+        r"""(?is)`?(?P<a1>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<c1>[A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?(?P<a2>[A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?(?P<c2>[A-Za-z_][A-Za-z0-9_]*)`?"""
+    )
+
+    changed = False
+
+    def _question_mentions_table(table_name: str) -> bool:
+        for term in _entity_words_for_table(table_name):
+            term_l = str(term or "").strip().lower()
+            if not term_l:
+                continue
+            pat = re.escape(term_l).replace(r"\ ", r"\s+")
+            if re.search(rf"\b{pat}\b", q, flags=re.I):
+                return True
+        return False
+
+    def _rewrite_not_exists(m: re.Match) -> str:
+        nonlocal changed
+
+        inner_table = str(m.group("table") or "").strip("`").lower()
+        inner_alias = str(m.group("alias") or "").strip() or inner_table
+        inner_body = str(m.group("body") or "").strip()
+        if not inner_table or not inner_alias or not inner_body:
+            return m.group(0)
+        if _has_top_level_or(inner_body):
+            return m.group(0)
+        if not _question_mentions_table(inner_table):
+            return m.group(0)
+
+        fk_candidates = [
+            str(fk_col or "").strip("`")
+            for fk_col, tgt in (fk_raw.get(inner_table, {}) or {}).items()
+            if str(tgt or "").strip("`").lower() == subject_table
+        ]
+        if len(fk_candidates) != 1:
+            return m.group(0)
+
+        subject_fk_col = fk_candidates[0]
+        subject_key_col = str(get_fk_target_column(inner_table, subject_fk_col) or "").strip("`")
+        if not subject_key_col:
+            subject_key_col = str(get_id_column(subject_table) or "").strip("`")
+        if not subject_key_col:
+            return m.group(0)
+
+        corr_matches = []
+        for eq_match in corr_eq_pat.finditer(inner_body):
+            a1 = str(eq_match.group("a1") or "").strip().lower()
+            c1 = str(eq_match.group("c1") or "").strip()
+            a2 = str(eq_match.group("a2") or "").strip().lower()
+            c2 = str(eq_match.group("c2") or "").strip()
+            if a1 == inner_alias.lower() and a2 in alias_to_table_l:
+                corr_matches.append((eq_match, c1, a2, c2))
+            elif a2 == inner_alias.lower() and a1 in alias_to_table_l:
+                corr_matches.append((eq_match, c2, a1, c1))
+
+        if len(corr_matches) != 1:
+            return m.group(0)
+
+        eq_match, inner_col, outer_alias_l, outer_col = corr_matches[0]
+        if (
+            outer_alias_l == subject_alias.lower()
+            and inner_col.lower() == subject_fk_col.lower()
+            and outer_col.lower() == subject_key_col.lower()
+        ):
+            return m.group(0)
+
+        replacement = f"{inner_alias}.{subject_fk_col} = {subject_alias}.{subject_key_col}"
+        new_body = f"{inner_body[:eq_match.start()]}{replacement}{inner_body[eq_match.end():]}"
+        if new_body == inner_body:
+            return m.group(0)
+
+        changed = True
+        alias_sql = f" AS {inner_alias}" if inner_alias.lower() != inner_table else ""
+        return f"NOT EXISTS(SELECT 1 FROM {inner_table}{alias_sql} WHERE {new_body})"
+
+    fixed = not_exists_pat.sub(_rewrite_not_exists, s)
+    if not changed:
+        return sql
+    if s.endswith(";") and not fixed.endswith(";"):
         fixed += ";"
     return fixed
 
@@ -35052,6 +38656,21 @@ def _rewrite_half_open_between_bounds(sql: str, question: str) -> str:
         except (InvalidOperation, ValueError):
             return str(left).strip() == str(right).strip()
 
+    def _is_integer_successor_minus_one(sql_high: str, question_high: str) -> bool:
+        """
+        Accept the common LLM near-miss where an exclusive upper bound `X`
+        becomes `BETWEEN low AND X-1`, which is only correct for integers.
+        For decimal-valued columns this must still be rewritten to `< X`.
+        """
+        try:
+            high_sql = Decimal(str(sql_high).strip())
+            high_q = Decimal(str(question_high).strip())
+        except (InvalidOperation, ValueError):
+            return False
+        if high_sql != high_sql.to_integral_value() or high_q != high_q.to_integral_value():
+            return False
+        return high_sql + Decimal("1") == high_q
+
     try:
         between_re = re.compile(AGENT_SQL_NUMERIC_BETWEEN_PATTERN, flags=re.I)
     except re.error:
@@ -35064,8 +38683,12 @@ def _rewrite_half_open_between_bounds(sql: str, question: str) -> str:
         if not expr or not sql_low or not sql_high:
             return m.group(0)
         for q_low, q_high in ranges:
-            if _same_number(sql_low, q_low) and _same_number(sql_high, q_high):
-                return f"({expr} >= {sql_low} AND {expr} < {sql_high})"
+            if not _same_number(sql_low, q_low):
+                continue
+            if _same_number(sql_high, q_high):
+                return f"({expr} >= {sql_low} AND {expr} < {q_high})"
+            if _is_integer_successor_minus_one(sql_high, q_high):
+                return f"({expr} >= {sql_low} AND {expr} < {q_high})"
         return m.group(0)
 
     return between_re.sub(_replace, s)
@@ -40803,6 +44426,223 @@ def _simplify_default_window_frame(sql: str, question: str = "") -> str:
     )
     out = frame_pat.sub("", sql)
     return out
+
+
+def _repair_running_window_missing_partition(sql: str, question: str = "") -> str:
+    """
+    Add a missing PARTITION BY to running/cumulative aggregate windows when the
+    question explicitly scopes the running value to an entity group.
+
+    Conservative trigger:
+    - running/cumulative intent only
+    - simple single-table SELECT
+    - aggregate window already has ORDER BY and no PARTITION BY
+    - a partition entity phrase resolves to exactly one non-metric, non-order
+      selected column
+    """
+    s = (sql or "").strip()
+    q = (question or "").strip().lower()
+    if not s or not q:
+        return sql
+
+    running_terms = rule_list(
+        ("agent_semantics", "running_window_sequence", "running_terms"),
+        ["running", "cumulative", "kumulatif", "akumulatif"],
+    )
+    if not any_phrase_in_text(q, running_terms):
+        return sql
+    if not re.search(r"\b(?:SUM|COUNT)\s*\(", s, flags=re.I) or not re.search(r"\bOVER\s*\(", s, flags=re.I):
+        return sql
+    if re.search(r"\bJOIN\b|\bGROUP\s+BY\b|\bHAVING\b", s, flags=re.I):
+        return sql
+
+    entity_patterns = rule_list(
+        ("agent_semantics", "running_window_sequence", "partition_reference_regex"),
+        [
+            r"\bfor\s+that\s+(?P<entity>[a-z][a-z0-9_ ]{1,40}?)(?=\s+(?:in|by|on|ordered|sorted|order|date|time|when|where|and|then|,|\.|$))",
+            r"\bfor\s+(?:each|every)\s+(?P<entity>[a-z][a-z0-9_ ]{1,40}?)(?=\s+(?:in|by|on|with|ordered|sorted|order|date|time|when|where|and|then|,|\.|$))",
+            r"\bper\s+(?P<entity>[a-z][a-z0-9_ ]{1,40}?)(?=\s+(?:in|by|on|with|ordered|sorted|order|date|time|when|where|and|then|,|\.|$))",
+            r"\bwithin\s+(?:each|the\s+same)\s+(?P<entity>[a-z][a-z0-9_ ]{1,40}?)(?=\s+(?:in|by|on|with|ordered|sorted|order|date|time|when|where|and|then|,|\.|$))",
+        ],
+    )
+    stop_terms = {
+        _to_singular(str(term or "").strip().lower())
+        for term in rule_list(
+            ("agent_semantics", "running_window_sequence", "partition_entity_stop_terms"),
+            ["record", "row", "entry", "item", "result"],
+        )
+        if str(term or "").strip()
+    }
+
+    def _identifier_tokens(text: str) -> List[str]:
+        raw = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or ""))
+        raw = raw.replace("_", " ").replace("-", " ")
+        return [tok for tok in re.findall(r"[a-z0-9]+", raw.lower()) if tok]
+
+    entity_token_sets: List[Set[str]] = []
+    for pattern in entity_patterns:
+        pat = str(pattern or "").strip()
+        if not pat:
+            continue
+        try:
+            matches = list(re.finditer(pat, q, flags=re.I))
+        except re.error:
+            continue
+        for match in matches:
+            if "entity" in match.re.groupindex:
+                entity_text = match.group("entity") or ""
+            elif match.groups():
+                entity_text = match.group(1) or ""
+            else:
+                entity_text = ""
+            tokens = {
+                _to_singular(tok)
+                for tok in _identifier_tokens(entity_text)
+                if _to_singular(tok) not in stop_terms
+            }
+            if tokens:
+                entity_token_sets.append(tokens)
+    if not entity_token_sets:
+        return sql
+
+    def _strip_identifier(raw: str) -> str:
+        return str(raw or "").strip().strip("`")
+
+    window_pat = re.compile(
+        r"""(?is)
+        (?P<func>\b(?:SUM|COUNT)\s*\()
+        (?P<metric>[^()]*(?:\([^()]*\)[^()]*)?)
+        (?P<func_close>\)\s*OVER\s*\()
+        (?P<body>[^()]*)
+        (?P<window_close>\))
+        """,
+        flags=re.X,
+    )
+
+    metric_cols: Set[str] = set()
+    order_cols: Set[str] = set()
+    needs_repair = False
+    for match in window_pat.finditer(s):
+        body = str(match.group("body") or "")
+        if re.search(r"\bPARTITION\s+BY\b", body, flags=re.I):
+            continue
+        if not re.search(r"\bORDER\s+BY\b", body, flags=re.I):
+            continue
+        needs_repair = True
+        metric_refs = re.findall(
+            r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            str(match.group("metric") or ""),
+            flags=re.I,
+        )
+        metric_cols.update(_strip_identifier(col).lower() for col in metric_refs if _strip_identifier(col))
+        order_part = re.split(r"\bORDER\s+BY\b", body, maxsplit=1, flags=re.I)[-1]
+        order_refs = re.findall(
+            r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            order_part,
+            flags=re.I,
+        )
+        order_cols.update(_strip_identifier(col).lower() for col in order_refs if _strip_identifier(col))
+    if not needs_repair:
+        return sql
+
+    select_match = re.search(
+        r"""(?is)^\s*SELECT\s+(?P<select>.*?)\s+FROM\s+`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?""",
+        s,
+    )
+    if not select_match:
+        return sql
+    select_part = str(select_match.group("select") or "").strip()
+    table_name = _strip_identifier(select_match.group("table") or "")
+    alias_name = _strip_identifier(select_match.group("alias") or table_name)
+    if not select_part or not table_name:
+        return sql
+
+    selected_refs: Dict[str, Tuple[str, str]] = {}
+    for item in _split_top_level_commas(select_part):
+        raw = str(item or "").strip()
+        if not raw or re.search(r"\bOVER\s*\(|\b(?:SUM|COUNT|AVG|MIN|MAX)\s*\(", raw, flags=re.I):
+            continue
+        expr = re.sub(
+            r"""(?is)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            "",
+            raw,
+        ).strip()
+        m_col = re.fullmatch(
+            r"""(?is)(?P<ref>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<col>[A-Za-z_][A-Za-z0-9_]*)`?)""",
+            expr,
+        )
+        if not m_col:
+            continue
+        col_name = _strip_identifier(m_col.group("col") or "")
+        ref_sql = re.sub(r"\s+", "", str(m_col.group("ref") or "").strip())
+        if col_name:
+            selected_refs[col_name.lower()] = (col_name, ref_sql or col_name)
+    if not selected_refs:
+        return sql
+
+    id_like_terms = {_to_singular(str(term or "").strip().lower()) for term in identifier_id_like_terms()}
+    id_like_terms.update({"id", "number", "code", "key"})
+
+    def _entity_match_score(col_name: str) -> int:
+        col_tokens = [_to_singular(tok) for tok in _identifier_tokens(col_name)]
+        core_tokens = {tok for tok in col_tokens if tok not in id_like_terms}
+        if not core_tokens:
+            core_tokens = set(col_tokens)
+        best = 0
+        for entity_tokens in entity_token_sets:
+            overlap = core_tokens.intersection(entity_tokens)
+            if not overlap:
+                continue
+            score = 100 + (10 * len(overlap))
+            if core_tokens.issubset(entity_tokens) or entity_tokens.issubset(core_tokens):
+                score += 30
+            if col_tokens and col_tokens[-1] in id_like_terms:
+                score += 15
+            best = max(best, score)
+        return best
+
+    candidates: List[Tuple[int, str, str]] = []
+    excluded_cols = metric_cols.union(order_cols)
+    for col_lower, (col_name, ref_sql) in selected_refs.items():
+        if col_lower in excluded_cols:
+            continue
+        score = _entity_match_score(col_name)
+        if score <= 0:
+            continue
+        try:
+            role = get_column_role(table_name, col_lower)
+        except Exception:
+            role = ""
+        if role in {"id", "identifier", "pk", "primary_key", "primary key", "foreign_key", "fk"}:
+            score += 10
+        candidates.append((score, col_lower, ref_sql))
+    if not candidates:
+        return sql
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return sql
+    partition_ref = candidates[0][2]
+    if "." not in partition_ref and alias_name:
+        partition_ref = f"{alias_name}.{partition_ref}"
+
+    changed = False
+
+    def _rewrite_window(match: re.Match) -> str:
+        nonlocal changed
+        body = str(match.group("body") or "").strip()
+        if re.search(r"\bPARTITION\s+BY\b", body, flags=re.I):
+            return match.group(0)
+        if not re.search(r"\bORDER\s+BY\b", body, flags=re.I):
+            return match.group(0)
+        changed = True
+        return (
+            f"{match.group('func')}{match.group('metric')}{match.group('func_close')}"
+            f"PARTITION BY {partition_ref} {body}{match.group('window_close')}"
+        )
+
+    out = window_pat.sub(_rewrite_window, s)
+    return out if changed else sql
 
 
 def _rewrite_same_group_avg_gap_window_to_partition_only(sql: str, question: str = "") -> str:
