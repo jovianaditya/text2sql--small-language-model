@@ -23387,6 +23387,137 @@ def _preserve_order_by_projection_alias_quotes(sql: str) -> str:
     return s0[:order_pos + len("order by")] + " " + fixed_order + s0[order_end:] + trailing
 
 
+def _ast_simplify_redundant_dedupe(sql: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first simplification for clearly safe dedupe structures.
+
+    Covered in this batch:
+    - DROP redundant GROUP BY when a flat non-aggregate query already behaves as
+      a pure dedupe over the projected expressions
+    - DROP redundant DISTINCT when GROUP BY already defines the visible groups
+
+    Guardrails:
+    - top-level SELECT only
+    - skip nested subqueries, window expressions, and QUALIFY
+    - flat GROUP BY rewrite only when projected expressions exactly match the
+      top-level GROUP BY expressions
+    """
+    meta: Dict[str, Any] = {"parse_ok": False, "fixes": [], "warnings": []}
+    s = str(sql or "").strip()
+    if not s:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    if not isinstance(ast, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+
+    sel = ast
+    group = sel.args.get("group")
+    if not isinstance(group, exp.Group) or not (group.expressions or []):
+        return sql, meta
+
+    if sel.args.get("qualify") is not None:
+        meta["warnings"].append("qualify_skipped")
+        return sql, meta
+    if any(True for _ in sel.find_all(exp.Subquery)):
+        meta["warnings"].append("nested_subquery_skipped")
+        return sql, meta
+    if any(True for _ in sel.find_all(exp.Window)):
+        meta["warnings"].append("window_skipped")
+        return sql, meta
+
+    def _base_expr(item: "exp.Expression") -> "exp.Expression":
+        return item.this if isinstance(item, exp.Alias) else item
+
+    def _expr_norm(node: "exp.Expression") -> str:
+        try:
+            return _normalize_sql_expr_for_match(node.sql(dialect=SQL_PARSE_DIALECT or "mysql"))
+        except Exception:
+            return ""
+
+    def _contains_agg(node: "exp.Expression") -> bool:
+        return isinstance(node, exp.AggFunc) or any(True for _ in node.find_all(exp.AggFunc))
+
+    alias_to_base_norm: Dict[str, str] = {}
+    select_norms: List[str] = []
+    select_nonagg_norms: List[str] = []
+    has_agg = False
+    for item in sel.expressions or []:
+        base = _base_expr(item)
+        norm = _expr_norm(base)
+        if not norm:
+            continue
+        if isinstance(item, exp.Alias) and str(item.alias or "").strip():
+            alias_to_base_norm[str(item.alias).strip("`").lower()] = norm
+        select_norms.append(norm)
+        if _contains_agg(base):
+            has_agg = True
+        else:
+            select_nonagg_norms.append(norm)
+
+    if not select_norms or not select_nonagg_norms:
+        return sql, meta
+
+    resolved_group_norms: List[str] = []
+    for group_expr in group.expressions or []:
+        if isinstance(group_expr, exp.Column) and not str(group_expr.table or "").strip():
+            alias_norm = alias_to_base_norm.get(str(group_expr.name or "").strip("`").lower())
+            if alias_norm:
+                resolved_group_norms.append(alias_norm)
+                continue
+        norm = _expr_norm(group_expr)
+        if norm:
+            resolved_group_norms.append(norm)
+
+    if not resolved_group_norms:
+        return sql, meta
+
+    select_norms_sorted = sorted(select_norms)
+    nonagg_norms_sorted = sorted(select_nonagg_norms)
+    group_norms_sorted = sorted(resolved_group_norms)
+    has_having = sel.args.get("having") is not None
+    has_distinct = sel.args.get("distinct") is not None
+
+    # Safe flat dedupe case:
+    # SELECT expr1, expr2 FROM ... GROUP BY expr1, expr2
+    #   -> SELECT DISTINCT expr1, expr2 FROM ...
+    if not has_agg and not has_having and select_norms_sorted == group_norms_sorted:
+        sel.set("group", None)
+        if not has_distinct:
+            sel.set("distinct", exp.Distinct())
+            meta["fixes"].append("flat_group_by_to_distinct")
+        else:
+            meta["fixes"].append("drop_redundant_group_by_with_distinct")
+    # Safe grouped aggregate dedupe case:
+    # SELECT DISTINCT key, SUM(x) FROM ... GROUP BY key
+    #   -> SELECT key, SUM(x) FROM ... GROUP BY key
+    elif has_distinct and nonagg_norms_sorted == group_norms_sorted:
+        sel.set("distinct", None)
+        meta["fixes"].append("drop_redundant_distinct_with_group_by")
+
+    if not meta["fixes"]:
+        return sql, meta
+
+    out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+    if sql.strip().endswith(";"):
+        out_sql = out_sql.rstrip(";") + ";"
+    return out_sql, meta
+
+
 def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
     """
     Repair malformed winner-row drafts that use a named WINDOW clause plus an

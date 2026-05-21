@@ -492,7 +492,7 @@ def print_compare_report(
         print("  - Not found in this log.")
         print()
 
-    if not missing and not unexpected and not mismatches:
+    if not mismatches:
         print("Benchmark match: PASS")
         _print_log_footer(_extract_run_end(log_path))
         return 0

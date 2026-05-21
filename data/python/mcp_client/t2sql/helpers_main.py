@@ -132,6 +132,7 @@ from .helpers_core import (
     _rewrite_grouped_winner_row_ranked_aggregate,
     _sanitize_order_by_alias_assignment,
     _preserve_order_by_projection_alias_quotes,
+    _ast_simplify_redundant_dedupe,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_metric_join_for_unqualified_rollup,
@@ -9009,6 +9010,13 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s = _repair_simple_single_table_column_names(s, ctx)
     # s = ensure_join_aliases(s)  # DISABLED: Let LLM handle its own alias consistency
     s = _escape_reserved_column_aliases(s)  # Escape reserved words used as column aliases (e.g., AS rank -> AS `rank`)
+    if ast_parseable:
+        ast_b2_sql, ast_b2_meta = _ast_simplify_redundant_dedupe(s)
+        if ast_b2_meta.get("parse_ok", False) and ast_b2_meta.get("fixes"):
+            s = ast_b2_sql
+            if DEBUG_WR:
+                print(f"[REFINER - AST B2] fixes={ast_b2_meta.get('fixes')}")
+                print(f"[REFINER - AST B2] sql={s}")
     # ---------------------------------------------------------------------------
     # Phase 1 — JOIN Semantics & Structural Rewrites (FINAL)
     # Decide JOIN necessity and semantics before touching aliases
