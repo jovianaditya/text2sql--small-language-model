@@ -131,6 +131,7 @@ from .helpers_core import (
     _rewrite_dual_fact_rollup_fanout,
     _rewrite_grouped_winner_row_ranked_aggregate,
     _sanitize_order_by_alias_assignment,
+    _preserve_order_by_projection_alias_quotes,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_metric_join_for_unqualified_rollup,
@@ -9531,6 +9532,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         if DEBUG_WR: print("[REFINER - PH4] after dual-fact fanout fix:", s)
         s = _sanitize_order_by_alias_assignment(s)
         if DEBUG_WR: print("[REFINER - PH4] after ORDER BY alias sanitize:", s)
+        s = _preserve_order_by_projection_alias_quotes(s)
+        if DEBUG_WR: print("[REFINER - PH4] after ORDER BY alias quote preserve:", s)
 
         s = _rewrite_latest_year_same_year_aggregate(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after latest-year-sum fix:", s)

@@ -16,6 +16,7 @@ import gzip
 import json
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from itertools import zip_longest
 from pathlib import Path
 from typing import Dict, Iterable
@@ -30,13 +31,19 @@ DEFAULT_LOG_BY_DIFFICULTY = {
 QUESTION_PREFIX_BY_DIFFICULTY = {
     "easy": "E",
     "medium": "M",
+    "hard": "H",
 }
 
 CASE_HEADER_RE = re.compile(r"^\[(?P<qid>[A-Z]\d+)\]\s.*$")
 SUMMARY_START_RE = re.compile(r"^\[CANDIDATE INTENT SUMMARY\]")
-SUMMARY_STOP_PREFIX = "Use this intent only as a reference."
+SUMMARY_STOP_RE = re.compile(r"^Use this intent only as ")
+TABLE_ORDER_GUIDANCE_RE = re.compile(
+    r"^\[PROMPT DEBUG\] Adding hint: (?P<guidance>TABLE ORDER GUIDANCE: .*?)\.\s+Use\b"
+)
+RUN_END_RE = re.compile(r"^RUN END:\s*(?P<value>.+?)\s*$")
 NUMBER_RE = re.compile(r"\d+")
 COMPACT_DIFFICULTY_FLAG_RE = re.compile(r"^(--(?P<difficulty>easy|medium|hard))(?P<suffix>\d.*)$")
+JAKARTA_TZ = timezone(timedelta(hours=7), name="UTC+07:00")
 
 _EMBEDDED_GOLD_BLOB = (
     "H4sIAPtFDmoC/+1de3PburH/Khj/46Qj64qi7MTubTOu7eS4Ezm5sXNOb9szHliCLR5ThMJHZLVzvnt38SBBEqBl"
@@ -165,7 +172,32 @@ def _load_embedded_gold() -> Dict[str, Dict[str, Dict[str, str]]]:
     return json.loads(raw)
 
 
+HARD_GOLD_BENCHMARK = {
+    "H2": {
+        "question_line": "[H2] (hard) Only include customers who have placed orders, and for each such customer return...",
+        "summary": "[CANDIDATE INTENT SUMMARY] (confidence=0.95):\n  - Query type: aggregate\n  - Dimensions: customers.customerName, customers.customerNumber\n  - Metrics: COUNT(orders.orderNumber)",
+        "table_order_guidance": "TABLE ORDER GUIDANCE: Prefer starting with FROM customers, then INNER JOIN orders",
+    },
+    "H3": {
+        "question_line": "[H3] (hard) List only products that have been ordered at least once, and for each such produ...",
+        "summary": "[CANDIDATE INTENT SUMMARY] (confidence=0.95):\n  - Query type: aggregate\n  - Dimensions: products.productName, products.productCode\n  - Metrics: SUM(orderdetails.quantityOrdered)",
+        "table_order_guidance": "TABLE ORDER GUIDANCE: Prefer starting with FROM products, then INNER JOIN orderdetails",
+    },
+    "H11": {
+        "question_line": "[H11] (hard) Return customers who have made at least one payment but have never placed any or...",
+        "summary": "[CANDIDATE INTENT SUMMARY] (confidence=0.95):\n  - Query type: aggregate\n  - Dimensions: customers.customerNumber, customers.customerName\n  - Metrics: SUM(payments.amount)",
+        "table_order_guidance": "TABLE ORDER GUIDANCE: Prefer starting with FROM customers, then INNER JOIN payments, LEFT JOIN orders",
+    },
+    "H15": {
+        "question_line": "[H15] (hard) Find products that were ordered in 2004 but never ordered in 2005. For each such...",
+        "summary": "[CANDIDATE INTENT SUMMARY] (confidence=0.85):\n  - Query type: aggregate\n  - Dimensions: products.productCode, products.productName\n  - Metrics: SUM(orderdetails.quantityOrdered)",
+        "table_order_guidance": "TABLE ORDER GUIDANCE: Prefer starting with FROM products, then INNER JOIN orderdetails, INNER JOIN orders",
+    },
+}
+
+
 GOLD_BENCHMARKS = _load_embedded_gold()
+GOLD_BENCHMARKS["hard"] = HARD_GOLD_BENCHMARK
 
 
 def _resolve_log_path(difficulty: str, log_arg: str | None) -> Path:
@@ -184,6 +216,7 @@ def parse_log(log_path: Path, difficulty: str) -> Dict[str, Dict[str, str]]:
     expected_prefix = QUESTION_PREFIX_BY_DIFFICULTY[difficulty]
     current_qid: str | None = None
     current_question_line: str | None = None
+    current_table_order_guidance: str | None = None
     capture: list[str] | None = None
     cases: Dict[str, Dict[str, str]] = {}
 
@@ -193,6 +226,11 @@ def parse_log(log_path: Path, difficulty: str) -> Dict[str, Dict[str, str]]:
         if header_match:
             current_qid = header_match.group("qid")
             current_question_line = line
+            current_table_order_guidance = None
+
+        guidance_match = TABLE_ORDER_GUIDANCE_RE.match(line)
+        if guidance_match:
+            current_table_order_guidance = guidance_match.group("guidance").rstrip(".")
 
         if SUMMARY_START_RE.match(line):
             capture = [line]
@@ -201,12 +239,15 @@ def parse_log(log_path: Path, difficulty: str) -> Dict[str, Dict[str, str]]:
         if capture is None:
             continue
 
-        if line.startswith(SUMMARY_STOP_PREFIX):
+        if SUMMARY_STOP_RE.match(line):
             if current_qid and current_qid.startswith(expected_prefix):
-                cases[current_qid] = {
+                payload = {
                     "question_line": current_question_line or current_qid,
                     "summary": _normalize_summary("\n".join(capture)),
                 }
+                if current_table_order_guidance:
+                    payload["table_order_guidance"] = current_table_order_guidance
+                cases[current_qid] = payload
             capture = None
             continue
 
@@ -239,6 +280,8 @@ def _iter_case_rows(cases: Dict[str, Dict[str, str]]) -> Iterable[tuple[str, Dic
 def print_cases_text(cases: Dict[str, Dict[str, str]]) -> None:
     for _, payload in _iter_case_rows(cases):
         print(payload["question_line"])
+        if payload.get("table_order_guidance"):
+            print(payload["table_order_guidance"])
         print(payload["summary"])
         print()
 
@@ -259,12 +302,12 @@ def _print_indented_block(title: str, content: str) -> None:
         print(f"  {line}")
 
 
-def _print_changed_lines(expected_summary: str, actual_summary: str) -> None:
+def _print_changed_lines(expected_text: str, actual_text: str) -> None:
     print("Changed lines:")
     changed_count = 0
     for expected_line, actual_line in zip_longest(
-        expected_summary.splitlines(),
-        actual_summary.splitlines(),
+        expected_text.splitlines(),
+        actual_text.splitlines(),
         fillvalue="<missing>",
     ):
         if expected_line == actual_line:
@@ -277,11 +320,55 @@ def _print_changed_lines(expected_summary: str, actual_summary: str) -> None:
         print("  - No line-level differences detected after normalization.")
 
 
+def _print_checked_timestamp() -> None:
+    checked_at = datetime.now(JAKARTA_TZ).strftime("%Y-%m-%d %H:%M:%S UTC+07:00")
+    print(f"Checked at: {checked_at}")
+
+
+def _extract_run_end(log_path: Path) -> str:
+    run_end = ""
+    try:
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            match = RUN_END_RE.match(line.rstrip())
+            if match:
+                run_end = match.group("value").strip()
+    except FileNotFoundError:
+        return ""
+    return run_end
+
+
+def _print_log_footer(run_end: str = "") -> None:
+    print(f"Run end: {run_end}")
+    _print_checked_timestamp()
+
+
+def _mismatch_label(summary_changed: bool, guidance_changed: bool) -> str:
+    if summary_changed and guidance_changed:
+        return "Guidance + Summary mismatch"
+    if guidance_changed:
+        return "Guidance mismatch"
+    return "Summary mismatch"
+
+
+def _unexpected_guidance_cases(
+    difficulty: str,
+    actual_cases: Dict[str, Dict[str, str]],
+) -> list[tuple[str, Dict[str, str]]]:
+    if difficulty not in {"easy", "medium"}:
+        return []
+
+    return [
+        (qid, payload)
+        for qid, payload in _iter_case_rows(actual_cases)
+        if str(payload.get("table_order_guidance") or "").strip()
+    ]
+
+
 def compare_cases(
     difficulty: str,
     actual_cases: Dict[str, Dict[str, str]],
     selected_ids: set[int] | None = None,
-) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
+) -> tuple[list[str], list[str], list[dict[str, str]]]:
     gold_cases = filter_cases_by_ids(GOLD_BENCHMARKS[difficulty], difficulty, selected_ids)
     gold_ids = set(gold_cases)
     actual_ids = set(actual_cases)
@@ -289,12 +376,22 @@ def compare_cases(
     missing = sorted(gold_ids - actual_ids, key=_numeric_qid_key)
     unexpected = sorted(actual_ids - gold_ids, key=_numeric_qid_key)
 
-    mismatches: list[tuple[str, str, str]] = []
+    mismatches: list[dict[str, str]] = []
     for qid in sorted(gold_ids & actual_ids, key=_numeric_qid_key):
         expected_summary = _normalize_summary(gold_cases[qid]["summary"])
         actual_summary = _normalize_summary(actual_cases[qid]["summary"])
-        if expected_summary != actual_summary:
-            mismatches.append((qid, expected_summary, actual_summary))
+        expected_guidance = str(gold_cases[qid].get("table_order_guidance") or "").strip()
+        actual_guidance = str(actual_cases[qid].get("table_order_guidance") or "").strip()
+        if expected_summary != actual_summary or expected_guidance != actual_guidance:
+            mismatches.append(
+                {
+                    "qid": qid,
+                    "expected_summary": expected_summary,
+                    "actual_summary": actual_summary,
+                    "expected_guidance": expected_guidance,
+                    "actual_guidance": actual_guidance,
+                }
+            )
 
     return missing, unexpected, mismatches
 
@@ -305,52 +402,103 @@ def print_compare_report(
     actual_cases: Dict[str, Dict[str, str]],
     selected_ids: set[int] | None = None,
 ) -> int:
+    is_easy_or_medium = difficulty in {"easy", "medium"}
+    total_gold_cases = len(GOLD_BENCHMARKS[difficulty])
     gold_cases = filter_cases_by_ids(GOLD_BENCHMARKS[difficulty], difficulty, selected_ids)
     missing, unexpected, mismatches = compare_cases(difficulty, actual_cases, selected_ids)
+    unexpected_guidance = _unexpected_guidance_cases(difficulty, actual_cases)
+    guidance_mismatch_count = sum(
+        1
+        for mismatch in mismatches
+        if mismatch["expected_guidance"] != mismatch["actual_guidance"]
+    )
+    summary_mismatch_count = sum(
+        1
+        for mismatch in mismatches
+        if mismatch["expected_summary"] != mismatch["actual_summary"]
+    )
 
     print(f"Difficulty: {difficulty}")
     print(f"Log: {log_path}")
-    print(f"Gold benchmark cases: {len(gold_cases)}")
+    print(f"Gold benchmark cases: {total_gold_cases}")
     print(f"Extracted cases: {len(actual_cases)}")
-    print(f"Missing cases: {len(missing)}")
-    print(f"Unexpected cases: {len(unexpected)}")
-    print(f"Mismatched summaries: {len(mismatches)}")
+    print(f"Mismatched cases: {len(mismatches)}")
+    if not is_easy_or_medium:
+        print(f"Guidance mismatches: {guidance_mismatch_count}")
+    print(f"Summary IR-HINT mismatches: {summary_mismatch_count}")
     print()
 
-    if missing:
-        print("Missing cases from log:")
-        for qid in missing:
-            print(f"  - {qid}: {gold_cases[qid]['question_line']}")
-        print()
-
-    if unexpected:
-        print("Unexpected cases in log:")
-        for qid in unexpected:
-            print(f"  - {qid}: {actual_cases[qid]['question_line']}")
-        print()
-
     if mismatches:
-        print("Summary mismatches:")
+        print("Case mismatches:")
         total_mismatches = len(mismatches)
         separator = "=" * 80
         inner_separator = "-" * 80
-        for index, (qid, expected_summary, actual_summary) in enumerate(mismatches, start=1):
+        for index, mismatch in enumerate(mismatches, start=1):
+            qid = mismatch["qid"]
+            expected_summary = mismatch["expected_summary"]
+            actual_summary = mismatch["actual_summary"]
+            expected_guidance = mismatch["expected_guidance"]
+            actual_guidance = mismatch["actual_guidance"]
+            guidance_changed = expected_guidance != actual_guidance
+            summary_changed = expected_summary != actual_summary
             print(separator)
             print(f"[Mismatch {index}/{total_mismatches}] {qid}")
+            print(f"Type: {_mismatch_label(summary_changed, guidance_changed)}")
             print(f"Question: {gold_cases[qid]['question_line']}")
             print(inner_separator)
-            _print_indented_block("Gold summary:", expected_summary)
-            print()
-            _print_indented_block("Predicted summary:", actual_summary)
-            print()
-            _print_changed_lines(expected_summary, actual_summary)
+            if expected_guidance or actual_guidance:
+                _print_indented_block(
+                    "Gold table order guidance:",
+                    expected_guidance or "<missing>",
+                )
+                print()
+                _print_indented_block(
+                    "Predicted table order guidance:",
+                    actual_guidance or "<missing>",
+                )
+                print()
+                if guidance_changed:
+                    _print_changed_lines(expected_guidance or "<missing>", actual_guidance or "<missing>")
+                    print()
+            if summary_changed or difficulty != "hard":
+                _print_indented_block("Gold summary:", expected_summary)
+                print()
+                _print_indented_block("Predicted summary:", actual_summary)
+                print()
+                if summary_changed:
+                    _print_changed_lines(expected_summary, actual_summary)
+                else:
+                    print("Changed lines:")
+                    print("  - No summary differences.")
+        print()
+
+    if unexpected_guidance:
+        print("Unexpected TABLE ORDER GUIDANCE logs:")
+        separator = "=" * 80
+        inner_separator = "-" * 80
+        total_unexpected_guidance = len(unexpected_guidance)
+        for index, (qid, payload) in enumerate(unexpected_guidance, start=1):
+            print(separator)
+            print(f"[Unexpected Guidance {index}/{total_unexpected_guidance}] {qid}")
+            print(f"Question: {payload['question_line']}")
+            print(inner_separator)
+            _print_indented_block(
+                "Logged table order guidance:",
+                str(payload.get("table_order_guidance") or "<missing>"),
+            )
+        print()
+    elif difficulty in {"easy", "medium"}:
+        print("TABLE ORDER GUIDANCE check:")
+        print("  - Not found in this log.")
         print()
 
     if not missing and not unexpected and not mismatches:
         print("Benchmark match: PASS")
+        _print_log_footer(_extract_run_end(log_path))
         return 0
 
     print("Benchmark match: FAIL")
+    _print_log_footer(_extract_run_end(log_path))
     return 1
 
 
@@ -383,7 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--hard",
             nargs="?",
             const="",
-            help="Reserved for hard questions. Gold benchmark is not embedded yet.",
+            help="Only use hard questions. Optionally specify ID/range: --hard 2, --hard 2-5, --hard 2,11,15",
         )
         if command_name in {"extract", "compare"}:
             subparser.add_argument(
@@ -455,6 +603,7 @@ def main() -> int:
         else:
             print_cases_text(cases)
             print(f"Embedded gold cases: {len(cases)}")
+        _print_checked_timestamp()
         return 0
 
     log_path = _resolve_log_path(difficulty, getattr(args, "log", None))
@@ -466,6 +615,7 @@ def main() -> int:
         else:
             print_cases_text(cases)
             print(f"Extracted cases: {len(cases)}")
+        _print_log_footer(_extract_run_end(log_path))
         return 0
 
     return print_compare_report(difficulty, log_path, cases, selected_ids)

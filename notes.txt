@@ -84,3 +84,8 @@ tmux attach -d -t thesis
 tmux new-window -t thesis
 tmux select-window -t thesis:1
 tmux kill-session -t thesis
+
+INTENT IR & TABLE ORDER GUIDANCE CHECKER:
+cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --easy --log /home/home/thesis/evaluation_easy_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_easy.log
+cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --medium --log /home/home/thesis/evaluation_medium_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_medium.log
+cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --hard --log /home/home/thesis/evaluation_hard_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_hard.log

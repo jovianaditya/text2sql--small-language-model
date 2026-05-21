@@ -23310,6 +23310,83 @@ def _sanitize_order_by_alias_assignment(sql: str) -> str:
     return sql[:m_order.start(1)] + fixed_order + sql[m_order.end(1):]
 
 
+def _preserve_order_by_projection_alias_quotes(sql: str) -> str:
+    """
+    Restore quoting for top-level ORDER BY items when they exactly reference a
+    projected alias containing spaces or other non-word characters.
+
+    This is intentionally clause-local: it does not rewrite semantics, only
+    preserves valid alias references that may have lost quoting after an AST or
+    formatting pass.
+    """
+    s = (sql or "").strip()
+    if not s or "order by" not in s.lower():
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    s0 = s[:-1].rstrip() if trailing else s
+
+    sel_pos = _find_top_level_clause(s0, "select")
+    from_pos = _find_top_level_clause(s0, "from", max(0, sel_pos + len("select")))
+    order_pos = _find_top_level_clause(s0, "order by", max(0, from_pos + len("from")))
+    if sel_pos != 0 or from_pos < 0 or order_pos < 0:
+        return sql
+
+    limit_pos = _find_top_level_clause(s0, "limit", order_pos + len("order by"))
+    order_end = min([p for p in (limit_pos, len(s0)) if p >= 0])
+
+    alias_map: Dict[str, str] = {}
+    select_items = _split_top_level_commas(s0[sel_pos + len("select"):from_pos].strip())
+    for item in select_items:
+        _, alias = _split_select_expr_alias(item)
+        alias_clean = str(alias or "").strip().strip("`'\"")
+        if not alias_clean or not re.search(r"\W", alias_clean):
+            continue
+        alias_key = re.sub(r"\s+", " ", alias_clean).strip().lower()
+        if alias_key and alias_key not in alias_map:
+            alias_map[alias_key] = f"`{alias_clean.replace('`', '')}`"
+
+    if not alias_map:
+        return sql
+
+    order_body = s0[order_pos + len("order by"):order_end].strip()
+    order_items = _split_top_level_commas(order_body)
+    if not order_items:
+        return sql
+
+    fixed_items: List[str] = []
+    changed = False
+    for item in order_items:
+        text = (item or "").strip()
+        m_dir = re.match(r"(?is)^(.*?)(\s+(?:ASC|DESC))?\s*$", text)
+        if not m_dir:
+            fixed_items.append(text)
+            continue
+
+        base = (m_dir.group(1) or "").strip()
+        direction = (m_dir.group(2) or "").upper()
+        if not base or re.search(r"[()./*+\-<>=%]", base):
+            fixed_items.append(text)
+            continue
+
+        alias_key = re.sub(r"\s+", " ", base.strip().strip("`'\"")).strip().lower()
+        alias_ref = alias_map.get(alias_key)
+        if not alias_ref:
+            fixed_items.append(text)
+            continue
+
+        rebuilt = f"{alias_ref}{direction}".strip()
+        fixed_items.append(rebuilt)
+        if rebuilt != text:
+            changed = True
+
+    if not changed:
+        return sql
+
+    fixed_order = ", ".join(fixed_items)
+    return s0[:order_pos + len("order by")] + " " + fixed_order + s0[order_end:] + trailing
+
+
 def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
     """
     Repair malformed winner-row drafts that use a named WINDOW clause plus an
@@ -42026,14 +42103,41 @@ def _ast_guardrails(sql: str, ctx: str = "", question: str = "") -> Tuple[str, D
         if isinstance(item, exp.Alias) and str(item.alias or "").strip()
     }
 
+    group_arg = sel.args.get("group")
+    group_expr_norms: Set[str] = set()
+    if isinstance(group_arg, exp.Group):
+        for group_expr in group_arg.expressions or []:
+            try:
+                group_norm = _normalize_sql_expr_for_match(group_expr.sql(dialect="mysql"))
+            except Exception:
+                group_norm = ""
+            if group_norm:
+                group_expr_norms.add(group_norm)
+
     projection_col_map: Dict[str, List["exp.Column"]] = {}
+    projection_expr_alias_map: Dict[str, List[str]] = {}
+    grouped_projection_aliases_by_token: Dict[str, List[str]] = {}
     for item in sel.expressions or []:
         base = item.this if isinstance(item, exp.Alias) else item
+        explicit_alias = str(item.alias or "").strip("`") if isinstance(item, exp.Alias) else ""
+        explicit_alias_low = explicit_alias.lower()
+        base_norm = ""
+        try:
+            base_norm = _normalize_sql_expr_for_match(base.sql(dialect="mysql"))
+        except Exception:
+            base_norm = ""
+
+        if explicit_alias_low and base_norm:
+            projection_expr_alias_map.setdefault(base_norm, []).append(explicit_alias)
+            if base_norm in group_expr_norms:
+                for token in _referenced_column_tokens(base.sql(dialect="mysql")):
+                    grouped_projection_aliases_by_token.setdefault(token, []).append(explicit_alias)
+
+        out_name_low = str(item.alias_or_name or "").strip("`").lower()
         if not isinstance(base, exp.Column):
             continue
-        out_name = str(item.alias_or_name or "").strip("`").lower()
-        if out_name:
-            projection_col_map.setdefault(out_name, []).append(base.copy())
+        if out_name_low:
+            projection_col_map.setdefault(out_name_low, []).append(base.copy())
         base_name = str(base.name or "").strip("`").lower()
         if base_name:
             projection_col_map.setdefault(base_name, []).append(base.copy())
@@ -42411,40 +42515,84 @@ def _ast_guardrails(sql: str, ctx: str = "", question: str = "") -> Tuple[str, D
     # -----------------------------
     # 2) Ambiguous ORDER BY disambiguation
     # -----------------------------
+    def _unique_alias_name(candidates: List[str]) -> Optional[str]:
+        uniq: List[str] = []
+        seen_aliases: Set[str] = set()
+        for cand in candidates or []:
+            cand_name = str(cand or "").strip("`")
+            cand_low = cand_name.lower()
+            if not cand_low or cand_low in seen_aliases:
+                continue
+            seen_aliases.add(cand_low)
+            uniq.append(cand_name)
+        if len(uniq) == 1:
+            return uniq[0]
+        return None
+
     order = sel.args.get("order")
     if order is not None:
         for ord_item in order.expressions or []:
             this_expr = getattr(ord_item, "this", None)
-            if not isinstance(this_expr, exp.Column):
+            if this_expr is None:
                 continue
-            if str(this_expr.table or "").strip():
-                continue
-
-            c_name = str(this_expr.name or "").strip("`")
-            c_low = c_name.lower()
-            if not c_low:
-                continue
-
-            proj_candidates = projection_col_map.get(c_low, [])
-            proj_norm = {}
-            for p in proj_candidates:
-                key = p.sql(dialect="mysql")
-                proj_norm[key] = p
 
             replacement = None
-            if len(proj_norm) == 1:
-                replacement = list(proj_norm.values())[0].copy()
-                meta["fixes"].append(f"order_by_qualified_from_projection:{c_low}")
-            else:
-                owners = col_to_aliases.get(c_low, [])
-                if owners:
-                    best = _preferred_alias(c_low, owners)
-                    if best:
-                        replacement = exp.column(c_name, table=best)
-                        if len(set(owners)) > 1:
-                            meta["fixes"].append(f"order_by_ambiguous_qualified:{best}.{c_low}")
-                elif len(set(proj_norm.keys())) > 1:
-                    meta["warnings"].append(f"order_by_projection_ambiguous:{c_low}")
+            expr_norm = ""
+            try:
+                expr_norm = _normalize_sql_expr_for_match(this_expr.sql(dialect="mysql"))
+            except Exception:
+                expr_norm = ""
+
+            # Prefer the exact projected alias when ORDER BY repeats a projected
+            # expression such as COUNT(*) / SUM(...) / DATE_FORMAT(...).
+            exact_alias = _unique_alias_name(projection_expr_alias_map.get(expr_norm, []))
+            if exact_alias:
+                exact_alias_low = exact_alias.lower()
+                if not (
+                    isinstance(this_expr, exp.Column)
+                    and not str(this_expr.table or "").strip()
+                    and str(this_expr.name or "").strip("`").lower() == exact_alias_low
+                ):
+                    replacement = exp.column(exact_alias)
+                    meta["fixes"].append(f"order_by_expr_aligned:{exact_alias_low}")
+
+            c_name = str(getattr(this_expr, "name", "") or "").strip("`")
+            c_low = c_name.lower()
+            table_q = str(getattr(this_expr, "table", "") or "").strip("`")
+            if replacement is None and isinstance(this_expr, exp.Column) and c_low:
+                proj_candidates = projection_col_map.get(c_low, [])
+                proj_norm = {}
+                for p in proj_candidates:
+                    key = p.sql(dialect="mysql")
+                    proj_norm[key] = p
+
+                # For grouped outputs, align raw source ordering like
+                # ORDER BY orderDate to a unique grouped projection alias like
+                # quarter_number when that grouped alias is the only projected
+                # grouping expression sourced from that column.
+                grouped_alias = _unique_alias_name(grouped_projection_aliases_by_token.get(c_low, []))
+                if grouped_alias and c_low not in projection_aliases:
+                    grouped_alias_low = grouped_alias.lower()
+                    if not (
+                        not table_q and c_low == grouped_alias_low
+                    ):
+                        replacement = exp.column(grouped_alias)
+                        meta["fixes"].append(f"order_by_group_alias_aligned:{c_low}->{grouped_alias_low}")
+
+                if replacement is None and not table_q:
+                    if len(proj_norm) == 1:
+                        replacement = list(proj_norm.values())[0].copy()
+                        meta["fixes"].append(f"order_by_qualified_from_projection:{c_low}")
+                    else:
+                        owners = col_to_aliases.get(c_low, [])
+                        if owners:
+                            best = _preferred_alias(c_low, owners)
+                            if best:
+                                replacement = exp.column(c_name, table=best)
+                                if len(set(owners)) > 1:
+                                    meta["fixes"].append(f"order_by_ambiguous_qualified:{best}.{c_low}")
+                        elif len(set(proj_norm.keys())) > 1:
+                            meta["warnings"].append(f"order_by_projection_ambiguous:{c_low}")
 
             if replacement is not None:
                 ord_item.set("this", replacement)
