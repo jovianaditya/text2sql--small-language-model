@@ -136,6 +136,7 @@ from .helpers_core import (
     _preserve_order_by_projection_alias_quotes,
     _ast_simplify_redundant_dedupe,
     _ast_repair_group_by_projection_validity,
+    _ast_validate_window_structure,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_metric_join_for_unqualified_rollup,
@@ -8848,6 +8849,13 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             parts.append(f"route={meta.get('route')}")
         if meta.get("attempt"):
             parts.append(f"attempt={meta.get('attempt')}")
+        if "window_count" in meta:
+            parts.append(f"window_count={int(meta.get('window_count') or 0)}")
+        if meta.get("window_kinds"):
+            parts.append(
+                "window_kinds="
+                + "|".join(str(item) for item in (meta.get("window_kinds") or []) if str(item).strip())
+            )
         if meta.get("cleanup_applied") is not None and "cleanup_applied" in meta:
             parts.append(f"cleanup_applied={bool(meta.get('cleanup_applied'))}")
         if meta.get("error"):
@@ -10072,6 +10080,21 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     # Phase 7 — Ordering, Limits, and Output Formatting
     # Cosmetic and execution-safety adjustments only
     # ---------------------------------------------------------------------------
+    if ast_parseable:
+        ast_b5_sql, ast_b5_meta = _ast_validate_window_structure(s, question)
+        if AST_TRACE:
+            print(
+                "[REFINER - AST WINDOW VALIDATION] "
+                + _ast_meta_text(ast_b5_meta)
+                + f" applied={bool(ast_b5_meta.get('fixes'))}"
+            )
+        if ast_b5_meta.get("parse_ok", False) and ast_b5_meta.get("handled_scope", False) and ast_b5_meta.get("fixes"):
+            s = ast_b5_sql
+            if AST_TRACE:
+                print(f"[REFINER - AST WINDOW VALIDATION] sql={s}")
+    elif AST_TRACE:
+        print("[REFINER - AST WINDOW VALIDATION] skipped=parse_gate_not_ast")
+
     s = _simplify_default_window_frame(s, question)
     s = _repair_running_window_missing_partition(s, question)
     s = _rewrite_same_group_avg_gap_window_to_partition_only(s, question)

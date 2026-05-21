@@ -23730,6 +23730,171 @@ def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, A
     return out_sql, meta
 
 
+def _ast_validate_window_structure(sql: str, question: str = "") -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first window structure validation for parseable SQL.
+
+    Scope for this batch:
+    - validate top-level/window AST shape conservatively
+    - surface missing ORDER BY / malformed frame warnings
+    - normalize only the explicit default running frame shape when safe
+
+    Out of scope for this batch:
+    - adding semantic PARTITION BY / ORDER BY choices
+    - ranking metric rewrites
+    - winner-row/window semantic correction
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+        "window_count": 0,
+        "window_kinds": [],
+    }
+    s = str(sql or "").strip()
+    if not s:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+
+    windows = [w for w in sel.find_all(exp.Window) if isinstance(w, exp.Window)]
+    meta["window_count"] = len(windows)
+    if not windows:
+        return sql, meta
+
+    meta["handled_scope"] = True
+    q = str(question or "").strip().lower()
+    running_terms = ("running", "cumulative", "kumulatif", "akumulatif")
+    has_running_intent = any(term in q for term in running_terms)
+
+    rank_types = tuple(
+        cls for cls in (
+            getattr(exp, "RowNumber", None),
+            getattr(exp, "Rank", None),
+            getattr(exp, "DenseRank", None),
+        )
+        if cls is not None
+    )
+    offset_types = tuple(
+        cls for cls in (
+            getattr(exp, "Lag", None),
+            getattr(exp, "Lead", None),
+            getattr(exp, "FirstValue", None),
+            getattr(exp, "LastValue", None),
+        )
+        if cls is not None
+    )
+
+    default_frame_pat = re.compile(
+        r"\b(?:ROWS|RANGE)\s+BETWEEN\s+UNBOUNDED\s+PRECEDING\s+AND\s+CURRENT\s+ROW\b",
+        flags=re.I,
+    )
+
+    def _window_partition_exprs(win: "exp.Window") -> List["exp.Expression"]:
+        raw = win.args.get("partition_by")
+        if raw is None:
+            raw = win.args.get("partition")
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, exp.Expression)]
+        if isinstance(raw, exp.Partition):
+            return [x for x in (raw.expressions or []) if isinstance(x, exp.Expression)]
+        if isinstance(raw, exp.Expression):
+            exprs = getattr(raw, "expressions", None)
+            if isinstance(exprs, list) and exprs:
+                return [x for x in exprs if isinstance(x, exp.Expression)]
+            return [raw]
+        return []
+
+    def _kind_name(win_func: Optional["exp.Expression"]) -> str:
+        if win_func is None:
+            return "unknown"
+        if rank_types and isinstance(win_func, rank_types):
+            return "rank"
+        if offset_types and isinstance(win_func, offset_types):
+            return "offset"
+        if isinstance(win_func, exp.AggFunc):
+            return "aggregate"
+        return "other"
+
+    kinds_seen: List[str] = []
+    should_drop_default_frame = False
+    for win in windows:
+        win_func = getattr(win, "this", None)
+        kind = _kind_name(win_func)
+        if kind not in kinds_seen:
+            kinds_seen.append(kind)
+
+        order = win.args.get("order")
+        order_items = list(order.expressions or []) if isinstance(order, exp.Order) else []
+        partition_exprs = _window_partition_exprs(win)
+        rendered = ""
+        try:
+            rendered = win.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            rendered = ""
+
+        if win_func is None:
+            meta["warnings"].append("window_missing_function")
+            continue
+
+        if kind in {"rank", "offset"} and not order_items:
+            meta["warnings"].append(f"{kind}_window_missing_order_by")
+
+        if rendered and default_frame_pat.search(rendered) and not order_items:
+            meta["warnings"].append("window_frame_without_order_by")
+
+        if (
+            kind == "aggregate"
+            and has_running_intent
+            and rendered
+            and default_frame_pat.search(rendered)
+            and order_items
+        ):
+            spec = win.args.get("spec")
+            if spec is not None:
+                win.set("spec", None)
+                should_drop_default_frame = True
+
+        if kind == "aggregate" and has_running_intent and order_items and not partition_exprs:
+            meta["warnings"].append("running_window_missing_partition_by")
+
+    meta["window_kinds"] = kinds_seen
+    meta["warnings"] = list(dict.fromkeys(meta["warnings"]))
+
+    if not should_drop_default_frame:
+        return sql, meta
+
+    out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+    if sql.strip().endswith(";"):
+        out_sql = out_sql.rstrip(";") + ";"
+
+    if out_sql.strip() == s:
+        return sql, meta
+
+    meta["fixes"].append("simplify_default_window_frame_ast")
+    return out_sql, meta
+
+
 def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
     """
     Repair malformed winner-row drafts that use a named WINDOW clause plus an
