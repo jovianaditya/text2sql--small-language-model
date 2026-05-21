@@ -23518,6 +23518,218 @@ def _ast_simplify_redundant_dedupe(sql: str) -> Tuple[str, Dict[str, Any]]:
     return out_sql, meta
 
 
+def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first GROUP BY projection validity repair for flat single-table queries.
+
+    Scope for this batch:
+    - top-level SELECT only
+    - exactly one base table, no JOINs
+    - skip nested subqueries, windows, and QUALIFY
+
+    Preservation rules:
+    - keep aggregates, literals, stars
+    - keep expressions explicitly covered by GROUP BY
+    - keep expressions whose referenced columns are all covered by GROUP BY
+    - keep same-table expressions when GROUP BY includes the table's primary
+      identifier column, because those projections are functionally dependent
+      in this narrow single-table scope
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+    }
+    s = str(sql or "").strip()
+    if not s:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    if not isinstance(ast, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+
+    sel = ast
+    group = sel.args.get("group")
+    if not isinstance(group, exp.Group) or not (group.expressions or []):
+        return sql, meta
+
+    if sel.args.get("qualify") is not None:
+        meta["warnings"].append("qualify_skipped")
+        return sql, meta
+    if any(True for _ in sel.find_all(exp.Subquery)):
+        meta["warnings"].append("nested_subquery_skipped")
+        return sql, meta
+    if any(True for _ in sel.find_all(exp.Window)):
+        meta["warnings"].append("window_skipped")
+        return sql, meta
+    if any(True for _ in sel.find_all(exp.Join)):
+        meta["warnings"].append("join_skipped")
+        return sql, meta
+
+    from_arg = sel.args.get("from") or sel.args.get("from_")
+    if from_arg is None:
+        meta["warnings"].append("missing_from")
+        return sql, meta
+
+    top_tables = [t for t in from_arg.find_all(exp.Table)]
+    if len(top_tables) != 1:
+        meta["warnings"].append("flat_single_table_only")
+        return sql, meta
+
+    base_table = str(top_tables[0].name or "").strip("`").lower()
+    base_alias = str(top_tables[0].alias_or_name or base_table).strip("`").lower()
+    if not base_table:
+        meta["warnings"].append("missing_table_name")
+        return sql, meta
+
+    meta["handled_scope"] = True
+
+    def _base_expr(item: "exp.Expression") -> "exp.Expression":
+        return item.this if isinstance(item, exp.Alias) else item
+
+    def _expr_norm(node: "exp.Expression") -> str:
+        try:
+            return _normalize_sql_expr_for_match(node.sql(dialect=SQL_PARSE_DIALECT or "mysql"))
+        except Exception:
+            return ""
+
+    def _contains_agg(node: "exp.Expression") -> bool:
+        return isinstance(node, exp.AggFunc) or any(True for _ in node.find_all(exp.AggFunc))
+
+    def _column_variants(col: "exp.Column") -> Set[str]:
+        variants: Set[str] = set()
+        col_name = str(col.name or "").strip("`")
+        if not col_name:
+            return variants
+
+        col_norm = _normalize_sql_expr_for_match(col_name)
+        if col_norm:
+            variants.add(col_norm)
+
+        col_table = str(col.table or "").strip("`").lower()
+        table_variants = {base_table}
+        if base_alias:
+            table_variants.add(base_alias)
+        if col_table:
+            table_variants.add(col_table)
+        for table_name in table_variants:
+            if not table_name:
+                continue
+            qualified_norm = _normalize_sql_expr_for_match(f"{table_name}.{col_name}")
+            if qualified_norm:
+                variants.add(qualified_norm)
+        return variants
+
+    alias_to_base_norm: Dict[str, str] = {}
+    for item in sel.expressions or []:
+        if isinstance(item, exp.Alias) and str(item.alias or "").strip():
+            alias_name = str(item.alias).strip("`").lower()
+            base_norm = _expr_norm(item.this)
+            if alias_name and base_norm:
+                alias_to_base_norm[alias_name] = base_norm
+
+    group_norms: Set[str] = set()
+    for group_expr in group.expressions or []:
+        if isinstance(group_expr, exp.Column):
+            alias_name = str(group_expr.name or "").strip("`").lower()
+            col_table = str(group_expr.table or "").strip("`").lower()
+            if not col_table:
+                alias_norm = alias_to_base_norm.get(alias_name)
+                if alias_norm:
+                    group_norms.add(alias_norm)
+            group_norms.update(_column_variants(group_expr))
+            continue
+        norm = _expr_norm(group_expr)
+        if norm:
+            group_norms.add(norm)
+
+    if not group_norms:
+        meta["warnings"].append("empty_group_norms")
+        return sql, meta
+
+    grouped_id = str(get_id_column(base_table) or "").strip("`").lower()
+    grouped_primary_identifier = False
+    if grouped_id:
+        for table_name in {base_table, base_alias}:
+            if not table_name:
+                continue
+            cand = _normalize_sql_expr_for_match(f"{table_name}.{grouped_id}")
+            if cand in group_norms:
+                grouped_primary_identifier = True
+                break
+        if not grouped_primary_identifier:
+            grouped_primary_identifier = _normalize_sql_expr_for_match(grouped_id) in group_norms
+
+    expressions_to_remove = []
+    for item in sel.expressions or []:
+        base = _base_expr(item)
+
+        if _contains_agg(base):
+            continue
+        if isinstance(base, (exp.Literal, exp.Star)):
+            continue
+
+        base_norm = _expr_norm(base)
+        if base_norm and base_norm in group_norms:
+            continue
+
+        ref_cols = [c for c in base.find_all(exp.Column)]
+        if ref_cols:
+            refs_all_grouped = all(
+                bool(_column_variants(ref_col).intersection(group_norms))
+                for ref_col in ref_cols
+            )
+            if refs_all_grouped:
+                continue
+
+            if grouped_primary_identifier:
+                same_table_refs = True
+                for ref_col in ref_cols:
+                    ref_table = str(ref_col.table or "").strip("`").lower()
+                    if ref_table and ref_table not in {base_table, base_alias}:
+                        same_table_refs = False
+                        break
+                if same_table_refs:
+                    continue
+        else:
+            # No column references means the expression is constant in this
+            # scope, so it does not violate grouped projection validity.
+            continue
+
+        expressions_to_remove.append(item)
+
+    if not expressions_to_remove:
+        return sql, meta
+
+    new_expressions = [expr for expr in sel.expressions if expr not in expressions_to_remove]
+    if not new_expressions:
+        meta["warnings"].append("drop_would_empty_select")
+        return sql, meta
+
+    sel.set("expressions", new_expressions)
+    meta["fixes"].append("repair_group_by_projection_validity_ast")
+
+    out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+    if sql.strip().endswith(";"):
+        out_sql = out_sql.rstrip(";") + ";"
+    return out_sql, meta
+
+
 def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
     """
     Repair malformed winner-row drafts that use a named WINDOW clause plus an

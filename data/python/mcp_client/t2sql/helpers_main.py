@@ -55,6 +55,8 @@ from .config import (
     AGENT_ROUTER_VALUE_RANK_TERMS,
     AGENT_ROUTER_TIME_RANK_TERMS,
     AGENT_ROUTER_QTYPE_SET_OPERATION,
+    REFINER_AST_TRACE_LOGS,
+    REFINER_VERBOSE_LOGS,
     SQL_PARSE_DIALECT,
 )
 from .schema_analyzer import (
@@ -133,6 +135,7 @@ from .helpers_core import (
     _sanitize_order_by_alias_assignment,
     _preserve_order_by_projection_alias_quotes,
     _ast_simplify_redundant_dedupe,
+    _ast_repair_group_by_projection_validity,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_metric_join_for_unqualified_rollup,
@@ -8823,10 +8826,33 @@ Question:
 # ================ Postprocess SQL & Normalize Pipeline ================
 # ======================================================================  
 def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool = False) -> str:
-    DEBUG_WR = True
+    DEBUG_WR = REFINER_VERBOSE_LOGS
+    AST_TRACE = REFINER_AST_TRACE_LOGS
     if not sql:
         return sql
     s = sql.strip()
+
+    def _ast_meta_text(meta: Dict[str, Any]) -> str:
+        fixes = meta.get("fixes") or []
+        warnings = meta.get("warnings") or []
+        fixes_text = "|".join(str(item) for item in fixes) if fixes else "none"
+        warnings_text = "|".join(str(item) for item in warnings) if warnings else "none"
+        parts = [
+            f"parse_ok={bool(meta.get('parse_ok', False))}",
+            f"fixes={fixes_text}",
+            f"warnings={warnings_text}",
+        ]
+        if "handled_scope" in meta:
+            parts.append(f"handled_scope={bool(meta.get('handled_scope', False))}")
+        if meta.get("route"):
+            parts.append(f"route={meta.get('route')}")
+        if meta.get("attempt"):
+            parts.append(f"attempt={meta.get('attempt')}")
+        if meta.get("cleanup_applied") is not None and "cleanup_applied" in meta:
+            parts.append(f"cleanup_applied={bool(meta.get('cleanup_applied'))}")
+        if meta.get("error"):
+            parts.append(f"error={meta.get('error')}")
+        return " ".join(parts)
     
     # -------------------------------------------------------------------------
     # Phase -1: Fix undefined alias typos (e.g., p2.amount -> p.amount)
@@ -9012,11 +9038,18 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s = _escape_reserved_column_aliases(s)  # Escape reserved words used as column aliases (e.g., AS rank -> AS `rank`)
     if ast_parseable:
         ast_b2_sql, ast_b2_meta = _ast_simplify_redundant_dedupe(s)
+        if AST_TRACE:
+            print(
+                "[REFINER - AST REDUNDANT DEDUPE] "
+                + _ast_meta_text(ast_b2_meta)
+                + f" applied={bool(ast_b2_meta.get('fixes'))}"
+            )
         if ast_b2_meta.get("parse_ok", False) and ast_b2_meta.get("fixes"):
             s = ast_b2_sql
-            if DEBUG_WR:
-                print(f"[REFINER - AST B2] fixes={ast_b2_meta.get('fixes')}")
-                print(f"[REFINER - AST B2] sql={s}")
+            if AST_TRACE:
+                print(f"[REFINER - AST REDUNDANT DEDUPE] sql={s}")
+    elif AST_TRACE:
+        print("[REFINER - AST REDUNDANT DEDUPE] skipped=parse_gate_not_ast")
     # ---------------------------------------------------------------------------
     # Phase 1 — JOIN Semantics & Structural Rewrites (FINAL)
     # Decide JOIN necessity and semantics before touching aliases
@@ -9207,8 +9240,34 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         # REMOVE invalid columns FIRST, then enforce GROUP BY consistency
         # This prevents columns from being added to GROUP BY unnecessarily
         if not skip_phase3_groupby_cleanup:
-            s = _remove_invalid_select_columns_with_group_by(s)
-            s = _enforce_explicit_group_by(s)
+            phase3_groupby_projection_handled = False
+            ast_b3_meta: Dict[str, Any] = {
+                "parse_ok": False,
+                "handled_scope": False,
+                "fixes": [],
+                "warnings": ["parse_gate_not_ast"] if not ast_parseable else [],
+            }
+            if ast_parseable:
+                ast_b3_sql, ast_b3_meta = _ast_repair_group_by_projection_validity(s)
+                if AST_TRACE:
+                    print(
+                        "[REFINER - AST GROUPED PROJECTION] "
+                        + _ast_meta_text(ast_b3_meta)
+                        + f" applied={bool(ast_b3_meta.get('fixes'))}"
+                    )
+                if ast_b3_meta.get("parse_ok", False) and ast_b3_meta.get("handled_scope", False):
+                    s = ast_b3_sql
+                    phase3_groupby_projection_handled = True
+                    if AST_TRACE and ast_b3_meta.get("fixes"):
+                        print(f"[REFINER - AST GROUPED PROJECTION] sql={s}")
+            if not phase3_groupby_projection_handled:
+                if AST_TRACE:
+                    reason = "ast_unhandled_scope_or_parse_fail" if ast_parseable else "parse_gate_not_ast"
+                    print(f"[REFINER - AST GROUPED PROJECTION] legacy_fallback=used reason={reason}")
+                s = _remove_invalid_select_columns_with_group_by(s)
+                s = _enforce_explicit_group_by(s)
+            elif AST_TRACE:
+                print("[REFINER - AST GROUPED PROJECTION] legacy_fallback=skipped reason=ast_handled_scope")
             # Fix ORDER BY to use GROUP BY expressions instead of raw columns
             # e.g., ORDER BY o.orderDate → ORDER BY MONTH(o.orderDate)
             s = _fix_order_by_group_by_consistency(s)
@@ -10302,21 +10361,33 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
             if "not in ALLOWED" in e or "invalid column" in e or "invalid columns" in e
         ]
 
+    def _ast_trace_text(meta: Dict[str, Any], *, include_scope: bool = False) -> str:
+        fixes = meta.get("fixes") or []
+        warnings = meta.get("warnings") or []
+        fixes_text = "|".join(str(item) for item in fixes) if fixes else "none"
+        warnings_text = "|".join(str(item) for item in warnings) if warnings else "none"
+        parts = [
+            f"parse_ok={bool(meta.get('parse_ok', False))}",
+            f"fixes={fixes_text}",
+            f"warnings={warnings_text}",
+        ]
+        if meta.get("route"):
+            parts.append(f"route={meta.get('route')}")
+        if meta.get("attempt"):
+            parts.append(f"attempt={meta.get('attempt')}")
+        if "cleanup_applied" in meta:
+            parts.append(f"cleanup_applied={bool(meta.get('cleanup_applied'))}")
+        if include_scope and "handled_scope" in meta:
+            parts.append(f"handled_scope={bool(meta.get('handled_scope', False))}")
+        if meta.get("error"):
+            parts.append(f"error={meta.get('error')}")
+        return " ".join(parts)
+
     def _apply_postprocess(sql_in: str) -> str:
         nonlocal rewrite_count
         gated_sql, gate_meta = _sqlglot_parse_gate(sql_in)
-        if AGENT_AST_GUARDS_DEBUG and (
-            gate_meta.get("cleanup_applied") or not gate_meta.get("parse_ok", False)
-        ):
-            _dbg_print_two(
-                "[REFINER - AST GATE]",
-                (
-                    f"route={gate_meta.get('route')} "
-                    f"attempt={gate_meta.get('attempt')} "
-                    f"cleanup_applied={gate_meta.get('cleanup_applied')} "
-                    f"error={gate_meta.get('error')}"
-                ),
-            )
+        if REFINER_AST_TRACE_LOGS:
+            _dbg_print_two("[REFINER - AST PARSE GATE]", _ast_trace_text(gate_meta))
         before_fp = _semantic_fingerprint(gated_sql)
         out = _postprocess_sql(
             gated_sql,
@@ -10331,12 +10402,14 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
 
     def _ast_stabilize(sql_in: str) -> tuple[str, Dict[str, Any]]:
         if not AGENT_AST_GUARDS_ENABLED:
+            if REFINER_AST_TRACE_LOGS:
+                _dbg_print_two("[REFINER - AST GUARDRAILS]", "enabled=False skipped=ast_guardrails_disabled")
             return sql_in, {}
         ast_sql, ast_meta = _ast_guardrails(sql_in, ctx=ctx, question=question)
+        if REFINER_AST_TRACE_LOGS:
+            _dbg_print_two("[REFINER - AST GUARDRAILS]", _ast_trace_text(ast_meta))
         if ast_meta.get("parse_ok", False) and ast_meta.get("fixes"):
             sql_in = ast_sql
-        if AGENT_AST_GUARDS_DEBUG and ast_meta.get("warnings"):
-            _dbg_print_two("[REFINER - AST] warnings", f"{ast_meta.get('warnings')}")
         return sql_in, ast_meta
 
     def _apply_final_question_repairs(sql_in: str) -> str:

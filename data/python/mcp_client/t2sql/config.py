@@ -516,6 +516,8 @@ AGENT_CONFIDENCE_RETRY_MIN_IMPROVEMENT = float(
 # ======================================================================
 SQL_DEBUG = bool(int(os.getenv("SQL_DEBUG", "1")))
 COMPARE_DEBUG = bool(int(os.getenv("COMPARE_DEBUG", "0")))
+REFINER_VERBOSE_LOGS = bool(int(os.getenv("REFINER_VERBOSE_LOGS", "0")))
+REFINER_AST_TRACE_LOGS = bool(int(os.getenv("REFINER_AST_TRACE_LOGS", "1")))
 
 # Alias output style
 ALIAS_MAX_LEN = int(os.getenv("ALIAS_MAX_LEN", "36"))
