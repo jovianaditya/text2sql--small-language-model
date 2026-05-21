@@ -8853,6 +8853,25 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         if meta.get("error"):
             parts.append(f"error={meta.get('error')}")
         return " ".join(parts)
+
+    def _emit_aggregate_filter_trace(
+        source: str,
+        *,
+        applied_fixes: Optional[List[str]] = None,
+        skipped_reason: str = "",
+        parse_gate_ast: Optional[bool] = None,
+    ) -> None:
+        if not AST_TRACE:
+            return
+        fixes = [str(item) for item in (applied_fixes or []) if str(item).strip()]
+        parts = [f"source={source}"]
+        if parse_gate_ast is not None:
+            parts.append(f"parse_gate_ast={parse_gate_ast}")
+        parts.append(f"applied={bool(fixes)}")
+        parts.append(f"fixes={'|'.join(fixes) if fixes else 'none'}")
+        if skipped_reason:
+            parts.append(f"skipped={skipped_reason}")
+        print("[REFINER - AST AGGREGATE FILTERS] " + " ".join(parts))
     
     # -------------------------------------------------------------------------
     # Phase -1: Fix undefined alias typos (e.g., p2.amount -> p.amount)
@@ -9648,14 +9667,39 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         if DEBUG_WR: print("[REFINER - PH4] after unrequested prefix-length filter drop:", s)
         
         if not (AGENT_AST_SEMANTIC_FIRST and ast_parseable):
-            s = _fix_aggregate_in_where(s)
+            agg_filter_fixes: List[str] = []
+            fixed_agg_where = _fix_aggregate_in_where(s)
+            if fixed_agg_where != s:
+                agg_filter_fixes.append("agg_in_where_regex")
+            s = fixed_agg_where
             if DEBUG_WR: print(f"[REFINER - PH4] after agg-in-where fix: {s}")
 
             # Fix raw column WHERE -> HAVING for aggregate questions
-            s = _fix_raw_column_where_to_having(s, question)
+            fixed_raw_where = _fix_raw_column_where_to_having(s, question)
+            if fixed_raw_where != s:
+                agg_filter_fixes.append("raw_where_to_having_regex")
+            s = fixed_raw_where
             if DEBUG_WR: print(f"[REFINER - PH4] after raw-where-to-having fix: {s}")
+            _emit_aggregate_filter_trace(
+                "regex_fallback",
+                applied_fixes=agg_filter_fixes,
+                parse_gate_ast=bool(ast_parseable),
+            )
         elif DEBUG_WR:
             print("[REFINER - PH4] AST parse gate enabled: skip regex agg/having surgery")
+            _emit_aggregate_filter_trace(
+                "regex_fallback",
+                applied_fixes=[],
+                skipped_reason="ast_parseable_semantic_first",
+                parse_gate_ast=True,
+            )
+        else:
+            _emit_aggregate_filter_trace(
+                "regex_fallback",
+                applied_fixes=[],
+                skipped_reason="ast_parseable_semantic_first",
+                parse_gate_ast=True,
+            )
 
         # Add missing COUNT(*) for GROUP BY aggregates
         s = _add_missing_count_for_group_by(s, question)
@@ -9776,12 +9820,37 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     else:
             # Phase 4 was skipped due to goto_phase5, but still need aggregate fix
             if not (AGENT_AST_SEMANTIC_FIRST and ast_parseable):
-                s = _fix_aggregate_in_where(s)
+                agg_filter_fixes: List[str] = []
+                fixed_agg_where = _fix_aggregate_in_where(s)
+                if fixed_agg_where != s:
+                    agg_filter_fixes.append("agg_in_where_regex")
+                s = fixed_agg_where
                 if DEBUG_WR: print(f"[REFINER - PH4-FORCE] after agg-in-where fix: {s}")
-                s = _fix_raw_column_where_to_having(s, question)
+                fixed_raw_where = _fix_raw_column_where_to_having(s, question)
+                if fixed_raw_where != s:
+                    agg_filter_fixes.append("raw_where_to_having_regex")
+                s = fixed_raw_where
                 if DEBUG_WR: print(f"[PH4-FORCE] after raw-where-to-having fix: {s}")
+                _emit_aggregate_filter_trace(
+                    "regex_fallback_force",
+                    applied_fixes=agg_filter_fixes,
+                    parse_gate_ast=bool(ast_parseable),
+                )
             elif DEBUG_WR:
                 print("[PH4-FORCE] AST parse gate enabled: skip regex agg/having surgery")
+                _emit_aggregate_filter_trace(
+                    "regex_fallback_force",
+                    applied_fixes=[],
+                    skipped_reason="ast_parseable_semantic_first",
+                    parse_gate_ast=True,
+                )
+            else:
+                _emit_aggregate_filter_trace(
+                    "regex_fallback_force",
+                    applied_fixes=[],
+                    skipped_reason="ast_parseable_semantic_first",
+                    parse_gate_ast=True,
+                )
             s = _repair_unbalanced_not_exists_order_by(s)
             if DEBUG_WR: print(f"[PH4-FORCE] after unbalanced NOT EXISTS fix: {s}")
             s = _repair_misnested_offset_window_function(s)
@@ -10348,6 +10417,11 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
 
     rewrite_budget = max(1, int(AGENT_NORMALIZE_REWRITE_BUDGET))
     rewrite_count = 0
+    aggregate_filter_ast_fix_names = {
+        "agg_where_to_having_ast",
+        "raw_metric_where_to_having_ast",
+        "count_distinct_threshold_having_ast",
+    }
 
     def _semantic_fingerprint(text: str) -> str:
         t = (text or "").strip().rstrip(";")
@@ -10383,6 +10457,25 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
             parts.append(f"error={meta.get('error')}")
         return " ".join(parts)
 
+    def _aggregate_filter_ast_trace_text(meta: Dict[str, Any]) -> str:
+        family_fixes = [
+            str(item)
+            for item in (meta.get("fixes") or [])
+            if str(item) in aggregate_filter_ast_fix_names
+        ]
+        parts = [
+            "source=ast_guardrails",
+            f"parse_ok={bool(meta.get('parse_ok', False))}",
+            f"applied={bool(family_fixes)}",
+            f"fixes={'|'.join(family_fixes) if family_fixes else 'none'}",
+        ]
+        warnings = meta.get("warnings") or []
+        if warnings:
+            parts.append(f"warnings={'|'.join(str(item) for item in warnings)}")
+        if meta.get("error"):
+            parts.append(f"error={meta.get('error')}")
+        return " ".join(parts)
+
     def _apply_postprocess(sql_in: str) -> str:
         nonlocal rewrite_count
         gated_sql, gate_meta = _sqlglot_parse_gate(sql_in)
@@ -10404,10 +10497,12 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
         if not AGENT_AST_GUARDS_ENABLED:
             if REFINER_AST_TRACE_LOGS:
                 _dbg_print_two("[REFINER - AST GUARDRAILS]", "enabled=False skipped=ast_guardrails_disabled")
+                _dbg_print_two("[REFINER - AST AGGREGATE FILTERS]", "source=ast_guardrails parse_ok=False applied=False fixes=none skipped=ast_guardrails_disabled")
             return sql_in, {}
         ast_sql, ast_meta = _ast_guardrails(sql_in, ctx=ctx, question=question)
         if REFINER_AST_TRACE_LOGS:
             _dbg_print_two("[REFINER - AST GUARDRAILS]", _ast_trace_text(ast_meta))
+            _dbg_print_two("[REFINER - AST AGGREGATE FILTERS]", _aggregate_filter_ast_trace_text(ast_meta))
         if ast_meta.get("parse_ok", False) and ast_meta.get("fixes"):
             sql_in = ast_sql
         return sql_in, ast_meta
