@@ -137,6 +137,7 @@ from .helpers_core import (
     _ast_simplify_redundant_dedupe,
     _ast_repair_group_by_projection_validity,
     _ast_validate_window_structure,
+    _ast_rewrite_window_semantics,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_metric_join_for_unqualified_rollup,
@@ -9550,6 +9551,21 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _repair_unbalanced_select_item_parentheses(s)
         if DEBUG_WR: print("[REFINER - PH4] after select-item parenthesis fix:", s)
 
+        if ast_parseable:
+            ast_b6_sql, ast_b6_meta = _ast_rewrite_window_semantics(s, question)
+            if AST_TRACE:
+                print(
+                    "[REFINER - AST WINDOW SEMANTICS] "
+                    + _ast_meta_text(ast_b6_meta)
+                    + f" applied={bool(ast_b6_meta.get('fixes'))}"
+                )
+            if ast_b6_meta.get("parse_ok", False) and ast_b6_meta.get("handled_scope", False) and ast_b6_meta.get("fixes"):
+                s = ast_b6_sql
+                if AST_TRACE:
+                    print(f"[REFINER - AST WINDOW SEMANTICS] sql={s}")
+        elif AST_TRACE:
+            print("[REFINER - AST WINDOW SEMANTICS] skipped=parse_gate_not_ast")
+
         s = _rewrite_explicit_single_table_scope(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after explicit single-table scope fix:", s)
 
@@ -9865,6 +9881,22 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             if DEBUG_WR: print(f"[PH4-FORCE] after offset window nesting fix: {s}")
             s = _repair_unbalanced_select_item_parentheses(s)
             if DEBUG_WR: print(f"[PH4-FORCE] after select-item parenthesis fix: {s}")
+
+            if ast_parseable:
+                ast_b6_sql, ast_b6_meta = _ast_rewrite_window_semantics(s, question)
+                if AST_TRACE:
+                    print(
+                        "[REFINER - AST WINDOW SEMANTICS] "
+                        + _ast_meta_text(ast_b6_meta)
+                        + f" applied={bool(ast_b6_meta.get('fixes'))}"
+                    )
+                if ast_b6_meta.get("parse_ok", False) and ast_b6_meta.get("handled_scope", False) and ast_b6_meta.get("fixes"):
+                    s = ast_b6_sql
+                    if AST_TRACE:
+                        print(f"[REFINER - AST WINDOW SEMANTICS] sql={s}")
+            elif AST_TRACE:
+                print("[REFINER - AST WINDOW SEMANTICS] skipped=parse_gate_not_ast")
+
             s = _rewrite_explicit_single_table_scope(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after explicit single-table scope fix: {s}")
             s = _repair_single_table_friendly_column_names(s, question, ctx)

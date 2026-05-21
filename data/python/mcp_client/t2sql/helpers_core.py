@@ -23895,6 +23895,207 @@ def _ast_validate_window_structure(sql: str, question: str = "") -> Tuple[str, D
     return out_sql, meta
 
 
+def _ast_rewrite_window_semantics(sql: str, question: str = "") -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first semantic rewrites for a narrow, low-risk subset of window queries.
+
+    This batch intentionally keeps scope small:
+    - no-skip rank intent -> DENSE_RANK
+    - LAG/LEAD sequence direction alignment from the question
+    - same-group average gap windows -> PARTITION-only AVG window
+
+    Out of scope:
+    - winner-row semantics
+    - rank metric replacement
+    - inferred/missing partition-key insertion
+    - broader running-total rewrites
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+        "window_count": 0,
+        "window_kinds": [],
+    }
+    s = str(sql or "").strip()
+    if not s or not question:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+
+    windows = [w for w in sel.find_all(exp.Window) if isinstance(w, exp.Window)]
+    meta["window_count"] = len(windows)
+    if not windows:
+        return sql, meta
+
+    meta["handled_scope"] = True
+    q = str(question or "").strip().lower()
+
+    rank_types = tuple(
+        cls for cls in (
+            getattr(exp, "RowNumber", None),
+            getattr(exp, "Rank", None),
+            getattr(exp, "DenseRank", None),
+        )
+        if cls is not None
+    )
+    offset_types = tuple(
+        cls for cls in (
+            getattr(exp, "Lag", None),
+            getattr(exp, "Lead", None),
+        )
+        if cls is not None
+    )
+
+    no_skip_rank = bool(
+        re.search(r"\brank", q, flags=re.I)
+        and (
+            re.search(r"\bwithout\s+skipping\b", q, flags=re.I)
+            or re.search(r"\b(?:does\s+not|doesn't|do\s+not|don't|not)\s+skip\b", q, flags=re.I)
+            or re.search(r"\bno\s+skipp?ing\b", q, flags=re.I)
+            or re.search(r"\bdense\s+rank\b", q, flags=re.I)
+        )
+    )
+
+    wants_same_group_avg_gap = (
+        not any(t in q for t in ("running", "cumulative", "kumulatif", "akumulatif"))
+        and any(re.search(pat, q, flags=re.I) for pat in HELPERS_AVERAGE_INTENT_PATTERNS)
+        and any(re.search(pat, q, flags=re.I) for pat in HELPERS_SAME_GROUP_INTENT_PATTERNS)
+        and any_phrase_in_text(q, group_average_difference_window_phrases())
+    )
+
+    desired_offset_desc: Optional[bool] = None
+    if re.search(r"\b(?:previous|prior|next|following)\b", q, flags=re.I):
+        sequence_cue = re.search(
+            r"\bordered\s+by\b|\bbased\s+on\b[^.]{0,80}\border\b|\b(?:date|time|timestamp)[-\s]+order\b",
+            q,
+            flags=re.I,
+        )
+        ordered_tail = ""
+        if sequence_cue:
+            ordered_idx = sequence_cue.start()
+            ordered_tail = q[ordered_idx:] if ordered_idx >= 0 else q
+            stop_positions: List[int] = []
+            for pat in (
+                r"[.;!?]",
+                r",",
+                r"\band\s+(?:sort|order|arrange)\b",
+                r"\bthen\s+(?:sort|order|arrange)\b",
+                r"\b(?:sort|order|arrange)\s+the\s+(?:final\s+)?(?:result|results|output|rows?)\s+by\b",
+            ):
+                m = re.search(pat, ordered_tail, flags=re.I)
+                if m:
+                    stop_positions.append(m.start())
+            if stop_positions:
+                ordered_tail = ordered_tail[:min(stop_positions)]
+
+        if re.search(r"\b(?:descending|desc|reverse)\b", ordered_tail, flags=re.I):
+            desired_offset_desc = True
+        elif re.search(r"\b(?:ascending|asc|chronological|earliest\s+first|oldest\s+first)\b", ordered_tail, flags=re.I):
+            desired_offset_desc = False
+        elif sequence_cue:
+            desired_offset_desc = False
+
+    def _mark_fix(name: str) -> None:
+        if name not in meta["fixes"]:
+            meta["fixes"].append(name)
+
+    def _window_partition_exprs(win: "exp.Window") -> List["exp.Expression"]:
+        raw = win.args.get("partition_by")
+        if raw is None:
+            raw = win.args.get("partition")
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, exp.Expression)]
+        if isinstance(raw, exp.Partition):
+            return [x for x in (raw.expressions or []) if isinstance(x, exp.Expression)]
+        if isinstance(raw, exp.Expression):
+            exprs = getattr(raw, "expressions", None)
+            if isinstance(exprs, list) and exprs:
+                return [x for x in exprs if isinstance(x, exp.Expression)]
+            return [raw]
+        return []
+
+    def _kind_name(win_func: Optional["exp.Expression"]) -> str:
+        if win_func is None:
+            return "unknown"
+        if rank_types and isinstance(win_func, rank_types):
+            return "rank"
+        if offset_types and isinstance(win_func, offset_types):
+            return "offset"
+        if isinstance(win_func, exp.AggFunc):
+            return "aggregate"
+        return "other"
+
+    kinds_seen: List[str] = []
+    changed = False
+    for win in windows:
+        win_func = getattr(win, "this", None)
+        kind = _kind_name(win_func)
+        if kind not in kinds_seen:
+            kinds_seen.append(kind)
+
+        if no_skip_rank and rank_types and isinstance(win_func, rank_types):
+            if not isinstance(win_func, getattr(exp, "DenseRank", ())):
+                if isinstance(win_func, tuple(cls for cls in (getattr(exp, "RowNumber", None), getattr(exp, "Rank", None)) if cls is not None)):
+                    win.set("this", exp.DenseRank())
+                    changed = True
+                    _mark_fix("no_skip_rank_to_dense_rank_ast")
+
+        if desired_offset_desc is not None and offset_types and isinstance(win_func, offset_types):
+            order = win.args.get("order")
+            order_items = list(order.expressions or []) if isinstance(order, exp.Order) else []
+            if order_items:
+                first = order_items[0]
+                if isinstance(first, exp.Ordered):
+                    current_desc = bool(first.args.get("desc"))
+                    if current_desc != desired_offset_desc:
+                        first.set("desc", desired_offset_desc)
+                        changed = True
+                        _mark_fix("offset_window_sequence_direction_ast")
+
+        if wants_same_group_avg_gap and isinstance(win_func, exp.Avg):
+            if _window_partition_exprs(win) and win.args.get("order") is not None:
+                win.set("order", None)
+                if win.args.get("spec") is not None:
+                    win.set("spec", None)
+                changed = True
+                _mark_fix("same_group_avg_partition_only_ast")
+
+    meta["window_kinds"] = kinds_seen
+    if not changed:
+        return sql, meta
+
+    out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+    if sql.strip().endswith(";"):
+        out_sql = out_sql.rstrip(";") + ";"
+
+    if out_sql.strip() == s:
+        meta["fixes"] = []
+        return sql, meta
+
+    return out_sql, meta
+
+
 def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
     """
     Repair malformed winner-row drafts that use a named WINDOW clause plus an
