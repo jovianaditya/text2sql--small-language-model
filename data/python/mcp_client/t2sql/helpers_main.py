@@ -192,6 +192,7 @@ from .helpers_core import (
     _rewrite_regex_filter_to_case_bucket, _rewrite_half_open_between_bounds,
     # phase 6
     _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _strip_redundant_distinct_in_in_not_in_subqueries, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
+    _sqlglot_parse_gate,
     _ast_guardrails,
     # phase 7
     _simplify_default_window_frame, _repair_running_window_missing_partition, _rewrite_same_group_avg_gap_window_to_partition_only, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes, _strip_empty_string_comparison_on_non_text, _drop_raw_column_covered_by_function,
@@ -8819,7 +8820,7 @@ Question:
 # =========================== MAIN PIPELINE ============================
 # ================ Postprocess SQL & Normalize Pipeline ================
 # ======================================================================  
-def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
+def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool = False) -> str:
     DEBUG_WR = True
     if not sql:
         return sql
@@ -9576,7 +9577,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         s = _drop_unrequested_length_filter_for_prefix_grouping(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after unrequested prefix-length filter drop:", s)
         
-        if not AGENT_AST_SEMANTIC_FIRST:
+        if not (AGENT_AST_SEMANTIC_FIRST and ast_parseable):
             s = _fix_aggregate_in_where(s)
             if DEBUG_WR: print(f"[REFINER - PH4] after agg-in-where fix: {s}")
 
@@ -9584,7 +9585,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
             s = _fix_raw_column_where_to_having(s, question)
             if DEBUG_WR: print(f"[REFINER - PH4] after raw-where-to-having fix: {s}")
         elif DEBUG_WR:
-            print("[REFINER - PH4] AST semantic-first enabled: skip regex agg/having surgery")
+            print("[REFINER - PH4] AST parse gate enabled: skip regex agg/having surgery")
 
         # Add missing COUNT(*) for GROUP BY aggregates
         s = _add_missing_count_for_group_by(s, question)
@@ -9704,13 +9705,13 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "") -> str:
         if DEBUG_WR: print("[REFINER - PH4] end ----", s, "\n")
     else:
             # Phase 4 was skipped due to goto_phase5, but still need aggregate fix
-            if not AGENT_AST_SEMANTIC_FIRST:
+            if not (AGENT_AST_SEMANTIC_FIRST and ast_parseable):
                 s = _fix_aggregate_in_where(s)
                 if DEBUG_WR: print(f"[REFINER - PH4-FORCE] after agg-in-where fix: {s}")
                 s = _fix_raw_column_where_to_having(s, question)
                 if DEBUG_WR: print(f"[PH4-FORCE] after raw-where-to-having fix: {s}")
             elif DEBUG_WR:
-                print("[PH4-FORCE] AST semantic-first enabled: skip regex agg/having surgery")
+                print("[PH4-FORCE] AST parse gate enabled: skip regex agg/having surgery")
             s = _repair_unbalanced_not_exists_order_by(s)
             if DEBUG_WR: print(f"[PH4-FORCE] after unbalanced NOT EXISTS fix: {s}")
             s = _repair_misnested_offset_window_function(s)
@@ -10292,8 +10293,26 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
 
     def _apply_postprocess(sql_in: str) -> str:
         nonlocal rewrite_count
-        before_fp = _semantic_fingerprint(sql_in)
-        out = _postprocess_sql(sql_in, question, ctx)
+        gated_sql, gate_meta = _sqlglot_parse_gate(sql_in)
+        if AGENT_AST_GUARDS_DEBUG and (
+            gate_meta.get("cleanup_applied") or not gate_meta.get("parse_ok", False)
+        ):
+            _dbg_print_two(
+                "[REFINER - AST GATE]",
+                (
+                    f"route={gate_meta.get('route')} "
+                    f"attempt={gate_meta.get('attempt')} "
+                    f"cleanup_applied={gate_meta.get('cleanup_applied')} "
+                    f"error={gate_meta.get('error')}"
+                ),
+            )
+        before_fp = _semantic_fingerprint(gated_sql)
+        out = _postprocess_sql(
+            gated_sql,
+            question,
+            ctx,
+            ast_parseable=bool(gate_meta.get("parse_ok", False)),
+        )
         after_fp = _semantic_fingerprint(out)
         if before_fp != after_fp:
             rewrite_count += 1

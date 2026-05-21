@@ -72,6 +72,7 @@ from .config import (
     HELPERS_SAME_GROUP_INTENT_PATTERNS,
     AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS,
     AGENT_SQL_NUMERIC_BETWEEN_PATTERN,
+    SQL_PARSE_DIALECT,
 )
 from .rulebook import (
     existence_anti_phrases,
@@ -45420,6 +45421,92 @@ def _collapse_spaces_outside_quotes(s: str) -> str:
         if i % 2 == 0:
             parts[i] = re.sub(r"[ \t]{2,}", " ", parts[i])
     return "".join(parts)
+
+
+def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
+    """
+    Apply only syntax-shape cleanup that is safe before AST routing.
+
+    Batch B0 keeps this intentionally narrow: spacing and backtick cleanup only,
+    with no semantic rewrite.
+    """
+    s = str(sql or "").strip()
+    if not s:
+        return s
+
+    had_semicolon = bool(re.search(r";\s*$", s))
+    s = re.sub(r";+\s*$", "", s).strip()
+    s = _fix_bad_backticks(s)
+    s = re.sub(
+        r"([A-Za-z0-9_`.)])"
+        r"(SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|JOIN|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN)(?=\s|\()",
+        r"\1 \2",
+        s,
+        flags=re.I,
+    )
+    s = _collapse_spaces_outside_quotes(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if had_semicolon and s:
+        s += ";"
+    return s
+
+
+def _sqlglot_parse_gate(sql: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Batch B0 AST parse gate for post-draft routing.
+
+    Flow:
+    - Try parsing the incoming SQL directly.
+    - If parsing fails, apply minimal cleanup and retry once.
+    - If it still fails, preserve the original SQL and route to regex fallback.
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "route": "regex_fallback",
+        "attempt": "initial",
+        "cleanup_applied": False,
+        "error": "",
+    }
+    if not sql:
+        return sql, meta
+
+    try:
+        import sqlglot
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    candidate = str(sql or "").strip()
+    if not candidate:
+        return candidate, meta
+
+    parse_target = re.sub(r";+\s*$", "", candidate).strip()
+    try:
+        sqlglot.parse_one(parse_target, read=SQL_PARSE_DIALECT)
+        meta["parse_ok"] = True
+        meta["route"] = "ast_first"
+        return candidate, meta
+    except Exception as e:
+        meta["error"] = f"parse_error:{e}"
+
+    cleaned = _minimal_sqlglot_parse_cleanup(candidate)
+    if not cleaned or cleaned == candidate:
+        return sql, meta
+
+    cleaned_parse_target = re.sub(r";+\s*$", "", cleaned).strip()
+    try:
+        sqlglot.parse_one(cleaned_parse_target, read=SQL_PARSE_DIALECT)
+        meta["parse_ok"] = True
+        meta["route"] = "ast_first"
+        meta["attempt"] = "cleanup_retry"
+        meta["cleanup_applied"] = True
+        meta["error"] = ""
+        return cleaned, meta
+    except Exception as e:
+        meta["attempt"] = "cleanup_retry"
+        meta["cleanup_applied"] = True
+        meta["error"] = f"cleanup_parse_error:{e}"
+        return sql, meta
 # ======================================================================
 # ======= Phase 4b — Aggregate in WHERE Fix (MySQL Error 1111) =========
 # ======================================================================
