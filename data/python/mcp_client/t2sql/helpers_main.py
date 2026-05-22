@@ -9589,6 +9589,23 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     #  CASE 2 — normal heuristic winner-row handling
     # ------------------------------------------------------------
     if not goto_phase5:
+        ast_b8_applied_early = False
+        if ast_parseable:
+            ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
+            if AST_TRACE:
+                print(
+                    "[REFINER - AST RANKED SELECTION] "
+                    + _ast_meta_text(ast_b8_meta)
+                    + f" applied={bool(ast_b8_meta.get('fixes'))}"
+                )
+            if ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False) and ast_b8_meta.get("fixes"):
+                s = ast_b8_sql
+                ast_b8_applied_early = True
+                if AST_TRACE:
+                    print(f"[REFINER - AST RANKED SELECTION] sql={s}")
+        elif AST_TRACE:
+            print("[REFINER - AST RANKED SELECTION] skipped=parse_gate_not_ast")
+
         s = _rewrite_winner_row_guardrail(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after guardrail:", s)
 
@@ -9616,7 +9633,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         elif AST_TRACE:
             print("[REFINER - AST WINDOW SEMANTICS] skipped=parse_gate_not_ast")
 
-        if ast_parseable:
+        if ast_parseable and not ast_b8_applied_early:
             ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
             if AST_TRACE:
                 print(

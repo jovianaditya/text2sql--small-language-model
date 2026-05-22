@@ -19481,10 +19481,11 @@ def _ast_normalize_ranked_selection(sql: str, question: str, ctx: str = "") -> T
       ranked outer selection
     - parseable same-table malformed winner-row near-misses that can be
       rewritten into canonical ROW_NUMBER winner-row selection
+    - parseable include-zero / multi-table winner-row near-misses that already
+      contain a child-ranked LEFT JOIN subquery and should rank at the
+      preserved parent grain instead
 
     Out of scope for this batch:
-    - include-zero winner-row source rewrites
-    - include-zero / multi-table winner-row rescue
     - arbitrary multi-stage winner-row planning from scratch
     """
     meta: Dict[str, Any] = {
@@ -19610,6 +19611,82 @@ def _ast_normalize_ranked_selection(sql: str, question: str, ctx: str = "") -> T
         if validated:
             meta["fixes"].append("same_level_rank_filter_wrap_ast")
             return validated, meta
+        return sql, meta
+
+    include_zero_ranked_near_miss = bool(
+        _question_wants_winner_row(question)
+        and _question_wants_include_zero(question, ctx)
+        and re.search(r"\bROW_NUMBER\s*\(", s, flags=re.I)
+        and (
+            top_level_joins
+            or re.search(r"\bLEFT\s+JOIN\b", s, flags=re.I)
+            or re.search(
+                r"(?is)\bJOIN\s*\(\s*SELECT\b[\s\S]{0,1200}\bROW_NUMBER\s*\(",
+                s,
+            )
+        )
+    )
+
+    if include_zero_ranked_near_miss:
+        meta["handled_scope"] = True
+        candidate = _rewrite_joined_ranked_subquery_to_outer_winner(s, question, ctx)
+        validated = _validate_candidate(candidate, "joined_ranked_subquery_outer_winner_ast")
+        if validated:
+            meta["fixes"].append("joined_ranked_subquery_outer_winner_ast")
+
+        if not validated:
+            candidate = s
+            candidate_fixes: List[str] = []
+
+            if re.search(r"\b(MAX|MIN)\s*\(", candidate, flags=re.I):
+                next_candidate = _rewrite_winner_row_aggregate_misuse(candidate, question, ctx)
+                if str(next_candidate or "").strip() != str(candidate or "").strip():
+                    candidate = next_candidate
+                    candidate_fixes.append("joined_ranked_aggregate_misuse_ast")
+
+            next_candidate = _rewrite_winner_row_guardrail(candidate, question)
+            if str(next_candidate or "").strip() != str(candidate or "").strip():
+                candidate = next_candidate
+                candidate_fixes.append("include_zero_winner_row_guardrail_ast")
+
+            next_candidate = _rewrite_include_zero_winner_row_identifier_source(candidate, question, ctx)
+            if str(next_candidate or "").strip() != str(candidate or "").strip():
+                candidate = next_candidate
+                candidate_fixes.append("include_zero_identifier_source_ast")
+
+            next_candidate = _drop_tuple_in_filter_from_include_zero_ranked_winner(candidate, question, ctx)
+            if str(next_candidate or "").strip() != str(candidate or "").strip():
+                candidate = next_candidate
+                candidate_fixes.append("include_zero_ranked_tuple_drop_ast")
+
+            next_candidate = _fix_winner_row_window_order_priority(candidate, question)
+            if str(next_candidate or "").strip() != str(candidate or "").strip():
+                candidate = next_candidate
+                candidate_fixes.append("winner_row_rank_order_normalized_ast")
+
+            next_candidate = _fix_winner_row_metric_order_priority(candidate, question)
+            if str(next_candidate or "").strip() != str(candidate or "").strip():
+                candidate = next_candidate
+                if "winner_row_rank_order_normalized_ast" not in candidate_fixes:
+                    candidate_fixes.append("winner_row_rank_order_normalized_ast")
+
+            validated = _validate_candidate(candidate, "include_zero_ranked_repair_sequence_ast")
+            if validated:
+                meta["fixes"].extend(candidate_fixes)
+        if validated:
+            normalized = _rewrite_include_zero_winner_row_identifier_source(validated, question, ctx)
+            final_sql = _validate_candidate(normalized, "include_zero_identifier_source_ast") or validated
+            if final_sql != validated:
+                if "include_zero_identifier_source_ast" not in meta["fixes"]:
+                    meta["fixes"].append("include_zero_identifier_source_ast")
+
+            normalized_2 = _drop_tuple_in_filter_from_include_zero_ranked_winner(final_sql, question, ctx)
+            final_sql_2 = _validate_candidate(normalized_2, "include_zero_ranked_tuple_drop_ast") or final_sql
+            if final_sql_2 != final_sql:
+                if "include_zero_ranked_tuple_drop_ast" not in meta["fixes"]:
+                    meta["fixes"].append("include_zero_ranked_tuple_drop_ast")
+
+            return final_sql_2, meta
         return sql, meta
 
     if (
