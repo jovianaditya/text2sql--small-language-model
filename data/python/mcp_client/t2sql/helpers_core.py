@@ -19469,6 +19469,163 @@ def _ast_normalize_scalar_subquery(sql: str) -> Tuple[str, Dict[str, Any]]:
         return rendered_sql, meta
     return sql, meta
 
+
+def _ast_normalize_ranked_selection(sql: str, question: str, ctx: str = "") -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first normalization for winner-row / top-N ranked selection shapes.
+
+    Scope for this batch:
+    - parseable queries that already project ROW_NUMBER/RANK/DENSE_RANK and
+      filter on that rank in the same SELECT block
+    - parseable grouped winner-row near-misses that should be wrapped into a
+      ranked outer selection
+
+    Out of scope for this batch:
+    - include-zero winner-row source rewrites
+    - malformed winner-row SQL that needs broader non-AST rescue
+    - arbitrary multi-stage winner-row planning from scratch
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+    }
+    s = str(sql or "").strip()
+    if not s:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+
+    rank_func_types = tuple(
+        cls for cls in (
+            getattr(exp, "RowNumber", None),
+            getattr(exp, "Rank", None),
+            getattr(exp, "DenseRank", None),
+        )
+        if cls is not None
+    )
+    cmp_types = tuple(
+        cls for cls in (
+            getattr(exp, "EQ", None),
+            getattr(exp, "GT", None),
+            getattr(exp, "GTE", None),
+            getattr(exp, "LT", None),
+            getattr(exp, "LTE", None),
+        )
+        if cls is not None
+    )
+
+    def _validate_candidate(candidate_sql: str, fix_name: str) -> Optional[str]:
+        candidate = str(candidate_sql or "").strip()
+        if not candidate or candidate == s:
+            return None
+        candidate_parse = re.sub(r";+\s*$", "", candidate).strip()
+        try:
+            sqlglot.parse_one(candidate_parse, read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            meta["warnings"].append(f"{fix_name}_parse_rejected")
+            return None
+        if s.endswith(";") and not candidate.endswith(";"):
+            candidate = candidate_parse + ";"
+        return candidate
+
+    def _flatten_and(node: Optional["exp.Expression"]) -> List["exp.Expression"]:
+        if node is None:
+            return []
+        if isinstance(node, exp.And):
+            return _flatten_and(node.this) + _flatten_and(node.expression)
+        return [node]
+
+    def _rank_aliases(select_exprs: List["exp.Expression"]) -> Set[str]:
+        aliases: Set[str] = set()
+        for idx, item in enumerate(select_exprs or []):
+            base = item.this if isinstance(item, exp.Alias) else item
+            found = base if isinstance(base, exp.Window) else base.find(exp.Window)
+            if not isinstance(found, exp.Window):
+                continue
+            win_func = getattr(found, "this", None)
+            if not rank_func_types or not isinstance(win_func, rank_func_types):
+                continue
+            alias_name = ""
+            if isinstance(item, exp.Alias):
+                alias_name = str(item.alias or "").strip("`")
+            elif isinstance(base, exp.Column):
+                alias_name = str(base.name or "").strip("`")
+            else:
+                alias_name = f"rank_col_{idx + 1}"
+            if alias_name:
+                aliases.add(alias_name.lower())
+        return aliases
+
+    def _has_same_level_rank_filter(clause: Optional["exp.Expression"], rank_aliases: Set[str]) -> bool:
+        if clause is None or not rank_aliases or not cmp_types:
+            return False
+        for pred in _flatten_and(clause.this if isinstance(clause, (exp.Where, exp.Having)) else clause):
+            if not isinstance(pred, cmp_types):
+                continue
+            left = getattr(pred, "this", None)
+            right = getattr(pred, "expression", None)
+            left_alias = str(left.name or "").strip("`").lower() if isinstance(left, exp.Column) and not left.table else ""
+            right_alias = str(right.name or "").strip("`").lower() if isinstance(right, exp.Column) and not right.table else ""
+            left_lit = isinstance(left, exp.Literal) and bool(re.match(r"^\d+$", str(left.this or "")))
+            right_lit = isinstance(right, exp.Literal) and bool(re.match(r"^\d+$", str(right.this or "")))
+            if left_alias in rank_aliases and right_lit:
+                return True
+            if right_alias in rank_aliases and left_lit:
+                return True
+        return False
+
+    rank_alias_names = _rank_aliases(list(sel.expressions or []))
+    has_group = bool(getattr(sel.args.get("group"), "expressions", None))
+    has_order = sel.args.get("order") is not None
+
+    same_level_rank_filter = _has_same_level_rank_filter(sel.args.get("where"), rank_alias_names) or _has_same_level_rank_filter(sel.args.get("having"), rank_alias_names)
+    if rank_alias_names and same_level_rank_filter:
+        meta["handled_scope"] = True
+        candidate = _wrap_same_level_window_rank_filter(s, question, ctx)
+        validated = _validate_candidate(candidate, "same_level_rank_filter_wrap_ast")
+        if validated:
+            meta["fixes"].append("same_level_rank_filter_wrap_ast")
+            return validated, meta
+        return sql, meta
+
+    if _question_wants_winner_row(question) and has_group and has_order and not rank_alias_names:
+        meta["handled_scope"] = True
+        candidate = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
+        validated = _validate_candidate(candidate, "grouped_winner_row_ranked_aggregate_ast")
+        if not validated:
+            return sql, meta
+        normalized = _fix_winner_row_window_order_priority(validated, question)
+        normalized = _fix_winner_row_metric_order_priority(normalized, question)
+        normalized = _winner_row_final_sanity(normalized, question)
+        final_sql = _validate_candidate(normalized, "grouped_winner_row_post_normalize_ast") or validated
+        meta["fixes"].append("grouped_winner_row_ranked_aggregate_ast")
+        if final_sql != validated:
+            meta["fixes"].append("winner_row_rank_order_normalized_ast")
+        return final_sql, meta
+
+    if rank_alias_names:
+        meta["handled_scope"] = True
+    return sql, meta
+
 def _drop_unrequested_fixed_year_filter_for_yearly_rollup(sql: str, question: str) -> str:
     """
     Drop hallucinated fixed YEAR(...) filters when the question asks a yearly

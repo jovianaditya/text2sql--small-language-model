@@ -139,6 +139,7 @@ from .helpers_core import (
     _ast_validate_window_structure,
     _ast_rewrite_window_semantics,
     _ast_normalize_scalar_subquery,
+    _ast_normalize_ranked_selection,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_metric_join_for_unqualified_rollup,
@@ -9608,12 +9609,27 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                     + _ast_meta_text(ast_b6_meta)
                     + f" applied={bool(ast_b6_meta.get('fixes'))}"
                 )
-            if ast_b6_meta.get("parse_ok", False) and ast_b6_meta.get("handled_scope", False) and ast_b6_meta.get("fixes"):
-                s = ast_b6_sql
-                if AST_TRACE:
-                    print(f"[REFINER - AST WINDOW SEMANTICS] sql={s}")
+        if ast_b6_meta.get("parse_ok", False) and ast_b6_meta.get("handled_scope", False) and ast_b6_meta.get("fixes"):
+            s = ast_b6_sql
+            if AST_TRACE:
+                print(f"[REFINER - AST WINDOW SEMANTICS] sql={s}")
         elif AST_TRACE:
             print("[REFINER - AST WINDOW SEMANTICS] skipped=parse_gate_not_ast")
+
+        if ast_parseable:
+            ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
+            if AST_TRACE:
+                print(
+                    "[REFINER - AST RANKED SELECTION] "
+                    + _ast_meta_text(ast_b8_meta)
+                    + f" applied={bool(ast_b8_meta.get('fixes'))}"
+                )
+            if ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False) and ast_b8_meta.get("fixes"):
+                s = ast_b8_sql
+                if AST_TRACE:
+                    print(f"[REFINER - AST RANKED SELECTION] sql={s}")
+        elif AST_TRACE:
+            print("[REFINER - AST RANKED SELECTION] skipped=parse_gate_not_ast")
 
         s = _rewrite_explicit_single_table_scope(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after explicit single-table scope fix:", s)
@@ -9960,6 +9976,21 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                         print(f"[REFINER - AST WINDOW SEMANTICS] sql={s}")
             elif AST_TRACE:
                 print("[REFINER - AST WINDOW SEMANTICS] skipped=parse_gate_not_ast")
+
+            if ast_parseable:
+                ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
+                if AST_TRACE:
+                    print(
+                        "[REFINER - AST RANKED SELECTION] "
+                        + _ast_meta_text(ast_b8_meta)
+                        + f" applied={bool(ast_b8_meta.get('fixes'))}"
+                    )
+                if ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False) and ast_b8_meta.get("fixes"):
+                    s = ast_b8_sql
+                    if AST_TRACE:
+                        print(f"[REFINER - AST RANKED SELECTION] sql={s}")
+            elif AST_TRACE:
+                print("[REFINER - AST RANKED SELECTION] skipped=parse_gate_not_ast")
 
             s = _rewrite_explicit_single_table_scope(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after explicit single-table scope fix: {s}")
