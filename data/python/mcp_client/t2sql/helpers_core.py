@@ -19479,10 +19479,12 @@ def _ast_normalize_ranked_selection(sql: str, question: str, ctx: str = "") -> T
       filter on that rank in the same SELECT block
     - parseable grouped winner-row near-misses that should be wrapped into a
       ranked outer selection
+    - parseable same-table malformed winner-row near-misses that can be
+      rewritten into canonical ROW_NUMBER winner-row selection
 
     Out of scope for this batch:
     - include-zero winner-row source rewrites
-    - malformed winner-row SQL that needs broader non-AST rescue
+    - include-zero / multi-table winner-row rescue
     - arbitrary multi-stage winner-row planning from scratch
     """
     meta: Dict[str, Any] = {
@@ -19596,6 +19598,9 @@ def _ast_normalize_ranked_selection(sql: str, question: str, ctx: str = "") -> T
     rank_alias_names = _rank_aliases(list(sel.expressions or []))
     has_group = bool(getattr(sel.args.get("group"), "expressions", None))
     has_order = sel.args.get("order") is not None
+    top_level_joins = bool(sel.args.get("joins"))
+    from_arg = sel.args.get("from") or sel.args.get("from_")
+    outer_tables = [t for t in from_arg.find_all(exp.Table)] if from_arg is not None else []
 
     same_level_rank_filter = _has_same_level_rank_filter(sel.args.get("where"), rank_alias_names) or _has_same_level_rank_filter(sel.args.get("having"), rank_alias_names)
     if rank_alias_names and same_level_rank_filter:
@@ -19606,6 +19611,35 @@ def _ast_normalize_ranked_selection(sql: str, question: str, ctx: str = "") -> T
             meta["fixes"].append("same_level_rank_filter_wrap_ast")
             return validated, meta
         return sql, meta
+
+    if (
+        _question_wants_winner_row(question)
+        and not top_level_joins
+        and len(outer_tables) == 1
+        and not rank_alias_names
+        and re.search(r"\b(MAX|MIN)\s*\(", s, flags=re.I)
+    ):
+        meta["handled_scope"] = True
+        candidate = _rewrite_winner_row_aggregate_misuse(s, question, ctx)
+        validated = _validate_candidate(candidate, "winner_row_aggregate_misuse_ast")
+        if not validated:
+            candidate = _rewrite_single_table_tuple_in_winner_row(s, question)
+            validated = _validate_candidate(candidate, "single_table_tuple_winner_row_ast")
+            if validated:
+                meta["fixes"].append("single_table_tuple_winner_row_ast")
+                normalized = _winner_row_final_sanity(validated, question)
+                final_sql = _validate_candidate(normalized, "winner_row_final_sanity_ast") or validated
+                if final_sql != validated:
+                    meta["fixes"].append("winner_row_final_sanity_ast")
+                return final_sql, meta
+            return sql, meta
+
+        meta["fixes"].append("winner_row_aggregate_misuse_ast")
+        normalized = _winner_row_final_sanity(validated, question)
+        final_sql = _validate_candidate(normalized, "winner_row_final_sanity_ast") or validated
+        if final_sql != validated:
+            meta["fixes"].append("winner_row_final_sanity_ast")
+        return final_sql, meta
 
     if _question_wants_winner_row(question) and has_group and has_order and not rank_alias_names:
         meta["handled_scope"] = True
