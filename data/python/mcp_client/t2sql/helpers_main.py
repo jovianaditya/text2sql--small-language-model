@@ -138,6 +138,7 @@ from .helpers_core import (
     _ast_repair_group_by_projection_validity,
     _ast_validate_window_structure,
     _ast_rewrite_window_semantics,
+    _ast_normalize_scalar_subquery,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_metric_join_for_unqualified_rollup,
@@ -9472,6 +9473,20 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     r"\1 \2",
     s)
     s = _fix_missing_space_before_clauses(s)
+    if ast_parseable:
+        ast_b7_sql, ast_b7_meta = _ast_normalize_scalar_subquery(s)
+        if AST_TRACE:
+            print(
+                "[REFINER - AST SCALAR SUBQUERY] "
+                + _ast_meta_text(ast_b7_meta)
+                + f" applied={bool(ast_b7_meta.get('fixes'))}"
+            )
+        if ast_b7_meta.get("parse_ok", False) and ast_b7_meta.get("handled_scope", False) and ast_b7_meta.get("fixes"):
+            s = ast_b7_sql
+            if AST_TRACE:
+                print(f"[REFINER - AST SCALAR SUBQUERY] sql={s}")
+    elif AST_TRACE:
+        print("[REFINER - AST SCALAR SUBQUERY] skipped=parse_gate_not_ast")
     s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
     if DEBUG_WR: print("[REFINER - PH4] after early scalar-window subquery fix:", s)
 
@@ -9915,6 +9930,21 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             if DEBUG_WR: print(f"[PH4-FORCE] after offset window nesting fix: {s}")
             s = _repair_unbalanced_select_item_parentheses(s)
             if DEBUG_WR: print(f"[PH4-FORCE] after select-item parenthesis fix: {s}")
+
+            if ast_parseable:
+                ast_b7_sql, ast_b7_meta = _ast_normalize_scalar_subquery(s)
+                if AST_TRACE:
+                    print(
+                        "[REFINER - AST SCALAR SUBQUERY] "
+                        + _ast_meta_text(ast_b7_meta)
+                        + f" applied={bool(ast_b7_meta.get('fixes'))}"
+                    )
+                if ast_b7_meta.get("parse_ok", False) and ast_b7_meta.get("handled_scope", False) and ast_b7_meta.get("fixes"):
+                    s = ast_b7_sql
+                    if AST_TRACE:
+                        print(f"[REFINER - AST SCALAR SUBQUERY] sql={s}")
+            elif AST_TRACE:
+                print("[REFINER - AST SCALAR SUBQUERY] skipped=parse_gate_not_ast")
 
             if ast_parseable:
                 ast_b6_sql, ast_b6_meta = _ast_rewrite_window_semantics(s, question)

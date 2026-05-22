@@ -19160,6 +19160,315 @@ def _rewrite_scalar_window_subquery_to_correlated_aggregate(sql: str) -> str:
         fixed += ";"
     return fixed
 
+
+def _ast_normalize_scalar_subquery(sql: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first normalization for simple same-table scalar aggregate subqueries.
+
+    Scope for this batch:
+    - top-level WHERE comparisons against a scalar subquery
+    - same outer/inner base table only
+    - grouped aggregate subquery with one grouping key
+    - window aggregate subquery with one PARTITION BY key
+    - ambiguous same-table self-correlation where the inner alias shadows the
+      outer table name and collapses intended correlation
+
+    Out of scope for this batch:
+    - multi-table subqueries
+    - nested subquery trees
+    - latest-year / extrema-date subqueries
+    - winner-row / top-N shapes
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+    }
+    s = str(sql or "").strip()
+    if not s:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+    if any(True for _ in sel.find_all(exp.Join)):
+        meta["warnings"].append("join_skipped")
+        return sql, meta
+
+    from_arg = sel.args.get("from") or sel.args.get("from_")
+    if from_arg is None:
+        meta["warnings"].append("missing_from")
+        return sql, meta
+
+    outer_tables = [t for t in from_arg.find_all(exp.Table)]
+    if len(outer_tables) != 1:
+        meta["warnings"].append("outer_single_table_only")
+        return sql, meta
+
+    outer_table = outer_tables[0]
+    outer_table_name = str(outer_table.name or "").strip("`")
+    outer_alias_name = str(outer_table.alias_or_name or outer_table_name).strip("`")
+    if not outer_table_name or not outer_alias_name:
+        meta["warnings"].append("missing_outer_table")
+        return sql, meta
+
+    where = sel.args.get("where")
+    if where is None:
+        return sql, meta
+
+    cmp_types = tuple(
+        cls for cls in (
+            getattr(exp, "EQ", None),
+            getattr(exp, "GT", None),
+            getattr(exp, "GTE", None),
+            getattr(exp, "LT", None),
+            getattr(exp, "LTE", None),
+        )
+        if cls is not None
+    )
+    if not cmp_types:
+        meta["warnings"].append("comparison_types_unavailable")
+        return sql, meta
+
+    def _column_name(node: Optional["exp.Expression"]) -> str:
+        if not isinstance(node, exp.Column):
+            return ""
+        return str(node.name or "").strip("`")
+
+    def _single_inner_table(inner_sel: "exp.Select") -> Optional["exp.Table"]:
+        inner_from = inner_sel.args.get("from") or inner_sel.args.get("from_")
+        if inner_from is None:
+            return None
+        tables = [t for t in inner_from.find_all(exp.Table)]
+        if len(tables) != 1:
+            return None
+        if any(True for _ in inner_sel.find_all(exp.Join)):
+            return None
+        return tables[0]
+
+    def _expr_sql(node: Optional["exp.Expression"]) -> str:
+        if not isinstance(node, exp.Expression):
+            return ""
+        try:
+            return node.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            return ""
+
+    def _safe_inner_alias() -> str:
+        alias = "sq"
+        if alias.lower() == outer_alias_name.lower():
+            alias = "sq_inner"
+        return alias
+
+    def _parse_select_expr(inner_sel: "exp.Select") -> Tuple[Optional[str], Optional[str], str, str]:
+        exprs = list(inner_sel.expressions or [])
+        if len(exprs) != 1:
+            return None, None, "", ""
+        item = exprs[0]
+        base = item.this if isinstance(item, exp.Alias) else item
+        alias_name = str(item.alias or "").strip("`") if isinstance(item, exp.Alias) else ""
+
+        if isinstance(base, exp.AggFunc):
+            metric = getattr(base, "this", None)
+            metric_col = _column_name(metric)
+            agg_name = str(getattr(base, "key", "") or base.__class__.__name__).replace("Func", "").upper()
+            return agg_name, metric_col, "", alias_name
+
+        if isinstance(base, exp.Window) and isinstance(getattr(base, "this", None), exp.AggFunc):
+            win_agg = base.this
+            metric = getattr(win_agg, "this", None)
+            metric_col = _column_name(metric)
+            agg_name = str(getattr(win_agg, "key", "") or win_agg.__class__.__name__).replace("Func", "").upper()
+            raw_part = base.args.get("partition_by")
+            if raw_part is None:
+                raw_part = base.args.get("partition")
+            part_exprs: List["exp.Expression"] = []
+            if isinstance(raw_part, list):
+                part_exprs = [x for x in raw_part if isinstance(x, exp.Expression)]
+            elif isinstance(raw_part, exp.Partition):
+                part_exprs = [x for x in (raw_part.expressions or []) if isinstance(x, exp.Expression)]
+            elif isinstance(raw_part, exp.Expression):
+                expr_list = getattr(raw_part, "expressions", None)
+                if isinstance(expr_list, list) and expr_list:
+                    part_exprs = [x for x in expr_list if isinstance(x, exp.Expression)]
+                else:
+                    part_exprs = [raw_part]
+            partition_col = _column_name(part_exprs[0]) if len(part_exprs) == 1 else ""
+            if base.args.get("order") is not None or base.args.get("spec") is not None:
+                return agg_name, metric_col, "", alias_name
+            return agg_name, metric_col, partition_col, alias_name
+
+        return None, None, "", alias_name
+
+    def _replace_subquery(comp: "exp.Expression", sub_sql: str, fix_name: str) -> bool:
+        try:
+            new_inner = sqlglot.parse_one(sub_sql, read=SQL_PARSE_DIALECT or "mysql")
+            new_outer = sqlglot.parse_one(
+                re.sub(r";+\s*$", "", ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")).strip(),
+                read=SQL_PARSE_DIALECT or "mysql",
+            )
+        except Exception:
+            meta["warnings"].append(f"{fix_name}_parse_rejected")
+            return False
+
+        target_outer_sel = new_outer if isinstance(new_outer, exp.Select) else new_outer.find(exp.Select)
+        if not isinstance(target_outer_sel, exp.Select):
+            meta["warnings"].append(f"{fix_name}_unsupported_root")
+            return False
+
+        where_new = target_outer_sel.args.get("where")
+        if where_new is None:
+            meta["warnings"].append(f"{fix_name}_missing_where")
+            return False
+
+        new_comparisons = [node for node in where_new.find_all(cmp_types)]
+        old_comparisons = [node for node in where.find_all(cmp_types)]
+        if len(new_comparisons) != len(old_comparisons):
+            meta["warnings"].append(f"{fix_name}_comparison_mismatch")
+            return False
+
+        idx = old_comparisons.index(comp)
+        target_comp = new_comparisons[idx]
+        target_comp.set("expression", exp.Subquery(this=new_inner))
+        rendered = new_outer.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+        if s.endswith(";"):
+            rendered = rendered.rstrip(";") + ";"
+        try:
+            sqlglot.parse_one(re.sub(r";+\s*$", "", rendered).strip(), read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            meta["warnings"].append(f"{fix_name}_render_parse_failed")
+            return False
+        meta["fixes"].append(fix_name)
+        meta["rendered_sql"] = rendered
+        return True
+
+    comparisons = [node for node in where.find_all(cmp_types)]
+    for comp in comparisons:
+        rhs = getattr(comp, "expression", None)
+        if not isinstance(rhs, exp.Subquery):
+            continue
+        inner_sel = rhs.this if isinstance(rhs.this, exp.Select) else rhs.find(exp.Select)
+        if not isinstance(inner_sel, exp.Select):
+            continue
+        if any(True for _ in inner_sel.find_all(exp.Subquery)):
+            meta["warnings"].append("nested_subquery_skipped")
+            continue
+
+        inner_table = _single_inner_table(inner_sel)
+        if inner_table is None:
+            continue
+        inner_table_name = str(inner_table.name or "").strip("`")
+        inner_alias_name = str(inner_table.alias_or_name or inner_table_name).strip("`")
+        if not inner_table_name or inner_table_name.lower() != outer_table_name.lower():
+            continue
+
+        meta["handled_scope"] = True
+        agg_name, metric_col, partition_col, _alias_name = _parse_select_expr(inner_sel)
+        if not agg_name or not metric_col:
+            meta["warnings"].append("unsupported_scalar_projection")
+            continue
+
+        inner_where = inner_sel.args.get("where")
+        inner_group = inner_sel.args.get("group")
+        has_group = isinstance(inner_group, exp.Group) and bool(inner_group.expressions or [])
+        has_window = any(True for _ in inner_sel.find_all(exp.Window))
+
+        # Case 1: grouped same-table scalar aggregate subquery.
+        if has_group and not has_window:
+            group_exprs = list(inner_group.expressions or [])
+            if len(group_exprs) != 1 or inner_where is not None:
+                if inner_where is not None:
+                    meta["warnings"].append("grouped_inner_where_skipped")
+                continue
+            group_col = _column_name(group_exprs[0])
+            if not group_col:
+                continue
+            inner_alias_safe = _safe_inner_alias()
+            sub_sql = (
+                f"SELECT {agg_name}({inner_alias_safe}.{metric_col}) "
+                f"FROM {inner_table_name} AS {inner_alias_safe} "
+                f"WHERE {inner_alias_safe}.{group_col} = {outer_alias_name}.{group_col}"
+            )
+            if _replace_subquery(comp, sub_sql, "grouped_scalar_subquery_to_correlated_aggregate_ast"):
+                break
+            continue
+
+        # Case 2: window aggregate same-table scalar subquery.
+        if has_window and partition_col:
+            if inner_where is not None:
+                meta["warnings"].append("window_inner_where_skipped")
+                continue
+            inner_alias_safe = _safe_inner_alias()
+            sub_sql = (
+                f"SELECT {agg_name}({inner_alias_safe}.{metric_col}) "
+                f"FROM {inner_table_name} AS {inner_alias_safe} "
+                f"WHERE {inner_alias_safe}.{partition_col} = {outer_alias_name}.{partition_col}"
+            )
+            if _replace_subquery(comp, sub_sql, "window_scalar_subquery_to_correlated_aggregate_ast"):
+                break
+            continue
+
+        # Case 3: ambiguous same-table self-correlation without distinct inner alias.
+        if has_group or has_window or inner_where is None:
+            continue
+        if outer_alias_name.lower() != outer_table_name.lower():
+            meta["warnings"].append("ambiguous_outer_alias_skipped")
+            continue
+
+        inner_cmp = inner_where.this if isinstance(inner_where, exp.Where) else inner_where
+        if not isinstance(inner_cmp, getattr(exp, "EQ", ())):
+            continue
+        left = getattr(inner_cmp, "this", None)
+        right = getattr(inner_cmp, "expression", None)
+        if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+            continue
+        left_col = _column_name(left)
+        right_col = _column_name(right)
+        if not left_col or left_col.lower() != right_col.lower():
+            continue
+
+        left_table = str(left.table or "").strip("`")
+        right_table = str(right.table or "").strip("`")
+        if left_table.lower() == outer_table_name.lower() and not right_table:
+            inner_col = right_col
+            outer_col = left_col
+        elif right_table.lower() == outer_table_name.lower() and not left_table:
+            inner_col = left_col
+            outer_col = right_col
+        else:
+            continue
+
+        inner_alias_safe = _safe_inner_alias()
+        sub_sql = (
+            f"SELECT {agg_name}({inner_alias_safe}.{metric_col}) "
+            f"FROM {inner_table_name} AS {inner_alias_safe} "
+            f"WHERE {inner_alias_safe}.{inner_col} = {outer_alias_name}.{outer_col}"
+        )
+        if _replace_subquery(comp, sub_sql, "ambiguous_scalar_subquery_to_correlated_aggregate_ast"):
+            break
+
+    rendered_sql = str(meta.pop("rendered_sql", "") or "")
+    meta["warnings"] = list(dict.fromkeys(meta["warnings"]))
+    if rendered_sql and meta.get("fixes"):
+        return rendered_sql, meta
+    return sql, meta
+
 def _drop_unrequested_fixed_year_filter_for_yearly_rollup(sql: str, question: str) -> str:
     """
     Drop hallucinated fixed YEAR(...) filters when the question asks a yearly
