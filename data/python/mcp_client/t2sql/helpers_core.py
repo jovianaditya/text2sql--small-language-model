@@ -23897,18 +23897,20 @@ def _ast_validate_window_structure(sql: str, question: str = "") -> Tuple[str, D
 
 def _ast_rewrite_window_semantics(sql: str, question: str = "") -> Tuple[str, Dict[str, Any]]:
     """
-    AST-first semantic rewrites for a narrow, low-risk subset of window queries.
+    AST-first semantic rewrites for non-winner-row window queries.
 
-    This batch intentionally keeps scope small:
+    B6b extends the earlier narrow slice with deeper, still scoped semantics:
     - no-skip rank intent -> DENSE_RANK
+    - grouped count-window near-misses -> ranking windows
+    - rank partition inference from the question
+    - rank metric replacement/direction alignment from the question
+    - running-window partition inference
     - LAG/LEAD sequence direction alignment from the question
-    - same-group average gap windows -> PARTITION-only AVG window
+    - same-group average gap conversion / partition-only AVG windows
 
-    Out of scope:
+    Still out of scope:
     - winner-row semantics
-    - rank metric replacement
-    - inferred/missing partition-key insertion
-    - broader running-total rewrites
+    - top-N-per-group rewrites
     """
     meta: Dict[str, Any] = {
         "parse_ok": False,
@@ -23942,11 +23944,14 @@ def _ast_rewrite_window_semantics(sql: str, question: str = "") -> Tuple[str, Di
         return sql, meta
 
     windows = [w for w in sel.find_all(exp.Window) if isinstance(w, exp.Window)]
+    has_window_text = bool(re.search(r"\bOVER\s*\(", s, flags=re.I))
     meta["window_count"] = len(windows)
-    if not windows:
+    if not windows and not has_window_text:
         return sql, meta
 
     meta["handled_scope"] = True
+    if not windows and has_window_text:
+        meta["warnings"].append("window_ast_enumeration_empty")
     q = str(question or "").strip().lower()
 
     rank_types = tuple(
@@ -24046,6 +24051,197 @@ def _ast_rewrite_window_semantics(sql: str, question: str = "") -> Tuple[str, Di
             return "aggregate"
         return "other"
 
+    def _validate_candidate(candidate_sql: str) -> Optional[str]:
+        candidate = str(candidate_sql or "").strip()
+        if not candidate:
+            return None
+        trailing = ";" if s.endswith(";") or candidate.endswith(";") else ""
+        candidate_parse = re.sub(r";+\s*$", "", candidate).strip()
+        try:
+            sqlglot.parse_one(candidate_parse, read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            return None
+        if trailing and not candidate_parse.endswith(";"):
+            return candidate_parse + trailing
+        return candidate if candidate.endswith(";") or not trailing else candidate + trailing
+
+    def _apply_text_fix(current_sql: str, fixer, fix_name: str) -> str:
+        try:
+            candidate = fixer(current_sql)
+        except TypeError:
+            candidate = fixer(current_sql, question)
+        except Exception:
+            return current_sql
+        if not candidate or candidate == current_sql:
+            return current_sql
+        validated = _validate_candidate(candidate)
+        if not validated:
+            meta["warnings"].append(f"{fix_name}_parse_rejected")
+            return current_sql
+        _mark_fix(fix_name)
+        return validated
+
+    def _rank_metric_target(select_sql: str, partition_expr: str) -> Tuple[str, Optional[bool]]:
+        metric_terms: Set[str] = set()
+        metric_patterns = [
+            r"\b(?:rank|ranking|ranked)\b[\s\S]{0,120}?\bby\s+(?P<seg>[a-z0-9_\s-]{1,64}?)(?=\s+(?:from|highest|lowest|descending|ascending|if|where|when|return|show|list|final|output|result|sort|order)\b|[,.;]|$)",
+            r"\bby\s+(?P<seg>[a-z0-9_\s-]{1,64}?)\s+(?:from\s+highest\s+to\s+lowest|from\s+lowest\s+to\s+highest|descending|ascending)\b",
+        ]
+        for pat in metric_patterns:
+            m = re.search(pat, q, flags=re.I | re.S)
+            if not m:
+                continue
+            metric_terms = _rank_text_terms(m.group("seg") or "")
+            if metric_terms:
+                break
+
+        candidates = _rank_partition_candidates_from_select(select_sql)
+        if not candidates:
+            return "", None
+
+        part_norm = _normalize_sql_expr_for_match(partition_expr or "")
+        order_candidates = [
+            (expr, terms)
+            for expr, terms in candidates
+            if not part_norm or _normalize_sql_expr_for_match(expr) != part_norm
+        ]
+        if not order_candidates:
+            return "", None
+
+        target_expr = ""
+        if metric_terms:
+            scored: List[Tuple[int, int, str]] = []
+            for expr, terms in order_candidates:
+                overlap = terms & metric_terms
+                if not overlap:
+                    continue
+                extra_penalty = len(terms - metric_terms)
+                scored.append((len(overlap), -extra_penalty, expr))
+            if scored:
+                scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                target_expr = scored[0][2]
+
+        if not target_expr:
+            def _score_order(expr: str) -> Tuple[int, int]:
+                base = expr.split(".")[-1].strip("`").lower()
+                id_like = int(bool(re.search(r"(?:id|number|code)$", base)))
+                return (id_like, len(base))
+            target_expr = sorted((expr for expr, _terms in order_candidates), key=_score_order, reverse=True)[0]
+
+        wants_desc = None
+        if re.search(r"\b(?:highest|largest|greatest|descending|high\s+to\s+low)\b", q, flags=re.I) or re.search(r"\bfrom\s+highest\s+to\s+lowest\b", q, flags=re.I):
+            wants_desc = True
+        if re.search(r"\b(?:lowest|smallest|least|ascending|low\s+to\s+high)\b", q, flags=re.I) or re.search(r"\bfrom\s+lowest\s+to\s+highest\b", q, flags=re.I):
+            wants_desc = False if wants_desc is None else wants_desc
+        return target_expr, wants_desc
+
+    def _rewrite_count_window_rank_semantics(text: str) -> str:
+        if not text or _question_wants_winner_row(question):
+            return text
+        if not re.search(r"\b(?:rank|ranking|ranked)\b", q, flags=re.I):
+            return text
+        if not re.search(r"\bCOUNT\s*\(\s*(?:\*|1)\s*\)\s*OVER\s*\(", text, flags=re.I):
+            return text
+        if not re.search(r"\bGROUP\s+BY\b", text, flags=re.I):
+            return text
+
+        select_part = _extract_top_level_select_list(text)
+        if not select_part:
+            return text
+        candidates = _rank_partition_candidates_from_select(select_part)
+        partition_terms = _extract_rank_partition_terms_from_question(q)
+        partition_expr = _choose_rank_partition_expr(candidates, partition_terms) if partition_terms else ""
+        if not partition_expr:
+            m_part = re.search(
+                r"\bCOUNT\s*\(\s*(?:\*|1)\s*\)\s*OVER\s*\(\s*PARTITION\s+BY\s+(?P<part>[^)]+?)\s*\)",
+                text,
+                flags=re.I | re.S,
+            )
+            partition_expr = str(m_part.group("part") or "").strip() if m_part else ""
+        if not partition_expr:
+            return text
+
+        target_expr, wants_desc = _rank_metric_target(select_part, partition_expr)
+        if not target_expr:
+            return text
+
+        rank_fn = "DENSE_RANK" if no_skip_rank else "RANK"
+        rank_dir = "DESC" if wants_desc is not False else "ASC"
+
+        count_window_pat = re.compile(
+            r"(?is)\bCOUNT\s*\(\s*(?:\*|1)\s*\)\s*OVER\s*\((?P<body>.*?)\)\s+AS\s+(?P<alias>`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"
+        )
+        replaced = count_window_pat.sub(
+            lambda m: (
+                f"{rank_fn}() OVER (PARTITION BY {partition_expr} ORDER BY {target_expr} {rank_dir}) "
+                f"AS {m.group('alias')}"
+            ),
+            text,
+            count=1,
+        )
+        if replaced == text:
+            return text
+
+        try:
+            rebuilt_ast = sqlglot.parse_one(re.sub(r";+\s*$", "", replaced).strip(), read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            return text
+        rebuilt_sel = rebuilt_ast if isinstance(rebuilt_ast, exp.Select) else rebuilt_ast.find(exp.Select)
+        if isinstance(rebuilt_sel, exp.Select) and rebuilt_sel.args.get("group") is not None:
+            rebuilt_sel.set("group", None)
+        out_sql = rebuilt_ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+        if text.strip().endswith(";"):
+            out_sql = out_sql.rstrip(";") + ";"
+        return out_sql
+
+    def _rewrite_offset_gap_to_same_group_avg(text: str) -> str:
+        if not wants_same_group_avg_gap:
+            return text
+        try:
+            parsed = sqlglot.parse_one(re.sub(r";+\s*$", "", text).strip(), read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            return text
+        parsed_sel = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+        if not isinstance(parsed_sel, exp.Select):
+            return text
+        if parsed_sel.args.get("joins") or parsed_sel.args.get("group") or parsed_sel.args.get("having"):
+            return text
+
+        updated = False
+        laglead_types = tuple(cls for cls in (getattr(exp, "Lag", None), getattr(exp, "Lead", None)) if cls is not None)
+        new_exprs: List["exp.Expression"] = []
+        for item in parsed_sel.expressions or []:
+            base = item.this if isinstance(item, exp.Alias) else item
+            found = base if isinstance(base, exp.Window) else base.find(exp.Window)
+            if not isinstance(found, exp.Window) or not laglead_types or not isinstance(getattr(found, "this", None), laglead_types):
+                new_exprs.append(item.copy())
+                continue
+
+            part_exprs = _window_partition_exprs(found)
+            metric_expr = getattr(found.this, "this", None)
+            if not part_exprs or not isinstance(metric_expr, exp.Expression):
+                new_exprs.append(item.copy())
+                continue
+
+            avg_window = exp.Window(
+                this=exp.Avg(this=metric_expr.copy()),
+                partition_by=exp.Partition(expressions=[p.copy() for p in part_exprs]),
+            )
+            rewritten_expr = exp.Sub(this=metric_expr.copy(), expression=avg_window)
+            if isinstance(item, exp.Alias) and item.alias:
+                new_exprs.append(exp.alias_(rewritten_expr, str(item.alias), quoted=False))
+            else:
+                new_exprs.append(rewritten_expr)
+            updated = True
+
+        if not updated:
+            return text
+        parsed_sel.set("expressions", new_exprs)
+        out_sql = parsed.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+        if text.strip().endswith(";"):
+            out_sql = out_sql.rstrip(";") + ";"
+        return out_sql
+
     kinds_seen: List[str] = []
     changed = False
     for win in windows:
@@ -24082,18 +24278,29 @@ def _ast_rewrite_window_semantics(sql: str, question: str = "") -> Tuple[str, Di
                 _mark_fix("same_group_avg_partition_only_ast")
 
     meta["window_kinds"] = kinds_seen
-    if not changed:
-        return sql, meta
+    current_sql = s
+    if changed:
+        current_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+        if sql.strip().endswith(";"):
+            current_sql = current_sql.rstrip(";") + ";"
 
-    out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
-    if sql.strip().endswith(";"):
-        out_sql = out_sql.rstrip(";") + ";"
+    current_sql = _apply_text_fix(current_sql, _rewrite_count_window_rank_semantics, "count_window_rank_semantics_ast")
+    current_sql = _apply_text_fix(current_sql, _rewrite_offset_gap_to_same_group_avg, "offset_to_same_group_avg_gap_ast")
+    current_sql = _apply_text_fix(current_sql, _rewrite_no_skip_rank_to_dense_rank, "no_skip_rank_to_dense_rank_ast")
+    current_sql = _apply_text_fix(current_sql, _repair_rank_window_partition_from_question, "rank_partition_inference_ast")
+    current_sql = _apply_text_fix(current_sql, _repair_rank_window_metric_from_question, "rank_metric_replacement_ast")
+    current_sql = _apply_text_fix(current_sql, _fix_grouped_aggregate_rank_direction, "grouped_rank_direction_ast")
+    current_sql = _apply_text_fix(current_sql, _repair_running_window_missing_partition, "running_window_partition_inference_ast")
+    current_sql = _apply_text_fix(current_sql, _rewrite_same_group_avg_gap_window_to_partition_only, "same_group_avg_partition_only_ast")
+    current_sql = _apply_text_fix(current_sql, _enforce_window_sequence_direction, "offset_window_sequence_direction_ast")
 
-    if out_sql.strip() == s:
+    if current_sql.strip() == s:
         meta["fixes"] = []
+        meta["warnings"] = list(dict.fromkeys(meta["warnings"]))
         return sql, meta
 
-    return out_sql, meta
+    meta["warnings"] = list(dict.fromkeys(meta["warnings"]))
+    return current_sql, meta
 
 
 def _rewrite_malformed_window_winner_clause(sql: str, question: str) -> str:
@@ -46284,8 +46491,12 @@ def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
     """
     Apply only syntax-shape cleanup that is safe before AST routing.
 
-    Batch B0 keeps this intentionally narrow: spacing and backtick cleanup only,
-    with no semantic rewrite.
+    Keep this intentionally narrow:
+    - spacing / backtick cleanup
+    - malformed offset-window nesting rescue
+    - illegal top-level GROUP BY direction tokens
+
+    No semantic rewrite should happen here.
     """
     s = str(sql or "").strip()
     if not s:
@@ -46294,6 +46505,7 @@ def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
     had_semicolon = bool(re.search(r";\s*$", s))
     s = re.sub(r";+\s*$", "", s).strip()
     s = _fix_bad_backticks(s)
+    s = _repair_misnested_offset_window_function(s)
     s = re.sub(
         r"([A-Za-z0-9_`.)])"
         r"(SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|JOIN|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN)(?=\s|\()",
@@ -46301,6 +46513,28 @@ def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
         s,
         flags=re.I,
     )
+    group_pos = _find_top_level_clause(s, "group by")
+    if group_pos >= 0:
+        group_end_candidates = [
+            pos for pos in (
+                _find_top_level_clause(s, "having", group_pos + len("group by")),
+                _find_top_level_clause(s, "order by", group_pos + len("group by")),
+                _find_top_level_clause(s, "limit", group_pos + len("group by")),
+                len(s),
+            )
+            if pos >= 0
+        ]
+        group_end = min(group_end_candidates) if group_end_candidates else len(s)
+        group_body = s[group_pos + len("group by"):group_end].strip()
+        if group_body:
+            group_items = [item.strip() for item in _split_top_level_commas(group_body) if item.strip()]
+            cleaned_items = [
+                re.sub(r"\s+\b(?:ASC|DESC)\b\s*$", "", item, flags=re.I).strip()
+                for item in group_items
+            ]
+            rebuilt_group = ", ".join(item for item in cleaned_items if item)
+            if rebuilt_group and rebuilt_group != group_body:
+                s = s[:group_pos + len("group by")] + " " + rebuilt_group + s[group_end:]
     s = _collapse_spaces_outside_quotes(s)
     s = re.sub(r"\s+", " ", s).strip()
     if had_semicolon and s:

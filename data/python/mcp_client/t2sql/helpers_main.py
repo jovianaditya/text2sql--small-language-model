@@ -9390,13 +9390,45 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             i += 1
         return False
 
+    def _should_preserve_grouped_aggregate_window_for_ranking(text: str, qtext: str) -> bool:
+        q_norm = str(qtext or "").strip().lower()
+        if not text or not q_norm:
+            return False
+        if not re.search(r"\b(?:rank|ranking|ranked)\b", q_norm, flags=re.I):
+            return False
+        if not re.search(r"\b(?:inside|within|per|each)\b", q_norm, flags=re.I):
+            return False
+
+        agg_window_match = re.search(
+            r"""(?is)\b(?:MIN|MAX|COUNT|SUM|AVG)\s*\([^)]*\)\s*OVER\s*\(\s*PARTITION\s+BY\b.*?\)\s+AS\s+(?P<alias>`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)""",
+            text,
+        )
+        if not agg_window_match:
+            return False
+
+        alias_name = str(agg_window_match.group("alias") or "").strip().strip("`").lower()
+        if alias_name and re.search(r"(?:^|_)(?:rank|ranking|position)(?:$|_)", alias_name, flags=re.I):
+            return True
+
+        order_alias_match = re.search(
+            r"""\bORDER\s+BY\b[\s\S]*?\b(`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)\b""",
+            text,
+            flags=re.I,
+        )
+        if order_alias_match:
+            order_alias = str(order_alias_match.group(1) or "").strip().strip("`").lower()
+            if order_alias and alias_name and order_alias == alias_name:
+                return True
+        return False
+
     # Skip if query uses window functions that REQUIRE OVER clause
     window_funcs_requiring_over = ["ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD",
                                     "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE",
                                     "NTILE", "PERCENT_RANK", "CUME_DIST"]
     has_window_func = any(f"{wf}()" in s_upper or f"{wf} (" in s_upper for wf in window_funcs_requiring_over)
+    preserve_rank_window = _should_preserve_grouped_aggregate_window_for_ranking(s, question)
 
-    if _has_top_level_group_by(s) and "OVER" in s_upper and "PARTITION" in s_upper and not has_window_func:
+    if _has_top_level_group_by(s) and "OVER" in s_upper and "PARTITION" in s_upper and not has_window_func and not preserve_rank_window:
         # Only fix if OVER is used with aggregate functions (MIN, MAX, COUNT, SUM, AVG)
         # Pattern: AGG(...) OVER (PARTITION BY ...) [ORDER BY ...]
         # We want: AGG(...)
@@ -9424,6 +9456,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                 print(f"[PH3.5] Before: {s[:200]}")
                 print(f"[PH3.5] After:  {fixed_sql[:200]}")
             s = fixed_sql
+    elif preserve_rank_window and DEBUG_WR:
+        print("[PH3.5] Preserve rank-shaped aggregate window for AST semantics")
     # ---------------------------------------------------------------------------
     # Phase 4 — Winner-Row & Aggregate Guardrails
     # Ensure semantic correctness for ranking-style queries
