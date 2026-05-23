@@ -9625,8 +9625,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     # ------------------------------------------------------------
     if not goto_phase5:
         ast_b8_applied_early = False
+        ast_b8_handled_scope = False
         if ast_parseable:
             ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
+            ast_b8_handled_scope = bool(
+                ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False)
+            )
             if AST_TRACE:
                 print(
                     "[REFINER - AST RANKED SELECTION] "
@@ -9670,6 +9674,10 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
 
         if ast_parseable and not ast_b8_applied_early:
             ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
+            ast_b8_handled_scope = bool(
+                ast_b8_handled_scope
+                or (ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False))
+            )
             if AST_TRACE:
                 print(
                     "[REFINER - AST RANKED SELECTION] "
@@ -9970,8 +9978,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _dedupe_top_level_having_conjuncts(s)
         if DEBUG_WR: print("[REFINER - PH4] after HAVING dedupe:", s)
 
-        s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
-        if DEBUG_WR: print("[REFINER - PH4] after grouped winner-row fallback:", s)
+        if not ast_b8_handled_scope:
+            s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
+            if DEBUG_WR: print("[REFINER - PH4] after grouped winner-row fallback:", s)
+        elif DEBUG_WR:
+            print("[REFINER - PH4] skip grouped winner-row fallback: ast ranked-selection handled scope")
         s = _fix_winner_row_window_order_priority(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after post-fallback window order fix:", s)
         s = _fix_winner_row_metric_order_priority(s, question)
@@ -10056,8 +10067,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             elif AST_TRACE:
                 print("[REFINER - AST WINDOW SEMANTICS] skipped=parse_gate_not_ast")
 
+            ast_b8_handled_scope = False
             if ast_parseable:
                 ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
+                ast_b8_handled_scope = bool(
+                    ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False)
+                )
                 if AST_TRACE:
                     print(
                         "[REFINER - AST RANKED SELECTION] "
@@ -10123,8 +10138,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             s = _repair_invalid_year_filter_via_fk_bridge(s, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after invalid YEAR alias repair: {s}")
 
-            s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
-            if DEBUG_WR: print(f"[PH4-FORCE] after grouped winner-row fallback: {s}")
+            if not ast_b8_handled_scope:
+                s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
+                if DEBUG_WR: print(f"[PH4-FORCE] after grouped winner-row fallback: {s}")
+            elif DEBUG_WR:
+                print("[PH4-FORCE] skip grouped winner-row fallback: ast ranked-selection handled scope")
             s = _fix_winner_row_window_order_priority(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after post-fallback window order fix: {s}")
             s = _fix_winner_row_metric_order_priority(s, question)
