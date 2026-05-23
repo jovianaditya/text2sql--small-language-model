@@ -21528,6 +21528,371 @@ def _repair_malformed_fk_join_path(sql: str, question: str, ctx: str = "") -> st
     return rebuilt
 
 
+def _ast_validate_join_logic(sql: str, question: str = "", ctx: str = "") -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first validation/routing for malformed FK join-path repairs.
+
+    Scope for this batch:
+    - parseable top-level SELECT queries with real table JOINs
+    - invalid direct FK ON predicates that are close to one schema-backed edge
+    - direct two-table joins that skip a required FK connector path
+    - outer-scope references to an alias whose backing table is missing but
+      inferable from schema columns
+
+    Guardrails:
+    - skip derived-table join graphs and set-operation roots
+    - reuse the existing conservative join repair helpers
+    - accept a rewrite only when the candidate remains sqlglot-parseable
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+        "scope_kinds": [],
+    }
+    s = str(sql or "").strip()
+    if not s:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+    if any(True for _ in sel.find_all(exp.SetOperation)):
+        meta["warnings"].append("setop_skipped")
+        return sql, meta
+
+    from_arg = sel.args.get("from") or sel.args.get("from_")
+    if from_arg is None:
+        meta["warnings"].append("missing_from")
+        return sql, meta
+
+    base_table_expr = getattr(from_arg, "this", None)
+    if not isinstance(base_table_expr, exp.Table):
+        meta["warnings"].append("derived_from_skipped")
+        return sql, meta
+
+    join_exprs = [j for j in (sel.args.get("joins") or []) if isinstance(j, exp.Join)]
+    if not join_exprs:
+        return sql, meta
+    if any(not isinstance(getattr(j, "this", None), exp.Table) for j in join_exprs):
+        meta["warnings"].append("derived_join_skipped")
+        return sql, meta
+
+    try:
+        analyzer = get_schema_analyzer()
+        all_tables = [str(t).strip().lower() for t in get_all_tables() if str(t).strip()]
+        fk_raw = get_fk_relationships() or {}
+    except Exception:
+        analyzer = None
+        all_tables = []
+        fk_raw = {}
+    if analyzer is None or not all_tables or not fk_raw:
+        meta["warnings"].append("schema_unavailable")
+        return sql, meta
+
+    fk_map: Dict[str, Dict[str, str]] = {}
+    for src, mapping in (fk_raw or {}).items():
+        src_l = str(src or "").strip().lower()
+        if not src_l:
+            continue
+        fk_map[src_l] = {
+            str(fk_col or "").strip().lower(): str(tgt or "").strip().lower()
+            for fk_col, tgt in (mapping or {}).items()
+            if str(fk_col or "").strip() and str(tgt or "").strip()
+        }
+
+    def _table_cols(table_l: str) -> Set[str]:
+        try:
+            return {str(c).strip("`").lower() for c in analyzer.get_table_columns(table_l) if str(c).strip()}
+        except Exception:
+            return set()
+
+    alias_to_table: Dict[str, str] = {}
+    source_pairs: List[Tuple[str, str]] = []
+
+    base_table = str(base_table_expr.name or "").strip("`").lower()
+    base_alias = str(base_table_expr.alias_or_name or base_table).strip("`").lower()
+    if not base_table or not base_alias:
+        meta["warnings"].append("missing_base_alias")
+        return sql, meta
+    alias_to_table[base_alias] = base_table
+    alias_to_table[base_table] = base_table
+    source_pairs.append((base_alias, base_table))
+
+    for join_expr in join_exprs:
+        table_expr = getattr(join_expr, "this", None)
+        if not isinstance(table_expr, exp.Table):
+            continue
+        table_l = str(table_expr.name or "").strip("`").lower()
+        alias_l = str(table_expr.alias_or_name or table_l).strip("`").lower()
+        if not table_l or not alias_l:
+            continue
+        alias_to_table[alias_l] = table_l
+        alias_to_table.setdefault(table_l, table_l)
+        source_pairs.append((alias_l, table_l))
+
+    def _nearest_select(node: "exp.Expression") -> Optional["exp.Select"]:
+        anc = getattr(node, "parent", None)
+        while anc is not None:
+            if isinstance(anc, exp.Select):
+                return anc
+            anc = getattr(anc, "parent", None)
+        return None
+
+    refs_by_alias: Dict[str, Set[str]] = {}
+    for col in sel.find_all(exp.Column):
+        if _nearest_select(col) is not sel:
+            continue
+        alias_l = str(col.table or "").strip("`").lower()
+        col_l = str(col.name or "").strip("`").lower()
+        if alias_l and col_l:
+            refs_by_alias.setdefault(alias_l, set()).add(col_l)
+
+    reserved_alias_tokens = {
+        "select", "from", "where", "group", "order", "having", "limit",
+        "join", "left", "right", "inner", "outer", "full", "cross", "on",
+        "and", "or",
+    }
+    undefined_aliases = {
+        alias_l for alias_l in refs_by_alias
+        if alias_l not in alias_to_table and alias_l not in reserved_alias_tokens
+    }
+
+    inferred_aliases: Dict[str, str] = {}
+    used_tables = {table_l for _alias_l, table_l in source_pairs}
+    for alias_l in sorted(undefined_aliases):
+        cols = refs_by_alias.get(alias_l, set())
+        if not cols:
+            continue
+        scored: List[Tuple[int, str]] = []
+        for table_l in all_tables:
+            table_cols = _table_cols(table_l)
+            overlap = cols & table_cols
+            if not overlap:
+                continue
+            score = 10 * len(overlap)
+            if cols.issubset(table_cols):
+                score += 100
+            if table_l not in used_tables:
+                score += 5
+            scored.append((score, table_l))
+        if not scored:
+            continue
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        best_score = scored[0][0]
+        best = [table_l for score, table_l in scored if score == best_score]
+        if len(best) == 1:
+            inferred_aliases[alias_l] = best[0]
+
+    scope_kinds: List[str] = []
+    if undefined_aliases and set(inferred_aliases) == undefined_aliases:
+        scope_kinds.append("missing_alias_table")
+
+    def _fk_table_path(start_table: str, end_table: str, max_edges: int = 3) -> List[str]:
+        start_l = str(start_table or "").strip().lower()
+        end_l = str(end_table or "").strip().lower()
+        if not start_l or not end_l or start_l == end_l:
+            return []
+        neighbors: Dict[str, Set[str]] = {}
+        for src_l, mapping in (fk_map or {}).items():
+            for tgt_l in (mapping or {}).values():
+                if not src_l or not tgt_l:
+                    continue
+                neighbors.setdefault(src_l, set()).add(tgt_l)
+                neighbors.setdefault(tgt_l, set()).add(src_l)
+        queue: List[List[str]] = [[start_l]]
+        seen: Set[str] = {start_l}
+        while queue:
+            path = queue.pop(0)
+            if len(path) - 1 >= max_edges:
+                continue
+            for nxt in sorted(neighbors.get(path[-1], set())):
+                if nxt in seen:
+                    continue
+                new_path = path + [nxt]
+                if nxt == end_l:
+                    return new_path
+                seen.add(nxt)
+                queue.append(new_path)
+        return []
+
+    def _expected_edge_specs(left_table: str, right_table: str) -> List[Tuple[str, str, str, str]]:
+        specs: List[Tuple[str, str, str, str]] = []
+        for fk_col, target in (fk_map.get(left_table, {}) or {}).items():
+            if target != right_table:
+                continue
+            right_id = str(get_id_column(right_table) or "").strip("`").lower()
+            if right_id and fk_col in _table_cols(left_table) and right_id in _table_cols(right_table):
+                specs.append((left_table, fk_col, right_table, right_id))
+        for fk_col, target in (fk_map.get(right_table, {}) or {}).items():
+            if target != left_table:
+                continue
+            left_id = str(get_id_column(left_table) or "").strip("`").lower()
+            if left_id and fk_col in _table_cols(right_table) and left_id in _table_cols(left_table):
+                specs.append((right_table, fk_col, left_table, left_id))
+        return specs
+
+    connected_aliases: List[Tuple[str, str]] = [source_pairs[0]]
+    for join_expr in join_exprs:
+        table_expr = getattr(join_expr, "this", None)
+        on_expr = join_expr.args.get("on")
+        if not isinstance(table_expr, exp.Table):
+            continue
+        join_alias = str(table_expr.alias_or_name or table_expr.name or "").strip("`").lower()
+        join_table = str(table_expr.name or "").strip("`").lower()
+        if not join_alias or not join_table:
+            continue
+
+        if len(source_pairs) == 2:
+            has_direct_edge = any(
+                _expected_edge_specs(existing_table, join_table)
+                for _existing_alias, existing_table in connected_aliases
+            )
+            if not has_direct_edge:
+                path = _fk_table_path(connected_aliases[0][1], join_table)
+                if len(path) > 2 and "missing_connector_path" not in scope_kinds:
+                    scope_kinds.append("missing_connector_path")
+
+        if on_expr is None:
+            connected_aliases.append((join_alias, join_table))
+            continue
+
+        conds: List["exp.Expression"] = []
+
+        def _flatten_and(node: Optional["exp.Expression"]) -> List["exp.Expression"]:
+            if node is None:
+                return []
+            if isinstance(node, exp.And):
+                return _flatten_and(node.this) + _flatten_and(node.expression)
+            return [node]
+
+        conds = _flatten_and(on_expr)
+        joined_pair_found = False
+        valid_pair_found = False
+        near_miss_found = False
+
+        for cond in conds:
+            if not isinstance(cond, exp.EQ):
+                continue
+            left = getattr(cond, "this", None)
+            right = getattr(cond, "expression", None)
+            if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+                continue
+            left_alias = str(left.table or "").strip("`").lower()
+            right_alias = str(right.table or "").strip("`").lower()
+            left_col = str(left.name or "").strip("`").lower()
+            right_col = str(right.name or "").strip("`").lower()
+            if not left_alias or not right_alias or not left_col or not right_col:
+                continue
+
+            other_alias = ""
+            other_table = ""
+            joined_col = ""
+            other_col = ""
+            if left_alias == join_alias and right_alias in {alias for alias, _table in connected_aliases}:
+                other_alias = right_alias
+                other_table = alias_to_table.get(right_alias, "")
+                joined_col = left_col
+                other_col = right_col
+            elif right_alias == join_alias and left_alias in {alias for alias, _table in connected_aliases}:
+                other_alias = left_alias
+                other_table = alias_to_table.get(left_alias, "")
+                joined_col = right_col
+                other_col = left_col
+            if not other_alias or not other_table:
+                continue
+
+            joined_pair_found = True
+            specs = _expected_edge_specs(other_table, join_table)
+            if len(specs) != 1:
+                continue
+            spec = specs[0]
+            expected_pairs = {
+                (spec[0], spec[1]),
+                (spec[2], spec[3]),
+            }
+            actual_pairs = {
+                (join_table, joined_col),
+                (other_table, other_col),
+            }
+            if actual_pairs == expected_pairs:
+                valid_pair_found = True
+                break
+            expected_cols = {spec[1], spec[3]}
+            if joined_col in expected_cols or other_col in expected_cols:
+                near_miss_found = True
+
+        if joined_pair_found and not valid_pair_found and near_miss_found:
+            if "invalid_fk_condition" not in scope_kinds:
+                scope_kinds.append("invalid_fk_condition")
+
+        connected_aliases.append((join_alias, join_table))
+
+    if not scope_kinds:
+        return sql, meta
+
+    meta["handled_scope"] = True
+    meta["scope_kinds"] = list(dict.fromkeys(scope_kinds))
+
+    def _validate_candidate(candidate_sql: str, fix_name: str) -> Optional[str]:
+        candidate = str(candidate_sql or "").strip()
+        if not candidate or candidate == s:
+            return None
+        parse_target = re.sub(r";+\s*$", "", candidate).strip()
+        try:
+            sqlglot.parse_one(parse_target, read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            meta["warnings"].append(f"{fix_name}_parse_rejected")
+            return None
+        if s.endswith(";") and not candidate.endswith(";"):
+            candidate = parse_target + ";"
+        return candidate
+
+    current_sql = s
+    rewrite_steps: List[Tuple[str, Any]] = []
+    if "invalid_fk_condition" in scope_kinds:
+        rewrite_steps.append(("invalid_fk_join_conditions_ast", lambda text: _rewrite_invalid_fk_join_conditions(text, ctx)))
+    if "missing_alias_table" in scope_kinds or "missing_connector_path" in scope_kinds:
+        rewrite_steps.append(("malformed_fk_join_path_ast", lambda text: _repair_malformed_fk_join_path(text, question, ctx)))
+    if "invalid_fk_condition" in scope_kinds or "missing_alias_table" in scope_kinds or "missing_connector_path" in scope_kinds:
+        rewrite_steps.append(("post_path_fk_join_conditions_ast", lambda text: _rewrite_invalid_fk_join_conditions(text, ctx)))
+
+    for fix_name, fixer in rewrite_steps:
+        try:
+            candidate = fixer(current_sql)
+        except Exception:
+            meta["warnings"].append(f"{fix_name}_error")
+            continue
+        if not candidate or candidate == current_sql:
+            continue
+        validated = _validate_candidate(candidate, fix_name)
+        if not validated:
+            continue
+        current_sql = validated
+        meta["fixes"].append(fix_name)
+
+    meta["warnings"] = list(dict.fromkeys(meta["warnings"]))
+    if meta["fixes"]:
+        return current_sql, meta
+    return sql, meta
+
+
 def _rewrite_ordered_quantity_stock_aggregate(
     sql: str,
     question: str,

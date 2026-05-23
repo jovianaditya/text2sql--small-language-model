@@ -141,6 +141,7 @@ from .helpers_core import (
     _ast_normalize_scalar_subquery,
     _ast_normalize_ranked_selection,
     _ast_validate_exclusion_logic,
+    _ast_validate_join_logic,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_metric_join_for_unqualified_rollup,
@@ -9090,12 +9091,40 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     # Phase 1 — JOIN Semantics & Structural Rewrites (FINAL)
     # Decide JOIN necessity and semantics before touching aliases
     # ---------------------------------------------------------------------------
+    ast_b10_handled = False
     # For "ALL entities" questions: preserve LEFT JOIN by moving RHS filter to ON
     s = _move_rhs_filter_from_where_to_on(s, question, ctx)
     # Otherwise: convert LEFT JOIN to INNER if RHS is filtered
     s = _rewrite_left_join_to_inner_if_not_needed(s, question, ctx)
     s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question, ctx)
-    s = _rewrite_invalid_fk_join_conditions(s, ctx)
+    if ast_parseable:
+        ast_b10_sql, ast_b10_meta = _ast_validate_join_logic(s, question, ctx)
+        ast_b10_handled = bool(
+            ast_b10_meta.get("parse_ok", False)
+            and ast_b10_meta.get("handled_scope", False)
+            and bool(ast_b10_meta.get("fixes"))
+        )
+        if AST_TRACE:
+            print(
+                "[REFINER - AST JOIN VALIDATION] "
+                + _ast_meta_text(ast_b10_meta)
+                + f" applied={bool(ast_b10_meta.get('fixes'))}"
+            )
+        if ast_b10_handled:
+            s = ast_b10_sql
+            if AST_TRACE:
+                print(f"[REFINER - AST JOIN VALIDATION] sql={s}")
+        if AST_TRACE:
+            print(
+                "[REFINER - AST JOIN VALIDATION] "
+                + f"legacy_fallback={'skipped' if ast_b10_handled else 'used'} "
+                + f"reason={'ast_rewrite_applied' if ast_b10_handled else 'ast_unhandled_scope_or_no_rewrite'}"
+            )
+    elif AST_TRACE:
+        print("[REFINER - AST JOIN VALIDATION] parse_ok=False fixes=none warnings=parse_gate_not_ast handled_scope=False applied=False")
+        print("[REFINER - AST JOIN VALIDATION] legacy_fallback=used reason=parse_gate_not_ast")
+    if not ast_b10_handled:
+        s = _rewrite_invalid_fk_join_conditions(s, ctx)
     s = _rewrite_invalid_grouped_existence_subquery_to_join(s, question, ctx)
     s = _rewrite_inner_join_filter_to_exists(s)
     s = _rewrite_inner_join_existence_to_exists(s, question, ctx)
@@ -9923,8 +9952,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _add_having_for_required_temporal_left_join(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after required temporal LEFT JOIN having fix: {s}")
 
-        s = _repair_malformed_fk_join_path(s, question, ctx)
-        if DEBUG_WR: print("[REFINER - PH4] after malformed FK join-path repair:", s)
+        if not ast_b10_handled:
+            s = _repair_malformed_fk_join_path(s, question, ctx)
+            if DEBUG_WR: print("[REFINER - PH4] after malformed FK join-path repair:", s)
         s = _remove_redundant_and_ornamental_joins(s)
         if DEBUG_WR: print("[REFINER - PH4] after post-repair ornamental-join cleanup:", s)
         s = _drop_unrequested_group_key_filters(s, question, ctx)
