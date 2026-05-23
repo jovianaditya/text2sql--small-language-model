@@ -39375,6 +39375,159 @@ def _repair_temporal_not_exists_scope(sql: str, ctx: str = "") -> str:
     return fixed
 
 
+def _ast_validate_exclusion_logic(sql: str, question: str = "", ctx: str = "") -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first validation/routing for exclusion and anti-join repairs.
+
+    Scope for this batch:
+    - parseable top-level SELECT queries that already contain one of:
+      - NOT EXISTS
+      - NOT IN (SELECT ...)
+      - LEFT JOIN ... WHERE rhs_col IS NULL anti-join patterns
+    - reuse the existing conservative exclusion repair helpers, but only after
+      AST has confirmed the query is in the exclusion family
+
+    Guardrails:
+    - no rewrite when the AST does not show an exclusion shape
+    - every candidate rewrite must remain sqlglot-parseable
+    - keep regex/text fallback available when AST does not own the scope
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+        "scope_kinds": [],
+    }
+    s = str(sql or "").strip()
+    if not s:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+
+    def _join_side(join_expr: "exp.Join") -> str:
+        side = join_expr.args.get("side")
+        return str(side or "").strip().upper()
+
+    def _is_null_check_on_left_join_alias(where_expr: Optional["exp.Where"]) -> bool:
+        if not isinstance(where_expr, exp.Where) or where_expr.this is None:
+            return False
+
+        left_join_aliases: Set[str] = set()
+        for join_expr in sel.args.get("joins") or []:
+            if not isinstance(join_expr, exp.Join):
+                continue
+            if "LEFT" not in _join_side(join_expr):
+                continue
+            table_expr = getattr(join_expr, "this", None)
+            if not isinstance(table_expr, exp.Table):
+                continue
+            alias_name = str(table_expr.alias_or_name or table_expr.name or "").strip("`").lower()
+            table_name = str(table_expr.name or "").strip("`").lower()
+            if alias_name:
+                left_join_aliases.add(alias_name)
+            if table_name:
+                left_join_aliases.add(table_name)
+        if not left_join_aliases:
+            return False
+
+        def _column_hits_left_alias(col_expr: Optional["exp.Expression"]) -> bool:
+            if not isinstance(col_expr, exp.Column):
+                return False
+            table_name = str(col_expr.table or "").strip("`").lower()
+            return bool(table_name and table_name in left_join_aliases)
+
+        for is_expr in where_expr.find_all(exp.Is):
+            left = getattr(is_expr, "this", None)
+            right = getattr(is_expr, "expression", None)
+            if isinstance(left, exp.Null) and _column_hits_left_alias(right):
+                return True
+            if isinstance(right, exp.Null) and _column_hits_left_alias(left):
+                return True
+        return False
+
+    scope_kinds: List[str] = []
+    for not_node in sel.find_all(exp.Not):
+        inner = not_node.this
+        if isinstance(inner, exp.Exists) and "not_exists" not in scope_kinds:
+            scope_kinds.append("not_exists")
+        elif (
+            isinstance(inner, exp.In)
+            and isinstance(inner.args.get("query"), (exp.Subquery, exp.Select))
+            and "not_in_subquery" not in scope_kinds
+        ):
+            scope_kinds.append("not_in_subquery")
+
+    if _is_null_check_on_left_join_alias(sel.args.get("where")):
+        scope_kinds.append("left_anti_join")
+
+    if not scope_kinds:
+        return sql, meta
+
+    meta["handled_scope"] = True
+    meta["scope_kinds"] = list(dict.fromkeys(scope_kinds))
+
+    def _validate_candidate(candidate_sql: str, fix_name: str) -> Optional[str]:
+        candidate = str(candidate_sql or "").strip()
+        if not candidate or candidate == s:
+            return None
+        parse_target = re.sub(r";+\s*$", "", candidate).strip()
+        try:
+            sqlglot.parse_one(parse_target, read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            meta["warnings"].append(f"{fix_name}_parse_rejected")
+            return None
+        if s.endswith(";") and not candidate.endswith(";"):
+            candidate = parse_target + ";"
+        return candidate
+
+    current_sql = s
+    rewrite_steps = [
+        ("grouped_temporal_exclusion_bridge_ast", lambda text: _rewrite_two_table_grouped_temporal_exclusion(text, question, ctx)),
+        ("missing_temporal_bridge_exclusion_ast", lambda text: _rewrite_missing_temporal_bridge_exclusion(text, question, ctx)),
+        ("temporal_year_exclusion_antijoin_ast", lambda text: _rewrite_temporal_year_exclusion_antijoin(text, question, ctx)),
+        ("prefer_not_exists_for_simple_exclusion_ast", lambda text: _prefer_not_exists_for_simple_exclusion(text, question, ctx)),
+        ("repair_exclusion_subject_fk_correlation_ast", lambda text: _repair_exclusion_subject_fk_correlation(text, question, ctx)),
+        ("repair_temporal_not_exists_scope_ast", lambda text: _repair_temporal_not_exists_scope(text, ctx)),
+    ]
+
+    for fix_name, fixer in rewrite_steps:
+        try:
+            candidate = fixer(current_sql)
+        except Exception:
+            meta["warnings"].append(f"{fix_name}_error")
+            continue
+        if not candidate or candidate == current_sql:
+            continue
+        validated = _validate_candidate(candidate, fix_name)
+        if not validated:
+            continue
+        current_sql = validated
+        meta["fixes"].append(fix_name)
+
+    meta["warnings"] = list(dict.fromkeys(meta["warnings"]))
+    if meta["fixes"]:
+        return current_sql, meta
+    return sql, meta
+
+
 def _repair_invalid_year_filter_via_fk_bridge(sql: str, ctx: str = "") -> str:
     """
     Repair invalid YEAR(alias.col)=YYYY predicates when `col` does not exist on

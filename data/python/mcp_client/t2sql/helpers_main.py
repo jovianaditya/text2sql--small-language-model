@@ -140,6 +140,7 @@ from .helpers_core import (
     _ast_rewrite_window_semantics,
     _ast_normalize_scalar_subquery,
     _ast_normalize_ranked_selection,
+    _ast_validate_exclusion_logic,
     _rewrite_invalid_metric_bridge_rollup,
     _rewrite_missing_metric_join_in_rollup,
     _rewrite_missing_metric_join_for_unqualified_rollup,
@@ -8859,6 +8860,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                 "window_kinds="
                 + "|".join(str(item) for item in (meta.get("window_kinds") or []) if str(item).strip())
             )
+        if meta.get("scope_kinds"):
+            parts.append(
+                "scope_kinds="
+                + "|".join(str(item) for item in (meta.get("scope_kinds") or []) if str(item).strip())
+            )
         if meta.get("cleanup_applied") is not None and "cleanup_applied" in meta:
             parts.append(f"cleanup_applied={bool(meta.get('cleanup_applied'))}")
         if meta.get("error"):
@@ -9871,21 +9877,47 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _drop_unrequested_temporal_filters(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested temporal-filter drop fix: {s}")
 
-        s = _rewrite_two_table_grouped_temporal_exclusion(s, question, ctx)
-        if DEBUG_WR: print(f"[REFINER - PH4] after two-table temporal exclusion fix: {s}")
+        ast_b9_handled = False
+        if ast_parseable:
+            ast_b9_sql, ast_b9_meta = _ast_validate_exclusion_logic(s, question, ctx)
+            ast_b9_handled = bool(ast_b9_meta.get("parse_ok", False) and ast_b9_meta.get("handled_scope", False))
+            if AST_TRACE:
+                print(
+                    "[REFINER - AST EXCLUSION LOGIC] "
+                    + _ast_meta_text(ast_b9_meta)
+                    + f" applied={bool(ast_b9_meta.get('fixes'))}"
+                )
+            if ast_b9_handled and ast_b9_meta.get("fixes"):
+                s = ast_b9_sql
+                if AST_TRACE:
+                    print(f"[REFINER - AST EXCLUSION LOGIC] sql={s}")
+            if AST_TRACE:
+                print(
+                    "[REFINER - AST EXCLUSION LOGIC] "
+                    + f"legacy_fallback={'skipped' if ast_b9_handled else 'used'} "
+                    + f"reason={'ast_handled_scope' if ast_b9_handled else 'ast_unhandled_scope_or_parse_fail'}"
+                )
+        elif AST_TRACE:
+            print("[REFINER - AST EXCLUSION LOGIC] parse_ok=False fixes=none warnings=parse_gate_not_ast handled_scope=False applied=False")
+            print("[REFINER - AST EXCLUSION LOGIC] legacy_fallback=used reason=parse_gate_not_ast")
 
-        s = _rewrite_missing_temporal_bridge_exclusion(s, question, ctx)
-        if DEBUG_WR: print(f"[REFINER - PH4] after temporal missing-bridge exclusion fix: {s}")
+        if not ast_b9_handled:
+            s = _rewrite_two_table_grouped_temporal_exclusion(s, question, ctx)
+            if DEBUG_WR: print(f"[REFINER - PH4] after two-table temporal exclusion fix: {s}")
 
-        s = _rewrite_temporal_year_exclusion_antijoin(s, question, ctx)
-        if DEBUG_WR: print(f"[REFINER - PH4] after temporal exclusion anti-join fix: {s}")
+            s = _rewrite_missing_temporal_bridge_exclusion(s, question, ctx)
+            if DEBUG_WR: print(f"[REFINER - PH4] after temporal missing-bridge exclusion fix: {s}")
 
-        s = _prefer_not_exists_for_simple_exclusion(s, question, ctx)
-        if DEBUG_WR: print(f"[REFINER - PH4] after NOT EXISTS anti-join preference: {s}")
-        s = _repair_exclusion_subject_fk_correlation(s, question, ctx)
-        if DEBUG_WR: print(f"[REFINER - PH4] after exclusion subject-FK correlation repair: {s}")
-        s = _repair_temporal_not_exists_scope(s, ctx)
-        if DEBUG_WR: print(f"[REFINER - PH4] after temporal NOT EXISTS scope repair: {s}")
+            s = _rewrite_temporal_year_exclusion_antijoin(s, question, ctx)
+            if DEBUG_WR: print(f"[REFINER - PH4] after temporal exclusion anti-join fix: {s}")
+
+            s = _prefer_not_exists_for_simple_exclusion(s, question, ctx)
+            if DEBUG_WR: print(f"[REFINER - PH4] after NOT EXISTS anti-join preference: {s}")
+            s = _repair_exclusion_subject_fk_correlation(s, question, ctx)
+            if DEBUG_WR: print(f"[REFINER - PH4] after exclusion subject-FK correlation repair: {s}")
+            s = _repair_temporal_not_exists_scope(s, ctx)
+            if DEBUG_WR: print(f"[REFINER - PH4] after temporal NOT EXISTS scope repair: {s}")
+
         s = _repair_invalid_year_filter_via_fk_bridge(s, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after invalid YEAR alias repair: {s}")
         s = _add_having_for_required_temporal_left_join(s, question, ctx)
