@@ -10320,8 +10320,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     # Phase 7 — Ordering, Limits, and Output Formatting
     # Cosmetic and execution-safety adjustments only
     # ---------------------------------------------------------------------------
+    ast_window_validation_handled_scope = False
     if ast_parseable:
         ast_window_validation_sql, ast_window_validation_meta = _ast_validate_window_structure(s, question)
+        ast_window_validation_handled_scope = bool(
+            ast_window_validation_meta.get("parse_ok", False) and ast_window_validation_meta.get("handled_scope", False)
+        )
         if AST_TRACE:
             print(
                 "[REFINER - AST WINDOW VALIDATION] "
@@ -10335,8 +10339,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     elif AST_TRACE:
         print("[REFINER - AST WINDOW VALIDATION] skipped=parse_gate_not_ast")
 
-    s = _simplify_default_window_frame(s, question)
-    s = _repair_running_window_missing_partition(s, question)
+    if not ast_window_validation_handled_scope:
+        s = _simplify_default_window_frame(s, question)
+        s = _repair_running_window_missing_partition(s, question)
+    elif DEBUG_WR:
+        print("[REFINER - PH7] skip legacy window-validation overlap: ast window validation handled scope")
     s = _rewrite_same_group_avg_gap_window_to_partition_only(s, question)
     s = _rewrite_single_table_case_band_derived_subquery(s, question)
     s = _rewrite_correlated_offset_subquery_to_window(s, question)

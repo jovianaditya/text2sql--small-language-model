@@ -24778,6 +24778,37 @@ def _ast_validate_window_structure(sql: str, question: str = "") -> Tuple[str, D
             return "aggregate"
         return "other"
 
+    def _validate_candidate(candidate_sql: str) -> Optional[str]:
+        candidate = str(candidate_sql or "").strip()
+        if not candidate:
+            return None
+        trailing = ";" if s.endswith(";") or candidate.endswith(";") else ""
+        candidate_parse = re.sub(r";+\s*$", "", candidate).strip()
+        try:
+            sqlglot.parse_one(candidate_parse, read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            return None
+        if trailing and not candidate_parse.endswith(";"):
+            return candidate_parse + trailing
+        return candidate if candidate.endswith(";") or not trailing else candidate + trailing
+
+    def _apply_text_fix(current_sql: str, fixer, fix_name: str) -> str:
+        try:
+            candidate = fixer(current_sql, question)
+        except TypeError:
+            candidate = fixer(current_sql)
+        except Exception:
+            return current_sql
+        if not candidate or candidate == current_sql:
+            return current_sql
+        validated = _validate_candidate(candidate)
+        if not validated:
+            meta["warnings"].append(f"{fix_name}_parse_rejected")
+            return current_sql
+        if fix_name not in meta["fixes"]:
+            meta["fixes"].append(fix_name)
+        return validated
+
     kinds_seen: List[str] = []
     should_drop_default_frame = False
     for win in windows:
@@ -24821,20 +24852,25 @@ def _ast_validate_window_structure(sql: str, question: str = "") -> Tuple[str, D
             meta["warnings"].append("running_window_missing_partition_by")
 
     meta["window_kinds"] = kinds_seen
+    current_sql = s
+    if should_drop_default_frame:
+        out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+        if sql.strip().endswith(";"):
+            out_sql = out_sql.rstrip(";") + ";"
+        if out_sql.strip() != s:
+            current_sql = out_sql
+            meta["fixes"].append("simplify_default_window_frame_ast")
+
+    current_sql = _apply_text_fix(
+        current_sql,
+        _repair_running_window_missing_partition,
+        "running_window_partition_inference_ast",
+    )
+
     meta["warnings"] = list(dict.fromkeys(meta["warnings"]))
-
-    if not should_drop_default_frame:
+    if current_sql.strip() == s:
         return sql, meta
-
-    out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
-    if sql.strip().endswith(";"):
-        out_sql = out_sql.rstrip(";") + ";"
-
-    if out_sql.strip() == s:
-        return sql, meta
-
-    meta["fixes"].append("simplify_default_window_frame_ast")
-    return out_sql, meta
+    return current_sql, meta
 
 
 def _ast_rewrite_window_semantics(sql: str, question: str = "") -> Tuple[str, Dict[str, Any]]:
