@@ -9552,8 +9552,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     r"\1 \2",
     s)
     s = _fix_missing_space_before_clauses(s)
+    ast_scalar_subquery_handled_scope = False
     if ast_parseable:
         ast_scalar_subquery_sql, ast_scalar_subquery_meta = _ast_normalize_scalar_subquery(s)
+        ast_scalar_subquery_handled_scope = bool(
+            ast_scalar_subquery_meta.get("parse_ok", False) and ast_scalar_subquery_meta.get("handled_scope", False)
+        )
         if AST_TRACE:
             print(
                 "[REFINER - AST SCALAR SUBQUERY] "
@@ -9566,8 +9570,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                 print(f"[REFINER - AST SCALAR SUBQUERY] sql={s}")
     elif AST_TRACE:
         print("[REFINER - AST SCALAR SUBQUERY] skipped=parse_gate_not_ast")
-    s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
-    if DEBUG_WR: print("[REFINER - PH4] after early scalar-window subquery fix:", s)
+    if not ast_scalar_subquery_handled_scope:
+        s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
+        if DEBUG_WR: print("[REFINER - PH4] after early scalar-window subquery fix:", s)
+    elif DEBUG_WR:
+        print("[REFINER - PH4] skip early scalar-window subquery fix: ast scalar-subquery handled scope")
 
     s = _canonicalize_single_computed_group_by_expression(s)
     s = _simplify_same_expression_group_threshold_subquery(s)
@@ -9795,8 +9802,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _rewrite_missing_overall_avg_having(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after overall-avg baseline fix:", s)
 
-        s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
-        if DEBUG_WR: print("[REFINER - PH4] after scalar-window subquery fix:", s)
+        if not ast_scalar_subquery_handled_scope:
+            s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
+            if DEBUG_WR: print("[REFINER - PH4] after scalar-window subquery fix:", s)
+        elif DEBUG_WR:
+            print("[REFINER - PH4] skip scalar-window subquery fix: ast scalar-subquery handled scope")
 
         s = _rewrite_average_ratio_to_sum_over_distinct_count(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after avg-ratio rollup fix:", s)
@@ -10053,8 +10063,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             s = _repair_unbalanced_select_item_parentheses(s)
             if DEBUG_WR: print(f"[PH4-FORCE] after select-item parenthesis fix: {s}")
 
+            ast_scalar_subquery_handled_scope = False
             if ast_parseable:
                 ast_scalar_subquery_sql, ast_scalar_subquery_meta = _ast_normalize_scalar_subquery(s)
+                ast_scalar_subquery_handled_scope = bool(
+                    ast_scalar_subquery_meta.get("parse_ok", False) and ast_scalar_subquery_meta.get("handled_scope", False)
+                )
                 if AST_TRACE:
                     print(
                         "[REFINER - AST SCALAR SUBQUERY] "
@@ -10128,9 +10142,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
 
             s = _rewrite_missing_overall_avg_having(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after overall-avg baseline fix: {s}")
-
-            s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
-            if DEBUG_WR: print(f"[PH4-FORCE] after scalar-window subquery fix: {s}")
+            if not ast_scalar_subquery_handled_scope:
+                s = _rewrite_scalar_window_subquery_to_correlated_aggregate(s)
+                if DEBUG_WR: print(f"[PH4-FORCE] after scalar-window subquery fix: {s}")
+            elif DEBUG_WR:
+                print("[PH4-FORCE] skip scalar-window subquery fix: ast scalar-subquery handled scope")
 
             s = _rewrite_average_ratio_to_sum_over_distinct_count(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after avg-ratio rollup fix: {s}")

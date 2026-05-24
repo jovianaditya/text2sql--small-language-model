@@ -19358,6 +19358,36 @@ def _ast_normalize_scalar_subquery(sql: str) -> Tuple[str, Dict[str, Any]]:
         meta["rendered_sql"] = rendered
         return True
 
+    def _validate_candidate(candidate_sql: str) -> Optional[str]:
+        candidate = str(candidate_sql or "").strip()
+        if not candidate:
+            return None
+        trailing = ";" if s.endswith(";") or candidate.endswith(";") else ""
+        candidate_parse = re.sub(r";+\s*$", "", candidate).strip()
+        try:
+            sqlglot.parse_one(candidate_parse, read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            return None
+        if trailing and not candidate_parse.endswith(";"):
+            return candidate_parse + trailing
+        return candidate if candidate.endswith(";") or not trailing else candidate + trailing
+
+    def _apply_text_fix(current_sql: str, fixer, fix_name: str) -> Optional[str]:
+        try:
+            candidate = fixer(current_sql)
+        except TypeError:
+            return None
+        except Exception:
+            return None
+        if not candidate or candidate == current_sql:
+            return None
+        validated = _validate_candidate(candidate)
+        if not validated:
+            meta["warnings"].append(f"{fix_name}_parse_rejected")
+            return None
+        meta["fixes"].append(fix_name)
+        return validated
+
     comparisons = [node for node in where.find_all(cmp_types)]
     for comp in comparisons:
         rhs = getattr(comp, "expression", None)
@@ -19464,6 +19494,14 @@ def _ast_normalize_scalar_subquery(sql: str) -> Tuple[str, Dict[str, Any]]:
             break
 
     rendered_sql = str(meta.pop("rendered_sql", "") or "")
+    if not rendered_sql and meta.get("handled_scope") and not meta.get("fixes"):
+        fallback_sql = _apply_text_fix(
+            s,
+            _rewrite_scalar_window_subquery_to_correlated_aggregate,
+            "scalar_window_subquery_to_correlated_aggregate_ast",
+        )
+        if fallback_sql:
+            rendered_sql = fallback_sql
     meta["warnings"] = list(dict.fromkeys(meta["warnings"]))
     if rendered_sql and meta.get("fixes"):
         return rendered_sql, meta
