@@ -6854,6 +6854,76 @@ def _deterministic_sql_acceptance_gate(
                 for count_alias in count_aliases
             )
 
+        def _has_safe_antijoin_rollup_pattern(
+            agg_nodes: List["exp.AggFunc"],
+        ) -> bool:
+            if not agg_nodes:
+                return False
+
+            sum_like_aliases: Set[str] = set()
+            count_aliases: Set[str] = set()
+            count_zero_aliases: Set[str] = set()
+
+            for agg in agg_nodes:
+                alias_refs = _expr_aliases(agg)
+                if not alias_refs:
+                    continue
+                if isinstance(agg, (exp.Sum, exp.Avg)):
+                    sum_like_aliases.update(alias_refs)
+                elif isinstance(agg, exp.Count):
+                    count_aliases.update(alias_refs)
+
+            if len(sum_like_aliases) != 1 or not count_aliases:
+                return False
+
+            having_arg = sel.args.get("having")
+            having_cond = having_arg.this if isinstance(having_arg, exp.Having) else None
+            if having_cond is None:
+                return False
+
+            def _flatten_and(node: Optional["exp.Expression"]) -> List["exp.Expression"]:
+                if node is None:
+                    return []
+                if isinstance(node, exp.And):
+                    return _flatten_and(node.this) + _flatten_and(node.expression)
+                return [node]
+
+            for cond in _flatten_and(having_cond):
+                if not isinstance(cond, exp.EQ):
+                    continue
+                left = getattr(cond, "this", None)
+                right = getattr(cond, "expression", None)
+                count_node = None
+                zero_node = None
+                if isinstance(left, exp.Count) and isinstance(right, exp.Literal) and str(right.this) == "0":
+                    count_node = left
+                    zero_node = right
+                elif isinstance(right, exp.Count) and isinstance(left, exp.Literal) and str(left.this) == "0":
+                    count_node = right
+                    zero_node = left
+                if count_node is None or zero_node is None:
+                    continue
+                alias_refs = _expr_aliases(count_node)
+                if len(alias_refs) == 1:
+                    count_zero_aliases.update(alias_refs)
+
+            if not count_zero_aliases:
+                return False
+
+            sum_alias = next(iter(sum_like_aliases))
+            safe_count_aliases = {
+                alias_l for alias_l in count_aliases
+                if alias_l in count_zero_aliases
+            }
+            if not safe_count_aliases:
+                return False
+
+            remaining_count_aliases = count_aliases - safe_count_aliases
+            return all(
+                count_alias == sum_alias or _has_parent_path(sum_alias, count_alias)
+                for count_alias in remaining_count_aliases
+            )
+
         invalid_join_edges: List[str] = []
         joins = sel.args.get("joins") or []
         for j in joins:
@@ -6939,7 +7009,8 @@ def _deterministic_sql_acceptance_gate(
 
                 has_group_or_agg = bool(group_arg is not None or top_level_aggs)
                 safe_ratio_rollup = _has_safe_ratio_rollup_pattern()
-                if has_group_or_agg and len(txn_tables_in_metrics) >= 2 and not safe_ratio_rollup:
+                safe_antijoin_rollup = _has_safe_antijoin_rollup_pattern(top_level_aggs)
+                if has_group_or_agg and len(txn_tables_in_metrics) >= 2 and not safe_ratio_rollup and not safe_antijoin_rollup:
                     verdict["fanout_risk_tables"] = sorted(txn_tables_in_metrics)
                     verdict["reasons"].append("fanout_risk_dual_fact")
 
@@ -6966,6 +7037,7 @@ def _deterministic_sql_acceptance_gate(
         if has_group_or_agg_fb and has_multi_join_fb:
             safe_ratio_rollup_fb = _has_safe_ratio_rollup_pattern()
             safe_single_branch_rollup_fb = _has_safe_single_branch_rollup_pattern(top_level_aggs_fb)
+            safe_antijoin_rollup_fb = _has_safe_antijoin_rollup_pattern(top_level_aggs_fb)
             agg_kinds_by_table: Dict[str, Set[str]] = {}
             for agg in top_level_aggs_fb:
                 if isinstance(agg, exp.Count):
@@ -6996,6 +7068,7 @@ def _deterministic_sql_acceptance_gate(
                     and has_sum_like
                     and not safe_ratio_rollup_fb
                     and not safe_single_branch_rollup_fb
+                    and not safe_antijoin_rollup_fb
                 ):
                     existing = set(verdict.get("fanout_risk_tables") or [])
                     existing.update(agg_kinds_by_table.keys())

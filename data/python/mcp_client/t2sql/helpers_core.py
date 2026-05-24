@@ -21786,6 +21786,31 @@ def _ast_validate_join_logic(sql: str, question: str = "", ctx: str = "") -> Tup
                 specs.append((right_table, fk_col, left_table, left_id))
         return specs
 
+    def _join_side(join_expr: "exp.Join") -> str:
+        side = join_expr.args.get("side")
+        return str(side or "").strip().upper()
+
+    def _flatten_top_and(node: Optional["exp.Expression"]) -> List["exp.Expression"]:
+        if node is None:
+            return []
+        if isinstance(node, exp.And):
+            return _flatten_top_and(node.this) + _flatten_top_and(node.expression)
+        return [node]
+
+    def _is_alias_null_check(
+        cond: Optional["exp.Expression"],
+        alias_l: str,
+    ) -> bool:
+        if not isinstance(cond, exp.Is):
+            return False
+        left = getattr(cond, "this", None)
+        right = getattr(cond, "expression", None)
+        if isinstance(left, exp.Column) and isinstance(right, exp.Null):
+            return str(left.table or "").strip("`").lower() == alias_l
+        if isinstance(right, exp.Column) and isinstance(left, exp.Null):
+            return str(right.table or "").strip("`").lower() == alias_l
+        return False
+
     connected_aliases: List[Tuple[str, str]] = [source_pairs[0]]
     for join_expr in join_exprs:
         table_expr = getattr(join_expr, "this", None)
@@ -21882,6 +21907,62 @@ def _ast_validate_join_logic(sql: str, question: str = "", ctx: str = "") -> Tup
 
         connected_aliases.append((join_alias, join_table))
 
+    left_join_aliases: Dict[str, "exp.Join"] = {}
+    for join_expr in join_exprs:
+        table_expr = getattr(join_expr, "this", None)
+        if not isinstance(table_expr, exp.Table):
+            continue
+        if "LEFT" not in _join_side(join_expr):
+            continue
+        join_alias = str(table_expr.alias_or_name or table_expr.name or "").strip("`").lower()
+        if join_alias:
+            left_join_aliases[join_alias] = join_expr
+
+    left_join_aliases_for_scope = set(left_join_aliases)
+    where_arg = sel.args.get("where")
+    rhs_filtered_outer_join_aliases: Set[str] = set()
+    if (
+        left_join_aliases_for_scope
+        and isinstance(where_arg, exp.Where)
+        and where_arg.this is not None
+        and not _question_wants_include_zero(question, ctx)
+    ):
+        conjuncts = _flatten_top_and(where_arg.this)
+        conjunction_only = bool(conjuncts) and all(
+            not isinstance(cond, exp.Or) and cond.find(exp.Or) is None
+            for cond in conjuncts
+        )
+        if conjunction_only:
+            anti_aliases: Set[str] = set()
+            positive_aliases: Set[str] = set()
+            ambiguous_aliases: Set[str] = set()
+
+            for cond in conjuncts:
+                referenced_left_aliases = {
+                    str(col.table or "").strip("`").lower()
+                    for col in cond.find_all(exp.Column)
+                    if str(col.table or "").strip("`").lower() in left_join_aliases_for_scope
+                }
+                if not referenced_left_aliases:
+                    continue
+                anti_here = {
+                    alias_l for alias_l in referenced_left_aliases
+                    if _is_alias_null_check(cond, alias_l)
+                }
+                anti_aliases.update(anti_here)
+                if len(referenced_left_aliases) == 1 and not anti_here:
+                    positive_aliases.update(referenced_left_aliases)
+                elif len(referenced_left_aliases) > 1:
+                    ambiguous_aliases.update(referenced_left_aliases)
+
+            rhs_filtered_outer_join_aliases = {
+                alias_l for alias_l in positive_aliases
+                if alias_l not in anti_aliases and alias_l not in ambiguous_aliases
+            }
+
+            if rhs_filtered_outer_join_aliases and "rhs_filtered_outer_join" not in scope_kinds:
+                scope_kinds.append("rhs_filtered_outer_join")
+
     if not scope_kinds:
         return sql, meta
 
@@ -21903,6 +21984,38 @@ def _ast_validate_join_logic(sql: str, question: str = "", ctx: str = "") -> Tup
         return candidate
 
     current_sql = s
+    if "rhs_filtered_outer_join" in meta["scope_kinds"]:
+        try:
+            rewrite_ast = sqlglot.parse_one(current_sql, read=SQL_PARSE_DIALECT or "mysql")
+            rewrite_sel = rewrite_ast if isinstance(rewrite_ast, exp.Select) else rewrite_ast.find(exp.Select)
+        except Exception:
+            rewrite_ast = None
+            rewrite_sel = None
+
+        if isinstance(rewrite_sel, exp.Select):
+            join_exprs_for_rewrite = [j for j in (rewrite_sel.args.get("joins") or []) if isinstance(j, exp.Join)]
+            changed_outer_join = False
+            for join_expr in join_exprs_for_rewrite:
+                table_expr = getattr(join_expr, "this", None)
+                if not isinstance(table_expr, exp.Table):
+                    continue
+                if "LEFT" not in _join_side(join_expr):
+                    continue
+                join_alias = str(table_expr.alias_or_name or table_expr.name or "").strip("`").lower()
+                if join_alias not in rhs_filtered_outer_join_aliases:
+                    continue
+                join_expr.set("side", None)
+                join_expr.set("kind", None)
+                changed_outer_join = True
+            if changed_outer_join:
+                rendered = rewrite_ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+                if s.endswith(";"):
+                    rendered = rendered.rstrip(";") + ";"
+                validated = _validate_candidate(rendered, "rhs_filtered_outer_join_ast")
+                if validated:
+                    current_sql = validated
+                    meta["fixes"].append("rhs_filtered_outer_join_ast")
+
     rewrite_steps: List[Tuple[str, Any]] = []
     if "invalid_fk_condition" in scope_kinds:
         rewrite_steps.append(("invalid_fk_join_conditions_ast", lambda text: _rewrite_invalid_fk_join_conditions(text, ctx)))
