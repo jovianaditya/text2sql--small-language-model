@@ -195,6 +195,7 @@ from .helpers_core import (
     _split_top_level_commas,
     _has_top_level_or,
     # phase 4b - Aggregate in WHERE fix
+    _ast_handle_aggregate_filters,
     _fix_aggregate_in_where,
     _fix_raw_column_where_to_having,
     _add_missing_count_for_group_by,
@@ -8890,6 +8891,48 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         if skipped_reason:
             parts.append(f"skipped={skipped_reason}")
         print("[REFINER - AST AGGREGATE FILTERS] " + " ".join(parts))
+
+    def _run_ast_aggregate_filter_owner(sql_in: str) -> tuple[str, bool]:
+        legacy_fallback_needed = True
+        legacy_fallback_reason = "parse_gate_not_ast"
+        ast_sql = sql_in
+        ast_meta: Dict[str, Any] = {
+            "parse_ok": False,
+            "handled_scope": False,
+            "fixes": [],
+            "warnings": [],
+        }
+
+        if AGENT_AST_SEMANTIC_FIRST and ast_parseable:
+            ast_sql, ast_meta = _ast_handle_aggregate_filters(sql_in, question)
+            if ast_meta.get("parse_ok", False):
+                legacy_fallback_needed = False
+                if ast_meta.get("fixes"):
+                    sql_in = ast_sql
+            else:
+                legacy_fallback_reason = "ast_parse_failed"
+        else:
+            if not ast_parseable:
+                ast_meta["warnings"] = ["parse_gate_not_ast"]
+            else:
+                ast_meta["warnings"] = ["ast_semantic_first_disabled"]
+                legacy_fallback_reason = "ast_semantic_first_disabled"
+
+        if AST_TRACE:
+            print(
+                "[REFINER - AST AGGREGATE FILTERS] "
+                + _ast_meta_text(ast_meta)
+                + f" applied={bool(ast_meta.get('fixes'))}"
+            )
+            if ast_meta.get("fixes"):
+                print(f"[REFINER - AST AGGREGATE FILTERS] sql={sql_in}")
+            if legacy_fallback_needed:
+                print(f"[REFINER - AST AGGREGATE FILTERS] legacy_fallback=used reason={legacy_fallback_reason}")
+            else:
+                reason = "ast_handled_scope" if ast_meta.get("handled_scope", False) else "ast_parseable_semantic_first"
+                print(f"[REFINER - AST AGGREGATE FILTERS] legacy_fallback=skipped reason={reason}")
+
+        return sql_in, legacy_fallback_needed
     
     # -------------------------------------------------------------------------
     # Phase -1: Fix undefined alias typos (e.g., p2.amount -> p.amount)
@@ -9074,15 +9117,15 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     # s = ensure_join_aliases(s)  # DISABLED: Let LLM handle its own alias consistency
     s = _escape_reserved_column_aliases(s)  # Escape reserved words used as column aliases (e.g., AS rank -> AS `rank`)
     if ast_parseable:
-        ast_b2_sql, ast_b2_meta = _ast_simplify_redundant_dedupe(s)
+        ast_redundant_dedupe_sql, ast_redundant_dedupe_meta = _ast_simplify_redundant_dedupe(s)
         if AST_TRACE:
             print(
                 "[REFINER - AST REDUNDANT DEDUPE] "
-                + _ast_meta_text(ast_b2_meta)
-                + f" applied={bool(ast_b2_meta.get('fixes'))}"
+                + _ast_meta_text(ast_redundant_dedupe_meta)
+                + f" applied={bool(ast_redundant_dedupe_meta.get('fixes'))}"
             )
-        if ast_b2_meta.get("parse_ok", False) and ast_b2_meta.get("fixes"):
-            s = ast_b2_sql
+        if ast_redundant_dedupe_meta.get("parse_ok", False) and ast_redundant_dedupe_meta.get("fixes"):
+            s = ast_redundant_dedupe_sql
             if AST_TRACE:
                 print(f"[REFINER - AST REDUNDANT DEDUPE] sql={s}")
     elif AST_TRACE:
@@ -9091,39 +9134,39 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     # Phase 1 — JOIN Semantics & Structural Rewrites (FINAL)
     # Decide JOIN necessity and semantics before touching aliases
     # ---------------------------------------------------------------------------
-    ast_b10_handled = False
+    ast_join_validation_applied = False
     # For "ALL entities" questions: preserve LEFT JOIN by moving RHS filter to ON
     s = _move_rhs_filter_from_where_to_on(s, question, ctx)
     # Otherwise: convert LEFT JOIN to INNER if RHS is filtered
     s = _rewrite_left_join_to_inner_if_not_needed(s, question, ctx)
     s = _rewrite_left_join_to_inner_if_rhs_filtered(s, question, ctx)
     if ast_parseable:
-        ast_b10_sql, ast_b10_meta = _ast_validate_join_logic(s, question, ctx)
-        ast_b10_handled = bool(
-            ast_b10_meta.get("parse_ok", False)
-            and ast_b10_meta.get("handled_scope", False)
-            and bool(ast_b10_meta.get("fixes"))
+        ast_join_validation_sql, ast_join_validation_meta = _ast_validate_join_logic(s, question, ctx)
+        ast_join_validation_applied = bool(
+            ast_join_validation_meta.get("parse_ok", False)
+            and ast_join_validation_meta.get("handled_scope", False)
+            and bool(ast_join_validation_meta.get("fixes"))
         )
         if AST_TRACE:
             print(
                 "[REFINER - AST JOIN VALIDATION] "
-                + _ast_meta_text(ast_b10_meta)
-                + f" applied={bool(ast_b10_meta.get('fixes'))}"
+                + _ast_meta_text(ast_join_validation_meta)
+                + f" applied={bool(ast_join_validation_meta.get('fixes'))}"
             )
-        if ast_b10_handled:
-            s = ast_b10_sql
+        if ast_join_validation_applied:
+            s = ast_join_validation_sql
             if AST_TRACE:
                 print(f"[REFINER - AST JOIN VALIDATION] sql={s}")
         if AST_TRACE:
             print(
                 "[REFINER - AST JOIN VALIDATION] "
-                + f"legacy_fallback={'skipped' if ast_b10_handled else 'used'} "
-                + f"reason={'ast_rewrite_applied' if ast_b10_handled else 'ast_unhandled_scope_or_no_rewrite'}"
+                + f"legacy_fallback={'skipped' if ast_join_validation_applied else 'used'} "
+                + f"reason={'ast_rewrite_applied' if ast_join_validation_applied else 'ast_unhandled_scope_or_no_rewrite'}"
             )
     elif AST_TRACE:
         print("[REFINER - AST JOIN VALIDATION] parse_ok=False fixes=none warnings=parse_gate_not_ast handled_scope=False applied=False")
         print("[REFINER - AST JOIN VALIDATION] legacy_fallback=used reason=parse_gate_not_ast")
-    if not ast_b10_handled:
+    if not ast_join_validation_applied:
         s = _rewrite_invalid_fk_join_conditions(s, ctx)
     s = _rewrite_invalid_grouped_existence_subquery_to_join(s, question, ctx)
     s = _rewrite_inner_join_filter_to_exists(s)
@@ -9306,24 +9349,24 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         # This prevents columns from being added to GROUP BY unnecessarily
         if not skip_phase3_groupby_cleanup:
             phase3_groupby_projection_handled = False
-            ast_b3_meta: Dict[str, Any] = {
+            ast_group_projection_meta: Dict[str, Any] = {
                 "parse_ok": False,
                 "handled_scope": False,
                 "fixes": [],
                 "warnings": ["parse_gate_not_ast"] if not ast_parseable else [],
             }
             if ast_parseable:
-                ast_b3_sql, ast_b3_meta = _ast_repair_group_by_projection_validity(s)
+                ast_group_projection_sql, ast_group_projection_meta = _ast_repair_group_by_projection_validity(s)
                 if AST_TRACE:
                     print(
                         "[REFINER - AST GROUPED PROJECTION] "
-                        + _ast_meta_text(ast_b3_meta)
-                        + f" applied={bool(ast_b3_meta.get('fixes'))}"
+                        + _ast_meta_text(ast_group_projection_meta)
+                        + f" applied={bool(ast_group_projection_meta.get('fixes'))}"
                     )
-                if ast_b3_meta.get("parse_ok", False) and ast_b3_meta.get("handled_scope", False):
-                    s = ast_b3_sql
+                if ast_group_projection_meta.get("parse_ok", False) and ast_group_projection_meta.get("handled_scope", False):
+                    s = ast_group_projection_sql
                     phase3_groupby_projection_handled = True
-                    if AST_TRACE and ast_b3_meta.get("fixes"):
+                    if AST_TRACE and ast_group_projection_meta.get("fixes"):
                         print(f"[REFINER - AST GROUPED PROJECTION] sql={s}")
             if not phase3_groupby_projection_handled:
                 if AST_TRACE:
@@ -9510,15 +9553,15 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s)
     s = _fix_missing_space_before_clauses(s)
     if ast_parseable:
-        ast_b7_sql, ast_b7_meta = _ast_normalize_scalar_subquery(s)
+        ast_scalar_subquery_sql, ast_scalar_subquery_meta = _ast_normalize_scalar_subquery(s)
         if AST_TRACE:
             print(
                 "[REFINER - AST SCALAR SUBQUERY] "
-                + _ast_meta_text(ast_b7_meta)
-                + f" applied={bool(ast_b7_meta.get('fixes'))}"
+                + _ast_meta_text(ast_scalar_subquery_meta)
+                + f" applied={bool(ast_scalar_subquery_meta.get('fixes'))}"
             )
-        if ast_b7_meta.get("parse_ok", False) and ast_b7_meta.get("handled_scope", False) and ast_b7_meta.get("fixes"):
-            s = ast_b7_sql
+        if ast_scalar_subquery_meta.get("parse_ok", False) and ast_scalar_subquery_meta.get("handled_scope", False) and ast_scalar_subquery_meta.get("fixes"):
+            s = ast_scalar_subquery_sql
             if AST_TRACE:
                 print(f"[REFINER - AST SCALAR SUBQUERY] sql={s}")
     elif AST_TRACE:
@@ -9624,22 +9667,22 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     #  CASE 2 — normal heuristic winner-row handling
     # ------------------------------------------------------------
     if not goto_phase5:
-        ast_b8_applied_early = False
-        ast_b8_handled_scope = False
+        ast_ranked_selection_applied_early = False
+        ast_ranked_selection_handled_scope = False
         if ast_parseable:
-            ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
-            ast_b8_handled_scope = bool(
-                ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False)
+            ast_ranked_selection_sql, ast_ranked_selection_meta = _ast_normalize_ranked_selection(s, question, ctx)
+            ast_ranked_selection_handled_scope = bool(
+                ast_ranked_selection_meta.get("parse_ok", False) and ast_ranked_selection_meta.get("handled_scope", False)
             )
             if AST_TRACE:
                 print(
                     "[REFINER - AST RANKED SELECTION] "
-                    + _ast_meta_text(ast_b8_meta)
-                    + f" applied={bool(ast_b8_meta.get('fixes'))}"
+                    + _ast_meta_text(ast_ranked_selection_meta)
+                    + f" applied={bool(ast_ranked_selection_meta.get('fixes'))}"
                 )
-            if ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False) and ast_b8_meta.get("fixes"):
-                s = ast_b8_sql
-                ast_b8_applied_early = True
+            if ast_ranked_selection_meta.get("parse_ok", False) and ast_ranked_selection_meta.get("handled_scope", False) and ast_ranked_selection_meta.get("fixes"):
+                s = ast_ranked_selection_sql
+                ast_ranked_selection_applied_early = True
                 if AST_TRACE:
                     print(f"[REFINER - AST RANKED SELECTION] sql={s}")
         elif AST_TRACE:
@@ -9658,34 +9701,34 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         if DEBUG_WR: print("[REFINER - PH4] after select-item parenthesis fix:", s)
 
         if ast_parseable:
-            ast_b6_sql, ast_b6_meta = _ast_rewrite_window_semantics(s, question)
+            ast_window_semantics_sql, ast_window_semantics_meta = _ast_rewrite_window_semantics(s, question)
             if AST_TRACE:
                 print(
                     "[REFINER - AST WINDOW SEMANTICS] "
-                    + _ast_meta_text(ast_b6_meta)
-                    + f" applied={bool(ast_b6_meta.get('fixes'))}"
+                    + _ast_meta_text(ast_window_semantics_meta)
+                    + f" applied={bool(ast_window_semantics_meta.get('fixes'))}"
                 )
-        if ast_b6_meta.get("parse_ok", False) and ast_b6_meta.get("handled_scope", False) and ast_b6_meta.get("fixes"):
-            s = ast_b6_sql
+        if ast_window_semantics_meta.get("parse_ok", False) and ast_window_semantics_meta.get("handled_scope", False) and ast_window_semantics_meta.get("fixes"):
+            s = ast_window_semantics_sql
             if AST_TRACE:
                 print(f"[REFINER - AST WINDOW SEMANTICS] sql={s}")
         elif AST_TRACE:
             print("[REFINER - AST WINDOW SEMANTICS] skipped=parse_gate_not_ast")
 
-        if ast_parseable and not ast_b8_applied_early:
-            ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
-            ast_b8_handled_scope = bool(
-                ast_b8_handled_scope
-                or (ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False))
+        if ast_parseable and not ast_ranked_selection_applied_early:
+            ast_ranked_selection_sql, ast_ranked_selection_meta = _ast_normalize_ranked_selection(s, question, ctx)
+            ast_ranked_selection_handled_scope = bool(
+                ast_ranked_selection_handled_scope
+                or (ast_ranked_selection_meta.get("parse_ok", False) and ast_ranked_selection_meta.get("handled_scope", False))
             )
             if AST_TRACE:
                 print(
                     "[REFINER - AST RANKED SELECTION] "
-                    + _ast_meta_text(ast_b8_meta)
-                    + f" applied={bool(ast_b8_meta.get('fixes'))}"
+                    + _ast_meta_text(ast_ranked_selection_meta)
+                    + f" applied={bool(ast_ranked_selection_meta.get('fixes'))}"
                 )
-            if ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False) and ast_b8_meta.get("fixes"):
-                s = ast_b8_sql
+            if ast_ranked_selection_meta.get("parse_ok", False) and ast_ranked_selection_meta.get("handled_scope", False) and ast_ranked_selection_meta.get("fixes"):
+                s = ast_ranked_selection_sql
                 if AST_TRACE:
                     print(f"[REFINER - AST RANKED SELECTION] sql={s}")
         elif AST_TRACE:
@@ -9815,7 +9858,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _drop_unrequested_length_filter_for_prefix_grouping(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after unrequested prefix-length filter drop:", s)
         
-        if not (AGENT_AST_SEMANTIC_FIRST and ast_parseable):
+        s, aggregate_filter_legacy_needed = _run_ast_aggregate_filter_owner(s)
+        if aggregate_filter_legacy_needed:
             agg_filter_fixes: List[str] = []
             fixed_agg_where = _fix_aggregate_in_where(s)
             if fixed_agg_where != s:
@@ -9829,26 +9873,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                 agg_filter_fixes.append("raw_where_to_having_regex")
             s = fixed_raw_where
             if DEBUG_WR: print(f"[REFINER - PH4] after raw-where-to-having fix: {s}")
-            _emit_aggregate_filter_trace(
-                "regex_fallback",
-                applied_fixes=agg_filter_fixes,
-                parse_gate_ast=bool(ast_parseable),
-            )
         elif DEBUG_WR:
-            print("[REFINER - PH4] AST parse gate enabled: skip regex agg/having surgery")
-            _emit_aggregate_filter_trace(
-                "regex_fallback",
-                applied_fixes=[],
-                skipped_reason="ast_parseable_semantic_first",
-                parse_gate_ast=True,
-            )
-        else:
-            _emit_aggregate_filter_trace(
-                "regex_fallback",
-                applied_fixes=[],
-                skipped_reason="ast_parseable_semantic_first",
-                parse_gate_ast=True,
-            )
+            print("[REFINER - PH4] AST aggregate-filter owner active: skip regex agg/having surgery")
 
         # Add missing COUNT(*) for GROUP BY aggregates
         s = _add_missing_count_for_group_by(s, question)
@@ -9914,31 +9940,31 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _drop_unrequested_temporal_filters(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after unrequested temporal-filter drop fix: {s}")
 
-        ast_b9_handled = False
+        ast_exclusion_handled_scope = False
         if ast_parseable:
-            ast_b9_sql, ast_b9_meta = _ast_validate_exclusion_logic(s, question, ctx)
-            ast_b9_handled = bool(ast_b9_meta.get("parse_ok", False) and ast_b9_meta.get("handled_scope", False))
+            ast_exclusion_sql, ast_exclusion_meta = _ast_validate_exclusion_logic(s, question, ctx)
+            ast_exclusion_handled_scope = bool(ast_exclusion_meta.get("parse_ok", False) and ast_exclusion_meta.get("handled_scope", False))
             if AST_TRACE:
                 print(
                     "[REFINER - AST EXCLUSION LOGIC] "
-                    + _ast_meta_text(ast_b9_meta)
-                    + f" applied={bool(ast_b9_meta.get('fixes'))}"
+                    + _ast_meta_text(ast_exclusion_meta)
+                    + f" applied={bool(ast_exclusion_meta.get('fixes'))}"
                 )
-            if ast_b9_handled and ast_b9_meta.get("fixes"):
-                s = ast_b9_sql
+            if ast_exclusion_handled_scope and ast_exclusion_meta.get("fixes"):
+                s = ast_exclusion_sql
                 if AST_TRACE:
                     print(f"[REFINER - AST EXCLUSION LOGIC] sql={s}")
             if AST_TRACE:
                 print(
                     "[REFINER - AST EXCLUSION LOGIC] "
-                    + f"legacy_fallback={'skipped' if ast_b9_handled else 'used'} "
-                    + f"reason={'ast_handled_scope' if ast_b9_handled else 'ast_unhandled_scope_or_parse_fail'}"
+                    + f"legacy_fallback={'skipped' if ast_exclusion_handled_scope else 'used'} "
+                    + f"reason={'ast_handled_scope' if ast_exclusion_handled_scope else 'ast_unhandled_scope_or_parse_fail'}"
                 )
         elif AST_TRACE:
             print("[REFINER - AST EXCLUSION LOGIC] parse_ok=False fixes=none warnings=parse_gate_not_ast handled_scope=False applied=False")
             print("[REFINER - AST EXCLUSION LOGIC] legacy_fallback=used reason=parse_gate_not_ast")
 
-        if not ast_b9_handled:
+        if not ast_exclusion_handled_scope:
             s = _rewrite_two_table_grouped_temporal_exclusion(s, question, ctx)
             if DEBUG_WR: print(f"[REFINER - PH4] after two-table temporal exclusion fix: {s}")
 
@@ -9960,7 +9986,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _add_having_for_required_temporal_left_join(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after required temporal LEFT JOIN having fix: {s}")
 
-        if not ast_b10_handled:
+        if not ast_join_validation_applied:
             s = _repair_malformed_fk_join_path(s, question, ctx)
             if DEBUG_WR: print("[REFINER - PH4] after malformed FK join-path repair:", s)
         s = _remove_redundant_and_ornamental_joins(s)
@@ -9978,7 +10004,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _dedupe_top_level_having_conjuncts(s)
         if DEBUG_WR: print("[REFINER - PH4] after HAVING dedupe:", s)
 
-        if not ast_b8_handled_scope:
+        if not ast_ranked_selection_handled_scope:
             s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
             if DEBUG_WR: print("[REFINER - PH4] after grouped winner-row fallback:", s)
         elif DEBUG_WR:
@@ -9998,7 +10024,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         if DEBUG_WR: print("[REFINER - PH4] end ----", s, "\n")
     else:
             # Phase 4 was skipped due to goto_phase5, but still need aggregate fix
-            if not (AGENT_AST_SEMANTIC_FIRST and ast_parseable):
+            s, aggregate_filter_legacy_needed = _run_ast_aggregate_filter_owner(s)
+            if aggregate_filter_legacy_needed:
                 agg_filter_fixes: List[str] = []
                 fixed_agg_where = _fix_aggregate_in_where(s)
                 if fixed_agg_where != s:
@@ -10010,26 +10037,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                     agg_filter_fixes.append("raw_where_to_having_regex")
                 s = fixed_raw_where
                 if DEBUG_WR: print(f"[PH4-FORCE] after raw-where-to-having fix: {s}")
-                _emit_aggregate_filter_trace(
-                    "regex_fallback_force",
-                    applied_fixes=agg_filter_fixes,
-                    parse_gate_ast=bool(ast_parseable),
-                )
             elif DEBUG_WR:
-                print("[PH4-FORCE] AST parse gate enabled: skip regex agg/having surgery")
-                _emit_aggregate_filter_trace(
-                    "regex_fallback_force",
-                    applied_fixes=[],
-                    skipped_reason="ast_parseable_semantic_first",
-                    parse_gate_ast=True,
-                )
-            else:
-                _emit_aggregate_filter_trace(
-                    "regex_fallback_force",
-                    applied_fixes=[],
-                    skipped_reason="ast_parseable_semantic_first",
-                    parse_gate_ast=True,
-                )
+                print("[PH4-FORCE] AST aggregate-filter owner active: skip regex agg/having surgery")
             s = _repair_unbalanced_not_exists_order_by(s)
             if DEBUG_WR: print(f"[PH4-FORCE] after unbalanced NOT EXISTS fix: {s}")
             s = _repair_misnested_offset_window_function(s)
@@ -10038,49 +10047,49 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             if DEBUG_WR: print(f"[PH4-FORCE] after select-item parenthesis fix: {s}")
 
             if ast_parseable:
-                ast_b7_sql, ast_b7_meta = _ast_normalize_scalar_subquery(s)
+                ast_scalar_subquery_sql, ast_scalar_subquery_meta = _ast_normalize_scalar_subquery(s)
                 if AST_TRACE:
                     print(
                         "[REFINER - AST SCALAR SUBQUERY] "
-                        + _ast_meta_text(ast_b7_meta)
-                        + f" applied={bool(ast_b7_meta.get('fixes'))}"
+                        + _ast_meta_text(ast_scalar_subquery_meta)
+                        + f" applied={bool(ast_scalar_subquery_meta.get('fixes'))}"
                     )
-                if ast_b7_meta.get("parse_ok", False) and ast_b7_meta.get("handled_scope", False) and ast_b7_meta.get("fixes"):
-                    s = ast_b7_sql
+                if ast_scalar_subquery_meta.get("parse_ok", False) and ast_scalar_subquery_meta.get("handled_scope", False) and ast_scalar_subquery_meta.get("fixes"):
+                    s = ast_scalar_subquery_sql
                     if AST_TRACE:
                         print(f"[REFINER - AST SCALAR SUBQUERY] sql={s}")
             elif AST_TRACE:
                 print("[REFINER - AST SCALAR SUBQUERY] skipped=parse_gate_not_ast")
 
             if ast_parseable:
-                ast_b6_sql, ast_b6_meta = _ast_rewrite_window_semantics(s, question)
+                ast_window_semantics_sql, ast_window_semantics_meta = _ast_rewrite_window_semantics(s, question)
                 if AST_TRACE:
                     print(
                         "[REFINER - AST WINDOW SEMANTICS] "
-                        + _ast_meta_text(ast_b6_meta)
-                        + f" applied={bool(ast_b6_meta.get('fixes'))}"
+                        + _ast_meta_text(ast_window_semantics_meta)
+                        + f" applied={bool(ast_window_semantics_meta.get('fixes'))}"
                     )
-                if ast_b6_meta.get("parse_ok", False) and ast_b6_meta.get("handled_scope", False) and ast_b6_meta.get("fixes"):
-                    s = ast_b6_sql
+                if ast_window_semantics_meta.get("parse_ok", False) and ast_window_semantics_meta.get("handled_scope", False) and ast_window_semantics_meta.get("fixes"):
+                    s = ast_window_semantics_sql
                     if AST_TRACE:
                         print(f"[REFINER - AST WINDOW SEMANTICS] sql={s}")
             elif AST_TRACE:
                 print("[REFINER - AST WINDOW SEMANTICS] skipped=parse_gate_not_ast")
 
-            ast_b8_handled_scope = False
+            ast_ranked_selection_handled_scope = False
             if ast_parseable:
-                ast_b8_sql, ast_b8_meta = _ast_normalize_ranked_selection(s, question, ctx)
-                ast_b8_handled_scope = bool(
-                    ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False)
+                ast_ranked_selection_sql, ast_ranked_selection_meta = _ast_normalize_ranked_selection(s, question, ctx)
+                ast_ranked_selection_handled_scope = bool(
+                    ast_ranked_selection_meta.get("parse_ok", False) and ast_ranked_selection_meta.get("handled_scope", False)
                 )
                 if AST_TRACE:
                     print(
                         "[REFINER - AST RANKED SELECTION] "
-                        + _ast_meta_text(ast_b8_meta)
-                        + f" applied={bool(ast_b8_meta.get('fixes'))}"
+                        + _ast_meta_text(ast_ranked_selection_meta)
+                        + f" applied={bool(ast_ranked_selection_meta.get('fixes'))}"
                     )
-                if ast_b8_meta.get("parse_ok", False) and ast_b8_meta.get("handled_scope", False) and ast_b8_meta.get("fixes"):
-                    s = ast_b8_sql
+                if ast_ranked_selection_meta.get("parse_ok", False) and ast_ranked_selection_meta.get("handled_scope", False) and ast_ranked_selection_meta.get("fixes"):
+                    s = ast_ranked_selection_sql
                     if AST_TRACE:
                         print(f"[REFINER - AST RANKED SELECTION] sql={s}")
             elif AST_TRACE:
@@ -10138,7 +10147,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             s = _repair_invalid_year_filter_via_fk_bridge(s, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after invalid YEAR alias repair: {s}")
 
-            if not ast_b8_handled_scope:
+            if not ast_ranked_selection_handled_scope:
                 s = _rewrite_grouped_winner_row_ranked_aggregate(s, question)
                 if DEBUG_WR: print(f"[PH4-FORCE] after grouped winner-row fallback: {s}")
             elif DEBUG_WR:
@@ -10305,15 +10314,15 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     # Cosmetic and execution-safety adjustments only
     # ---------------------------------------------------------------------------
     if ast_parseable:
-        ast_b5_sql, ast_b5_meta = _ast_validate_window_structure(s, question)
+        ast_window_validation_sql, ast_window_validation_meta = _ast_validate_window_structure(s, question)
         if AST_TRACE:
             print(
                 "[REFINER - AST WINDOW VALIDATION] "
-                + _ast_meta_text(ast_b5_meta)
-                + f" applied={bool(ast_b5_meta.get('fixes'))}"
+                + _ast_meta_text(ast_window_validation_meta)
+                + f" applied={bool(ast_window_validation_meta.get('fixes'))}"
             )
-        if ast_b5_meta.get("parse_ok", False) and ast_b5_meta.get("handled_scope", False) and ast_b5_meta.get("fixes"):
-            s = ast_b5_sql
+        if ast_window_validation_meta.get("parse_ok", False) and ast_window_validation_meta.get("handled_scope", False) and ast_window_validation_meta.get("fixes"):
+            s = ast_window_validation_sql
             if AST_TRACE:
                 print(f"[REFINER - AST WINDOW VALIDATION] sql={s}")
     elif AST_TRACE:
@@ -10710,6 +10719,8 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
             for item in (meta.get("fixes") or [])
             if str(item) in aggregate_filter_ast_fix_names
         ]
+        if not family_fixes:
+            return ""
         parts = [
             "source=ast_guardrails",
             f"parse_ok={bool(meta.get('parse_ok', False))}",
@@ -10749,7 +10760,9 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
         ast_sql, ast_meta = _ast_guardrails(sql_in, ctx=ctx, question=question)
         if REFINER_AST_TRACE_LOGS:
             _dbg_print_two("[REFINER - AST GUARDRAILS]", _ast_trace_text(ast_meta))
-            _dbg_print_two("[REFINER - AST AGGREGATE FILTERS]", _aggregate_filter_ast_trace_text(ast_meta))
+            aggregate_filter_trace = _aggregate_filter_ast_trace_text(ast_meta)
+            if aggregate_filter_trace:
+                _dbg_print_two("[REFINER - AST AGGREGATE FILTERS]", aggregate_filter_trace)
         if ast_meta.get("parse_ok", False) and ast_meta.get("fixes"):
             sql_in = ast_sql
         return sql_in, ast_meta

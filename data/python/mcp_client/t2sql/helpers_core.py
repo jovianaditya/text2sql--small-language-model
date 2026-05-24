@@ -24841,7 +24841,7 @@ def _ast_rewrite_window_semantics(sql: str, question: str = "") -> Tuple[str, Di
     """
     AST-first semantic rewrites for non-winner-row window queries.
 
-    B6b extends the earlier narrow slice with deeper, still scoped semantics:
+    This extends the earlier narrow slice with deeper, still scoped semantics:
     - no-skip rank intent -> DENSE_RANK
     - grouped count-window near-misses -> ranking windows
     - rank partition inference from the question
@@ -43583,6 +43583,381 @@ def _add_having_for_required_temporal_left_join(sql: str, question: str, ctx: st
     return stripped + having + semi
 
 
+def _ast_handle_aggregate_filters(sql: str, question: str = "") -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first ownership for aggregate-filter repairs on grouped queries.
+
+    Scope:
+    - aggregate predicates incorrectly placed in WHERE
+    - raw grouped metric thresholds that belong in HAVING
+    - missing COUNT(DISTINCT ...) threshold HAVING inferred from the question
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+        "error": "",
+    }
+    if not sql:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(sql, read=SQL_PARSE_DIALECT or "mysql")
+        meta["parse_ok"] = True
+    except Exception as e:
+        meta["error"] = f"parse_error:{e}"
+        return sql, meta
+
+    sel = ast.find(exp.Select)
+    if sel is None:
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+
+    def _flatten_top_and(expr_in: Optional["exp.Expression"]) -> List["exp.Expression"]:
+        if expr_in is None:
+            return []
+        if isinstance(expr_in, exp.And):
+            return _flatten_top_and(expr_in.this) + _flatten_top_and(expr_in.expression)
+        return [expr_in]
+
+    def _build_and(exprs: List["exp.Expression"]) -> Optional["exp.Expression"]:
+        cleaned = [e for e in exprs if e is not None]
+        if not cleaned:
+            return None
+        out = cleaned[0]
+        for nxt in cleaned[1:]:
+            out = exp.And(this=out, expression=nxt)
+        return out
+
+    def _parse_number_words(text: str) -> Optional[float]:
+        ql = (text or "").strip().lower()
+        if not ql:
+            return None
+        try:
+            return float(ql.replace(",", ""))
+        except Exception:
+            pass
+
+        units = {
+            "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+            "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+            "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+        }
+        tens = {
+            "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+            "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+        }
+        tokens = [tok for tok in re.findall(r"[a-z]+", ql) if tok != "and"]
+        if not tokens:
+            return None
+
+        total = 0
+        current = 0
+        seen = False
+        for tok in tokens:
+            if tok in units:
+                current += units[tok]
+                seen = True
+            elif tok in tens:
+                current += tens[tok]
+                seen = True
+            elif tok == "hundred":
+                current = max(1, current) * 100
+                seen = True
+            elif tok == "thousand":
+                current = max(1, current) * 1000
+                total += current
+                current = 0
+                seen = True
+            else:
+                return None
+        if not seen:
+            return None
+        return float(total + current)
+
+    def _extract_count_distinct_threshold(q: str) -> Optional[Tuple[str, float]]:
+        ql = (q or "").lower()
+        if not ql or not _question_wants_count_distinct(q):
+            return None
+
+        num_pat = r"(\d+(?:\.\d+)?(?:,\d{3})*|[a-z]+(?:[\s-]+[a-z]+){0,3})"
+        patterns = [
+            (r"\bmore\s+than\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "gt"),
+            (r"\bover\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "gt"),
+            (r"\bgreater\s+than\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "gt"),
+            (r"\bat\s+least\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "gte"),
+            (r"\bno\s+fewer\s+than\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "gte"),
+            (r"\bless\s+than\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "lt"),
+            (r"\bfewer\s+than\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "lt"),
+            (r"\bunder\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "lt"),
+            (r"\bat\s+most\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "lte"),
+            (r"\bno\s+more\s+than\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "lte"),
+            (r"\bexactly\s+" + num_pat + r"\s+(?:distinct|unique|different)\b", "eq"),
+        ]
+        for pat, op in patterns:
+            m = re.search(pat, ql, flags=re.I)
+            if not m:
+                continue
+            parsed = _parse_number_words(m.group(1))
+            if parsed is not None:
+                return (op, parsed)
+        return None
+
+    def _question_has_agg_threshold(q: str) -> bool:
+        ql = (q or "").lower()
+        if not ql:
+            return False
+        if _extract_numeric_aggregate_threshold(q, require_filter_intent=True) is None:
+            return False
+        if re.search(r"\b(?:when|if)\b[^.]{0,96}\b(?:otherwise|else)\b", ql, flags=re.I):
+            return False
+        if re.search(r"\b(?:average|avg|mean|sum|maximum|minimum|max|min)\b", ql, flags=re.I):
+            return True
+        if not re.search(r"\btotal\b", ql, flags=re.I):
+            return False
+
+        entity_terms: Set[str] = {
+            "row", "rows", "record", "records", "entry", "entries",
+            "item", "items", "line", "lines", "group", "groups",
+        }
+        try:
+            for table_name in get_all_tables() or []:
+                table_l = str(table_name or "").strip().lower()
+                if not table_l:
+                    continue
+                entity_terms.add(table_l)
+                singular = str(get_singular_form(table_l) or "").strip().lower()
+                if singular:
+                    entity_terms.add(singular)
+                for syn in get_table_synonyms(table_l) or []:
+                    syn_l = str(syn or "").strip().lower()
+                    if syn_l:
+                        entity_terms.add(syn_l)
+        except Exception:
+            pass
+
+        threshold_match = re.search(
+            r"\b(?:more\s+than|over|greater\s+than|above|exceeds?|at\s+least|no\s+fewer\s+than|"
+            r"less\s+than|fewer\s+than|under|below|at\s+most|no\s+more\s+than|exactly)\s+"
+            r"(?:\d[\d,]*(?:\.\d+)?|[a-z]+(?:[\s-]+[a-z]+){0,4})\b(?P<tail>[^.;!?]{0,48})",
+            ql,
+            flags=re.I,
+        )
+        if not threshold_match:
+            return True
+
+        threshold_prefix = ql[max(0, threshold_match.start() - 56):threshold_match.start()]
+        threshold_tail = str(threshold_match.group("tail") or "")
+        for term in sorted(entity_terms, key=len, reverse=True):
+            term_l = str(term or "").strip().lower()
+            if not term_l:
+                continue
+            term_pat = re.escape(term_l).replace(r"\ ", r"\s+")
+            if re.search(rf"\b(?:count|number\s+of|total)\s+(?:{term_pat})\b", threshold_prefix, flags=re.I):
+                return False
+            if re.search(rf"\b{term_pat}\b", threshold_tail, flags=re.I):
+                return False
+        return True
+
+    def _expr_contains_agg(expr_in: Optional["exp.Expression"]) -> bool:
+        if expr_in is None:
+            return False
+
+        def _has_agg_no_subquery(node: "exp.Expression") -> bool:
+            if isinstance(node, exp.Subquery):
+                return False
+            if isinstance(node, exp.AggFunc):
+                return True
+            for child in node.iter_expressions():
+                if _has_agg_no_subquery(child):
+                    return True
+            return False
+
+        return _has_agg_no_subquery(expr_in)
+
+    group_arg = sel.args.get("group")
+    if group_arg is None:
+        meta["warnings"].append("group_by_missing")
+        return sql, meta
+
+    handled_scope = False
+    where_arg = sel.args.get("where")
+    having_arg = sel.args.get("having")
+
+    if isinstance(where_arg, exp.Where):
+        where_cond = where_arg.this
+        conds = _flatten_top_and(where_cond)
+        move_to_having: List["exp.Expression"] = []
+        keep_in_where: List["exp.Expression"] = []
+        for c in conds:
+            if c.find(exp.Subquery):
+                keep_in_where.append(c.copy())
+                continue
+            if _expr_contains_agg(c):
+                move_to_having.append(c.copy())
+            else:
+                keep_in_where.append(c.copy())
+
+        if move_to_having:
+            handled_scope = True
+            new_where = _build_and(keep_in_where)
+            if new_where is None:
+                sel.set("where", None)
+            else:
+                sel.set("where", exp.Where(this=new_where))
+
+            existing_having_cond = having_arg.this if isinstance(having_arg, exp.Having) else None
+            merged_having = _build_and(
+                ([existing_having_cond.copy()] if existing_having_cond is not None else [])
+                + move_to_having
+            )
+            if merged_having is not None:
+                sel.set("having", exp.Having(this=merged_having))
+                meta["fixes"].append("agg_where_to_having_ast")
+
+    where_arg = sel.args.get("where")
+    if (
+        isinstance(where_arg, exp.Where)
+        and _question_has_agg_threshold(question)
+    ):
+        agg_map: Dict[str, "exp.Expression"] = {}
+        for item in sel.expressions or []:
+            base = item.this if isinstance(item, exp.Alias) else item
+            if base is None:
+                continue
+            for agg in base.find_all(exp.AggFunc):
+                cols = [c for c in agg.find_all(exp.Column)]
+                if len(cols) != 1:
+                    continue
+                c0 = cols[0]
+                key_name = str(c0.name or "").strip("`").lower()
+                if key_name and key_name not in agg_map:
+                    agg_map[key_name] = agg.copy()
+
+        if agg_map:
+            cmp_types = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ)
+
+            def _is_literalish(x: Optional["exp.Expression"]) -> bool:
+                return isinstance(x, (exp.Literal, exp.Null))
+
+            def _rewrite_cmp(expr_in: "exp.Expression") -> Optional["exp.Expression"]:
+                if not isinstance(expr_in, cmp_types) or _expr_contains_agg(expr_in):
+                    return None
+                left = getattr(expr_in, "this", None)
+                right = getattr(expr_in, "expression", None)
+                if left is None or right is None:
+                    return None
+                if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+                    return None
+                if not (_is_literalish(left) or _is_literalish(right)):
+                    return None
+
+                changed = False
+                new_expr = expr_in.copy()
+                new_left = getattr(new_expr, "this", None)
+                new_right = getattr(new_expr, "expression", None)
+
+                if isinstance(new_left, exp.Column):
+                    agg_expr = agg_map.get(str(new_left.name or "").strip("`").lower())
+                    if agg_expr is not None:
+                        new_expr.set("this", agg_expr.copy())
+                        changed = True
+                if isinstance(new_right, exp.Column):
+                    agg_expr = agg_map.get(str(new_right.name or "").strip("`").lower())
+                    if agg_expr is not None:
+                        new_expr.set("expression", agg_expr.copy())
+                        changed = True
+                return new_expr if changed else None
+
+            conds = _flatten_top_and(where_arg.this)
+            move_to_having = []
+            keep_in_where = []
+            for c in conds:
+                rewritten = _rewrite_cmp(c)
+                if rewritten is not None:
+                    move_to_having.append(rewritten)
+                else:
+                    keep_in_where.append(c.copy())
+
+            if move_to_having:
+                handled_scope = True
+                new_where = _build_and(keep_in_where)
+                if new_where is None:
+                    sel.set("where", None)
+                else:
+                    sel.set("where", exp.Where(this=new_where))
+
+                having_arg = sel.args.get("having")
+                existing_having_cond = having_arg.this if isinstance(having_arg, exp.Having) else None
+                merged_having = _build_and(
+                    ([existing_having_cond.copy()] if existing_having_cond is not None else [])
+                    + move_to_having
+                )
+                if merged_having is not None:
+                    sel.set("having", exp.Having(this=merged_having))
+                    meta["fixes"].append("raw_metric_where_to_having_ast")
+
+    having_arg = sel.args.get("having")
+    threshold_spec = _extract_count_distinct_threshold(question)
+    if threshold_spec is not None and not isinstance(having_arg, exp.Having):
+        def _is_count_distinct_expr(expr_in: Optional["exp.Expression"]) -> bool:
+            if not isinstance(expr_in, exp.Count):
+                return False
+            if bool(expr_in.args.get("distinct")):
+                return True
+            this_expr = getattr(expr_in, "this", None)
+            if isinstance(this_expr, exp.Distinct):
+                return True
+            try:
+                return any(True for _ in expr_in.find_all(exp.Distinct))
+            except Exception:
+                return False
+
+        count_distinct_agg = None
+        for item in sel.expressions or []:
+            base = item.this if isinstance(item, exp.Alias) else item
+            if _is_count_distinct_expr(base) and not base.find(exp.Window):
+                count_distinct_agg = base.copy()
+                break
+
+        if count_distinct_agg is not None:
+            handled_scope = True
+            op, threshold_val = threshold_spec
+            literal = exp.Literal.number(
+                str(int(threshold_val)) if float(threshold_val).is_integer() else str(threshold_val)
+            )
+            cmp_map = {
+                "gt": exp.GT,
+                "gte": exp.GTE,
+                "lt": exp.LT,
+                "lte": exp.LTE,
+                "eq": exp.EQ,
+            }
+            cmp_cls = cmp_map.get(op)
+            if cmp_cls is not None:
+                sel.set("having", exp.Having(this=cmp_cls(this=count_distinct_agg, expression=literal)))
+                meta["fixes"].append("count_distinct_threshold_having_ast")
+
+    meta["handled_scope"] = handled_scope
+    meta["warnings"] = list(dict.fromkeys(meta["warnings"]))
+    if not meta["fixes"]:
+        return sql, meta
+
+    out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+    if sql.strip().endswith(";"):
+        out_sql = out_sql.rstrip(";") + ";"
+    return out_sql, meta
+
+
 def _ast_guardrails(sql: str, ctx: str = "", question: str = "") -> Tuple[str, Dict[str, Any]]:
     """
     SQL AST guardrails (sqlglot-first).
@@ -47639,7 +48014,7 @@ def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
 
 def _sqlglot_parse_gate(sql: str) -> Tuple[str, Dict[str, Any]]:
     """
-    Batch B0 AST parse gate for post-draft routing.
+    AST parse gate for post-draft routing.
 
     Flow:
     - Try parsing the incoming SQL directly.
