@@ -9669,6 +9669,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     if not goto_phase5:
         ast_ranked_selection_applied_early = False
         ast_ranked_selection_handled_scope = False
+        ast_window_semantics_handled_scope = False
         if ast_parseable:
             ast_ranked_selection_sql, ast_ranked_selection_meta = _ast_normalize_ranked_selection(s, question, ctx)
             ast_ranked_selection_handled_scope = bool(
@@ -9702,6 +9703,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
 
         if ast_parseable:
             ast_window_semantics_sql, ast_window_semantics_meta = _ast_rewrite_window_semantics(s, question)
+            ast_window_semantics_handled_scope = bool(
+                ast_window_semantics_meta.get("parse_ok", False) and ast_window_semantics_meta.get("handled_scope", False)
+            )
             if AST_TRACE:
                 print(
                     "[REFINER - AST WINDOW SEMANTICS] "
@@ -9773,8 +9777,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _repair_rank_window_metric_from_question(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after rank metric fix:", s)
 
-        s = _add_rank_value_nonnull_filter_from_question(s, question)
-        if DEBUG_WR: print("[REFINER - PH4] after rank nonnull filter fix:", s)
+        if not ast_window_semantics_handled_scope:
+            s = _add_rank_value_nonnull_filter_from_question(s, question)
+            if DEBUG_WR: print("[REFINER - PH4] after rank nonnull filter fix:", s)
+        elif DEBUG_WR:
+            print("[REFINER - PH4] skip rank nonnull filter fix: ast window semantics handled scope")
 
         s = _rewrite_metric_aggregate_column_mismatch(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after metric-agg-column fix:", s)

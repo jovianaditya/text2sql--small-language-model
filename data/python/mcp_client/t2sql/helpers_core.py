@@ -25231,6 +25231,7 @@ def _ast_rewrite_window_semantics(sql: str, question: str = "") -> Tuple[str, Di
     current_sql = _apply_text_fix(current_sql, _rewrite_no_skip_rank_to_dense_rank, "no_skip_rank_to_dense_rank_ast")
     current_sql = _apply_text_fix(current_sql, _repair_rank_window_partition_from_question, "rank_partition_inference_ast")
     current_sql = _apply_text_fix(current_sql, _repair_rank_window_metric_from_question, "rank_metric_replacement_ast")
+    current_sql = _apply_text_fix(current_sql, _add_rank_value_nonnull_filter_from_question, "rank_value_nonnull_filter_ast")
     current_sql = _apply_text_fix(current_sql, _fix_grouped_aggregate_rank_direction, "grouped_rank_direction_ast")
     current_sql = _apply_text_fix(current_sql, _repair_running_window_missing_partition, "running_window_partition_inference_ast")
     current_sql = _apply_text_fix(current_sql, _rewrite_same_group_avg_gap_window_to_partition_only, "same_group_avg_partition_only_ast")
