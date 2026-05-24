@@ -9960,7 +9960,18 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         ast_exclusion_handled_scope = False
         if ast_parseable:
             ast_exclusion_sql, ast_exclusion_meta = _ast_validate_exclusion_logic(s, question, ctx)
-            ast_exclusion_handled_scope = bool(ast_exclusion_meta.get("parse_ok", False) and ast_exclusion_meta.get("handled_scope", False))
+            ast_exclusion_warnings = {
+                str(w).strip() for w in (ast_exclusion_meta.get("warnings") or []) if str(w).strip()
+            }
+            ast_exclusion_declined_needs_fallback = (
+                "mixed_left_join_filters_skipped" in ast_exclusion_warnings
+                and not ast_exclusion_meta.get("fixes")
+            )
+            ast_exclusion_handled_scope = bool(
+                ast_exclusion_meta.get("parse_ok", False)
+                and ast_exclusion_meta.get("handled_scope", False)
+                and not ast_exclusion_declined_needs_fallback
+            )
             if AST_TRACE:
                 print(
                     "[REFINER - AST EXCLUSION LOGIC] "
@@ -9975,7 +9986,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                 print(
                     "[REFINER - AST EXCLUSION LOGIC] "
                     + f"legacy_fallback={'skipped' if ast_exclusion_handled_scope else 'used'} "
-                    + f"reason={'ast_handled_scope' if ast_exclusion_handled_scope else 'ast_unhandled_scope_or_parse_fail'}"
+                    + f"reason={'ast_handled_scope' if ast_exclusion_handled_scope else ('ast_declined_scope_needs_fallback' if ast_exclusion_declined_needs_fallback else 'ast_unhandled_scope_or_parse_fail')}"
                 )
         elif AST_TRACE:
             print("[REFINER - AST EXCLUSION LOGIC] parse_ok=False fixes=none warnings=parse_gate_not_ast handled_scope=False applied=False")

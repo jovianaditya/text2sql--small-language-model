@@ -39866,10 +39866,7 @@ def _ast_validate_exclusion_logic(sql: str, question: str = "", ctx: str = "") -
         side = join_expr.args.get("side")
         return str(side or "").strip().upper()
 
-    def _is_null_check_on_left_join_alias(where_expr: Optional["exp.Where"]) -> bool:
-        if not isinstance(where_expr, exp.Where) or where_expr.this is None:
-            return False
-
+    def _left_join_aliases() -> Set[str]:
         left_join_aliases: Set[str] = set()
         for join_expr in sel.args.get("joins") or []:
             if not isinstance(join_expr, exp.Join):
@@ -39885,6 +39882,13 @@ def _ast_validate_exclusion_logic(sql: str, question: str = "", ctx: str = "") -
                 left_join_aliases.add(alias_name)
             if table_name:
                 left_join_aliases.add(table_name)
+        return left_join_aliases
+
+    def _is_null_check_on_left_join_alias(where_expr: Optional["exp.Where"]) -> bool:
+        if not isinstance(where_expr, exp.Where) or where_expr.this is None:
+            return False
+
+        left_join_aliases = _left_join_aliases()
         if not left_join_aliases:
             return False
 
@@ -39939,6 +39943,183 @@ def _ast_validate_exclusion_logic(sql: str, question: str = "", ctx: str = "") -
         return candidate
 
     current_sql = s
+
+    def _flatten_top_and(expr_in: Optional["exp.Expression"]) -> List["exp.Expression"]:
+        if expr_in is None:
+            return []
+        if isinstance(expr_in, exp.And):
+            return _flatten_top_and(expr_in.this) + _flatten_top_and(expr_in.expression)
+        return [expr_in]
+
+    def _build_and(exprs: List["exp.Expression"]) -> Optional["exp.Expression"]:
+        cleaned = [e for e in exprs if e is not None]
+        if not cleaned:
+            return None
+        out = cleaned[0]
+        for nxt in cleaned[1:]:
+            out = exp.And(this=out, expression=nxt)
+        return out
+
+    def _condition_references_left_join_alias(
+        cond: Optional["exp.Expression"],
+        left_join_aliases: Set[str],
+    ) -> bool:
+        if cond is None or not left_join_aliases:
+            return False
+        for col_expr in cond.find_all(exp.Column):
+            table_name = str(getattr(col_expr, "table", "") or "").strip("`").lower()
+            if table_name and table_name in left_join_aliases:
+                return True
+        return False
+
+    if "left_anti_join" in meta["scope_kinds"]:
+        group_arg = sel.args.get("group")
+        where_arg = sel.args.get("where")
+        left_join_aliases = _left_join_aliases()
+        if isinstance(group_arg, exp.Group) and isinstance(where_arg, exp.Where) and left_join_aliases:
+            where_cond = where_arg.this
+            conjuncts = _flatten_top_and(where_cond)
+            anti_null_checks: List[Tuple["exp.Expression", "exp.Column"]] = []
+            keep_in_where: List["exp.Expression"] = []
+
+            for cond in conjuncts:
+                matched_col: Optional["exp.Column"] = None
+                if isinstance(cond, exp.Is):
+                    left = getattr(cond, "this", None)
+                    right = getattr(cond, "expression", None)
+                    if isinstance(left, exp.Column) and isinstance(right, exp.Null):
+                        matched_col = left
+                    elif isinstance(right, exp.Column) and isinstance(left, exp.Null):
+                        matched_col = right
+                if (
+                    matched_col is not None
+                    and str(getattr(matched_col, "table", "") or "").strip("`").lower() in left_join_aliases
+                ):
+                    anti_null_checks.append((cond, matched_col.copy()))
+                else:
+                    keep_in_where.append(cond.copy())
+
+            mixed_left_join_where = any(
+                _condition_references_left_join_alias(cond, left_join_aliases)
+                for cond in keep_in_where
+            )
+
+            if mixed_left_join_where:
+                meta["warnings"].append("mixed_left_join_filters_skipped")
+            elif len(anti_null_checks) == 1:
+                _anti_cond, anti_col = anti_null_checks[0]
+                count_zero = exp.EQ(
+                    this=exp.Count(this=anti_col.copy()),
+                    expression=exp.Literal.number("0"),
+                )
+                existing_having = sel.args.get("having")
+                existing_having_cond = existing_having.this.copy() if isinstance(existing_having, exp.Having) and existing_having.this is not None else None
+                merged_having = _build_and(
+                    ([existing_having_cond] if existing_having_cond is not None else [])
+                    + [count_zero]
+                )
+                if merged_having is not None:
+                    new_where = _build_and(keep_in_where)
+                    if new_where is None:
+                        sel.set("where", None)
+                    else:
+                        sel.set("where", exp.Where(this=new_where))
+                    sel.set("having", exp.Having(this=merged_having))
+                    rendered = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+                    if s.endswith(";"):
+                        rendered = rendered.rstrip(";") + ";"
+                    validated = _validate_candidate(rendered, "grouped_left_anti_join_having_ast")
+                    if validated:
+                        current_sql = validated
+                        meta["fixes"].append("grouped_left_anti_join_having_ast")
+
+    if "left_anti_join" in meta["scope_kinds"] and not meta["fixes"]:
+        joins = [j for j in (sel.args.get("joins") or []) if isinstance(j, exp.Join)]
+        group_arg = sel.args.get("group")
+        where_arg = sel.args.get("where")
+        if len(joins) == 1 and group_arg is None and isinstance(where_arg, exp.Where):
+            only_join = joins[0]
+            join_aliases = _left_join_aliases()
+            join_table_expr = getattr(only_join, "this", None)
+            join_on_expr = only_join.args.get("on")
+            if (
+                "LEFT" in _join_side(only_join)
+                and isinstance(join_table_expr, exp.Table)
+                and join_on_expr is not None
+                and join_aliases
+            ):
+                where_cond = where_arg.this
+                conjuncts = _flatten_top_and(where_cond)
+                anti_null_checks: List[Tuple["exp.Expression", "exp.Column"]] = []
+                keep_in_where: List["exp.Expression"] = []
+
+                for cond in conjuncts:
+                    matched_col: Optional["exp.Column"] = None
+                    if isinstance(cond, exp.Is):
+                        left = getattr(cond, "this", None)
+                        right = getattr(cond, "expression", None)
+                        if isinstance(left, exp.Column) and isinstance(right, exp.Null):
+                            matched_col = left
+                        elif isinstance(right, exp.Column) and isinstance(left, exp.Null):
+                            matched_col = right
+                    if (
+                        matched_col is not None
+                        and str(getattr(matched_col, "table", "") or "").strip("`").lower() in join_aliases
+                    ):
+                        anti_null_checks.append((cond, matched_col.copy()))
+                    else:
+                        keep_in_where.append(cond.copy())
+
+                mixed_join_filters = any(
+                    _condition_references_left_join_alias(cond, join_aliases)
+                    for cond in keep_in_where
+                )
+
+                def _expr_references_join_alias(expr_in: Optional["exp.Expression"]) -> bool:
+                    return _condition_references_left_join_alias(expr_in, join_aliases)
+
+                other_join_refs = False
+                for select_expr in sel.expressions or []:
+                    if _expr_references_join_alias(select_expr):
+                        other_join_refs = True
+                        break
+                if not other_join_refs:
+                    for order_expr in ((sel.args.get("order") or exp.Order()).expressions or []):
+                        if _expr_references_join_alias(order_expr):
+                            other_join_refs = True
+                            break
+                if not other_join_refs:
+                    having_expr = sel.args.get("having")
+                    having_cond = having_expr.this if isinstance(having_expr, exp.Having) else None
+                    other_join_refs = _expr_references_join_alias(having_cond)
+
+                if mixed_join_filters:
+                    meta["warnings"].append("simple_left_anti_join_mixed_filters_skipped")
+                elif other_join_refs:
+                    meta["warnings"].append("simple_left_anti_join_rhs_refs_skipped")
+                elif len(anti_null_checks) == 1:
+                    subquery_where_parts = [join_on_expr.copy()]
+                    not_exists_where = _build_and(subquery_where_parts)
+                    if not_exists_where is not None:
+                        anti_subquery = exp.Select()
+                        anti_subquery.set("expressions", [exp.Literal.number(1)])
+                        anti_subquery.set("from_", exp.From(this=join_table_expr.copy()))
+                        anti_subquery.set("where", exp.Where(this=not_exists_where))
+                        not_exists_expr = exp.Not(this=exp.Exists(this=anti_subquery))
+
+                        new_where_parts = keep_in_where + [not_exists_expr]
+                        new_where = _build_and(new_where_parts)
+                        if new_where is not None:
+                            sel.set("joins", [])
+                            sel.set("where", exp.Where(this=new_where))
+                            rendered = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+                            if s.endswith(";"):
+                                rendered = rendered.rstrip(";") + ";"
+                            validated = _validate_candidate(rendered, "simple_left_anti_join_not_exists_ast")
+                            if validated:
+                                current_sql = validated
+                                meta["fixes"].append("simple_left_anti_join_not_exists_ast")
+
     rewrite_steps = [
         ("grouped_temporal_exclusion_bridge_ast", lambda text: _rewrite_two_table_grouped_temporal_exclusion(text, question, ctx)),
         ("missing_temporal_bridge_exclusion_ast", lambda text: _rewrite_missing_temporal_bridge_exclusion(text, question, ctx)),
