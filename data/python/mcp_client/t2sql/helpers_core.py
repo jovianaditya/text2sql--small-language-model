@@ -5914,6 +5914,108 @@ def _drop_redundant_column_aliases(sql: str) -> str:
     ast2 = ast.transform(transform)
     return ast2.sql(dialect="mysql") if changed else sql
 
+
+def _ast_normalize_from_aliases(sql: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first cleanup for unused base-table aliases in simple single-table SELECTs.
+
+    Scope for this batch:
+    - top-level SELECT only
+    - exactly one real table in FROM
+    - no JOINs and no derived FROM source
+    - no nested subqueries or set operations
+
+    Within that scope, removing an unused base-table alias is structurally safe
+    because all alias references are inspected directly from the AST.
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+    }
+    s = str(sql or "").strip()
+    if not s:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    if not isinstance(ast, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+
+    sel = ast
+    if any(True for _ in sel.find_all(exp.Subquery)):
+        meta["warnings"].append("nested_subquery_skipped")
+        return sql, meta
+
+    from_arg = sel.args.get("from") or sel.args.get("from_")
+    if from_arg is None:
+        meta["warnings"].append("missing_from")
+        return sql, meta
+
+    base_table_expr = getattr(from_arg, "this", None)
+    if not isinstance(base_table_expr, exp.Table):
+        meta["warnings"].append("derived_from_skipped")
+        return sql, meta
+
+    join_exprs = [j for j in (sel.args.get("joins") or []) if isinstance(j, exp.Join)]
+    if join_exprs:
+        meta["warnings"].append("join_skipped")
+        return sql, meta
+
+    meta["handled_scope"] = True
+
+    table_alias_expr = getattr(base_table_expr, "args", {}).get("alias")
+    if table_alias_expr is None:
+        return sql, meta
+
+    alias_name = str(base_table_expr.alias or "").strip("`")
+    if not alias_name:
+        return sql, meta
+    if alias_name.lower() in _RESERVED_ALIASES:
+        meta["warnings"].append("reserved_alias_skipped")
+        return sql, meta
+
+    for col in sel.find_all(exp.Column):
+        table_name = str(col.table or "").strip("`").lower()
+        if table_name and table_name == alias_name.lower():
+            return sql, meta
+
+    changed = False
+
+    def _drop_base_alias(node: "exp.Expression") -> "exp.Expression":
+        nonlocal changed
+        if node is base_table_expr:
+            new_node = node.copy()
+            new_node.set("alias", None)
+            changed = True
+            return new_node
+        return node
+
+    ast2 = ast.transform(_drop_base_alias)
+    if not changed:
+        return sql, meta
+
+    meta["fixes"].append("drop_unused_from_alias_ast")
+    out_sql = ast2.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+    if sql.strip().endswith(";"):
+        out_sql = out_sql.rstrip(";") + ";"
+    return out_sql, meta
+
+
 def _drop_unused_from_table_aliases(sql: str) -> str:
     """
     Hapus alias di FROM <table> [AS] <alias> jika alias itu tidak pernah dipakai sebagai qualifier (alias.col)
@@ -5924,11 +6026,8 @@ def _drop_unused_from_table_aliases(sql: str) -> str:
     - tidak menyentuh derived table: FROM (SELECT ...) t  (karena MySQL butuh alias derived table)
     - tidak menyentuh alias reserved
     """
-    
     if not sql:
         return sql
-    print(f"[REFINER - DROP ALIAS] Input: {sql[:100]}")
-    print(f"[REFINER - DROP ALIAS] has_join: {has_join(sql)}")
     # FIX 1: Kalau ada JOIN di mana pun, jangan sentuh (biar aman).
     if has_join(sql):
         return sql
