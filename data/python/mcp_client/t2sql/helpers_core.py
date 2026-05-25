@@ -24820,7 +24820,9 @@ def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, A
     Scope for this batch:
     - top-level SELECT only
     - one or more real tables from FROM/JOIN, but no derived tables
-    - skip nested subqueries, windows, QUALIFY, and set operations
+    - allow narrow WHERE/HAVING subqueries, but skip subqueries inside the
+      projected/grouped expressions themselves
+    - skip windows, QUALIFY, and set operations
 
     Preservation rules:
     - keep aggregates, literals, stars
@@ -24866,9 +24868,15 @@ def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, A
     if sel.args.get("qualify") is not None:
         meta["warnings"].append("qualify_skipped")
         return sql, meta
-    if any(True for _ in sel.find_all(exp.Subquery)):
-        meta["warnings"].append("nested_subquery_skipped")
-        return sql, meta
+    for item in sel.expressions or []:
+        base_item = item.this if isinstance(item, exp.Alias) else item
+        if any(True for _ in base_item.find_all(exp.Subquery)):
+            meta["warnings"].append("projection_subquery_skipped")
+            return sql, meta
+    for group_expr in group.expressions or []:
+        if any(True for _ in group_expr.find_all(exp.Subquery)):
+            meta["warnings"].append("group_subquery_skipped")
+            return sql, meta
     if any(True for _ in sel.find_all(exp.Window)):
         meta["warnings"].append("window_skipped")
         return sql, meta
