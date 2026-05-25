@@ -24613,20 +24613,20 @@ def _ast_simplify_redundant_dedupe(sql: str) -> Tuple[str, Dict[str, Any]]:
 
 def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, Any]]:
     """
-    AST-first GROUP BY projection validity repair for flat single-table queries.
+    AST-first GROUP BY projection validity repair for flat and simple real-table join queries.
 
     Scope for this batch:
     - top-level SELECT only
-    - exactly one base table, no JOINs
-    - skip nested subqueries, windows, and QUALIFY
+    - one or more real tables from FROM/JOIN, but no derived tables
+    - skip nested subqueries, windows, QUALIFY, and set operations
 
     Preservation rules:
     - keep aggregates, literals, stars
     - keep expressions explicitly covered by GROUP BY
     - keep expressions whose referenced columns are all covered by GROUP BY
-    - keep same-table expressions when GROUP BY includes the table's primary
+    - keep same-table expressions when GROUP BY includes that table's primary
       identifier column, because those projections are functionally dependent
-      in this narrow single-table scope
+      in this narrow real-table scope
     """
     meta: Dict[str, Any] = {
         "parse_ok": False,
@@ -24670,25 +24670,43 @@ def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, A
     if any(True for _ in sel.find_all(exp.Window)):
         meta["warnings"].append("window_skipped")
         return sql, meta
-    if any(True for _ in sel.find_all(exp.Join)):
-        meta["warnings"].append("join_skipped")
-        return sql, meta
-
     from_arg = sel.args.get("from") or sel.args.get("from_")
     if from_arg is None:
         meta["warnings"].append("missing_from")
         return sql, meta
 
-    top_tables = [t for t in from_arg.find_all(exp.Table)]
-    if len(top_tables) != 1:
-        meta["warnings"].append("flat_single_table_only")
+    base_table_expr = getattr(from_arg, "this", None)
+    if not isinstance(base_table_expr, exp.Table):
+        meta["warnings"].append("derived_from_skipped")
         return sql, meta
 
-    base_table = str(top_tables[0].name or "").strip("`").lower()
-    base_alias = str(top_tables[0].alias_or_name or base_table).strip("`").lower()
-    if not base_table:
+    alias_to_table: Dict[str, str] = {}
+    table_aliases: Dict[str, Set[str]] = {}
+
+    def _register_table(table_expr: "exp.Table") -> bool:
+        table_name = str(table_expr.name or "").strip("`").lower()
+        alias_name = str(table_expr.alias_or_name or table_name).strip("`").lower()
+        if not table_name or not alias_name:
+            return False
+        alias_to_table[alias_name] = table_name
+        alias_to_table.setdefault(table_name, table_name)
+        table_aliases.setdefault(table_name, set()).add(alias_name)
+        table_aliases[table_name].add(table_name)
+        return True
+
+    if not _register_table(base_table_expr):
         meta["warnings"].append("missing_table_name")
         return sql, meta
+
+    join_exprs = [j for j in (sel.args.get("joins") or []) if isinstance(j, exp.Join)]
+    for join_expr in join_exprs:
+        join_table_expr = getattr(join_expr, "this", None)
+        if not isinstance(join_table_expr, exp.Table):
+            meta["warnings"].append("derived_join_skipped")
+            return sql, meta
+        if not _register_table(join_table_expr):
+            meta["warnings"].append("missing_join_table_name")
+            return sql, meta
 
     meta["handled_scope"] = True
 
@@ -24715,11 +24733,16 @@ def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, A
             variants.add(col_norm)
 
         col_table = str(col.table or "").strip("`").lower()
-        table_variants = {base_table}
-        if base_alias:
-            table_variants.add(base_alias)
+        table_variants: Set[str] = set()
         if col_table:
+            mapped_table = alias_to_table.get(col_table, col_table)
             table_variants.add(col_table)
+            table_variants.add(mapped_table)
+            table_variants.update(table_aliases.get(mapped_table, set()))
+        else:
+            for table_name, aliases in table_aliases.items():
+                table_variants.add(table_name)
+                table_variants.update(aliases)
         for table_name in table_variants:
             if not table_name:
                 continue
@@ -24755,18 +24778,19 @@ def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, A
         meta["warnings"].append("empty_group_norms")
         return sql, meta
 
-    grouped_id = str(get_id_column(base_table) or "").strip("`").lower()
-    grouped_primary_identifier = False
-    if grouped_id:
-        for table_name in {base_table, base_alias}:
-            if not table_name:
-                continue
-            cand = _normalize_sql_expr_for_match(f"{table_name}.{grouped_id}")
-            if cand in group_norms:
-                grouped_primary_identifier = True
-                break
-        if not grouped_primary_identifier:
-            grouped_primary_identifier = _normalize_sql_expr_for_match(grouped_id) in group_norms
+    grouped_identifier_tables: Set[str] = set()
+    for table_name, aliases in table_aliases.items():
+        grouped_id = str(get_id_column(table_name) or "").strip("`").lower()
+        if not grouped_id:
+            continue
+        candidate_qualifiers = set(aliases)
+        candidate_qualifiers.add(table_name)
+        if any(
+            _normalize_sql_expr_for_match(f"{qualifier}.{grouped_id}") in group_norms
+            for qualifier in candidate_qualifiers
+            if qualifier
+        ) or _normalize_sql_expr_for_match(grouped_id) in group_norms:
+            grouped_identifier_tables.add(table_name)
 
     expressions_to_remove = []
     for item in sel.expressions or []:
@@ -24790,14 +24814,14 @@ def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, A
             if refs_all_grouped:
                 continue
 
-            if grouped_primary_identifier:
-                same_table_refs = True
-                for ref_col in ref_cols:
-                    ref_table = str(ref_col.table or "").strip("`").lower()
-                    if ref_table and ref_table not in {base_table, base_alias}:
-                        same_table_refs = False
-                        break
-                if same_table_refs:
+            ref_tables = {
+                alias_to_table.get(str(ref_col.table or "").strip("`").lower(), str(ref_col.table or "").strip("`").lower())
+                for ref_col in ref_cols
+                if str(ref_col.table or "").strip("`").lower()
+            }
+            if len(ref_tables) == 1:
+                only_ref_table = next(iter(ref_tables))
+                if only_ref_table in grouped_identifier_tables:
                     continue
         else:
             # No column references means the expression is constant in this
