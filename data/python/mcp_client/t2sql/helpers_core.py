@@ -6023,6 +6023,109 @@ def _strip_alias_if_single_table(sql: str) -> str:
     result = "".join(parts)
     print(f"[REFINER - STRIP ALIAS] Output: {result[:100]}")
     return result
+
+
+def _ast_normalize_cosmetic_aliases(sql: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    AST-first cosmetic alias normalization.
+
+    Scope for this batch:
+    - top-level SELECT only
+    - no nested subqueries or set operations
+    - always safe to drop same-name plain-column aliases
+    - only strip table qualifiers for simple single-table non-aggregate,
+      non-grouped, non-window queries
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+    }
+    s = str(sql or "").strip()
+    if not s:
+        return sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return sql, meta
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return sql, meta
+
+    meta["parse_ok"] = True
+    if not isinstance(ast, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return sql, meta
+
+    sel = ast
+    if any(True for _ in sel.find_all(exp.Subquery)):
+        meta["warnings"].append("nested_subquery_skipped")
+        return sql, meta
+
+    meta["handled_scope"] = True
+    changed = False
+
+    new_expressions: List["exp.Expression"] = []
+    for item in sel.expressions or []:
+        if isinstance(item, exp.Alias) and isinstance(item.this, exp.Column):
+            alias_name = str(item.alias or "").strip("`")
+            col_name = str(item.this.name or "").strip("`")
+            if alias_name and col_name and alias_name.lower() == col_name.lower():
+                new_expressions.append(item.this.copy())
+                changed = True
+                if "drop_redundant_column_alias_ast" not in meta["fixes"]:
+                    meta["fixes"].append("drop_redundant_column_alias_ast")
+                continue
+        new_expressions.append(item)
+
+    if changed:
+        sel.set("expressions", new_expressions)
+
+    from_arg = sel.args.get("from") or sel.args.get("from_")
+    base_table_expr = getattr(from_arg, "this", None) if from_arg is not None else None
+    join_exprs = [j for j in (sel.args.get("joins") or []) if isinstance(j, exp.Join)]
+    has_group = sel.args.get("group") is not None
+    has_window = any(True for _ in sel.find_all(exp.Window))
+    has_aggregate = any(True for _ in sel.find_all(exp.AggFunc))
+
+    if (
+        isinstance(base_table_expr, exp.Table)
+        and not join_exprs
+        and not has_group
+        and not has_window
+        and not has_aggregate
+    ):
+        base_name = str(base_table_expr.name or "").strip("`").lower()
+        alias_name = str(base_table_expr.alias_or_name or "").strip("`").lower()
+        allowed_qualifiers = {q for q in {base_name, alias_name} if q}
+
+        def _strip_simple_qualifier(node: "exp.Expression") -> "exp.Expression":
+            nonlocal changed
+            if isinstance(node, exp.Column):
+                table_name = str(node.table or "").strip("`").lower()
+                if table_name and table_name in allowed_qualifiers:
+                    changed = True
+                    return exp.column(str(node.name or "").strip("`"))
+            return node
+
+        ast = ast.transform(_strip_simple_qualifier)
+        if changed and "strip_single_table_qualifier_ast" not in meta["fixes"]:
+            meta["fixes"].append("strip_single_table_qualifier_ast")
+
+    if not changed:
+        return sql, meta
+
+    out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+    if sql.strip().endswith(";"):
+        out_sql = out_sql.rstrip(";") + ";"
+    return out_sql, meta
 # =======================================================================
 # ============ Phase 3 — Column Naming & GROUP BY Consistency ===========
 # ================== Operate on final column identities =================
@@ -24779,6 +24882,7 @@ def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, A
         return sql, meta
 
     grouped_identifier_tables: Set[str] = set()
+    real_tables_in_scope: Set[str] = set(table_aliases.keys())
     for table_name, aliases in table_aliases.items():
         grouped_id = str(get_id_column(table_name) or "").strip("`").lower()
         if not grouped_id:
@@ -24814,11 +24918,16 @@ def _ast_repair_group_by_projection_validity(sql: str) -> Tuple[str, Dict[str, A
             if refs_all_grouped:
                 continue
 
-            ref_tables = {
-                alias_to_table.get(str(ref_col.table or "").strip("`").lower(), str(ref_col.table or "").strip("`").lower())
-                for ref_col in ref_cols
-                if str(ref_col.table or "").strip("`").lower()
-            }
+            ref_tables: Set[str] = set()
+            for ref_col in ref_cols:
+                ref_table = str(ref_col.table or "").strip("`").lower()
+                if ref_table:
+                    ref_tables.add(alias_to_table.get(ref_table, ref_table))
+                elif len(real_tables_in_scope) == 1:
+                    # In a true single-table grouped query, unqualified columns
+                    # still belong to that sole table and can be functionally
+                    # dependent on its grouped identifier.
+                    ref_tables.update(real_tables_in_scope)
             if len(ref_tables) == 1:
                 only_ref_table = next(iter(ref_tables))
                 if only_ref_table in grouped_identifier_tables:

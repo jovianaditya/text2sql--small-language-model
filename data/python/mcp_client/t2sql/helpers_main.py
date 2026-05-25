@@ -94,6 +94,7 @@ from .helpers_core import (
     _remove_redundant_and_ornamental_joins, _rewrite_invalid_fk_join_conditions, has_non_inner_join, join_count,
     # phase 2
     _drop_redundant_column_aliases, _drop_unused_from_table_aliases, _strip_alias_if_single_table, _repair_invalid_qualified_columns, _repair_simple_single_table_column_names,
+    _ast_normalize_cosmetic_aliases,
     # phase 3
     _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _ensure_explicit_simple_projection_columns, _prune_non_primary_dimensions_for_primary_aggregate, _drop_unrequested_nonprimary_identifier_group_keys, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
     _align_requested_description_variant, _align_requested_joined_description_variant, _drop_unrequested_difference_operand_columns,
@@ -9176,9 +9177,37 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     # Phase 2 — Alias Hygiene & FROM Cleanup
     # Safe only after JOIN structure is frozen
     # ---------------------------------------------------------------------------
-    s = _drop_redundant_column_aliases(s)
-    s = _drop_unused_from_table_aliases(s)
-    s = _strip_alias_if_single_table(s)
+    ast_alias_meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": ["parse_gate_not_ast"] if not ast_parseable else [],
+    }
+    phase2_alias_handled = False
+    if ast_parseable:
+        ast_alias_sql, ast_alias_meta = _ast_normalize_cosmetic_aliases(s)
+        if AST_TRACE:
+            print(
+                "[REFINER - AST ALIAS NORMALIZATION] "
+                + _ast_meta_text(ast_alias_meta)
+                + f" applied={bool(ast_alias_meta.get('fixes'))}"
+            )
+        if ast_alias_meta.get("parse_ok", False) and ast_alias_meta.get("handled_scope", False):
+            s = ast_alias_sql
+            phase2_alias_handled = True
+            if AST_TRACE and ast_alias_meta.get("fixes"):
+                print(f"[REFINER - AST ALIAS NORMALIZATION] sql={s}")
+    if not phase2_alias_handled:
+        if AST_TRACE:
+            reason = "ast_unhandled_scope_or_parse_fail" if ast_parseable else "parse_gate_not_ast"
+            print(f"[REFINER - AST ALIAS NORMALIZATION] legacy_fallback=used reason={reason}")
+        s = _drop_redundant_column_aliases(s)
+        s = _drop_unused_from_table_aliases(s)
+        s = _strip_alias_if_single_table(s)
+    else:
+        if AST_TRACE:
+            print("[REFINER - AST ALIAS NORMALIZATION] legacy_fallback=skipped reason=ast_handled_scope")
+        s = _drop_unused_from_table_aliases(s)
     # ---------------------------------------------------------------------------
     # Phase 2.5 — Force Remove AS from Plain Columns (keep for computed expressions)
     # Plain columns: columnName AS alias → columnName (remove ALL aliases)
