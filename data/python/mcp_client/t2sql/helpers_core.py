@@ -5917,13 +5917,12 @@ def _drop_redundant_column_aliases(sql: str) -> str:
 
 def _ast_normalize_from_aliases(sql: str) -> Tuple[str, Dict[str, Any]]:
     """
-    AST-first cleanup for unused base-table aliases in simple single-table SELECTs.
+    AST-first cleanup for unused base-table aliases.
 
     Scope for this batch:
-    - top-level SELECT only
-    - exactly one real table in FROM
-    - no JOINs and no derived FROM source
-    - no nested subqueries or set operations
+    - parseable query roots handled in AST-first mode
+    - actual alias removal remains narrow: top-level SELECT with one real table
+      in FROM and no JOINs
 
     Within that scope, removing an unused base-table alias is structurally safe
     because all alias references are inspected directly from the AST.
@@ -5952,31 +5951,35 @@ def _ast_normalize_from_aliases(sql: str) -> Tuple[str, Dict[str, Any]]:
         return sql, meta
 
     meta["parse_ok"] = True
-    if not isinstance(ast, exp.Select):
+    setop_types = tuple(
+        cls for cls in (
+            getattr(exp, "SetOperation", None),
+            getattr(exp, "Union", None),
+            getattr(exp, "Intersect", None),
+            getattr(exp, "Except", None),
+        )
+        if cls is not None
+    )
+    if not isinstance(ast, (exp.Select,) + setop_types):
         meta["warnings"].append("unsupported_root")
         return sql, meta
 
-    sel = ast
-    if any(True for _ in sel.find_all(exp.Subquery)):
-        meta["warnings"].append("nested_subquery_skipped")
+    meta["handled_scope"] = True
+    if not isinstance(ast, exp.Select):
         return sql, meta
 
+    sel = ast
     from_arg = sel.args.get("from") or sel.args.get("from_")
     if from_arg is None:
-        meta["warnings"].append("missing_from")
         return sql, meta
 
     base_table_expr = getattr(from_arg, "this", None)
     if not isinstance(base_table_expr, exp.Table):
-        meta["warnings"].append("derived_from_skipped")
         return sql, meta
 
     join_exprs = [j for j in (sel.args.get("joins") or []) if isinstance(j, exp.Join)]
     if join_exprs:
-        meta["warnings"].append("join_skipped")
         return sql, meta
-
-    meta["handled_scope"] = True
 
     table_alias_expr = getattr(base_table_expr, "args", {}).get("alias")
     if table_alias_expr is None:
@@ -6129,8 +6132,7 @@ def _ast_normalize_cosmetic_aliases(sql: str) -> Tuple[str, Dict[str, Any]]:
     AST-first cosmetic alias normalization.
 
     Scope for this batch:
-    - top-level SELECT only
-    - no nested subqueries or set operations
+    - parseable query roots handled in AST-first mode
     - always safe to drop same-name plain-column aliases
     - only strip table qualifiers for simple single-table non-aggregate,
       non-grouped, non-window queries
@@ -6159,64 +6161,70 @@ def _ast_normalize_cosmetic_aliases(sql: str) -> Tuple[str, Dict[str, Any]]:
         return sql, meta
 
     meta["parse_ok"] = True
-    if not isinstance(ast, exp.Select):
+    setop_types = tuple(
+        cls for cls in (
+            getattr(exp, "SetOperation", None),
+            getattr(exp, "Union", None),
+            getattr(exp, "Intersect", None),
+            getattr(exp, "Except", None),
+        )
+        if cls is not None
+    )
+    if not isinstance(ast, (exp.Select,) + setop_types):
         meta["warnings"].append("unsupported_root")
-        return sql, meta
-
-    sel = ast
-    if any(True for _ in sel.find_all(exp.Subquery)):
-        meta["warnings"].append("nested_subquery_skipped")
         return sql, meta
 
     meta["handled_scope"] = True
     changed = False
 
-    new_expressions: List["exp.Expression"] = []
-    for item in sel.expressions or []:
-        if isinstance(item, exp.Alias) and isinstance(item.this, exp.Column):
-            alias_name = str(item.alias or "").strip("`")
-            col_name = str(item.this.name or "").strip("`")
+    def _drop_same_name_alias(node: "exp.Expression") -> "exp.Expression":
+        nonlocal changed
+        if isinstance(node, exp.Alias) and isinstance(node.this, exp.Column):
+            alias_name = str(node.alias or "").strip("`")
+            col_name = str(node.this.name or "").strip("`")
             if alias_name and col_name and alias_name.lower() == col_name.lower():
-                new_expressions.append(item.this.copy())
                 changed = True
-                if "drop_redundant_column_alias_ast" not in meta["fixes"]:
-                    meta["fixes"].append("drop_redundant_column_alias_ast")
-                continue
-        new_expressions.append(item)
+                return node.this.copy()
+        return node
 
-    if changed:
-        sel.set("expressions", new_expressions)
+    ast = ast.transform(_drop_same_name_alias)
+    if changed and "drop_redundant_column_alias_ast" not in meta["fixes"]:
+        meta["fixes"].append("drop_redundant_column_alias_ast")
 
-    from_arg = sel.args.get("from") or sel.args.get("from_")
-    base_table_expr = getattr(from_arg, "this", None) if from_arg is not None else None
-    join_exprs = [j for j in (sel.args.get("joins") or []) if isinstance(j, exp.Join)]
-    has_group = sel.args.get("group") is not None
-    has_window = any(True for _ in sel.find_all(exp.Window))
-    has_aggregate = any(True for _ in sel.find_all(exp.AggFunc))
+    if isinstance(ast, exp.Select):
+        sel = ast
+        from_arg = sel.args.get("from") or sel.args.get("from_")
+        base_table_expr = getattr(from_arg, "this", None) if from_arg is not None else None
+        join_exprs = [j for j in (sel.args.get("joins") or []) if isinstance(j, exp.Join)]
+        has_group = sel.args.get("group") is not None
+        has_window = any(True for _ in sel.find_all(exp.Window))
+        has_aggregate = any(True for _ in sel.find_all(exp.AggFunc))
+        has_subquery = any(True for _ in sel.find_all(exp.Subquery))
 
-    if (
-        isinstance(base_table_expr, exp.Table)
-        and not join_exprs
-        and not has_group
-        and not has_window
-        and not has_aggregate
-    ):
-        base_name = str(base_table_expr.name or "").strip("`").lower()
-        alias_name = str(base_table_expr.alias_or_name or "").strip("`").lower()
-        allowed_qualifiers = {q for q in {base_name, alias_name} if q}
+        if (
+            isinstance(base_table_expr, exp.Table)
+            and not join_exprs
+            and not has_group
+            and not has_window
+            and not has_aggregate
+            and not has_subquery
+        ):
+            base_name = str(base_table_expr.name or "").strip("`").lower()
+            alias_name = str(base_table_expr.alias_or_name or "").strip("`").lower()
+            allowed_qualifiers = {q for q in {base_name, alias_name} if q}
 
-        def _strip_simple_qualifier(node: "exp.Expression") -> "exp.Expression":
-            nonlocal changed
-            if isinstance(node, exp.Column):
-                table_name = str(node.table or "").strip("`").lower()
-                if table_name and table_name in allowed_qualifiers:
-                    changed = True
-                    return exp.column(str(node.name or "").strip("`"))
-            return node
+            def _strip_simple_qualifier(node: "exp.Expression") -> "exp.Expression":
+                nonlocal changed
+                if isinstance(node, exp.Column):
+                    table_name = str(node.table or "").strip("`").lower()
+                    if table_name and table_name in allowed_qualifiers:
+                        changed = True
+                        return exp.column(str(node.name or "").strip("`"))
+                return node
 
-        ast = ast.transform(_strip_simple_qualifier)
-        if changed and "strip_single_table_qualifier_ast" not in meta["fixes"]:
-            meta["fixes"].append("strip_single_table_qualifier_ast")
+            ast = ast.transform(_strip_simple_qualifier)
+            if changed and "strip_single_table_qualifier_ast" not in meta["fixes"]:
+                meta["fixes"].append("strip_single_table_qualifier_ast")
 
     if not changed:
         return sql, meta
