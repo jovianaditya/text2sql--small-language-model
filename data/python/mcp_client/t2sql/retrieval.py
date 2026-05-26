@@ -134,7 +134,7 @@ from .config import (
 )
 from .state import RAGState
 from .chroma_embedding import build_vector_store
-from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
+from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_aliases_for_map
 from .helpers_main import _get_qtype, build_dynamic_probe
 from .rulebook import question_has_hierarchy_role_intent
 from .schema_analyzer import (
@@ -146,6 +146,12 @@ from .schema_analyzer import (
     is_transaction_table,
     get_column_synonyms,
     get_column_entity_variants,
+    get_column_description,
+    get_column_datatype,
+    get_column_primary_role,
+    get_column_role_tags,
+    get_column_alias_tags,
+    get_column_stats,
     get_name_column,
     get_id_column,
     get_fk_relationships,
@@ -214,6 +220,114 @@ def _extract_cards_and_hint(ctx: str) -> tuple[str, str]:
         hint_text = text[hint_start:].strip()
 
     return cards_text, hint_text
+
+
+def _normalize_stats_dict(stats_raw: Any) -> Dict[str, Any]:
+    if isinstance(stats_raw, dict):
+        return dict(stats_raw)
+    if isinstance(stats_raw, str):
+        try:
+            parsed = json.loads(stats_raw)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _merge_unique_lower(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for value in values or []:
+        s = str(value or "").strip().lower()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _column_structured_metadata(table: str, column: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    md = metadata if isinstance(metadata, dict) else {}
+    nested_meta = md.get("metadata") if isinstance(md.get("metadata"), dict) else {}
+    table_l = str(table or "").strip().lower()
+    col_s = str(column or "").strip()
+
+    raw_roles = _parse_str_or_list_lower(
+        md.get("tags_role")
+        or md.get("roles")
+        or nested_meta.get("tags_role")
+        or nested_meta.get("roles")
+        or []
+    )
+    raw_aliases = _parse_str_or_list_lower(
+        md.get("tags_alias")
+        or md.get("aliases")
+        or md.get("synonyms")
+        or nested_meta.get("tags_alias")
+        or nested_meta.get("aliases")
+        or nested_meta.get("synonyms")
+        or []
+    )
+
+    primary_role = ""
+    role_tags: List[str] = []
+    alias_tags: List[str] = []
+    stats = _normalize_stats_dict(nested_meta.get("stats") or md.get("stats"))
+    description = str(
+        nested_meta.get("description")
+        or md.get(RETRIEVAL_META_DESCRIPTION_KEY)
+        or md.get("description")
+        or ""
+    ).strip()
+    datatype = str(
+        nested_meta.get("datatype")
+        or md.get("datatype")
+        or md.get("data_type")
+        or ""
+    ).strip()
+
+    if table_l and col_s:
+        try:
+            primary_role = str(get_column_primary_role(table_l, col_s) or "").strip().lower()
+        except Exception:
+            primary_role = ""
+        try:
+            role_tags = _parse_str_or_list_lower(get_column_role_tags(table_l, col_s) or [])
+        except Exception:
+            role_tags = []
+        try:
+            alias_tags = _parse_str_or_list_lower(get_column_alias_tags(table_l, col_s) or [])
+        except Exception:
+            alias_tags = []
+        try:
+            schema_stats = _normalize_stats_dict(get_column_stats(table_l, col_s) or {})
+        except Exception:
+            schema_stats = {}
+        if schema_stats:
+            stats.update({k: v for k, v in schema_stats.items() if v not in (None, "")})
+        try:
+            schema_desc = str(get_column_description(table_l, col_s) or "").strip()
+        except Exception:
+            schema_desc = ""
+        if schema_desc:
+            description = schema_desc
+        try:
+            schema_datatype = str(get_column_datatype(table_l, col_s) or "").strip()
+        except Exception:
+            schema_datatype = ""
+        if schema_datatype:
+            datatype = schema_datatype
+
+    roles = _merge_unique_lower(([primary_role] if primary_role else []) + role_tags + raw_roles)
+    aliases = _merge_unique_lower(alias_tags + raw_aliases)
+    return {
+        "primary_role": primary_role,
+        "roles": roles,
+        "aliases": aliases,
+        "stats": stats,
+        "description": description,
+        "datatype": datatype,
+    }
 
 
 def _compute_retrieval_evidence_strength(snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -572,9 +686,10 @@ def _is_likely_filtered_requested_metric(
     if not (has_count_intent and (has_non_count_agg_intent or has_total_metric_intent)):
         return False
 
-    roles = _parse_str_or_list_lower(metadata.get("tags_role") or metadata.get("roles") or [])
+    col_meta = _column_structured_metadata(table, column, metadata)
+    roles = list(col_meta.get("roles") or [])
     is_metric_role = any(r in RETRIEVAL_METRIC_ROLE_TAGS for r in roles)
-    datatype = str(metadata.get("datatype") or "").lower()
+    datatype = str(col_meta.get("datatype") or "").lower()
     is_numeric = any(t in datatype for t in RETRIEVAL_NUMERIC_TYPE_HINTS)
     col_lower = str(column or "").strip().lower()
     has_numeric_pattern = any(p in col_lower for p in RETRIEVAL_NUMERIC_PATTERN_KEYWORDS)
@@ -595,14 +710,7 @@ def _is_likely_filtered_requested_metric(
     except Exception:
         pass
 
-    nested_meta = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
-    alias_variants = _parse_str_or_list_lower(
-        metadata.get("tags_alias")
-        or metadata.get("aliases")
-        or nested_meta.get("tags_alias")
-        or nested_meta.get("aliases")
-        or []
-    )
+    alias_variants = list(col_meta.get("aliases") or [])
     for alias in alias_variants:
         mention_tokens.update(tok for tok in re.findall(RETRIEVAL_TOKENIZE_ALNUM_PATTERN, str(alias).lower()) if tok)
 
@@ -648,6 +756,7 @@ def _is_column_relevant_to_query(
     q_norm = _normalize_text(question)
     q_words = set(q_norm.split())
     table_lower = table.lower()
+    col_meta = _column_structured_metadata(table, column, metadata)
     has_count_intent = any(k in q_l for k in RETRIEVAL_COUNT_QUERY_TERMS)
     # Mixed aggregate intent should keep metric columns (e.g., "count and average amount").
     has_non_count_agg_intent = bool(
@@ -678,15 +787,7 @@ def _is_column_relevant_to_query(
         except Exception:
             pass
 
-        nested_meta = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
-        alias_variants = _parse_str_or_list_lower(
-            metadata.get("tags_alias")
-            or metadata.get("aliases")
-            or nested_meta.get("tags_alias")
-            or nested_meta.get("aliases")
-            or []
-        )
-        for alias in alias_variants:
+        for alias in list(col_meta.get("aliases") or []):
             alias_s = str(alias or "").strip()
             if alias_s:
                 variants.add(alias_s)
@@ -704,7 +805,7 @@ def _is_column_relevant_to_query(
     explicit_column_match = any(_question_mentions_variant(v) for v in _column_variants())
 
     # === RULE 1: Always include primary keys and identifying columns ===
-    roles = _parse_str_or_list_lower(metadata.get("tags_role") or metadata.get("roles") or [])
+    roles = list(col_meta.get("roles") or [])
     if any(r in RETRIEVAL_ID_ROLE_TAGS for r in roles):
         return True
 
@@ -715,7 +816,7 @@ def _is_column_relevant_to_query(
         return True
 
     # Check column description (with word boundary matching)
-    desc = str(metadata.get(RETRIEVAL_META_DESCRIPTION_KEY) or "").lower()
+    desc = str(col_meta.get("description") or "").lower()
     # Extract key terms from description (first few words)
     desc_words = set(desc.split()[:RETRIEVAL_DESC_KEYWORD_HEAD_WORDS])
     # Only match if description words actually appear as whole words in question
@@ -734,7 +835,7 @@ def _is_column_relevant_to_query(
         is_metric = any(r in RETRIEVAL_METRIC_ROLE_TAGS for r in roles)
 
         # Check if column is a numeric measure
-        datatype = (metadata.get("datatype") or "").lower()
+        datatype = str(col_meta.get("datatype") or "").lower()
         is_numeric = any(t in datatype for t in RETRIEVAL_NUMERIC_TYPE_HINTS)
 
         # Numeric column patterns (generic, not table-specific)
@@ -825,13 +926,14 @@ def _build_cards(
                         )
                 continue
 
+        col_meta = _column_structured_metadata(table, column, md)
+
         # --- LOGIKA DESKRIPSI (WATERFALL PRIORITY) ---
         desc = ""
 
-        # 1. PRIORITY 1: Metadata Explicit (Hasil Sparse JSONL Anda)
-        # JSONL Sparse Anda sekarang punya key "description" di dalam metadata.
-        if md.get(RETRIEVAL_META_DESCRIPTION_KEY):
-            desc = md.get(RETRIEVAL_META_DESCRIPTION_KEY).strip()
+        # 1. PRIORITY 1: structured/schema-aware description
+        if col_meta.get("description"):
+            desc = str(col_meta.get("description") or "").strip()
 
         # 2. PRIORITY 2: Parsing Teks Dokumen (Hasil Dense JSONL Anda)
         # JSONL Dense Anda formatnya: "Table: ... Description: <ISI>.. Primary Key..."
@@ -877,7 +979,7 @@ def _build_cards(
             desc = desc[:desc_max_len] + "..."
         
         # --- AMBIL STATISTIK ---
-        stats_str = _format_stats_for_llm(md.get("stats"))
+        stats_str = _format_stats_for_llm(col_meta.get("stats") or md.get("stats"))
         
         # --- BUILD STRING ---
         card_str = f"- table: {table} | column: {column} | desc: {desc}{stats_str}"
@@ -1105,26 +1207,10 @@ def _doc_tokens_from_meta(meta: Dict[str, Any]) -> List[str]:
     # --- Fallback: Legacy Logic (jika jsonl belum di-update) ---
     table = (_meta_table(meta) or _meta_table(nested_meta) or "").lower()
     column = (_meta_column(meta) or _meta_column(nested_meta) or "").lower()
-    desc = str(
-        meta.get(RETRIEVAL_META_DESCRIPTION_KEY)
-        or nested_meta.get(RETRIEVAL_META_DESCRIPTION_KEY)
-        or ""
-    ).lower()
-
-    aliases = _parse_str_or_list_lower(
-        meta.get("tags_alias")
-        or meta.get("aliases")
-        or nested_meta.get("tags_alias")
-        or nested_meta.get("aliases")
-        or []
-    )
-    roles   = _parse_str_or_list_lower(
-        meta.get("tags_role")
-        or meta.get("roles")
-        or nested_meta.get("tags_role")
-        or nested_meta.get("roles")
-        or []
-    )
+    col_meta = _column_structured_metadata(table, column, meta)
+    desc = str(col_meta.get("description") or "").lower()
+    aliases = list(col_meta.get("aliases") or [])
+    roles = list(col_meta.get("roles") or [])
 
     extra: List[str] = []
     has_semantic = bool(aliases or roles)
@@ -1458,7 +1544,9 @@ def score_tables_from_reranked(reranked: List[Dict[str, Any]], query_tokens: Lis
         md = it.get("meta") or {}
         tbl = _meta_table(md)
         if not tbl: continue
-        desc = (md.get(RETRIEVAL_META_DESCRIPTION_KEY) or "").lower()
+        col_name = _meta_column(md) or ""
+        col_meta = _column_structured_metadata(tbl, col_name, md)
+        desc = str(col_meta.get("description") or "").lower()
         base = 0.0
         tl = tbl.lower()
 
@@ -1508,27 +1596,36 @@ def _check_needs_numeric_data_from_retrieved(reranked: List[Dict[str, Any]]) -> 
     """
     for item in reranked[:MAX_CTX_DOCS]:
         md = item.get("meta") or {}
+        table = _meta_table(md) or ""
+        column = _meta_column(md) or ""
+        col_meta = _column_structured_metadata(table, column, md)
+        roles = {str(role or "").strip().lower() for role in (col_meta.get("roles") or []) if str(role or "").strip()}
 
         # Primary: Check datatype field from metadata
-        datatype = (md.get("datatype") or md.get("data_type") or "").strip().lower()
+        datatype = str(col_meta.get("datatype") or "").strip().lower()
         if datatype:
             # Remove any size specification (e.g., "decimal(10,2)" -> "decimal")
             base_type = datatype.split('(')[0].strip()
             if base_type in _NUMERIC_SQL_TYPES:
                 # Check if this numeric column is used for calculations
                 # (not just IDs or counts)
-                col = _meta_column(md).lower()
+                col = column.lower()
+                if roles.intersection({"pk", "fk", "id", "identifier", "primary_key", "foreign_key", "reference"}):
+                    continue
                 # Exclude primary keys and foreign keys (IDs) as they're not used for calculations
-                desc = str(md.get(RETRIEVAL_META_DESCRIPTION_KEY) or "").lower()
+                desc = str(col_meta.get("description") or "").lower()
                 if not any(kw in col for kw in RETRIEVAL_NUMERIC_EXCLUDE_COLUMN_KEYWORDS):
                     return True
                 # Check description for calculation-related terms
                 if any(kw in desc for kw in RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS):
                     return True
+                stats = col_meta.get("stats") or {}
+                if any(isinstance(stats.get(k), (int, float)) and not isinstance(stats.get(k), bool) for k in ("min", "max", "mean", "stddev")):
+                    return True
 
         # Fallback: Check column name pattern for numeric-sounding columns
         # (only if datatype check above didn't trigger)
-        col = _meta_column(md).lower()
+        col = column.lower()
         if any(kw in col for kw in RETRIEVAL_NUMERIC_SIGNAL_KEYWORDS):
             return True
 
@@ -1576,13 +1673,14 @@ def _build_effective_fk_graph(reranked: List[Dict[str, Any]]) -> Dict[str, Dict[
     fk_graph: Dict[str, Dict[str, str]] = {}
     for item in reranked:
         md = item.get("meta") or {}
-        desc = str(md.get(RETRIEVAL_META_DESCRIPTION_KEY) or "")
+        source_table = _meta_table(md)
+        fk_column = _meta_column(md)
+        col_meta = _column_structured_metadata(source_table or "", fk_column or "", md)
+        desc = str(col_meta.get("description") or "")
 
         fk_match = re.search(RETRIEVAL_FK_REFERENCE_PATTERN, desc, re.IGNORECASE)
         if not fk_match:
             continue
-        source_table = _meta_table(md)
-        fk_column = _meta_column(md)
         target_table = fk_match.group(1)
         if not (source_table and fk_column and target_table):
             continue
@@ -2119,7 +2217,9 @@ def retrieve_node(state: RAGState) -> RAGState:
         table_name = _meta_table(md) or ""
         col_raw = _meta_column(md) or ""
         col_name = col_raw.lower()
-        roles, aliases = _extract_roles_aliases(md)
+        col_meta = _column_structured_metadata(table_name, col_raw, md)
+        roles = list(col_meta.get("roles") or [])
+        aliases = list(col_meta.get("aliases") or [])
 
         boosted = base + (SPARSE_BONUS if sparse_hit else 0.0)
         boosted += apply_column_priority_boost(q_l=q_l, table=table_name, col_name=col_name, roles=roles, aliases=aliases)
@@ -2147,10 +2247,12 @@ def retrieve_node(state: RAGState) -> RAGState:
                 if got and got.get("ids"):
                     md = (got.get("metadatas") or [{}])[0]
                     doc = (got.get("documents") or [""])[0]
-                    roles, aliases = _extract_roles_aliases(md)
                     table_name = _meta_table(md) or ""
                     col_raw = _meta_column(md) or ""
                     col_name = col_raw.lower()
+                    col_meta = _column_structured_metadata(table_name, col_raw, md)
+                    roles = list(col_meta.get("roles") or [])
+                    aliases = list(col_meta.get("aliases") or [])
                     max_boost = max((x["boosted"] for x in scored), default=0.0)
                     boosted = max_boost + RETRIEVAL_AUTO_INJECT_BONUS_DELTA
                     boosted += apply_column_priority_boost(q_l=q_l, table=table_name, col_name=col_name, roles=roles, aliases=aliases)
@@ -2267,7 +2369,10 @@ def retrieve_node(state: RAGState) -> RAGState:
         t_key = t.strip().lower()
         c_key = c.strip()
         allowed[t_key].append(c_key)
-        aliases2 = _extract_aliases_for_map(md)
+        col_meta = _column_structured_metadata(t, c, md)
+        aliases2 = _merge_unique_lower(
+            list(col_meta.get("aliases") or []) + _extract_aliases_for_map(md)
+        )
         for al in aliases2:
             al = al.strip()
             if al: alias_map[t_key][al] = c_key
@@ -2421,7 +2526,9 @@ def retrieve_node(state: RAGState) -> RAGState:
                         col_name = _meta_column(md) or ""
                         if not table_name or not col_name:
                             continue
-                        roles, aliases = _extract_roles_aliases(md)
+                        col_meta = _column_structured_metadata(table_name, col_name, md)
+                        roles = list(col_meta.get("roles") or [])
+                        aliases = list(col_meta.get("aliases") or [])
                         role_hits = {
                             str(role or "").strip().lower()
                             for role in roles
@@ -2473,7 +2580,8 @@ def retrieve_node(state: RAGState) -> RAGState:
 
                         # Temporal-capable table detection from metadata and column name.
                         col = (_meta_column(md) or "").strip().lower()
-                        datatype = str(md.get("datatype") or md.get("data_type") or "").strip().lower()
+                        col_meta = _column_structured_metadata(tbl_l, col, md)
+                        datatype = str(col_meta.get("datatype") or "").strip().lower()
                         base_type = datatype.split("(")[0].strip() if datatype else ""
                         is_temporal = base_type in {"date", "datetime", "timestamp", "time", "year"}
                         if not is_temporal and col:
