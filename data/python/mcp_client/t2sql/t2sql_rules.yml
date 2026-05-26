@@ -332,6 +332,21 @@ retrieval_intent:
       - name
       - nama
 
+hierarchy_intent:
+  role_terms:
+    - manager
+    - subordinate
+    - supervisor
+    - parent
+    - child
+    - owner
+    - member
+    - leader
+    - mentor
+    - boss
+    - reports to
+    - reporting to
+
 query_classification:
   ordinal_terms:
     - second

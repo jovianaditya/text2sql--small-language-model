@@ -55,6 +55,10 @@ class SchemaAnalyzer:
         self._lineage_fk_relationships: Dict[str, Dict[str, str]] = defaultdict(dict)
         self._lineage_fk_target_columns: Dict[str, Dict[str, str]] = defaultdict(dict)
         self._column_roles: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: role}}
+        self._column_primary_roles: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: primary_role}}
+        self._column_role_tags: Dict[str, Dict[str, List[str]]] = defaultdict(dict)  # {table: {col: [role tags]}}
+        self._column_alias_tags: Dict[str, Dict[str, List[str]]] = defaultdict(dict)  # {table: {col: [alias tags]}}
+        self._column_stats: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)  # {table: {col: stats}}
         self._column_datatypes: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: datatype}}
         self._column_descriptions: Dict[str, Dict[str, str]] = defaultdict(dict)  # {table: {col: description}}
         self._column_primary_key_hints: Dict[str, bool] = {}
@@ -103,6 +107,39 @@ class SchemaAnalyzer:
         # Post-processing: infer table types
         self._infer_table_types()
 
+    @staticmethod
+    def _normalize_string_list(values: Any) -> List[str]:
+        if values is None:
+            return []
+        if isinstance(values, str):
+            candidates = [values]
+        elif isinstance(values, (list, tuple, set)):
+            candidates = list(values)
+        else:
+            return []
+
+        normalized: List[str] = []
+        seen: Set[str] = set()
+        for value in candidates:
+            item = str(value or "").strip().lower()
+            if not item or item in seen:
+                continue
+            normalized.append(item)
+            seen.add(item)
+        return normalized
+
+    @staticmethod
+    def _merge_unique_strings(*groups: Any) -> List[str]:
+        merged: List[str] = []
+        seen: Set[str] = set()
+        for group in groups:
+            for item in SchemaAnalyzer._normalize_string_list(group):
+                if item in seen:
+                    continue
+                merged.append(item)
+                seen.add(item)
+        return merged
+
     def _process_entry(self, data: Dict[str, Any]):
         """Process a single JSONL entry."""
         metadata = data.get("metadata", {})
@@ -119,13 +156,22 @@ class SchemaAnalyzer:
         col_key = f"{table.lower()}.{column.lower()}"
         self._column_original_case[col_key] = column
 
+        tags_role = self._normalize_string_list(metadata.get("tags_role"))
+        tags_alias = self._normalize_string_list(metadata.get("tags_alias"))
+        primary_role = str(metadata.get("primary_role", "") or "").strip().lower()
+
         # Extract synonyms
         text = data.get("text", "")
+        parsed_synonyms: List[str] = []
         synonyms_match = re.search(r'Synonyms:\s*(.+?)\.', text)
         if synonyms_match:
             synonyms_str = synonyms_match.group(1).strip()
-            synonyms = [s.strip().lower() for s in synonyms_str.split(",")]
-            self._column_synonyms[f"{table.lower()}.{column.lower()}"].extend(synonyms)
+            parsed_synonyms = [s.strip().lower() for s in synonyms_str.split(",") if str(s or "").strip()]
+        self._column_alias_tags[table.lower()][column.lower()] = tags_alias
+        self._column_synonyms[f"{table.lower()}.{column.lower()}"] = self._merge_unique_strings(
+            tags_alias,
+            parsed_synonyms,
+        )
 
         # Extract FK info.
         # Dense JSONL entries often store FK cues in `text` while sparse entries
@@ -164,13 +210,23 @@ class SchemaAnalyzer:
         )
 
         # Extract column role
-        role = self._next_field_after(text, "Role:")
-        if role:
-            self._column_roles[table.lower()][column.lower()] = role.strip().lower()
+        parsed_role = str(self._next_field_after(text, "Role:") or "").strip().lower()
+        effective_role = primary_role or (tags_role[0] if tags_role else "") or parsed_role
+        if effective_role:
+            self._column_roles[table.lower()][column.lower()] = effective_role
+            self._column_primary_roles[table.lower()][column.lower()] = effective_role
+        fallback_role_tags = [effective_role] if effective_role and not tags_role else []
+        self._column_role_tags[table.lower()][column.lower()] = self._merge_unique_strings(
+            tags_role,
+            fallback_role_tags,
+        )
 
         # Extract datatype
         datatype = metadata.get("datatype", "")
         self._column_datatypes[table.lower()][column.lower()] = datatype
+        self._column_stats[table.lower()][column.lower()] = (
+            metadata.get("stats", {}) if isinstance(metadata.get("stats", {}), dict) else {}
+        )
 
     def _record_fk_edge(
         self,
@@ -409,12 +465,25 @@ class SchemaAnalyzer:
             # Check for bridge table (multiple FKs)
             fk_count = len(self._fk_relationships.get(table, {}))
 
-            roles = self._column_roles.get(table, {})
             datatypes = self._column_datatypes.get(table, {})
+            role_tags = {col: set(self.get_column_role_tags(table, col)) for col in columns}
+            primary_roles = {col: self.get_column_primary_role(table, col) for col in columns}
 
             metric_role_cols = {
                 col for col in columns
-                if str(roles.get(col, "")).strip().lower() in {"metric", "measure", "amount", "quantity"}
+                if {"metric", "measure", "amount", "quantity", "price", "monetary"}.intersection(role_tags.get(col, set()))
+                or primary_roles.get(col) in {"metric", "measure", "amount", "quantity"}
+            }
+            temporal_cols = {
+                col for col in columns
+                if {"date", "datetime", "timestamp", "time", "temporal"}.intersection(role_tags.get(col, set()))
+                or primary_roles.get(col) in {"date", "datetime", "timestamp", "time"}
+                or "DATE" in str(datatypes.get(col, "")).upper()
+                or "TIME" in str(datatypes.get(col, "")).upper()
+            }
+            name_like_cols = {
+                col for col in columns
+                if {"name", "entity_name"}.intersection(role_tags.get(col, set()))
             }
 
             numeric_dtype_cols = {
@@ -440,19 +509,21 @@ class SchemaAnalyzer:
                 )
             }
 
-            has_temporal_signal = any(
+            has_temporal_signal = bool(temporal_cols) or any(
                 any(k in col for k in ("date", "time", "timestamp"))
-                or "DATE" in str(datatypes.get(col, "")).upper()
-                or "TIME" in str(datatypes.get(col, "")).upper()
                 for col in columns
             )
-
             has_metric_signal = bool(metric_role_cols) or bool(non_key_numeric_cols)
             has_activity_signal = has_metric_signal and (has_temporal_signal or fk_count >= 2)
 
             # Check for dimension indicators
-            has_name = any('name' in col for col in columns)
-            is_master = table.endswith('s') and fk_count == 0 and has_name
+            has_name = bool(name_like_cols) or any('name' in col for col in columns)
+            has_identifier_structure = any(
+                {"pk", "primary_key", "id", "identifier"}.intersection(role_tags.get(col, set()))
+                or self._column_primary_key_hints.get(f"{table}.{col}", False)
+                for col in columns
+            )
+            is_master = table.endswith('s') and fk_count == 0 and has_name and has_identifier_structure
 
             if has_activity_signal and fk_count >= 1:
                 self._table_types[table] = "transaction"
@@ -515,11 +586,34 @@ class SchemaAnalyzer:
         synonyms = set()
 
         for col in self._table_columns.get(table, []):
-            key = f"{table}.{col}"
-            if key in self._column_synonyms:
-                synonyms.update(self._column_synonyms[key])
+            synonyms.update(self.get_column_synonyms(table, col))
 
         return list(synonyms)
+
+    def get_column_primary_role(self, table: str, column: str) -> str:
+        """Get the structured primary role for a column, or empty string."""
+        t = (table or "").lower().strip()
+        c = (column or "").lower().strip()
+        return str(self._column_primary_roles.get(t, {}).get(c, "")).strip().lower()
+
+    def get_column_role_tags(self, table: str, column: str) -> List[str]:
+        """Get structured/fallback role tags for a column."""
+        t = (table or "").lower().strip()
+        c = (column or "").lower().strip()
+        return list(self._column_role_tags.get(t, {}).get(c, []) or [])
+
+    def get_column_alias_tags(self, table: str, column: str) -> List[str]:
+        """Get structured alias tags for a column."""
+        t = (table or "").lower().strip()
+        c = (column or "").lower().strip()
+        return list(self._column_alias_tags.get(t, {}).get(c, []) or [])
+
+    def get_column_stats(self, table: str, column: str) -> Dict[str, Any]:
+        """Get structured stats metadata for a column."""
+        t = (table or "").lower().strip()
+        c = (column or "").lower().strip()
+        stats = self._column_stats.get(t, {}).get(c, {})
+        return dict(stats) if isinstance(stats, dict) else {}
 
     def get_column_synonyms(self, table: str, column: str) -> List[str]:
         """
@@ -536,7 +630,7 @@ class SchemaAnalyzer:
             List of synonyms for the column
         """
         key = f"{table.lower()}.{column.lower()}"
-        return self._column_synonyms.get(key, [])
+        return list(self._column_synonyms.get(key, []) or [])
 
     def get_column_description(self, table: str, column: str) -> str:
         """
@@ -559,7 +653,8 @@ class SchemaAnalyzer:
         anchors = []
 
         for col, role in self._column_roles.get(table, {}).items():
-            if role == "metric":
+            role_tags = set(self.get_column_role_tags(table, col))
+            if role == "metric" or role == "measure" or {"metric", "measure"}.intersection(role_tags):
                 anchors.append(col)
 
         return anchors
@@ -576,6 +671,10 @@ class SchemaAnalyzer:
         """
         table = table.lower()
         for col in self._table_columns.get(table, []):
+            primary_role = self.get_column_primary_role(table, col)
+            role_tags = set(self.get_column_role_tags(table, col))
+            if primary_role == "pk" or {"pk", "primary_key"}.intersection(role_tags):
+                return col
             col_synonyms = self._column_synonyms.get(f"{table}.{col}", [])
             if any('primary key' in s or 'unique' in s or 'pk' in s for s in col_synonyms):
                 return col
@@ -796,6 +895,26 @@ def get_column_description(table: str, column: str) -> str:
     return get_schema_analyzer().get_column_description(table, column)
 
 
+def get_column_primary_role(table: str, column: str) -> str:
+    """Get structured primary role for a specific column from metadata (schema-agnostic)."""
+    return get_schema_analyzer().get_column_primary_role(table, column)
+
+
+def get_column_role_tags(table: str, column: str) -> List[str]:
+    """Get structured/fallback role tags for a specific column from metadata (schema-agnostic)."""
+    return get_schema_analyzer().get_column_role_tags(table, column)
+
+
+def get_column_alias_tags(table: str, column: str) -> List[str]:
+    """Get structured alias tags for a specific column from metadata (schema-agnostic)."""
+    return get_schema_analyzer().get_column_alias_tags(table, column)
+
+
+def get_column_stats(table: str, column: str) -> Dict[str, Any]:
+    """Get structured stats for a specific column from metadata (schema-agnostic)."""
+    return get_schema_analyzer().get_column_stats(table, column)
+
+
 def get_anchor_columns(table: str) -> List[str]:
     """Get anchor/scoring columns for a table."""
     return get_schema_analyzer().get_anchor_columns(table)
@@ -842,13 +961,96 @@ def _get_original_case(table_lower: str, col_lower: str) -> str:
 def _identifier_phrase_hints(table_lower: str, col_lower: str) -> Set[str]:
     analyzer = get_schema_analyzer()
     out: Set[str] = set()
-    for syn in analyzer._column_synonyms.get(f"{table_lower}.{col_lower}", []):
+    for syn in analyzer.get_column_synonyms(table_lower, col_lower):
         syn_l = str(syn or "").strip().lower()
         if not syn_l:
             continue
         out.add(syn_l)
         out.add(syn_l.replace(" ", ""))
     return out
+
+
+def _column_role_signal_set(table: str, column: str) -> Set[str]:
+    signals = set(get_column_role_tags(table, column) or [])
+    primary_role = str(get_column_primary_role(table, column) or "").strip().lower()
+    if primary_role:
+        signals.add(primary_role)
+    role = str(get_column_role(table, column) or "").strip().lower()
+    if role:
+        signals.add(role)
+    return {s for s in signals if s}
+
+
+def _column_has_role_signal(table: str, column: str, *signals: str) -> bool:
+    signal_set = _column_role_signal_set(table, column)
+    if not signal_set:
+        return False
+    return any(str(signal or "").strip().lower() in signal_set for signal in signals)
+
+
+def _stats_support_numeric(table: str, column: str) -> bool:
+    stats = get_column_stats(table, column)
+    if not stats:
+        return False
+    for key in ("min", "max", "mean", "stddev"):
+        value = stats.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return True
+    sample = str(stats.get("sample_value", "") or "").strip()
+    if not sample:
+        return False
+    return bool(re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)", sample))
+
+
+def _stats_support_temporal(table: str, column: str) -> bool:
+    stats = get_column_stats(table, column)
+    if not stats:
+        return False
+    sample = str(stats.get("sample_value", "") or "").strip()
+    if not sample:
+        return False
+    return bool(
+        re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}(?:[ t]\d{2}:\d{2}(?::\d{2})?)?",
+            sample.lower(),
+        )
+    )
+
+
+def _column_name_score(table_lower: str, col_lower: str) -> float:
+    score = 0.0
+    has_name_evidence = False
+    role_signals = _column_role_signal_set(table_lower, col_lower)
+    alias_tags = {str(tag or "").strip().lower() for tag in get_column_alias_tags(table_lower, col_lower)}
+    stats = get_column_stats(table_lower, col_lower)
+    singular = get_singular_form(table_lower)
+    compact_col = col_lower.replace("_", "")
+    compact_singular = singular.replace("_", "")
+
+    if "entity_name" in role_signals:
+        score += 8.0
+        has_name_evidence = True
+    if "name" in role_signals:
+        score += 6.0
+        has_name_evidence = True
+    if any("name" in tag for tag in alias_tags):
+        score += 2.5
+        has_name_evidence = True
+    if compact_singular and compact_col in {f"{compact_singular}name", compact_singular}:
+        score += 4.0
+        has_name_evidence = True
+    if col_lower.endswith("name") and not col_lower.endswith("codename"):
+        score += 3.0
+        has_name_evidence = True
+    if any("name" == syn or syn.endswith(" name") for syn in get_column_synonyms(table_lower, col_lower)):
+        score += 1.5
+        has_name_evidence = True
+
+    distinct_count = stats.get("distinct_count")
+    if has_name_evidence and isinstance(distinct_count, (int, float)) and distinct_count > 0:
+        score += min(float(distinct_count) / 1000.0, 1.0)
+
+    return score
 
 
 def _column_has_identifier_hint(table_lower: str, col_lower: str) -> bool:
@@ -888,6 +1090,7 @@ def _column_matches_entity_key_shape(table_lower: str, col_lower: str) -> bool:
 def _column_identifier_score(table_lower: str, col_lower: str) -> int:
     analyzer = get_schema_analyzer()
     key = f"{table_lower}.{col_lower}"
+    role_signals = _column_role_signal_set(table_lower, col_lower)
     is_pk = bool(analyzer._column_primary_key_hints.get(key))
     is_fk = bool(
         analyzer._column_foreign_key_hints.get(key)
@@ -897,6 +1100,17 @@ def _column_identifier_score(table_lower: str, col_lower: str) -> int:
 
     base_identifier_evidence = False
 
+    if "pk" in role_signals or "primary_key" in role_signals:
+        score += 100
+        is_pk = True
+        base_identifier_evidence = True
+    if {"fk", "foreign_key", "reference"}.intersection(role_signals):
+        score += 35
+        is_fk = True
+        base_identifier_evidence = True
+    if {"id", "identifier"}.intersection(role_signals):
+        score += 35
+        base_identifier_evidence = True
     if is_pk:
         score += 100
         base_identifier_evidence = True
@@ -986,22 +1200,24 @@ def get_name_column(table: str) -> Optional[str]:
     table_lower = table.lower()
     columns = analyzer._table_columns.get(table_lower, [])
 
-    # 1. Check role metadata
+    scored_cols: List[Tuple[float, str]] = []
     for col in columns:
-        role = analyzer._column_roles.get(table_lower, {}).get(col, "")
-        if role == "name":
-            return _get_original_case(table_lower, col)
+        score = _column_name_score(table_lower, col)
+        if score > 0:
+            scored_cols.append((score, col))
 
-    # 2. Pattern matching for {singular}name
-    singular = get_singular_form(table_lower)
-    # Check for column ending with "name" (case-insensitive)
+    if scored_cols:
+        scored_cols.sort(key=lambda item: (-item[0], item[1]))
+        return _get_original_case(table_lower, scored_cols[0][1])
+
+    # Fallback: any column ending with "name" (case-insensitive)
     for col in columns:
         if col.lower().endswith("name"):
             return _get_original_case(table_lower, col)
 
-    # 3. Check synonyms for "name"
+    # Fallback: check synonyms for "name"
     for col in columns:
-        synonyms = analyzer._column_synonyms.get(f"{table_lower}.{col}", [])
+        synonyms = analyzer.get_column_synonyms(table_lower, col)
         if "name" in synonyms:
             return _get_original_case(table_lower, col)
 
@@ -1203,7 +1419,7 @@ def get_column_role(table: str, column: str) -> str:
     c = (column or "").lower().strip()
     
     roles = analyzer._column_roles.get(t, {})
-    return str(roles.get(c, "")).lower().strip()
+    return str(roles.get(c, "") or analyzer.get_column_primary_role(t, c) or "").lower().strip()
 
 
 # ==================== ENHANCED COLUMN ROLE DETECTION ===================
@@ -1228,19 +1444,26 @@ def is_numeric_column(table: str, column: str) -> bool:
     t = (table or "").lower()
     c = (column or "").lower()
 
-    # 1. Check role from metadata first
-    role = get_column_role(t, c)
-    if role in ('metric', 'measure', 'quantity', 'amount'):
+    role_signals = _column_role_signal_set(t, c)
+
+    # 1. Check structured role metadata first
+    if {"metric", "measure", "quantity", "amount", "price", "monetary", "ratio", "percent"}.intersection(role_signals):
         return True
+    if {"pk", "fk", "id", "identifier", "primary_key", "foreign_key", "reference"}.intersection(role_signals):
+        return False
     
     # 2. Check datatype from metadata
     dtype = get_column_datatype(t, c).upper()
     numeric_types = {'INT', 'INTEGER', 'DECIMAL', 'FLOAT', 'DOUBLE', 'NUMERIC', 
                      'SMALLINT', 'BIGINT', 'TINYINT', 'MEDIUMINT', 'REAL'}
     if any(nt in dtype for nt in numeric_types):
-        return True
+        return not is_id_column(t, c)
+
+    # 3. Check structured stats
+    if _stats_support_numeric(t, c):
+        return not is_id_column(t, c)
     
-    # 3. Check generic cross-domain name patterns.
+    # 4. Check generic cross-domain name patterns.
     # Keep this intentionally narrow and avoid domain-specific tokens such as
     # MSRP / buyPrice / creditLimit / quantityInStock.
     numeric_patterns = (
@@ -1272,13 +1495,25 @@ def is_date_column(table: str, column: str) -> bool:
     t = (table or "").lower()
     c = (column or "").lower()
     
-    # 1. Check datatype from metadata
+    role_signals = _column_role_signal_set(t, c)
+
+    # 1. Check structured role metadata first
+    if {"date", "datetime", "timestamp", "time", "temporal"}.intersection(role_signals):
+        return True
+    if {"pk", "fk", "id", "identifier", "primary_key", "foreign_key"}.intersection(role_signals):
+        return False
+
+    # 2. Check datatype from metadata
     dtype = get_column_datatype(t, c).upper()
     date_types = {'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR'}
     if any(dt in dtype for dt in date_types):
         return True
+
+    # 3. Check structured stats
+    if _stats_support_temporal(t, c):
+        return True
     
-    # 2. Check narrow generic temporal name patterns as a last fallback.
+    # 4. Check narrow generic temporal name patterns as a last fallback.
     # Keep this metadata-first and avoid business-process verbs such as
     # shipped / ordered / paid, which are more domain-lexical than temporal.
     date_patterns = (
@@ -1310,17 +1545,23 @@ def is_id_column(table: str, column: str) -> bool:
     t = (table or "").lower()
     c = (column or "").lower()
     
-    # 1. Prefer metadata-aware identifier score over raw suffix matching.
+    role_signals = _column_role_signal_set(t, c)
+
+    # 1. Prefer structured PK/FK/identifier metadata.
+    if {"pk", "fk", "id", "identifier", "primary_key", "foreign_key", "reference"}.intersection(role_signals):
+        return True
+
+    # 2. Prefer metadata-aware identifier score over raw suffix matching.
     if _column_identifier_score(t, c) > 0:
         return True
 
-    # 2. Check if it's an FK column
+    # 3. Check if it's an FK column
     analyzer = get_schema_analyzer()
     fk_map = analyzer._fk_relationships.get(t, {})
     if c in fk_map:
         return True
     
-    # 3. Check if column matches singular table name
+    # 4. Check if column matches singular table name
     singular = get_singular_form(t)
     if c == singular or c == singular.replace('_', ''):
         return True
@@ -1347,13 +1588,17 @@ def is_name_column(table: str, column: str) -> bool:
     t = (table or "").lower()
     c = (column or "").lower()
     
-    # 1. Check name pattern
-    if c.endswith('name') and not c.endswith('codename'):
+    role_signals = _column_role_signal_set(t, c)
+    alias_tags = {str(tag or "").strip().lower() for tag in get_column_alias_tags(t, c)}
+
+    # 1. Check structured role and alias metadata first
+    if {"name", "entity_name"}.intersection(role_signals):
         return True
-    
-    # 2. Check role from metadata
-    role = get_column_role(t, c)
-    if role == 'name':
+    if any("name" in tag for tag in alias_tags):
+        return True
+
+    # 2. Check name pattern
+    if c.endswith('name') and not c.endswith('codename'):
         return True
     
     # 3. Check synonyms
@@ -1388,19 +1633,26 @@ def get_columns_by_role(table: str, role: str) -> List[str]:
     columns = analyzer._table_columns.get(t, [])
     result = []
     
+    role_normalized = str(role or "").strip().lower()
+
     for col in columns:
         match = False
-        if role == 'numeric':
+        if role_normalized == 'numeric':
             match = is_numeric_column(t, col)
-        elif role == 'date':
+        elif role_normalized == 'date':
             match = is_date_column(t, col)
-        elif role == 'id':
+        elif role_normalized == 'id':
             match = is_id_column(t, col)
-        elif role == 'name':
+        elif role_normalized == 'name':
             match = is_name_column(t, col)
-        elif role == 'text':
+        elif role_normalized == 'text':
             dtype = get_column_datatype(t, col).upper()
-            match = any(tt in dtype for tt in ('VARCHAR', 'CHAR', 'TEXT', 'STRING'))
+            role_signals = _column_role_signal_set(t, col)
+            match = "text" in role_signals or "narrative_text" in role_signals or any(
+                tt in dtype for tt in ('VARCHAR', 'CHAR', 'TEXT', 'STRING')
+            )
+        else:
+            match = role_normalized in _column_role_signal_set(t, col)
         
         if match:
             result.append(_get_original_case(t, col))
@@ -1422,7 +1674,7 @@ def get_orderable_columns(table: str) -> List[str]:
     """
     numeric_cols = get_columns_by_role(table, 'numeric')
     date_cols = get_columns_by_role(table, 'date')
-    return list(set(numeric_cols + date_cols))
+    return list(dict.fromkeys(date_cols + numeric_cols))
 
 
 def get_aggregatable_columns(table: str) -> List[str]:
@@ -1437,7 +1689,26 @@ def get_aggregatable_columns(table: str) -> List[str]:
     Returns:
         List of aggregatable column names (original case)
     """
-    return get_columns_by_role(table, 'numeric')
+    analyzer = get_schema_analyzer()
+    t = (table or "").lower()
+    columns = analyzer._table_columns.get(t, [])
+    scored: List[Tuple[float, str]] = []
+
+    for col in columns:
+        if not is_numeric_column(t, col) or is_date_column(t, col) or is_id_column(t, col):
+            continue
+        score = 0.0
+        role_signals = _column_role_signal_set(t, col)
+        if {"measure", "metric"}.intersection(role_signals):
+            score += 3.0
+        if {"amount", "quantity", "price", "monetary", "transaction_amount", "transaction_quantity"}.intersection(role_signals):
+            score += 2.0
+        if _stats_support_numeric(t, col):
+            score += 0.5
+        scored.append((score, col))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [_get_original_case(t, col) for _, col in scored]
 
 
 def get_joinable_columns(table: str) -> List[str]:
@@ -1463,7 +1734,26 @@ def get_filterable_date_columns(table: str) -> List[str]:
     Returns:
         List of date column names (original case)
     """
-    return get_columns_by_role(table, 'date')
+    analyzer = get_schema_analyzer()
+    t = (table or "").lower()
+    columns = analyzer._table_columns.get(t, [])
+    scored: List[Tuple[float, str]] = []
+
+    for col in columns:
+        if not is_date_column(t, col):
+            continue
+        score = 0.0
+        role_signals = _column_role_signal_set(t, col)
+        if {"transaction_date", "event_date", "created_at", "created_date", "temporal"}.intersection(role_signals):
+            score += 2.0
+        if {"date", "datetime", "timestamp", "time"}.intersection(role_signals):
+            score += 1.0
+        if _stats_support_temporal(t, col):
+            score += 0.25
+        scored.append((score, col))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [_get_original_case(t, col) for _, col in scored]
 
 
 def _question_semantic_tokens(question: str) -> Set[str]:
@@ -1496,6 +1786,14 @@ def _column_semantic_tokens(table: str, column: str) -> Set[str]:
     role = str(get_column_role(t, c) or "").strip().lower()
     if role:
         phrases.add(role)
+    for tag in get_column_role_tags(t, c):
+        tag_text = str(tag or "").strip()
+        if tag_text:
+            phrases.add(tag_text)
+            phrases.add(tag_text.replace("_", " "))
+    desc = str(get_column_description(t, c) or "").strip()
+    if desc:
+        phrases.add(desc)
 
     tokens: Set[str] = set()
     for text in phrases:
@@ -1523,8 +1821,8 @@ def _best_semantic_numeric_column(table: str, question: str, columns: List[str])
         if not overlap:
             continue
         score = float(len(overlap))
-        role = str(get_column_role(table, col) or "").strip().lower()
-        if role in {"metric", "measure", "amount", "quantity"}:
+        role_signals = _column_role_signal_set(table, col)
+        if {"metric", "measure", "amount", "quantity", "price", "monetary"}.intersection(role_signals):
             score += 0.5
         if score > best_score:
             best_col = col
@@ -1554,8 +1852,11 @@ def infer_best_order_column(table: str, question: str) -> Optional[str]:
     # Check for temporal ordering
     temporal_keywords = ('date', 'time', 'recent', 'latest', 'newest', 'oldest', 
                         'first', 'last', 'before', 'after')
+    date_cols = get_filterable_date_columns(table)
     if any(kw in q for kw in temporal_keywords):
-        date_cols = get_filterable_date_columns(table)
+        semantic_date = _best_semantic_numeric_column(table, question, date_cols)
+        if semantic_date:
+            return semantic_date
         if date_cols:
             return date_cols[0]
     
@@ -1571,7 +1872,7 @@ def infer_best_order_column(table: str, question: str) -> Optional[str]:
             return numeric_cols[0]
     
     # Fallback
-    orderable = get_orderable_columns(table)
+    orderable = date_cols + [col for col in get_orderable_columns(table) if col not in date_cols]
     return orderable[0] if orderable else None
 
 
@@ -1691,6 +1992,10 @@ __all__ = [
     'get_table_synonyms',
     'get_column_synonyms',
     'get_column_description',
+    'get_column_primary_role',
+    'get_column_role_tags',
+    'get_column_alias_tags',
+    'get_column_stats',
     'get_anchor_columns',
     'is_transaction_table',
     'get_fk_relationships',

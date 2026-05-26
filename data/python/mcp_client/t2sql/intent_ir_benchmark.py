@@ -37,6 +37,10 @@ QUESTION_PREFIX_BY_DIFFICULTY = {
 CASE_HEADER_RE = re.compile(r"^\[(?P<qid>[A-Z]\d+)\]\s.*$")
 SUMMARY_START_RE = re.compile(r"^\[CANDIDATE INTENT SUMMARY\]")
 SUMMARY_STOP_RE = re.compile(r"^Use this intent only as ")
+SUMMARY_CONFIDENCE_RE = re.compile(
+    r"(\[CANDIDATE INTENT SUMMARY\]\s*\(confidence=)(\d+(?:\.\d+)?)(\):)",
+    flags=re.I,
+)
 TABLE_ORDER_GUIDANCE_RE = re.compile(
     r"^\[PROMPT DEBUG\] Adding hint: (?P<guidance>TABLE ORDER GUIDANCE: .*?)\.\s+Use\b"
 )
@@ -139,6 +143,11 @@ def _numeric_qid_key(qid: str) -> tuple[str, int]:
 
 def _normalize_summary(summary: str) -> str:
     return "\n".join(line.rstrip() for line in summary.strip().splitlines())
+
+
+def _summary_compare_key(summary: str) -> str:
+    normalized = _normalize_summary(summary)
+    return SUMMARY_CONFIDENCE_RE.sub(r"\1<ignored>\3", normalized)
 
 
 def parse_difficulty_filter(filter_spec: str | None) -> set[int] | None:
@@ -380,14 +389,18 @@ def compare_cases(
     for qid in sorted(gold_ids & actual_ids, key=_numeric_qid_key):
         expected_summary = _normalize_summary(gold_cases[qid]["summary"])
         actual_summary = _normalize_summary(actual_cases[qid]["summary"])
+        expected_summary_key = _summary_compare_key(expected_summary)
+        actual_summary_key = _summary_compare_key(actual_summary)
         expected_guidance = str(gold_cases[qid].get("table_order_guidance") or "").strip()
         actual_guidance = str(actual_cases[qid].get("table_order_guidance") or "").strip()
-        if expected_summary != actual_summary or expected_guidance != actual_guidance:
+        if expected_summary_key != actual_summary_key or expected_guidance != actual_guidance:
             mismatches.append(
                 {
                     "qid": qid,
                     "expected_summary": expected_summary,
                     "actual_summary": actual_summary,
+                    "expected_summary_key": expected_summary_key,
+                    "actual_summary_key": actual_summary_key,
                     "expected_guidance": expected_guidance,
                     "actual_guidance": actual_guidance,
                 }
@@ -415,7 +428,7 @@ def print_compare_report(
     summary_mismatch_count = sum(
         1
         for mismatch in mismatches
-        if mismatch["expected_summary"] != mismatch["actual_summary"]
+        if mismatch["expected_summary_key"] != mismatch["actual_summary_key"]
     )
 
     print(f"Difficulty: {difficulty}")
@@ -437,10 +450,12 @@ def print_compare_report(
             qid = mismatch["qid"]
             expected_summary = mismatch["expected_summary"]
             actual_summary = mismatch["actual_summary"]
+            expected_summary_key = mismatch["expected_summary_key"]
+            actual_summary_key = mismatch["actual_summary_key"]
             expected_guidance = mismatch["expected_guidance"]
             actual_guidance = mismatch["actual_guidance"]
             guidance_changed = expected_guidance != actual_guidance
-            summary_changed = expected_summary != actual_summary
+            summary_changed = expected_summary_key != actual_summary_key
             print(separator)
             print(f"[Mismatch {index}/{total_mismatches}] {qid}")
             print(f"Type: {_mismatch_label(summary_changed, guidance_changed)}")

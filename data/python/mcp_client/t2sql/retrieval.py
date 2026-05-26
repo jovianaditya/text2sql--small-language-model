@@ -136,6 +136,7 @@ from .state import RAGState
 from .chroma_embedding import build_vector_store
 from .utils import _print_banner, _meta_table, _meta_column, read_jsonl, _parse_str_or_list_lower, _extract_roles_aliases, _extract_aliases_for_map
 from .helpers_main import _get_qtype, build_dynamic_probe
+from .rulebook import question_has_hierarchy_role_intent
 from .schema_analyzer import (
     get_schema_analyzer,
     get_all_tables,
@@ -1901,6 +1902,50 @@ def _should_lock_single_table_ctx(question: str, qtype: str) -> bool:
     return primary is not None
 
 
+def _has_self_hierarchy_lookup_intent(question: str, primary_table: str, qtype: str) -> bool:
+    primary = str(primary_table or "").strip().lower()
+    if qtype != AGENT_ROUTER_QTYPE_LOOKUP or not primary:
+        return False
+    if not question_has_hierarchy_role_intent(question):
+        return False
+    try:
+        fk_map = get_fk_relationships() or {}
+    except Exception:
+        fk_map = {}
+    rels = fk_map.get(primary, {}) or {}
+    return any(str(target or "").strip().lower() == primary for target in rels.values())
+
+
+def _filter_allowed_for_self_hierarchy_lookup(
+    question: str,
+    primary_table: str,
+    qtype: str,
+    allowed: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    allowed_map = dict(allowed or {})
+    if not _has_self_hierarchy_lookup_intent(question, primary_table, qtype):
+        return allowed_map
+
+    primary = str(primary_table or "").strip().lower()
+    if not primary:
+        return allowed_map
+
+    keep_tables: Set[str] = {primary}
+    for table_name in allowed_map.keys():
+        table_l = str(table_name or "").strip().lower()
+        if not table_l or table_l == primary:
+            continue
+        if _text_mentions_table(question, table_l, include_synonyms=False):
+            keep_tables.add(table_l)
+
+    filtered = {
+        table_name: cols
+        for table_name, cols in allowed_map.items()
+        if str(table_name or "").strip().lower() in keep_tables
+    }
+    return filtered or allowed_map
+
+
 def _single_table_lock_is_high_confidence(
     primary_table: str,
     table_scores: Dict[str, float],
@@ -2523,6 +2568,13 @@ def retrieve_node(state: RAGState) -> RAGState:
                     filtered_allowed = dict(allowed)
             else:
                 filtered_allowed = dict(allowed)
+
+    filtered_allowed = _filter_allowed_for_self_hierarchy_lookup(
+        q,
+        primary_lookup_table or "",
+        qtype,
+        filtered_allowed,
+    )
 
     if prefer_name_table and preferred_name_col:
         for t_key in list(filtered_allowed.keys()):

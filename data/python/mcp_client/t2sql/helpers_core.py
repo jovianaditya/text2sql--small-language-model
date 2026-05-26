@@ -690,9 +690,16 @@ def _rewrite_derived_self_join_lookup_subquery(sql: str, question: str, ctx: str
     inner_where_pos = _find_kw(inner_rest, "WHERE")
     inner_order_pos = _find_kw(inner_rest, "ORDER BY")
     inner_group_pos = _find_kw(inner_rest, "GROUP BY")
-    if inner_where_pos >= 0 or inner_group_pos >= 0:
+    if inner_group_pos >= 0:
         return sql
-    inner_from_core = inner_rest[:inner_order_pos].strip() if inner_order_pos >= 0 else inner_rest
+    inner_where_clause = ""
+    if inner_where_pos >= 0:
+        where_end_candidates = [pos for pos in (inner_group_pos, inner_order_pos) if pos >= 0 and pos > inner_where_pos]
+        where_end = min(where_end_candidates) if where_end_candidates else len(inner_rest)
+        inner_where_clause = str(inner_rest[inner_where_pos + len("WHERE"):where_end] or "").strip()
+        inner_from_core = inner_rest[:inner_where_pos].strip()
+    else:
+        inner_from_core = inner_rest[:inner_order_pos].strip() if inner_order_pos >= 0 else inner_rest
     if not inner_from_core:
         return sql
 
@@ -755,6 +762,84 @@ def _rewrite_derived_self_join_lookup_subquery(sql: str, question: str, ctx: str
             self_join_on = m_eq.group(0)
             break
     if not child_alias or not parent_alias or not self_fk_col or not self_join_on:
+        return sql
+
+    def _split_top_level_and(text: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        in_sq = False
+        in_dq = False
+        i = 0
+        up = str(text or "").upper()
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    buf.append(ch)
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+                buf.append(ch)
+                i += 1
+                continue
+            if not in_sq and not in_dq:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif depth == 0 and up.startswith("AND", i):
+                    left_ok = i == 0 or not (up[i - 1].isalnum() or up[i - 1] == "_")
+                    right_idx = i + 3
+                    right_ok = right_idx >= len(up) or not (up[right_idx].isalnum() or up[right_idx] == "_")
+                    if left_ok and right_ok:
+                        item = "".join(buf).strip()
+                        if item:
+                            items.append(item)
+                        buf = []
+                        i += 3
+                        continue
+            buf.append(ch)
+            i += 1
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _is_safe_hierarchy_lookup_where(where_sql: str) -> bool:
+        clause = str(where_sql or "").strip()
+        if not clause:
+            return True
+        if re.search(r"\b(?:OR|NOT\s+EXISTS|EXISTS|IN|LIKE|REGEXP|BETWEEN)\b", clause, flags=re.I):
+            return False
+        for pred in _split_top_level_and(clause):
+            pred_s = str(pred or "").strip()
+            if not pred_s:
+                continue
+            if re.search(r"\bIS\s+NOT\s+NULL\b", pred_s, flags=re.I):
+                lhs = re.sub(r"(?is)\bIS\s+NOT\s+NULL\b", "", pred_s).strip()
+                if re.fullmatch(r"`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?", lhs):
+                    continue
+                return False
+            if re.search(r"\bIS\s+NULL\b", pred_s, flags=re.I):
+                lhs = re.sub(r"(?is)\bIS\s+NULL\b", "", pred_s).strip()
+                if re.fullmatch(r"`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?", lhs):
+                    continue
+                return False
+            if not re.fullmatch(
+                r"""(?is)`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*(?:=|<>|!=)\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?""",
+                pred_s,
+            ):
+                return False
+        return True
+
+    if inner_where_clause and not _is_safe_hierarchy_lookup_where(inner_where_clause):
         return sql
 
     def _split_top_level_csv(text: str) -> List[str]:
@@ -824,6 +909,17 @@ def _rewrite_derived_self_join_lookup_subquery(sql: str, question: str, ctx: str
             for tok in re.findall(r"[a-z0-9]+", split.replace("_", " ").replace("-", " ").lower())
             if tok
         }
+
+    def _expr_refs_alias(expr: str, alias: str) -> bool:
+        alias_s = str(alias or "").strip()
+        if not alias_s:
+            return False
+        return bool(
+            re.search(
+                rf"(?is)\b{re.escape(alias_s)}\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?\b",
+                str(expr or ""),
+            )
+        )
 
     def _table_cols_lower(table_name: str) -> Set[str]:
         t_l = str(table_name or "").strip("`").lower()
@@ -946,7 +1042,11 @@ def _rewrite_derived_self_join_lookup_subquery(sql: str, question: str, ctx: str
 
     # Child identifier
     child_id_alias = next(
-        (alias for alias, (expr, _a) in inner_alias_items.items() if re.search(rf"(?is)\b{re.escape(child_alias)}\s*\.\s*`?{re.escape(base_id_col)}`?\b", expr)),
+        (
+            alias
+            for alias, (expr, _a) in inner_alias_items.items()
+            if re.search(rf"(?is)\b{re.escape(child_alias)}\s*\.\s*`?{re.escape(base_id_col)}`?\b", expr)
+        ),
         "",
     )
     if child_id_alias:
@@ -957,7 +1057,14 @@ def _rewrite_derived_self_join_lookup_subquery(sql: str, question: str, ctx: str
 
     # Child full name
     if _role_wants_full_name(child_role_terms):
-        child_name_alias = next((alias for alias in inner_alias_items if alias.startswith("subordinate_") and "name" in alias), "")
+        child_name_alias = next(
+            (
+                alias
+                for alias, (expr, _a) in inner_alias_items.items()
+                if alias.startswith("subordinate_") and "name" in alias and _expr_refs_alias(expr, child_alias)
+            ),
+            "",
+        )
         if child_name_alias:
             expr, alias = inner_alias_items[child_name_alias]
             _append_item(expr, alias)
@@ -968,7 +1075,16 @@ def _rewrite_derived_self_join_lookup_subquery(sql: str, question: str, ctx: str
 
     # Child title
     if _role_wants_title(child_role_terms):
-        child_title_alias = next((alias for alias in inner_alias_items if alias.startswith("subordinate_") and ("title" in alias or "role" in alias or "position" in alias)), "")
+        child_title_alias = next(
+            (
+                alias
+                for alias, (expr, _a) in inner_alias_items.items()
+                if alias.startswith("subordinate_")
+                and ("title" in alias or "role" in alias or "position" in alias)
+                and _expr_refs_alias(expr, child_alias)
+            ),
+            "",
+        )
         if child_title_alias:
             expr, alias = inner_alias_items[child_title_alias]
             _append_item(expr, alias)
@@ -1007,55 +1123,115 @@ def _rewrite_derived_self_join_lookup_subquery(sql: str, question: str, ctx: str
             if fk_l and tgt_l:
                 fk_map[src_l][fk_l] = tgt_l
 
-    outer_lookup_match = re.search(
-        r"""(?is)\b(?:INNER|LEFT|RIGHT|CROSS)?\s*JOIN\s+`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?\s+ON\b""",
-        outer_tail,
-    )
+    outer_lookup_match = None
+    if not re.search(r"(?is)\bJOIN\s*\(", outer_tail):
+        outer_lookup_match = re.search(
+            r"""(?is)\b(?:INNER|LEFT|RIGHT|CROSS)?\s*JOIN\s+`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?\s+ON\b""",
+            outer_tail,
+        )
+
+    def _table_phrase_variants(table_name: str) -> Set[str]:
+        table_l = str(table_name or "").strip().lower()
+        variants: Set[str] = set()
+        if not table_l:
+            return variants
+        variants.add(table_l)
+        singular = str(get_singular_form(table_l) or "").strip().lower()
+        if singular:
+            variants.add(singular)
+        if "_" in table_l:
+            variants.add(table_l.replace("_", " "))
+        if singular and "_" in singular:
+            variants.add(singular.replace("_", " "))
+        for syn in get_table_synonyms(table_l) or []:
+            syn_s = str(syn or "").strip().lower()
+            if syn_s:
+                variants.add(syn_s)
+        return {v for v in variants if v}
+
+    def _requested_lookup_cols_for_table(lookup_table: str) -> List[str]:
+        lookup_cols = _table_cols_lower(lookup_table)
+        requested: List[str] = []
+        for col in sorted(lookup_cols):
+            col_terms = _identifier_terms(col)
+            if not col_terms:
+                continue
+            if all(re.search(rf"\b{re.escape(term)}\b", q_l) for term in sorted(col_terms) if len(term) >= 3):
+                requested.append(col)
+        if requested:
+            return requested
+        for col in sorted(lookup_cols):
+            if col in {"city", "country", "state", "territory", "name"} and re.search(rf"\b{re.escape(col)}\b", q_l):
+                requested.append(col)
+        return requested
+
+    def _infer_lookup_target() -> Tuple[str, str, str, List[str]]:
+        candidates: List[Tuple[int, str, str, List[str]]] = []
+        for fk_col, tgt in sorted((fk_map.get(base_table, {}) or {}).items()):
+            tgt_l = str(tgt or "").strip().lower()
+            fk_l = str(fk_col or "").strip().lower()
+            if not tgt_l or not fk_l or tgt_l == base_table:
+                continue
+            requested_cols = _requested_lookup_cols_for_table(tgt_l)
+            table_hit = False
+            for phrase in _table_phrase_variants(tgt_l):
+                phrase_pat = re.escape(phrase).replace(r"\ ", r"\s+")
+                if re.search(rf"\b{phrase_pat}\b", q_l, flags=re.I):
+                    table_hit = True
+                    break
+            if not table_hit and not requested_cols:
+                continue
+            score = 0
+            if table_hit:
+                score += 4
+            score += 2 * len(requested_cols)
+            candidates.append((score, tgt_l, fk_l, requested_cols))
+        if not candidates:
+            return "", "", "", []
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        score, table_name, fk_col, requested_cols = candidates[0]
+        return table_name, table_name, fk_col, requested_cols
+
     lookup_join_sql = ""
     order_items: List[str] = []
+    lookup_table = ""
+    lookup_alias = ""
+    child_fk_col = ""
+    requested_lookup_cols: List[str] = []
     if outer_lookup_match:
         lookup_table = str(outer_lookup_match.group("table") or "").strip().lower()
         lookup_alias = str(outer_lookup_match.group("alias") or "").strip() or lookup_table
-        child_fk_col = ""
         for fk_col, tgt in (fk_map.get(base_table, {}) or {}).items():
             if tgt == lookup_table:
                 child_fk_col = fk_col
                 break
-        if child_fk_col:
-            lookup_cols = _table_cols_lower(lookup_table)
-            requested_lookup_cols: List[str] = []
-            for col in sorted(lookup_cols):
-                col_terms = _identifier_terms(col)
-                if not col_terms:
-                    continue
-                if all(re.search(rf"\b{re.escape(term)}\b", q_l) for term in sorted(col_terms) if len(term) >= 3):
-                    requested_lookup_cols.append(col)
-            if not requested_lookup_cols:
-                for col in sorted(lookup_cols):
-                    if col in {"city", "country", "state", "territory", "name"} and re.search(rf"\b{re.escape(col)}\b", q_l):
-                        requested_lookup_cols.append(col)
-            lookup_join_sql = (
-                f" INNER JOIN {lookup_table} AS {lookup_alias}"
-                f" ON {child_alias}.{_original_case_col(base_table, child_fk_col)} = {lookup_alias}.{_original_case_col(lookup_table, get_id_column(lookup_table) or child_fk_col)}"
+        requested_lookup_cols = _requested_lookup_cols_for_table(lookup_table)
+    else:
+        lookup_table, lookup_alias, child_fk_col, requested_lookup_cols = _infer_lookup_target()
+
+    if lookup_table and child_fk_col:
+        lookup_join_sql = (
+            f" INNER JOIN {lookup_table} AS {lookup_alias}"
+            f" ON {child_alias}.{_original_case_col(base_table, child_fk_col)} = {lookup_alias}.{_original_case_col(lookup_table, get_id_column(lookup_table) or child_fk_col)}"
+        )
+        for col in requested_lookup_cols:
+            _append_item(
+                f"{lookup_alias}.{_original_case_col(lookup_table, col)}",
+                f"{lookup_table.rstrip('s')}_{col}",
             )
-            for col in requested_lookup_cols:
-                _append_item(
-                    f"{lookup_alias}.{_original_case_col(lookup_table, col)}",
-                    f"{lookup_table.rstrip('s')}_{col}",
-                )
-            sort_segment = ""
-            m_sort = re.search(r"(?is)\b(?:sort(?:ed)?|order(?:ed)?)\s+by\s+(.+)$", q_l)
-            if m_sort:
-                sort_segment = str(m_sort.group(1) or "").strip()
-            for col in requested_lookup_cols:
-                if col and col in sort_segment:
-                    direction = "DESC" if re.search(rf"\b{re.escape(col)}\b.{{0,24}}\bdesc", sort_segment, flags=re.I | re.S) else "ASC"
-                    order_items.append(f"{lookup_alias}.{_original_case_col(lookup_table, col)} {direction}")
-                    break
-            id_terms = _identifier_terms(base_id_col) | {"employee", "number", "id", "code"}
-            if sort_segment and any(term in sort_segment for term in id_terms):
-                direction = "DESC" if re.search(r"\b(?:employee\s+number|employee\s+id|id|number|code)\b.{0,24}\bdesc", sort_segment, flags=re.I | re.S) else "ASC"
-                order_items.append(f"{child_alias}.{_original_case_col(base_table, base_id_col)} {direction}")
+        sort_segment = ""
+        m_sort = re.search(r"(?is)\b(?:sort(?:ed)?|order(?:ed)?)\s+by\s+(.+)$", q_l)
+        if m_sort:
+            sort_segment = str(m_sort.group(1) or "").strip()
+        for col in requested_lookup_cols:
+            if col and col in sort_segment:
+                direction = "DESC" if re.search(rf"\b{re.escape(col)}\b.{{0,24}}\bdesc", sort_segment, flags=re.I | re.S) else "ASC"
+                order_items.append(f"{lookup_alias}.{_original_case_col(lookup_table, col)} {direction}")
+                break
+        id_terms = _identifier_terms(base_id_col) | {"employee", "number", "id", "code"}
+        if sort_segment and any(term in sort_segment for term in id_terms):
+            direction = "DESC" if re.search(r"\b(?:employee\s+number|employee\s+id|id|number|code)\b.{0,24}\bdesc", sort_segment, flags=re.I | re.S) else "ASC"
+            order_items.append(f"{child_alias}.{_original_case_col(base_table, base_id_col)} {direction}")
 
     if not rebuilt_items:
         return sql
@@ -37393,13 +37569,15 @@ def _parse_flat_groupby_clauses(sql: str) -> Optional[dict]:
 
 def _drop_unrequested_missing_value_subset_filters(sql: str, question: str, ctx: str = "") -> str:
     """
-    Drop row-level missing-value subset filters from grouped single-table
+    Drop row-level missing/present subset filters from grouped single-table
     queries when the SELECT already computes both:
     - a total row count, and
     - a conditional missing-value count for the same column.
 
     This prevents COUNT(*) totals from shrinking down to only the missing-value
-    subset when the draft leaks `WHERE col IS NULL OR col = ''`.
+    subset when the draft leaks `WHERE col IS NULL OR col = ''`, and also
+    prevents the inverse non-empty subset filter from silently excluding the
+    rows that the conditional missing-count metric is supposed to count.
     """
     if not sql or not question:
         return sql
@@ -37445,6 +37623,18 @@ def _drop_unrequested_missing_value_subset_filters(sql: str, question: str, ctx:
             \s*\)?\s*$""",
         flags=re.X,
     )
+    present_pat = re.compile(
+        rf"""(?is)^\s*\(?\s*(?:
+            (?P<p1>{colref})\s+IS\s+NOT\s+NULL
+            |
+            NOT\s+(?P<p2>{colref})\s+IS\s+NULL
+            |
+            NOT\s*\(\s*(?P<p3>{colref})\s+IS\s+NULL\s+OR\s*(?P<p4>{colref})\s*=\s*{empty_lit}\s*\)
+            |
+            \(\s*(?P<p5>{colref})\s+IS\s+NOT\s+NULL\s+AND\s+(?P<p6>{colref})\s*<>\s*{empty_lit}\s*\)
+        )\s*\)?\s*$""",
+        flags=re.X,
+    )
 
     def _norm_ref(ref: str) -> str:
         return re.sub(r"[\s`]+", "", str(ref or "")).lower()
@@ -37486,19 +37676,43 @@ def _drop_unrequested_missing_value_subset_filters(sql: str, question: str, ctx:
             continue
 
         m_missing = null_or_empty_pat.match(c0)
-        if not m_missing:
+        if m_missing:
+            null_ref = (m_missing.group("n1") or m_missing.group("n2") or "").strip()
+            empty_ref = (m_missing.group("e1") or m_missing.group("e2") or "").strip()
+            if not null_ref or not empty_ref:
+                keep_conds.append(c0)
+                continue
+            if _norm_ref(null_ref) != _norm_ref(empty_ref):
+                keep_conds.append(c0)
+                continue
+            if not _select_has_missing_metric_for(null_ref):
+                keep_conds.append(c0)
+                continue
+
+            removed_any = True
+            continue
+
+        m_present = present_pat.match(c0)
+        if not m_present:
             keep_conds.append(c0)
             continue
 
-        null_ref = (m_missing.group("n1") or m_missing.group("n2") or "").strip()
-        empty_ref = (m_missing.group("e1") or m_missing.group("e2") or "").strip()
-        if not null_ref or not empty_ref:
+        ref_candidates = [
+            (m_present.group("p1") or "").strip(),
+            (m_present.group("p2") or "").strip(),
+            (m_present.group("p3") or "").strip(),
+            (m_present.group("p4") or "").strip(),
+            (m_present.group("p5") or "").strip(),
+            (m_present.group("p6") or "").strip(),
+        ]
+        refs = [ref for ref in ref_candidates if ref]
+        if not refs:
             keep_conds.append(c0)
             continue
-        if _norm_ref(null_ref) != _norm_ref(empty_ref):
+        if len({_norm_ref(ref) for ref in refs}) != 1:
             keep_conds.append(c0)
             continue
-        if not _select_has_missing_metric_for(null_ref):
+        if not _select_has_missing_metric_for(refs[0]):
             keep_conds.append(c0)
             continue
 

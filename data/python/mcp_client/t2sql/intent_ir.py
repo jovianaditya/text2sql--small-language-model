@@ -1025,7 +1025,10 @@ def _best_semantic_column_match(
     min_score: float = 1.5,
 ) -> Optional[str]:
     t = (table or "").strip().lower()
-    cols = list(allowed.get(t, set()))
+    cols = sorted(
+        allowed.get(t, set()),
+        key=lambda col: (len(str(col or "")), str(col or "").lower()),
+    )
     if not cols:
         return None
 
@@ -1073,7 +1076,10 @@ def _best_descriptor_column_match(
     min_score: float = 1.0,
 ) -> Optional[str]:
     t = (table or "").strip().lower()
-    cols = list(allowed.get(t, set()))
+    cols = sorted(
+        allowed.get(t, set()),
+        key=lambda col: (len(str(col or "")), str(col or "").lower()),
+    )
     if not cols:
         return None
 
@@ -3062,6 +3068,50 @@ def _detect_filters(
                 candidates.append(matched)
         return candidates + deferred_name
 
+    def _pick_explicit_text_target_column(anchor_pos: int) -> Optional[Tuple[str, str]]:
+        prefix = q_raw[max(0, int(anchor_pos) - 96):int(anchor_pos)]
+        prefix_l = re.sub(r"\s+", " ", prefix.strip().lower())
+        if not prefix_l:
+            return None
+
+        best_exact: Optional[Tuple[str, str]] = None
+        best_exact_len = -1
+        best_exact_pos = -1
+        for column in sorted(allowed.get(subject, set()), key=lambda c: (len(str(c or "")), str(c or "").lower())):
+            if not _supports_categorical_text_filter(subject, column):
+                continue
+            for variant in sorted(_column_variants(subject, column), key=len, reverse=True):
+                variant_l = str(variant or "").strip().lower()
+                if not variant_l:
+                    continue
+                variant_tokens = _tokenize_for_match(
+                    variant_l,
+                    stop_tokens=_LEXICAL_MATCH_STOP_TOKENS,
+                )
+                if variant_tokens == ["name"]:
+                    continue
+                pos = _phrase_pos(prefix_l, variant_l)
+                if pos < 0:
+                    continue
+                if pos > best_exact_pos or (pos == best_exact_pos and len(variant_l) > best_exact_len):
+                    best_exact = (subject, column)
+                    best_exact_len = len(variant_l)
+                    best_exact_pos = pos
+                    break
+
+        if best_exact is not None:
+            return best_exact
+
+        matched = _best_semantic_column_match(
+            text=prefix,
+            table=subject,
+            allowed=allowed,
+            min_score=1.0,
+        )
+        if matched and _supports_categorical_text_filter(subject, matched):
+            return (subject, matched)
+        return None
+
     def _pick_exact_numeric_target_column(anchor_pos: int) -> Optional[Tuple[str, str]]:
         window_start = max(0, anchor_pos - 96)
         anchor_window = q[window_start:anchor_pos]
@@ -3452,6 +3502,7 @@ def _detect_filters(
         if _looks_like_nonliteral_category_phrase(raw_value):
             return None
 
+        target = _pick_explicit_text_target_column(match.start())
         name_contains_intent = bool(
             re.search(
                 r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+contain(?:s|ing)?\b",
@@ -3464,8 +3515,7 @@ def _detect_filters(
                 flags=re.I,
             )
         )
-        target = None
-        if name_contains_intent:
+        if not target and name_contains_intent:
             name_col = _best_name_column(subject, allowed)
             if name_col:
                 target = (subject, name_col)
@@ -3509,6 +3559,7 @@ def _detect_filters(
         if _looks_like_nonliteral_category_phrase(raw_value):
             return None
 
+        target = _pick_explicit_text_target_column(match.start())
         name_contains_intent = bool(
             re.search(
                 r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,6}[\s,;:()'\"-]+contain(?:s|ing)?\b",
@@ -3531,8 +3582,7 @@ def _detect_filters(
                 flags=re.I,
             )
         )
-        target = None
-        if name_contains_intent:
+        if not target and name_contains_intent:
             name_col = _best_name_column(subject, allowed)
             if name_col:
                 target = (subject, name_col)

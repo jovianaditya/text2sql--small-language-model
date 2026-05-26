@@ -1404,6 +1404,32 @@ def present_value_phrases() -> list[str]:
     return rule_list(("missing_value_intent", "present_phrases"), defaults)
 
 
+@lru_cache(maxsize=1)
+def hierarchy_role_terms() -> list[str]:
+    defaults = [
+        "manager",
+        "subordinate",
+        "supervisor",
+        "parent",
+        "child",
+        "owner",
+        "member",
+        "leader",
+        "mentor",
+        "boss",
+        "reports to",
+        "reporting to",
+    ]
+    return rule_list(("hierarchy_intent", "role_terms"), defaults)
+
+
+def question_has_hierarchy_role_intent(question: str) -> bool:
+    q = normalized_text(question)
+    if not q:
+        return False
+    return any_phrase_in_text(q, hierarchy_role_terms())
+
+
 def question_wants_split_name_components(question: str) -> bool:
     q = normalized_text(question)
     if not q:

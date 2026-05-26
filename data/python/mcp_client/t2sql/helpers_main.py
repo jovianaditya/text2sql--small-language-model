@@ -219,6 +219,7 @@ from .rulebook import (
     aggregate_threshold_intent_comparison_terms,
     any_phrase_in_text,
     guidance_fact_support_phrases,
+    question_has_hierarchy_role_intent,
     name_request_terms,
     ordering_temporal_asc_terms,
     ordering_temporal_desc_terms,
@@ -2989,13 +2990,7 @@ def _guidance_self_fk_columns(table: str) -> List[str]:
 
 
 def _question_has_hierarchy_role_intent(question: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(?:manager|subordinate|supervisor|parent|child|owner|member|leader|mentor|boss|report(?:s|ing)?\s+to)\b",
-            str(question or ""),
-            flags=re.I,
-        )
-    )
+    return question_has_hierarchy_role_intent(question)
 
 
 def _question_requests_primary_entity_grain(question: str, table: str) -> bool:
@@ -8395,6 +8390,11 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     constraints.append(
                         "HIERARCHY LOOKUP SHAPE (CRITICAL): For same-table role lookups, use one flat SELECT over the base table and its parent-role alias. "
                         "Do NOT wrap the self-join in a derived table/subquery unless the question explicitly asks for ranking, aggregation, or filtering on derived results."
+                    )
+                    constraints.append(
+                        "SELF-JOIN DEPTH RULE (CRITICAL): Unless the question explicitly asks for multiple hierarchy levels "
+                        "(for example grand-manager, chain, path, recursive, ancestor, descendant, or level/depth), "
+                        "use exactly one parent-role alias of the same table. Do NOT add extra same-table hops."
                     )
                     if len(self_fk_cols) == 1 and subject_key_case:
                         constraints.append(
