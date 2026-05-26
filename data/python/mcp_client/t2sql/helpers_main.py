@@ -9199,11 +9199,14 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             if AST_TRACE and ast_alias_meta.get("fixes"):
                 print(f"[REFINER - AST ALIAS NORMALIZATION] sql={s}")
     if not phase2_alias_handled:
-        if AST_TRACE:
-            reason = "ast_unhandled_scope_or_parse_fail" if ast_parseable else "parse_gate_not_ast"
-            print(f"[REFINER - AST ALIAS NORMALIZATION] legacy_fallback=used reason={reason}")
-        s = _drop_redundant_column_aliases(s)
-        s = _strip_alias_if_single_table(s)
+        if ast_parseable:
+            if AST_TRACE:
+                print("[REFINER - AST ALIAS NORMALIZATION] legacy_fallback=skipped reason=regex_retired_for_parseable_sql")
+        else:
+            if AST_TRACE:
+                print("[REFINER - AST ALIAS NORMALIZATION] legacy_fallback=used reason=parse_gate_not_ast")
+            s = _drop_redundant_column_aliases(s)
+            s = _strip_alias_if_single_table(s)
     else:
         if AST_TRACE:
             print("[REFINER - AST ALIAS NORMALIZATION] legacy_fallback=skipped reason=ast_handled_scope")
@@ -9228,10 +9231,13 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             if AST_TRACE and ast_from_alias_meta.get("fixes"):
                 print(f"[REFINER - AST FROM ALIAS NORMALIZATION] sql={s}")
     if not phase2_from_alias_handled:
-        if AST_TRACE:
-            reason = "ast_unhandled_scope_or_parse_fail" if ast_parseable else "parse_gate_not_ast"
-            print(f"[REFINER - AST FROM ALIAS NORMALIZATION] legacy_fallback=used reason={reason}")
-        s = _drop_unused_from_table_aliases(s)
+        if ast_parseable:
+            if AST_TRACE:
+                print("[REFINER - AST FROM ALIAS NORMALIZATION] legacy_fallback=skipped reason=regex_retired_for_parseable_sql")
+        else:
+            if AST_TRACE:
+                print("[REFINER - AST FROM ALIAS NORMALIZATION] legacy_fallback=used reason=parse_gate_not_ast")
+            s = _drop_unused_from_table_aliases(s)
     elif AST_TRACE:
         print("[REFINER - AST FROM ALIAS NORMALIZATION] legacy_fallback=skipped reason=ast_handled_scope")
     # ---------------------------------------------------------------------------
