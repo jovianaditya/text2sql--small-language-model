@@ -64,7 +64,12 @@ from .schema_analyzer import (
     get_anchor_columns,
     get_all_tables,
     get_aggregatable_columns,
+    get_column_alias_tags,
+    get_column_datatype,
     get_column_description,
+    get_column_primary_role,
+    get_column_role_tags,
+    get_column_stats,
     get_filterable_date_columns,
     get_fk_relationships,
     get_fk_target_column,
@@ -292,6 +297,213 @@ def get_single_allowed_table(ctx: str) -> Optional[str]:
     if len(allowed) == 1:
         return next(iter(allowed.keys()))
     return None
+
+
+_STRUCTURED_IDENTIFIER_ROLE_TERMS = {
+    "id", "identifier", "pk", "fk",
+    "primary_key", "foreign_key",
+    "bridge_key", "fact_key",
+}
+_STRUCTURED_NAME_ROLE_TERMS = {
+    "name", "entity_name", "display_name",
+    "label", "title", "descriptor",
+}
+_STRUCTURED_METRIC_ROLE_TERMS = {
+    "metric", "measure", "amount", "quantity",
+    "monetary", "numeric", "value", "score",
+    "ratio", "percentage", "percent", "count", "total",
+}
+_STRUCTURED_TEMPORAL_ROLE_TERMS = {
+    "date", "datetime", "timestamp", "time", "temporal",
+    "year", "month", "day", "event_date", "event_time",
+}
+_NUMERIC_DTYPE_HINTS = ("INT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL", "MONEY")
+_TEMPORAL_DTYPE_HINTS = ("DATE", "TIME", "DATETIME", "TIMESTAMP", "YEAR")
+
+
+def _normalize_semantic_label(label: str) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", str(label or "").strip().lower()).strip("_")
+
+
+def _role_term_variants(term: str) -> Set[str]:
+    term_n = _normalize_semantic_label(term)
+    if not term_n:
+        return set()
+    parts = [part for part in re.split(r"[_\s]+", term_n) if part]
+    variants = {term_n, term_n.replace("_", "")}
+    variants.update(parts)
+    return {variant for variant in variants if variant}
+
+
+def _structured_role_matches(role_terms: Set[str], targets: Set[str]) -> bool:
+    normalized_targets: Set[str] = set()
+    for target in targets:
+        normalized_targets.update(_role_term_variants(target))
+    for term in role_terms:
+        if _role_term_variants(term).intersection(normalized_targets):
+            return True
+    return False
+
+
+def _stats_look_numeric(stats: Dict[str, Any]) -> bool:
+    if not isinstance(stats, dict) or not stats:
+        return False
+    for key in ("min", "max", "mean", "stddev", "median", "sum"):
+        value = stats.get(key)
+        if isinstance(value, (int, float)):
+            return True
+    return False
+
+
+def _sample_value_looks_temporal(sample_value: Any) -> bool:
+    sample = str(sample_value or "").strip()
+    if not sample:
+        return False
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", sample):
+        return True
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}[ t]\d{2}:\d{2}(?::\d{2})?", sample, flags=re.I):
+        return True
+    if re.fullmatch(r"\d{2}:\d{2}(?::\d{2})?", sample):
+        return True
+    return False
+
+
+@lru_cache(maxsize=4096)
+def _column_schema_semantics(table: str, column: str) -> Dict[str, Any]:
+    table_l = str(table or "").strip().lower()
+    column_s = str(column or "").strip()
+    role = str(get_column_role(table_l, column_s) or "").strip().lower() if table_l and column_s else ""
+    primary_role = _normalize_semantic_label(str(get_column_primary_role(table_l, column_s) or ""))
+    role_tags = [
+        _normalize_semantic_label(tag)
+        for tag in (get_column_role_tags(table_l, column_s) or [])
+        if _normalize_semantic_label(tag)
+    ]
+    alias_tags = [
+        str(tag or "").strip().lower()
+        for tag in (get_column_alias_tags(table_l, column_s) or [])
+        if str(tag or "").strip()
+    ]
+    datatype = str(get_column_datatype(table_l, column_s) or "").strip().upper()
+    description = str(get_column_description(table_l, column_s) or "").strip()
+    stats = get_column_stats(table_l, column_s) or {}
+    stats = dict(stats) if isinstance(stats, dict) else {}
+
+    role_terms = set(role_tags)
+    if primary_role:
+        role_terms.add(primary_role)
+    if role:
+        role_terms.add(_normalize_semantic_label(role))
+
+    return {
+        "role": role,
+        "primary_role": primary_role,
+        "role_tags": role_tags,
+        "role_terms": role_terms,
+        "alias_tags": alias_tags,
+        "datatype": datatype,
+        "description": description,
+        "stats": stats,
+    }
+
+
+def _column_is_identifier_like(table: str, column: str) -> bool:
+    col_l = str(column or "").strip().lower()
+    if not col_l:
+        return False
+    semantics = _column_schema_semantics(table, column)
+    if _structured_role_matches(semantics["role_terms"], _STRUCTURED_IDENTIFIER_ROLE_TERMS):
+        return True
+    if col_l.endswith(("id", "code", "number", "key")):
+        return True
+    return semantics["role"] in {"pk", "fk", "id"}
+
+
+def _column_is_name_like(table: str, column: str) -> bool:
+    col_l = str(column or "").strip().lower()
+    if not col_l:
+        return False
+    semantics = _column_schema_semantics(table, column)
+    if _structured_role_matches(semantics["role_terms"], _STRUCTURED_NAME_ROLE_TERMS):
+        return True
+    alias_terms = {
+        _normalize_semantic_label(tok)
+        for alias in semantics["alias_tags"]
+        for tok in re.findall(r"[a-z0-9_]+", alias)
+        if _normalize_semantic_label(tok)
+    }
+    if alias_terms.intersection({"name", "label", "title"}):
+        return True
+    return "name" in col_l
+
+
+def _column_is_temporal_like(table: str, column: str) -> bool:
+    col_l = str(column or "").strip().lower()
+    semantics = _column_schema_semantics(table, column)
+    if _structured_role_matches(semantics["role_terms"], _STRUCTURED_TEMPORAL_ROLE_TERMS):
+        return True
+    if col_l in {
+        str(col or "").strip().lower()
+        for col in (get_filterable_date_columns(str(table or "").strip().lower()) or [])
+        if str(col or "").strip()
+    }:
+        return True
+    if any(tok in semantics["datatype"] for tok in _TEMPORAL_DTYPE_HINTS):
+        return True
+    if _sample_value_looks_temporal(semantics["stats"].get("sample_value")):
+        return True
+    return any(tok in col_l for tok in ("date", "time", "year", "month", "day"))
+
+
+def _column_is_metric_like(table: str, column: str) -> bool:
+    col_l = str(column or "").strip().lower()
+    if not col_l or _column_is_identifier_like(table, column) or _column_is_temporal_like(table, column):
+        return False
+    semantics = _column_schema_semantics(table, column)
+    if _structured_role_matches(semantics["role_terms"], _STRUCTURED_METRIC_ROLE_TERMS):
+        return True
+    if col_l in {
+        str(col or "").strip().lower()
+        for col in (get_aggregatable_columns(str(table or "").strip().lower()) or [])
+        if str(col or "").strip()
+    }:
+        return True
+    if any(tok in semantics["datatype"] for tok in _NUMERIC_DTYPE_HINTS):
+        return True
+    return _stats_look_numeric(semantics["stats"])
+
+
+def _column_semantic_alias_terms(table: str, column: str) -> Set[str]:
+    terms: Set[str] = set()
+    for alias in _column_schema_semantics(table, column)["alias_tags"]:
+        alias_s = str(alias or "").strip().lower()
+        if alias_s:
+            terms.add(alias_s)
+            terms.add(alias_s.replace("_", " ").replace("-", " "))
+    return {term for term in terms if term}
+
+
+def _column_entity_only_token_match_disallowed(table: str, column: str) -> bool:
+    table_l = str(table or "").strip().lower()
+    col_l = str(column or "").strip().lower()
+    if not table_l or not col_l:
+        return False
+    name_col = str(get_name_column(table_l) or "").strip().lower()
+    id_col = str(get_id_column(table_l) or "").strip().lower()
+    col_tokens = [
+        tok for tok in re.findall(
+            r"[a-z0-9]+",
+            re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', str(column or "")).replace("_", " ").lower(),
+        )
+        if tok
+    ]
+    last_token = col_tokens[-1] if col_tokens else ""
+    return bool(
+        col_l in {name_col, id_col}
+        or _column_is_identifier_like(table_l, column)
+        or _column_is_name_like(table_l, column)
+        or last_token in {"id", "code", "number", "name"}
+    )
 # ======================================================================
 # ========================= HELPER CROSS MODULE ========================
 # ======================================================================
@@ -860,8 +1072,6 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
     }
 
     semantic_stopwords = retrieval_probe_semantic_stopwords()
-    metric_roles = {"metric", "measure", "amount", "quantity"}
-
     def _semantic_tokens(text: str) -> Set[str]:
         tokens = {
             tok
@@ -876,6 +1086,8 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         if not col:
             return terms
         terms.update(_semantic_tokens(col))
+        for alias in _column_semantic_alias_terms(table, col):
+            terms.update(_semantic_tokens(alias))
         try:
             for syn in get_column_synonyms(table, col) or []:
                 terms.update(_semantic_tokens(syn))
@@ -916,8 +1128,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         anchor_cols = {str(c or "").strip().lower() for c in (get_anchor_columns(table) or [])}
         for col in get_aggregatable_columns(table):
             col_l = str(col or "").strip().lower()
-            role = get_column_role(table, col)
-            if role not in metric_roles and col_l not in anchor_cols and _is_metric_id_like(col):
+            if not _column_is_metric_like(table, col) and col_l not in anchor_cols and _is_metric_id_like(col):
                 continue
             terms = _column_semantic_terms(table, col)
             if not terms:
@@ -941,8 +1152,7 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         if not name_col:
             return None
         col_lower = name_col.lower()
-        role = get_column_role(table, name_col)
-        if role == "name":
+        if _column_is_name_like(table, name_col):
             return name_col
         if any(part in col_lower for part in ("firstname", "lastname", "surname", "givenname")):
             return None
@@ -967,7 +1177,6 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
             col = str(column or "").strip()
             if not col:
                 continue
-            role = get_column_role(table, col)
             anchor_cols = {str(c or "").strip().lower() for c in (get_anchor_columns(table) or [])}
             semantic_terms = _column_semantic_terms(table, col)
             overlap_terms = semantic_terms.intersection(metric_terms_in_question)
@@ -975,14 +1184,14 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
             if _column_mentioned_in_question(table, col):
                 score += 5
             if prefer_metric:
-                if role in metric_roles or str(col).strip().lower() in anchor_cols:
+                if _column_is_metric_like(table, col) or str(col).strip().lower() in anchor_cols:
                     score += 3
                 if overlap_terms:
                     score += min(len(overlap_terms), 2) * 2
                 elif semantic_terms.intersection(metric_query_terms):
                     score += 1
             if prefer_temporal:
-                if role in {"date", "datetime", "timestamp", "time"}:
+                if _column_is_temporal_like(table, col):
                     score += 3
                 col_lower = col.lower()
                 if ("date" in col_lower) or ("time" in col_lower) or col_lower.endswith("at"):
@@ -995,14 +1204,13 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
         col = str(column or "").strip()
         if not col:
             return False
-        role = get_column_role(table, col)
-        if role in metric_roles:
+        if _column_is_metric_like(table, col):
             return True
         col_l = col.lower()
         anchor_cols = {str(c or "").strip().lower() for c in (get_anchor_columns(table) or [])}
         if col_l in anchor_cols:
             return True
-        if _is_metric_id_like(col):
+        if _column_is_identifier_like(table, col) or _is_metric_id_like(col):
             return False
         return bool(_column_semantic_terms(table, col).intersection(metric_query_terms))
 
@@ -1070,10 +1278,9 @@ def build_dynamic_probe(question: str, qtype: Optional[str] = None, max_tokens: 
             )
             for col in metric_cols[:2]:
                 col_lower = col.lower()
-                role = get_column_role(table_lower, col)
                 if col in {id_col, name_col}:
                     continue
-                if role == "id":
+                if _column_is_identifier_like(table_lower, col):
                     continue
                 if col_lower.endswith("id") or col_lower.endswith("number") or col_lower.endswith("code"):
                     continue
@@ -2054,6 +2261,8 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
                     table_columns = list(allowed_identifiers.get(table, ()))
                 for col in table_columns:
                     semantic_keys = _semantic_alias_keys(col)
+                    for alias in _column_semantic_alias_terms(table, col):
+                        semantic_keys.update(_semantic_alias_keys(alias))
                     try:
                         for syn in get_column_synonyms(table, col) or []:
                             semantic_keys.update(_semantic_alias_keys(syn))
@@ -2074,6 +2283,8 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
                 table_columns = list(allowed_identifiers.get(table, ()))
             for col_idx, col in enumerate(table_columns):
                 semantic_keys = _semantic_alias_keys(col)
+                for alias in _column_semantic_alias_terms(table, col):
+                    semantic_keys.update(_semantic_alias_keys(alias))
                 try:
                     for syn in get_column_synonyms(table, col) or []:
                         semantic_keys.update(_semantic_alias_keys(syn))
@@ -2086,8 +2297,7 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
                     continue
                 score = len(overlap_keys) * 10
                 score += len(semantic_keys.intersection(alias_keys)) * 20
-                role = get_column_role(table, col)
-                if role in {"metric", "measure", "amount", "quantity"}:
+                if _column_is_metric_like(table, col):
                     score += 5
                 if str(col or "").strip().lower() == str(alias or "").strip().lower():
                     score += 20
@@ -2141,6 +2351,20 @@ def _repair_with_aliases(sql: str, ctx: str) -> str:
                             syn_low.replace(" ", "_"),
                             syn_low.replace("-", ""),
                             syn_low.replace("-", "_"),
+                        }
+                        for cand in candidates:
+                            if re.match(r"^[a-z_][a-z0-9_]*$", cand):
+                                _put_fallback(cand, canon)
+                    for alias in _column_semantic_alias_terms(table, col):
+                        alias_low = str(alias).strip().lower()
+                        if not alias_low:
+                            continue
+                        candidates = {
+                            alias_low,
+                            alias_low.replace(" ", ""),
+                            alias_low.replace(" ", "_"),
+                            alias_low.replace("-", ""),
+                            alias_low.replace("-", "_"),
                         }
                         for cand in candidates:
                             if re.match(r"^[a-z_][a-z0-9_]*$", cand):
@@ -2556,9 +2780,6 @@ def _infer_tables_from_question_columns(
 
         # 3) Informative token boundary match (avoid weak generic tokens)
         stop_tokens = set(AGENT_COLUMN_STOP_TOKENS)
-        name_col = str(get_name_column(table_l) or "").strip().lower() if table_l else ""
-        id_col = str(get_id_column(table_l) or "").strip().lower() if table_l else ""
-        role = str(get_column_role(table_l, column) or "").strip().lower() if table_l else ""
         entity_tokens: Set[str] = set()
         if table_l:
             for cand in _table_mention_candidates(table_l, include_synonyms=True):
@@ -2570,14 +2791,7 @@ def _infer_tables_from_question_columns(
             for tok in col_tokens
             if len(tok) >= 4 and tok not in stop_tokens and tok not in entity_tokens
         }
-        entity_only_token_match_disallowed = bool(
-            table_l
-            and (
-                col_lower in {name_col, id_col}
-                or role in {"pk", "fk", "id", "identifier", "name", "label", "title"}
-                or last_token in {"id", "code", "number", "name"}
-            )
-        )
+        entity_only_token_match_disallowed = bool(table_l and _column_entity_only_token_match_disallowed(table_l, column))
         matched_tokens: Set[str] = set()
         for token in re.findall(r"[a-z0-9]+", spaced):
             if len(token) < 4 or token in stop_tokens:
@@ -2886,6 +3100,7 @@ def _guidance_column_semantic_terms(table: str, column: str) -> Set[str]:
         variants.update(get_column_entity_variants(table_l, col) or set())
     except Exception:
         pass
+    variants.update(_column_semantic_alias_terms(table_l, col))
     try:
         variants.update(get_column_synonyms(table_l, col) or [])
     except Exception:
@@ -3331,10 +3546,6 @@ def _guidance_question_mentions_column(question: str, table: str, column: str) -
         return True
 
     stop_tokens = set(AGENT_COLUMN_STOP_TOKENS)
-    name_col = str(get_name_column(table_l) or "").strip().lower()
-    id_col = str(get_id_column(table_l) or "").strip().lower()
-    role = str(get_column_role(table_l, col_text) or "").strip().lower()
-
     entity_tokens: Set[str] = set()
     for cand in _table_mention_candidates(table_l, include_synonyms=True):
         entity_tokens.update(_guidance_semantic_tokens(cand))
@@ -3346,11 +3557,7 @@ def _guidance_question_mentions_column(question: str, table: str, column: str) -
         for tok in col_tokens
         if len(tok) >= 4 and tok not in stop_tokens and tok not in entity_tokens
     }
-    entity_only_token_match_disallowed = bool(
-        col_lower in {name_col, id_col}
-        or role in {"pk", "fk", "id", "identifier", "name", "label", "title"}
-        or last_token in {"id", "code", "number", "name"}
-    )
+    entity_only_token_match_disallowed = _column_entity_only_token_match_disallowed(table_l, col_text)
 
     matched_tokens: Set[str] = set()
     for token in re.findall(r"[a-z0-9]+", spaced):
@@ -3519,14 +3726,13 @@ def _guidance_support_candidate_columns(table: str) -> List[str]:
             continue
         seen.add(col_l)
 
-        role = str(get_column_role(table_l, col_name) or "").strip().lower()
         is_date_col = col_l in date_cols
         tokenized_col = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", col_name).replace("_", " ").lower()
         col_tokens = [tok for tok in re.findall(r"[a-z0-9]+", tokenized_col) if tok]
         last_token = col_tokens[-1] if col_tokens else ""
         is_id_like = bool(
             col_l == id_col
-            or role in {"pk", "fk", "id", "identifier"}
+            or _column_is_identifier_like(table_l, col_name)
             or last_token in {"id", "code", "number"}
             or re.search(r"(?:^|_)(?:id|code|number)$", col_l, flags=re.I)
         )
@@ -3765,7 +3971,6 @@ def _find_schema_support_tables_for_guidance(
         fact_support_seen = False
         non_temporal_support_seen = False
         for col in candidate_cols:
-            role = get_column_role(table_l, col)
             col_l = str(col or "").strip().lower()
             if (
                 prompt_visible_cols
@@ -3798,11 +4003,11 @@ def _find_schema_support_tables_for_guidance(
                 if fact_phrase_overlap:
                     fact_support_seen = True
                     col_score += 3
-                    if role in {"metric", "measure", "amount", "quantity"}:
+                    if _column_is_metric_like(table_l, col):
                         col_score += 2
-                if role in {"metric", "measure", "amount", "quantity"} or fact_phrase_overlap:
+                if _column_is_metric_like(table_l, col) or fact_phrase_overlap:
                     non_temporal_support_seen = True
-                if role in {"metric", "measure", "amount", "quantity", "date"}:
+                if _column_is_metric_like(table_l, col) or _column_is_temporal_like(table_l, col):
                     col_score += 2
                 if explicit_metric_terms and overlap.intersection(explicit_metric_terms):
                     col_score += 2
@@ -3909,8 +4114,7 @@ def _find_schema_support_tables_for_guidance(
         score = min(len(novel_metric_cols), 3) * 3
         role_bonus = 0
         for col_name in novel_metric_cols:
-            role = str(get_column_role(table_l, col_name) or "").strip().lower()
-            if role in {"metric", "measure", "amount", "quantity"}:
+            if _column_is_metric_like(table_l, col_name):
                 role_bonus += 1
         score += min(role_bonus, 2)
         fallback_scores.append(
@@ -5578,7 +5782,6 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             for col in (get_filterable_date_columns(table_l) or [])
             if str(col or "").strip()
         }
-        role = str(get_column_role(table_l, c) or "").strip().lower()
 
         if agg == "COUNT":
             if c == "*":
@@ -5586,18 +5789,25 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             distinct_kw = "DISTINCT " if bool(metric.get("distinct")) else ""
             return _with_alias(f"{agg}({distinct_kw}{t}.{c})")
         if agg == "PCT_NON_NULL":
-            if c != "*" and (col_l in date_cols or role in {"date", "dimension", "status", "text", "name"} or col_l in agg_cols):
+            if c != "*" and (
+                col_l in date_cols
+                or _column_is_temporal_like(table_l, c)
+                or _column_is_name_like(table_l, c)
+                or col_l in agg_cols
+            ):
                 return f"percentage of rows with non-null {t}.{c}"
             return ""
         if agg in {"SUM", "AVG"}:
-            if c != "*" and (col_l in agg_cols or role in {"metric", "measure", "amount", "quantity"}):
+            if c != "*" and (col_l in agg_cols or _column_is_metric_like(table_l, c)):
                 return _with_alias(f"{agg}({t}.{c})")
             return ""
         if agg in {"MIN", "MAX"}:
             if c != "*" and (
                 col_l in agg_cols
                 or col_l in date_cols
-                or role in {"metric", "measure", "amount", "quantity", "date", "id", "fk", "pk"}
+                or _column_is_metric_like(table_l, c)
+                or _column_is_temporal_like(table_l, c)
+                or _column_is_identifier_like(table_l, c)
             ):
                 return _with_alias(f"{agg}({t}.{c})")
             return ""
@@ -6037,6 +6247,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
     def _column_variant_texts(table: str, column: str) -> Set[str]:
         variants = {column.lower(), _camel_words(column)}
+        variants.update(_column_semantic_alias_terms(table.lower(), column))
         for syn in get_column_synonyms(table.lower(), column) or []:
             syn_text = str(syn or "").strip().lower()
             if syn_text:
@@ -6378,24 +6589,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         return score
 
     def _column_is_date_like(table: str, column: str) -> bool:
-        col_l = str(column or "").strip().lower()
-        role = str(get_column_role(table.lower(), column) or "").strip().lower()
-        date_cols = {
-            str(col or "").strip().lower()
-            for col in (get_filterable_date_columns(table.lower()) or [])
-            if str(col or "").strip()
-        }
-        return col_l in date_cols or role == "date" or any(tok in col_l for tok in ("date", "time", "year", "month", "day"))
+        return _column_is_temporal_like(table.lower(), column)
 
     def _column_is_numeric_like(table: str, column: str) -> bool:
-        col_l = str(column or "").strip().lower()
-        role = str(get_column_role(table.lower(), column) or "").strip().lower()
-        agg_cols = {
-            str(col or "").strip().lower()
-            for col in (get_aggregatable_columns(table.lower()) or [])
-            if str(col or "").strip()
-        }
-        return col_l in agg_cols or role in {"metric", "measure", "amount", "quantity"}
+        return _column_is_metric_like(table.lower(), column)
 
     def _resolve_derived_column(
         phrase: str = "",
