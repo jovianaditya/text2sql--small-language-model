@@ -10,14 +10,19 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .schema_analyzer import (
     get_all_tables,
+    get_column_alias_tags,
     get_column_datatype,
     get_column_synonyms,
+    get_column_primary_role,
     get_column_description,
     get_column_role,
+    get_column_role_tags,
+    get_column_stats,
     get_fk_relationships,
     get_id_column,
     get_name_column,
@@ -95,6 +100,27 @@ _GENERIC_GROUPING_TERMS = {
     "month", "year", "quarter",
     "country", "city", "state", "territory",
 }
+_STRUCTURED_IDENTIFIER_ROLE_TERMS = {
+    "id", "identifier", "pk", "fk",
+    "primary_key", "foreign_key",
+    "bridge_key", "fact_key",
+}
+_STRUCTURED_NAME_ROLE_TERMS = {
+    "name", "entity_name", "display_name",
+    "label", "title", "descriptor",
+}
+_STRUCTURED_NUMERIC_ROLE_TERMS = {
+    "metric", "measure", "amount", "quantity",
+    "monetary", "numeric", "value", "score",
+    "ratio", "percentage", "percent", "count", "total",
+}
+_STRUCTURED_TEMPORAL_ROLE_TERMS = {
+    "date", "datetime", "timestamp", "time", "temporal",
+    "year", "month", "day", "event_date", "event_time",
+}
+_NUMERIC_DTYPE_HINTS = ("INT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL", "MONEY")
+_TEMPORAL_DTYPE_HINTS = ("DATE", "TIME", "DATETIME", "TIMESTAMP", "YEAR")
+_TEXTUAL_DTYPE_HINTS = ("CHAR", "TEXT", "CLOB", "ENUM", "SET")
 
 
 def _fallback_singular(table: str) -> str:
@@ -125,6 +151,49 @@ def _safe_get_column_synonyms(table: str, column: str) -> List[str]:
         return list(get_column_synonyms(table, column) or [])
     except Exception:
         return []
+
+
+def _safe_get_column_primary_role(table: str, column: str) -> str:
+    try:
+        return str(get_column_primary_role(table, column) or "")
+    except Exception:
+        return ""
+
+
+def _safe_get_column_role_tags(table: str, column: str) -> List[str]:
+    try:
+        return list(get_column_role_tags(table, column) or [])
+    except Exception:
+        return []
+
+
+def _safe_get_column_alias_tags(table: str, column: str) -> List[str]:
+    try:
+        return list(get_column_alias_tags(table, column) or [])
+    except Exception:
+        return []
+
+
+def _safe_get_column_stats(table: str, column: str) -> Dict[str, Any]:
+    try:
+        stats = get_column_stats(table, column) or {}
+    except Exception:
+        stats = {}
+    return dict(stats) if isinstance(stats, dict) else {}
+
+
+def _safe_get_column_datatype(table: str, column: str) -> str:
+    try:
+        return str(get_column_datatype(table, column) or "")
+    except Exception:
+        return ""
+
+
+def _safe_get_column_description(table: str, column: str) -> str:
+    try:
+        return str(get_column_description(table, column) or "")
+    except Exception:
+        return ""
 
 
 def _safe_get_id_column(table: str) -> Optional[str]:
@@ -609,19 +678,23 @@ def _augment_subject_allowed_columns_from_schema(
     return out
 
 
-def _is_numeric_column(col: str) -> bool:
+def _is_numeric_column(col: str, table: str = "") -> bool:
     cl = (col or "").lower()
-    if _is_date_column(col):
+    if table and _column_has_numeric_semantics(table, col):
+        return True
+    if _is_date_column(col, table):
         return False
     # ID-like columns (*Number, *Id, *Code) are identifiers, not numeric measures
-    if cl.endswith("number") or cl.endswith("id") or cl.endswith("code"):
+    if (table and _is_identifier_like_column(table, col)) or cl.endswith("number") or cl.endswith("id") or cl.endswith("code"):
         return False
     words = _camel_to_words(col or "")
     tokens = {t for t in re.findall(r"[a-z0-9]+", words) if t}
     return any(k in tokens for k in _numeric_hint_terms())
 
 
-def _is_date_column(col: str) -> bool:
+def _is_date_column(col: str, table: str = "") -> bool:
+    if table and _column_has_temporal_semantics(table, col):
+        return True
     c = (col or "").lower()
     return any(k in c for k in _DATE_HINTS)
 
@@ -897,6 +970,132 @@ def _schema_groupable_terms() -> Set[str]:
     return set(terms)
 
 
+def _normalize_semantic_label(label: str) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", str(label or "").strip().lower()).strip("_")
+
+
+def _role_term_variants(term: str) -> Set[str]:
+    term_n = _normalize_semantic_label(term)
+    if not term_n:
+        return set()
+    parts = [part for part in re.split(r"[_\s]+", term_n) if part]
+    variants = {term_n}
+    variants.update(parts)
+    variants.add(term_n.replace("_", ""))
+    return {variant for variant in variants if variant}
+
+
+def _structured_role_matches(role_terms: Set[str], targets: Set[str]) -> bool:
+    normalized_targets: Set[str] = set()
+    for target in targets:
+        normalized_targets.update(_role_term_variants(target))
+    for term in role_terms:
+        if _role_term_variants(term).intersection(normalized_targets):
+            return True
+    return False
+
+
+def _stats_look_numeric(stats: Dict[str, Any]) -> bool:
+    if not isinstance(stats, dict) or not stats:
+        return False
+    for key in ("min", "max", "mean", "stddev", "median", "sum"):
+        value = stats.get(key)
+        if isinstance(value, (int, float)):
+            return True
+    return False
+
+
+def _sample_value_looks_temporal(sample_value: Any) -> bool:
+    sample = str(sample_value or "").strip()
+    if not sample:
+        return False
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", sample):
+        return True
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}[ t]\d{2}:\d{2}(?::\d{2})?", sample, flags=re.I):
+        return True
+    if re.fullmatch(r"\d{2}:\d{2}(?::\d{2})?", sample):
+        return True
+    return False
+
+
+@lru_cache(maxsize=4096)
+def _column_schema_semantics(table: str, column: str) -> Dict[str, Any]:
+    table_l = str(table or "").strip().lower()
+    column_s = str(column or "").strip()
+    role = str(get_column_role(table_l, column_s) or "").strip().lower() if table_l and column_s else ""
+    primary_role = _normalize_semantic_label(_safe_get_column_primary_role(table_l, column_s))
+    role_tags = [
+        _normalize_semantic_label(tag)
+        for tag in _safe_get_column_role_tags(table_l, column_s)
+        if _normalize_semantic_label(tag)
+    ]
+    alias_tags = [
+        str(tag or "").strip().lower()
+        for tag in _safe_get_column_alias_tags(table_l, column_s)
+        if str(tag or "").strip()
+    ]
+    datatype = _safe_get_column_datatype(table_l, column_s).strip().upper()
+    description = _safe_get_column_description(table_l, column_s).strip()
+    stats = _safe_get_column_stats(table_l, column_s)
+
+    role_terms = set(role_tags)
+    if primary_role:
+        role_terms.add(primary_role)
+    if role:
+        role_terms.add(_normalize_semantic_label(role))
+
+    return {
+        "table": table_l,
+        "column": column_s,
+        "role": role,
+        "primary_role": primary_role,
+        "role_tags": role_tags,
+        "role_terms": role_terms,
+        "alias_tags": alias_tags,
+        "datatype": datatype,
+        "description": description,
+        "stats": stats,
+    }
+
+
+def _column_has_identifier_semantics(table: str, column: str) -> bool:
+    semantics = _column_schema_semantics(table, column)
+    return _structured_role_matches(semantics["role_terms"], _STRUCTURED_IDENTIFIER_ROLE_TERMS)
+
+
+def _column_has_name_semantics(table: str, column: str) -> bool:
+    semantics = _column_schema_semantics(table, column)
+    if _structured_role_matches(semantics["role_terms"], _STRUCTURED_NAME_ROLE_TERMS):
+        return True
+    alias_terms = {
+        _normalize_semantic_label(tok)
+        for alias in semantics["alias_tags"]
+        for tok in re.findall(r"[a-z0-9_]+", alias)
+        if _normalize_semantic_label(tok)
+    }
+    return bool(alias_terms.intersection({"name", "label", "title"}))
+
+
+def _column_has_temporal_semantics(table: str, column: str) -> bool:
+    semantics = _column_schema_semantics(table, column)
+    if _structured_role_matches(semantics["role_terms"], _STRUCTURED_TEMPORAL_ROLE_TERMS):
+        return True
+    if any(tok in semantics["datatype"] for tok in _TEMPORAL_DTYPE_HINTS):
+        return True
+    return _sample_value_looks_temporal(semantics["stats"].get("sample_value"))
+
+
+def _column_has_numeric_semantics(table: str, column: str) -> bool:
+    semantics = _column_schema_semantics(table, column)
+    if _column_has_identifier_semantics(table, column) or _column_has_temporal_semantics(table, column):
+        return False
+    if _structured_role_matches(semantics["role_terms"], _STRUCTURED_NUMERIC_ROLE_TERMS):
+        return True
+    if any(tok in semantics["datatype"] for tok in _NUMERIC_DTYPE_HINTS):
+        return True
+    return _stats_look_numeric(semantics["stats"])
+
+
 def _column_semantic_tokens(table: str, column: str) -> Set[str]:
     c = str(column or "").strip()
     if not c:
@@ -905,6 +1104,11 @@ def _column_semantic_tokens(table: str, column: str) -> Set[str]:
     phrases: Set[str] = {_camel_to_words(c)}
     if "_" in c:
         phrases.add(c.lower().replace("_", " "))
+    for alias in _column_schema_semantics(table, c)["alias_tags"]:
+        alias_s = str(alias or "").strip().lower()
+        if alias_s:
+            phrases.add(alias_s.replace("_", " "))
+            phrases.add(alias_s.replace("-", " "))
     for syn in _safe_get_column_synonyms(table, c):
         s = str(syn).strip().lower()
         if not s:
@@ -929,7 +1133,7 @@ def _column_descriptor_tokens(table: str, column: str) -> Set[str]:
     c = str(column or "").strip()
     if not c:
         return set()
-    desc = str(get_column_description(table, c) or "").strip()
+    desc = _column_schema_semantics(table, c)["description"]
     if not desc:
         return set()
     desc_norm = _camel_to_words(desc)
@@ -940,9 +1144,12 @@ def _is_identifier_like_column(table: str, column: str) -> bool:
     cl = str(column or "").strip().lower()
     if not cl:
         return False
+    semantics = _column_schema_semantics(table, column) if table else None
+    if table and _column_has_identifier_semantics(table, column):
+        return True
     if cl.endswith(("id", "number", "code", "key")):
         return True
-    role = str(get_column_role(table, column) or "").strip().lower()
+    role = str((semantics or {}).get("role", "") or "").strip().lower()
     return role in {"id", "pk", "fk"}
 
 
@@ -969,7 +1176,6 @@ def _numeric_hint_terms(question_tokens: Optional[Set[str]] = None) -> Set[str]:
         except Exception:
             schema_tables = []
 
-        numeric_roles = {"metric", "measure", "amount", "quantity"}
         schema_enriched = False
         for table in schema_tables:
             t = str(table or "").strip().lower()
@@ -986,16 +1192,8 @@ def _numeric_hint_terms(question_tokens: Optional[Set[str]] = None) -> Set[str]:
                 c_low = c.lower()
                 if c_low.endswith(("id", "number", "code", "key")):
                     continue
-
-                role = ""
-                try:
-                    if analyzer is not None:
-                        role = str(analyzer._column_roles.get(t, {}).get(c_low, "") or "").lower()
-                except Exception:
-                    role = ""
-
                 semantic_terms = _column_semantic_tokens(t, c)
-                if role in numeric_roles or semantic_terms.intersection(hints):
+                if _column_has_numeric_semantics(t, c) or semantic_terms.intersection(hints):
                     schema_enriched = True
                     hints.update(semantic_terms)
 
@@ -1041,7 +1239,7 @@ def _best_semantic_column_match(
     best_score = 0.0
     best_overlap = 0
     for col in cols:
-        if numeric_only and not _is_numeric_column(col):
+        if numeric_only and not _is_numeric_column(col, t):
             continue
         col_tokens = _column_semantic_tokens(t, col)
         if not col_tokens:
@@ -1290,7 +1488,7 @@ def _detect_column_mentions(question: str, allowed: Dict[str, Set[str]]) -> List
 
 def _find_best_date_column(table: str, allowed: Dict[str, Set[str]]) -> Optional[str]:
     cols = list(allowed.get((table or "").lower(), set()))
-    date_like = [c for c in cols if _is_date_column(c)]
+    date_like = [c for c in cols if _is_date_column(c, table)]
     if not date_like:
         return None
     date_like.sort(key=lambda x: (0 if "date" in x.lower() else 1, len(x)))
@@ -1358,16 +1556,26 @@ def _best_name_column(table: str, allowed: Dict[str, Set[str]]) -> Optional[str]
     if name_col and name_col in allowed.get((table or "").lower(), set()):
         return name_col
     cols = list(allowed.get((table or "").lower(), set()))
-    name_like = [c for c in cols if c.lower().endswith("name") or "name" in c.lower()]
+    name_like = [c for c in cols if _column_has_name_semantics(table, c)]
+    if not name_like:
+        name_like = [c for c in cols if c.lower().endswith("name") or "name" in c.lower()]
     if name_like:
-        name_like.sort(key=len)
+        name_like.sort(
+            key=lambda c: (
+                1 if _column_has_name_semantics(table, c) else 0,
+                -len(_column_semantic_tokens(table, c).intersection({"name", "entity", "label", "title"})),
+                -len(_column_schema_semantics(table, c)["alias_tags"]),
+                -len(str(c or "")),
+            ),
+            reverse=True,
+        )
         return name_like[0]
     return None
 
 
 def _find_best_numeric_column(table: str, allowed: Dict[str, Set[str]]) -> Optional[str]:
     cols = list(allowed.get((table or "").lower(), set()))
-    num_like = [c for c in cols if _is_numeric_column(c)]
+    num_like = [c for c in cols if _is_numeric_column(c, table)]
     if not num_like:
         return None
     num_like.sort(key=lambda x: len(x))
@@ -1562,14 +1770,14 @@ def _detect_metrics(
                 best_table = t
         return best_table if best_score > 0 else None
 
-    def _is_numeric_measure_column(col: str) -> bool:
+    def _is_numeric_measure_column(table: str, col: str) -> bool:
         # Numeric aggregates should not bind to temporal columns unless the
         # caller explicitly takes the temporal-extrema path.
-        return _is_numeric_column(col) and not _is_date_column(col)
+        return _is_numeric_column(col, table) and not _is_date_column(col, table)
 
     def _find_best_numeric_measure_column(table: str) -> Optional[str]:
         cols = list(allowed.get((table or "").lower(), set()))
-        num_like = [c for c in cols if _is_numeric_measure_column(c)]
+        num_like = [c for c in cols if _is_numeric_measure_column(table, c)]
         if not num_like:
             return None
         num_like.sort(key=lambda x: len(x))
@@ -1577,10 +1785,10 @@ def _detect_metrics(
 
     # Candidate numeric/date mentions from question.
     mentioned_numeric_cols = [
-        (t, c, p) for (t, c, p) in column_mentions if _is_numeric_measure_column(c)
+        (t, c, p) for (t, c, p) in column_mentions if _is_numeric_measure_column(t, c)
     ]
     mentioned_date_cols = [
-        (t, c, p) for (t, c, p) in column_mentions if _is_date_column(c)
+        (t, c, p) for (t, c, p) in column_mentions if _is_date_column(c, t)
     ]
 
     def add_metric(m: IRMetric) -> None:
@@ -1679,7 +1887,7 @@ def _detect_metrics(
         explicit_variant_hits: List[Tuple[int, int, str, str]] = []
         for t in metric_target_tables:
             for c in allowed.get((t or "").lower(), set()):
-                if not _is_numeric_measure_column(c):
+                if not _is_numeric_measure_column(t, c):
                     continue
                 best_variant_score = 0
                 for v in _column_variants(t, c):
@@ -1711,7 +1919,7 @@ def _detect_metrics(
         best_pos = 10**9
         for t in metric_target_tables:
             for c in allowed.get((t or "").lower(), set()):
-                if not _is_numeric_measure_column(c):
+                if not _is_numeric_measure_column(t, c):
                     continue
                 col_tokens = _column_semantic_tokens(t, c)
                 if not col_tokens:
@@ -1735,7 +1943,7 @@ def _detect_metrics(
         resolved = _resolve_column_from_phrase(p)
         if resolved:
             t, c = resolved
-            if _is_numeric_measure_column(c):
+            if _is_numeric_measure_column(t, c):
                 return t, c
 
         return None
@@ -1762,7 +1970,7 @@ def _detect_metrics(
             resolved_table = _resolve_table_from_phrase(phrase)
             resolved_col = _resolve_column_from_phrase(phrase)
             if resolved_table and not (
-                resolved_col and _is_numeric_measure_column(resolved_col[1])
+                resolved_col and _is_numeric_measure_column(resolved_col[0], resolved_col[1])
             ):
                 continue
 
@@ -1826,7 +2034,7 @@ def _detect_metrics(
                 continue
 
             resolved_col = _resolve_column_from_phrase(phrase_norm)
-            if resolved_col and _is_numeric_measure_column(resolved_col[1]):
+            if resolved_col and _is_numeric_measure_column(resolved_col[0], resolved_col[1]):
                 continue
 
             resolved_table = _resolve_table_from_phrase(phrase_norm)
@@ -2108,10 +2316,10 @@ def _detect_metrics(
 
         # Fallback: percentage of non-null usually targets date-like status columns.
         for t, c, _ in column_mentions:
-            if t == subject and _is_date_column(c):
+            if t == subject and _is_date_column(c, t):
                 return (t, c)
         for c in allowed.get(subject, set()):
-            if _is_date_column(c):
+            if _is_date_column(c, subject):
                 return (subject, c)
         return None
 
@@ -2184,7 +2392,7 @@ def _detect_metrics(
             return t, c
         for t in dict.fromkeys([subject] + [tm for tm, _ in table_mentions]):
             preferred = _prefer_numeric_column_from_question(question, t, allowed)
-            if preferred and _is_numeric_measure_column(preferred):
+            if preferred and _is_numeric_measure_column(t, preferred):
                 return t, preferred
         for t, _ in table_mentions:
             col = _find_best_numeric_measure_column(t)
@@ -2432,9 +2640,9 @@ def _detect_dimensions(
                 is_id_like = cl.endswith("id") or cl.endswith("number") or cl.endswith("code")
                 if is_id_like and not subject_id_requested and not _explicit_group_dim_requested(table, col):
                     continue
-                if not is_id_like and _is_numeric_column(col):
+                if not is_id_like and _is_numeric_column(col, table):
                     continue
-                if _is_date_column(col) and not date_day_group_requested:
+                if _is_date_column(col, table) and not date_day_group_requested:
                     continue
             add_dim(IRDimension(table=table, column=col))
 
@@ -2479,7 +2687,7 @@ def _detect_dimensions(
                 table=subject,
                 text=phrase,
             )
-            if resolved_col and not _is_numeric_column(resolved_col):
+            if resolved_col and not _is_numeric_column(resolved_col, subject):
                 add_dim(IRDimension(table=subject, column=resolved_col))
 
     # Projection-list semantic enrichment for lookup questions:
@@ -2556,11 +2764,11 @@ def _detect_dimensions(
     ):
         ranked_numeric_col = _prefer_numeric_column_from_question(question, subject, allowed)
         has_numeric_dim = any(
-            d.table == subject and _is_numeric_column(d.column)
+            d.table == subject and _is_numeric_column(d.column, d.table)
             for d in dims
         )
         has_identity_dim = any(
-            d.table == subject and not _is_numeric_column(d.column)
+            d.table == subject and not _is_numeric_column(d.column, d.table)
             for d in dims
         )
         if ranked_numeric_col and not any(
@@ -2579,7 +2787,7 @@ def _detect_dimensions(
         if has_numeric_dim:
             dims.sort(
                 key=lambda d: (
-                    1 if d.table == subject and _is_numeric_column(d.column) else 0,
+                    1 if d.table == subject and _is_numeric_column(d.column, d.table) else 0,
                     d.table.lower(),
                     d.column.lower(),
                 )
@@ -2740,7 +2948,7 @@ def _detect_filters(
         date_col = None
         date_table = subject
         for t, c, _ in column_mentions:
-            if _is_date_column(c):
+            if _is_date_column(c, t):
                 date_table, date_col = t, c
                 break
         if not date_col:
@@ -2888,16 +3096,16 @@ def _detect_filters(
         return best_col
 
     def _supports_categorical_text_filter(table: str, column: str) -> bool:
-        if _is_date_column(column) or _is_identifier_like_column(table, column):
+        if _is_date_column(column, table) or _is_identifier_like_column(table, column):
             return False
-        if not _is_numeric_column(column):
+        if not _is_numeric_column(column, table):
             return True
 
-        dtype = str(get_column_datatype(table, column) or "").upper()
-        if any(tok in dtype for tok in ("CHAR", "TEXT", "CLOB", "ENUM", "SET")):
+        dtype = _column_schema_semantics(table, column)["datatype"]
+        if any(tok in dtype for tok in _TEXTUAL_DTYPE_HINTS):
             return True
 
-        desc = str(get_column_description(table, column) or "").lower()
+        desc = _column_schema_semantics(table, column)["description"].lower()
         if re.search(r"\b(?:text|string|label|ratio|category|status|state|type)\b", desc, flags=re.I):
             return True
         if re.search(r"\be\.g\.[^.]*[:/-]", desc, flags=re.I):
@@ -2931,7 +3139,7 @@ def _detect_filters(
                 if not table_l:
                     continue
                 for c in cols:
-                    if _is_date_column(c):
+                    if _is_date_column(c, table_l):
                         continue
                     for variant in sorted(_column_variants(table_l, c), key=len, reverse=True):
                         variant_l = str(variant or "").strip().lower()
@@ -2988,10 +3196,10 @@ def _detect_filters(
             best_score = float("-inf")
             best_distance = 10**9
             for t, c, pos in column_mentions:
-                if _is_date_column(c):
+                if _is_date_column(c, t):
                     continue
                 cl = c.lower()
-                is_id_like = cl.endswith(("id", "number", "code", "key"))
+                is_id_like = _is_identifier_like_column(t, c) or cl.endswith(("id", "number", "code", "key"))
                 semantic_tokens = _column_semantic_tokens(t, c)
                 overlap = anchor_tokens.intersection(semantic_tokens)
                 distance = abs(pos - anchor_pos)
@@ -3000,7 +3208,7 @@ def _detect_filters(
                 if pos <= anchor_pos:
                     score += 0.6
                 score += max(0.0, 1.5 - (distance / 40.0))
-                if not _is_numeric_column(c) and not is_id_like:
+                if not _is_numeric_column(c, t) and not is_id_like:
                     score += 1.0
                 elif is_id_like:
                     score -= 1.0
@@ -3016,7 +3224,7 @@ def _detect_filters(
                 return best_local
         # Fallback to first non-numeric/non-date mention.
         for t, c, _ in column_mentions:
-            if not _is_numeric_column(c) and not _is_date_column(c):
+            if not _is_numeric_column(c, t) and not _is_date_column(c, t):
                 return (t, c)
         name_col = _best_name_column(subject, allowed)
         if name_col:
@@ -3143,7 +3351,7 @@ def _detect_filters(
         for t, c, pos in column_mentions:
             if t != subject:
                 continue
-            if not (_is_numeric_column(c) or _is_identifier_like_column(t, c)):
+            if not (_is_numeric_column(c, t) or _is_identifier_like_column(t, c)):
                 continue
             distance = abs(pos - anchor_pos)
             score = max(0.0, 2.0 - (distance / 48.0))
@@ -3891,7 +4099,7 @@ def _detect_filters(
             column = str(getattr(dim, "column", "") or "").strip()
             if table != subject or not column:
                 continue
-            if not (_is_numeric_column(column) or _is_date_column(column)):
+            if not (_is_numeric_column(column, table) or _is_date_column(column, table)):
                 continue
             key = column.lower()
             if key in seen:
@@ -3908,7 +4116,7 @@ def _detect_filters(
         projected_cols = _subject_projection_comparable_columns()
         candidate_cols = projected_cols or [
             c for c in allowed.get(subject, set())
-            if _is_numeric_column(c) or _is_date_column(c)
+            if _is_numeric_column(c, subject) or _is_date_column(c, subject)
         ]
         if not candidate_cols:
             return None
@@ -3960,7 +4168,7 @@ def _detect_filters(
 
     # Numeric comparisons.
     numeric_col = None
-    numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c)]
+    numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c, t)]
 
     def _pick_comparison_numeric_target(anchor_pos: int) -> Optional[Tuple[str, str]]:
         numeric_candidate_tables = [subject]
@@ -4102,7 +4310,7 @@ def _detect_filters(
     if not numeric_col and metrics:
         m0 = metrics[0]
         m0_agg = str(m0.agg or "").strip().lower()
-        if m0.column != "*" and (_is_numeric_column(m0.column) or m0_agg == "count"):
+        if m0.column != "*" and (_is_numeric_column(m0.column, m0.table) or m0_agg == "count"):
             numeric_col = (m0.table, m0.column)
     if not numeric_col:
         c0 = _find_best_numeric_column(subject, allowed)
@@ -4362,7 +4570,7 @@ def _detect_filters(
             (r"\b(?:earlier\s+than|(?<!on or )before)\b", "col_lt"),
         )
         date_mentions = [
-            (t, c, p) for (t, c, p) in column_mentions if _is_date_column(c)
+            (t, c, p) for (t, c, p) in column_mentions if _is_date_column(c, t)
         ]
         best_compare = None
         best_gap = 10**9
@@ -4415,7 +4623,7 @@ def _detect_filters(
                 allowed=allowed,
                 min_score=1.0,
             )
-            if matched and not _is_date_column(matched) and not _is_numeric_column(matched):
+            if matched and not _is_date_column(matched, subject) and not _is_numeric_column(matched, subject):
                 return matched
         for preferred in ("country", "territory", "state", "city"):
             for c in allowed.get(subject, set()):
@@ -5372,7 +5580,7 @@ def _detect_ordering_and_limit(
     temporal_desc = bool(re.search(r"\b(?:latest|newest|most\s+recent)\b", q, flags=re.I))
     temporal_asc = bool(re.search(r"\b(?:earliest|oldest)\b", q, flags=re.I))
     if not ordering and not metrics and (temporal_desc or temporal_asc):
-        date_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_date_column(c)]
+        date_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_date_column(c, t)]
         if date_mentions:
             temporal_anchor = min(
                 (
@@ -5408,14 +5616,14 @@ def _detect_ordering_and_limit(
             or has_value_rank_lookup
         )
     ):
-        numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c)]
+        numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c, t)]
         subject_numeric_mentions = [
             item for item in numeric_mentions
             if subject_l and str(item[0] or "").strip().lower() == subject_l
         ]
         numeric_dims = [
             d for d in dimensions
-            if _is_numeric_column(d.column)
+            if _is_numeric_column(d.column, d.table)
         ]
         subject_numeric_dims = [
             d for d in numeric_dims
@@ -5439,14 +5647,14 @@ def _detect_ordering_and_limit(
     if limit and metrics:
         add_order(IROrder(kind="alias", by=metrics[0].alias, direction="DESC" if "bottom" not in q else "ASC"))
     elif limit and not ordering:
-        numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c)]
+        numeric_mentions = [(t, c, p) for (t, c, p) in column_mentions if _is_numeric_column(c, t)]
         subject_numeric_mentions = [
             item for item in numeric_mentions
             if subject_l and str(item[0] or "").strip().lower() == subject_l
         ]
         numeric_dims = [
             d for d in dimensions
-            if _is_numeric_column(d.column)
+            if _is_numeric_column(d.column, d.table)
         ]
         subject_numeric_dims = [
             d for d in numeric_dims
@@ -5634,7 +5842,7 @@ def _detect_row_level_computed_projections(
         return []
 
     def _is_numeric_measure_column(col: str) -> bool:
-        return _is_numeric_column(col) and not _is_date_column(col)
+        return _is_numeric_column(col, subject_l) and not _is_date_column(col, subject_l)
 
     numeric_subject_cols = [
         str(col or "").strip()
