@@ -22,6 +22,7 @@ from .schema_analyzer import (
     get_all_tables,
     get_column_entity_variants,
     infer_best_aggregate_column,
+    get_metric_candidates,
     get_transaction_tables,
     get_fk_relationships,
     get_column_role,
@@ -266,21 +267,45 @@ def _latest_year_metric_question_terms() -> Set[str]:
     }
     for table in sorted(get_all_tables()):
         try:
-            numeric_cols = get_columns_by_role(table, "numeric") or []
+            numeric_cols = get_metric_candidates(table) or get_columns_by_role(table, "numeric") or []
         except Exception:
             numeric_cols = []
         for col in numeric_cols:
-            role = str(get_column_role(table, col) or "").strip().lower()
-            if role in {"metric", "measure", "amount", "quantity"}:
-                metric_terms.add(role)
+            semantic_view: Dict[str, Any] = {}
+            try:
+                semantic_view = get_column_semantics(table, col) or {}
+            except Exception:
+                semantic_view = {}
+            role_terms = {
+                str(semantic_view.get("primary_role") or "").strip().lower(),
+                str(semantic_view.get("semantic_type") or "").strip().lower(),
+                *[
+                    str(tag).strip().lower()
+                    for tag in (semantic_view.get("role_tags") or [])
+                    if str(tag).strip()
+                ],
+            }
+            for role_term in role_terms:
+                if role_term in {"metric", "measure", "amount", "quantity", "price", "monetary"}:
+                    metric_terms.add(role_term)
             try:
                 variants = get_column_entity_variants(table, col) or set()
             except Exception:
                 variants = {str(col or "").strip().lower()}
+            alias_tags = {
+                str(tag).strip()
+                for tag in (semantic_view.get("alias_tags") or [])
+                if str(tag).strip()
+            }
+            variants.update(alias_tags)
             for variant in variants:
                 metric_terms.update(_semantic_question_tokens(variant))
             try:
-                metric_terms.update(_semantic_question_tokens(get_column_description(table, col)))
+                metric_terms.update(
+                    _semantic_question_tokens(
+                        str(semantic_view.get("description") or get_column_description(table, col) or "")
+                    )
+                )
             except Exception:
                 pass
     return {term for term in metric_terms if term}
@@ -1630,10 +1655,16 @@ def _rewrite_missing_ordered_lookup_join(sql: str, question: str, ctx: str = "")
                 candidates.append(col_l)
                 continue
             try:
-                role_l = str(get_column_role(t_l, col_l) or "").strip().lower()
+                semantic_view = get_column_semantics(t_l, col_l) or {}
             except Exception:
-                role_l = ""
-            if role_l == "name":
+                semantic_view = {}
+            primary_role = str(semantic_view.get("primary_role") or "").strip().lower()
+            role_tags = {
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            }
+            if primary_role == "name" or "name" in role_tags:
                 candidates.append(col_l)
 
         if len(candidates) >= 2:
@@ -5864,33 +5895,36 @@ def _repair_simple_single_table_column_names(sql: str, ctx: str = "") -> str:
         syn_tokens: Set[str] = set()
         desc_tokens: Set[str] = set()
         role_tokens: Set[str] = set()
-
-        if analyzer is not None:
-            try:
-                for syn in analyzer.get_column_synonyms(table_l, c_l) or []:
-                    syn_tokens.update(_identifier_tokens(str(syn or "")))
-            except Exception:
-                pass
-            try:
-                desc_txt = str(analyzer.get_column_description(table_l, c_l) or "").strip()
-                if desc_txt:
-                    desc_tokens.update(_identifier_tokens(desc_txt))
-            except Exception:
-                pass
-        else:
-            try:
-                desc_txt = str(get_column_description(table_l, c_l) or "").strip()
-                if desc_txt:
-                    desc_tokens.update(_identifier_tokens(desc_txt))
-            except Exception:
-                pass
-
+        semantic_view: Dict[str, Any] = {}
         try:
-            role_txt = str(get_column_role(table_l, c_l) or "").strip()
+            semantic_view = get_column_semantics(table_l, c_l) or {}
         except Exception:
-            role_txt = ""
-        if role_txt:
-            role_tokens.update(_identifier_tokens(role_txt))
+            semantic_view = {}
+
+        for alias_tag in (semantic_view.get("alias_tags") or []):
+            syn_tokens.update(_identifier_tokens(str(alias_tag or "")))
+        try:
+            for syn in get_column_synonyms(table_l, c_l) or []:
+                syn_tokens.update(_identifier_tokens(str(syn or "")))
+        except Exception:
+            pass
+
+        desc_txt = str(semantic_view.get("description") or get_column_description(table_l, c_l) or "").strip()
+        if desc_txt:
+            desc_tokens.update(_identifier_tokens(desc_txt))
+
+        role_terms = [
+            str(semantic_view.get("primary_role") or "").strip(),
+            str(semantic_view.get("semantic_type") or "").strip(),
+            *[
+                str(tag).strip()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            ],
+        ]
+        for role_txt in role_terms:
+            if role_txt:
+                role_tokens.update(_identifier_tokens(role_txt))
 
         col_syn_tokens[c_l] = syn_tokens
         col_desc_tokens[c_l] = desc_tokens
@@ -7543,45 +7577,48 @@ def _choose_preferred_description_column(
             continue
 
         tokens = set(_tokens(col_raw))
-        if analyzer is not None:
-            try:
-                for syn in analyzer.get_column_synonyms(table_l, col_l) or []:
-                    tokens.update(_tokens(str(syn or "")))
-            except Exception:
-                pass
-
-            try:
-                desc_txt = str(analyzer.get_column_description(table_l, col_l) or "").strip()
-                if desc_txt:
-                    tokens.update(_tokens(desc_txt))
-            except Exception:
-                pass
-        else:
-            try:
-                desc_txt = str(get_column_description(table_l, col_l) or "").strip()
-                if desc_txt:
-                    tokens.update(_tokens(desc_txt))
-            except Exception:
-                pass
-
+        semantic_view: Dict[str, Any] = {}
         try:
-            role_l = str(get_column_role(table_l, col_l) or "").strip().lower()
+            semantic_view = get_column_semantics(table_l, col_l) or {}
         except Exception:
-            role_l = ""
-        if role_l:
-            tokens.update(_tokens(role_l))
+            semantic_view = {}
+
+        for alias_tag in (semantic_view.get("alias_tags") or []):
+            tokens.update(_tokens(str(alias_tag or "")))
+        try:
+            for syn in get_column_synonyms(table_l, col_l) or []:
+                tokens.update(_tokens(str(syn or "")))
+        except Exception:
+            pass
+
+        desc_txt = str(semantic_view.get("description") or get_column_description(table_l, col_l) or "").strip()
+        if desc_txt:
+            tokens.update(_tokens(desc_txt))
+
+        role_signals = {
+            str(semantic_view.get("primary_role") or "").strip().lower(),
+            str(semantic_view.get("semantic_type") or "").strip().lower(),
+            *[
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            ],
+        }
+        for role_term in role_signals:
+            if role_term:
+                tokens.update(_tokens(role_term))
 
         has_desc_signal = (
             any(tok.startswith("descript") for tok in tokens)
             or any(tok in {"detail", "details"} for tok in tokens)
             or ("description" in col_l)
-            or (role_l in {"description", "text"})
+            or bool({"description", "text"}.intersection(role_signals))
         )
         if not has_desc_signal:
             continue
 
         is_markup = bool(tokens & markup_terms)
-        is_plain = bool(tokens & plain_terms) or role_l == "text"
+        is_plain = bool(tokens & plain_terms) or "text" in role_signals
         variant_overlap = len(request_variant_tokens & tokens)
 
         score = 0
@@ -8796,22 +8833,34 @@ def _align_requested_description_variant(sql: str, question: str, ctx: str = "")
         syn_tokens: Set[str] = set()
         desc_text_tokens: Set[str] = set()
         role_tokens: Set[str] = set()
-        if analyzer is not None:
-            try:
-                for syn in analyzer.get_column_synonyms(base_table, col_clean):
-                    syn_tokens.update(_identifier_tokens(syn))
-            except Exception:
-                pass
-            try:
-                desc_text_tokens.update(_identifier_tokens(analyzer.get_column_description(base_table, col_clean)))
-            except Exception:
-                pass
         try:
-            role_l = str(get_column_role(base_table, col_clean) or "").strip().lower()
+            semantic_view = get_column_semantics(base_table, col_clean) or {}
         except Exception:
-            role_l = ""
-        if role_l:
-            role_tokens.update(_identifier_tokens(role_l))
+            semantic_view = {}
+        for alias_tag in (semantic_view.get("alias_tags") or []):
+            syn_tokens.update(_identifier_tokens(str(alias_tag or "")))
+        try:
+            for syn in get_column_synonyms(base_table, col_clean) or []:
+                syn_tokens.update(_identifier_tokens(syn))
+        except Exception:
+            pass
+        desc_text_tokens.update(
+            _identifier_tokens(
+                str(semantic_view.get("description") or get_column_description(base_table, col_clean) or "")
+            )
+        )
+        role_signals = {
+            str(semantic_view.get("primary_role") or "").strip().lower(),
+            str(semantic_view.get("semantic_type") or "").strip().lower(),
+            *[
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            ],
+        }
+        for role_term in role_signals:
+            if role_term:
+                role_tokens.update(_identifier_tokens(role_term))
 
         all_tokens = name_tokens | syn_tokens | desc_text_tokens | role_tokens
         is_desc = bool(all_tokens & desc_terms) or ("description" in col_clean.lower())
@@ -9244,10 +9293,19 @@ def _align_requested_joined_description_variant(sql: str, question: str, ctx: st
         if "description" in c_l or "detail" in c_l:
             return True
         try:
-            role_l = str(get_column_role(table_name, c_l) or "").strip().lower()
+            semantic_view = get_column_semantics(table_name, c_l) or {}
         except Exception:
-            role_l = ""
-        return role_l in {"description", "text"}
+            semantic_view = {}
+        role_signals = {
+            str(semantic_view.get("primary_role") or "").strip().lower(),
+            str(semantic_view.get("semantic_type") or "").strip().lower(),
+            *[
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            ],
+        }
+        return bool({"description", "text"}.intersection(role_signals))
 
     select_items = [
         str(it).strip()
@@ -9696,10 +9754,19 @@ def _drop_unrequested_nonprimary_identifier_group_keys(
         }:
             return True
         try:
-            role_l = str(get_column_role(table_l, col_l) or "").strip().lower()
+            semantic_view = get_column_semantics(table_l, col_l) or {}
         except Exception:
-            role_l = ""
-        if role_l in {"pk", "fk", "id", "identifier"}:
+            semantic_view = {}
+        role_signals = {
+            str(semantic_view.get("primary_role") or "").strip().lower(),
+            str(semantic_view.get("semantic_type") or "").strip().lower(),
+            *[
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            ],
+        }
+        if semantic_view.get("is_identifier") or {"pk", "fk", "id", "identifier"}.intersection(role_signals):
             return True
         tokens = re.findall(
             r"[a-z0-9]+",
@@ -17215,8 +17282,16 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
         terms: Set[str] = set()
         candidate_texts = [col_l]
         try:
-            if analyzer is not None:
-                candidate_texts.extend(analyzer.get_column_synonyms(table_l, col_l) or [])
+            semantic_view = get_column_semantics(table_l, col_l) or {}
+        except Exception:
+            semantic_view = {}
+        candidate_texts.extend(
+            str(tag).strip()
+            for tag in (semantic_view.get("alias_tags") or [])
+            if str(tag).strip()
+        )
+        try:
+            candidate_texts.extend(get_column_synonyms(table_l, col_l) or [])
         except Exception:
             pass
 
@@ -17228,12 +17303,16 @@ def _fix_winner_row_window_order_priority(sql: str, question: str) -> str:
             )
             terms.update(tok for tok in re.findall(r"[a-z0-9]+", normalized) if tok)
 
-        try:
-            role = str(get_column_role(table_l, col_l) or "").strip().lower()
-        except Exception:
-            role = ""
-        if role:
-            terms.add(role)
+        role_terms = {
+            str(semantic_view.get("primary_role") or "").strip().lower(),
+            str(semantic_view.get("semantic_type") or "").strip().lower(),
+            *[
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            ],
+        }
+        terms.update(term for term in role_terms if term)
 
         column_term_cache[key] = {term for term in terms if term}
         return column_term_cache[key]
@@ -17587,20 +17666,32 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
         terms: Set[str] = set()
         candidate_texts = [col_l]
         try:
-            if analyzer is not None:
-                candidate_texts.extend(analyzer.get_column_synonyms(table_l, col_l) or [])
+            semantic_view = get_column_semantics(table_l, col_l) or {}
+        except Exception:
+            semantic_view = {}
+        candidate_texts.extend(
+            str(tag).strip()
+            for tag in (semantic_view.get("alias_tags") or [])
+            if str(tag).strip()
+        )
+        try:
+            candidate_texts.extend(get_column_synonyms(table_l, col_l) or [])
         except Exception:
             pass
 
         for text in candidate_texts:
             terms.update(_text_semantic_terms(text))
 
-        try:
-            role = str(get_column_role(table_l, col_l) or "").strip().lower()
-        except Exception:
-            role = ""
-        if role:
-            terms.add(role)
+        role_terms = {
+            str(semantic_view.get("primary_role") or "").strip().lower(),
+            str(semantic_view.get("semantic_type") or "").strip().lower(),
+            *[
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            ],
+        }
+        terms.update(term for term in role_terms if term)
 
         column_term_cache[key] = {term for term in terms if term}
         return column_term_cache[key]
