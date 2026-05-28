@@ -615,6 +615,39 @@ class SchemaAnalyzer:
         stats = self._column_stats.get(t, {}).get(c, {})
         return dict(stats) if isinstance(stats, dict) else {}
 
+    def get_column_semantics(self, table: str, column: str) -> Dict[str, Any]:
+        """
+        Get a stable structured semantic view for a column.
+
+        This consolidates schema metadata plus derived semantic flags so
+        downstream modules can consume one stable helper instead of stitching
+        together multiple role/tag/datatype lookups.
+        """
+        t = (table or "").lower().strip()
+        c = (column or "").lower().strip()
+        if not t or not c:
+            return {}
+
+        original_column = self._column_original_case.get(f"{t}.{c}", str(column or "").strip())
+        return {
+            "table": t,
+            "column": original_column,
+            "original_column": original_column,
+            "primary_role": self.get_column_primary_role(t, c),
+            "role_tags": self.get_column_role_tags(t, c),
+            "alias_tags": self.get_column_alias_tags(t, c),
+            "stats": self.get_column_stats(t, c),
+            "datatype": str(self._column_datatypes.get(t, {}).get(c, "")).upper().strip(),
+            "description": self.get_column_description(t, c),
+            "semantic_type": get_column_semantic_type(t, c),
+            "is_identifier": is_id_column(t, c),
+            "is_numeric": is_numeric_column(t, c),
+            "is_date": is_date_column(t, c),
+            "is_name": is_name_column(t, c),
+            "fk_target_table": str(self._fk_relationships.get(t, {}).get(c, "")).strip(),
+            "fk_target_column": self.get_fk_target_column(t, c),
+        }
+
     def get_column_synonyms(self, table: str, column: str) -> List[str]:
         """
         Get synonyms for a specific column from metadata.
@@ -642,6 +675,10 @@ class SchemaAnalyzer:
         t = (table or "").lower().strip()
         c = (column or "").lower().strip()
         return str(self._column_descriptions.get(t, {}).get(c, "")).strip()
+
+    def get_preferred_name_column(self, table: str) -> Optional[str]:
+        """Return the preferred display/name column for a table."""
+        return get_name_column(table)
 
     def get_anchor_columns(self, table: str) -> List[str]:
         """
@@ -913,6 +950,11 @@ def get_column_alias_tags(table: str, column: str) -> List[str]:
 def get_column_stats(table: str, column: str) -> Dict[str, Any]:
     """Get structured stats for a specific column from metadata (schema-agnostic)."""
     return get_schema_analyzer().get_column_stats(table, column)
+
+
+def get_column_semantics(table: str, column: str) -> Dict[str, Any]:
+    """Get structured column semantics plus derived semantic flags."""
+    return get_schema_analyzer().get_column_semantics(table, column)
 
 
 def get_anchor_columns(table: str) -> List[str]:
@@ -1222,6 +1264,11 @@ def get_name_column(table: str) -> Optional[str]:
             return _get_original_case(table_lower, col)
 
     return None
+
+
+def get_preferred_name_column(table: str) -> Optional[str]:
+    """Get the preferred display/name column for a table."""
+    return get_schema_analyzer().get_preferred_name_column(table)
 
 
 def get_all_mentioned_tables(question: str) -> Set[str]:
@@ -1925,9 +1972,15 @@ def get_column_semantic_type(table: str, column: str) -> str:
     Returns:
         Semantic type string
     """
-    t = (table or "").lower()
-    c = (column or "").lower()
-    
+    t = (table or "").lower().strip()
+    c = (column or "").lower().strip()
+    if not t or not c:
+        return 'unknown'
+
+    primary_role = get_column_primary_role(t, c)
+    role_tags = set(get_column_role_tags(t, c) or [])
+    datatype = get_column_datatype(t, c).upper()
+
     # Check in order of specificity
     if is_id_column(t, c):
         return 'id'
@@ -1937,16 +1990,19 @@ def get_column_semantic_type(table: str, column: str) -> str:
         return 'metric'
     if is_name_column(t, c):
         return 'name'
-    
-    # Check for code columns (not ID but classification)
-    if 'code' in c or 'type' in c or 'status' in c or 'category' in c:
+
+    # Check structured role/tag hints for classification-like columns
+    if (
+        {'status', 'category', 'type', 'enum', 'code', 'classification'}.intersection(role_tags)
+        or primary_role in {'status', 'category', 'type', 'enum', 'code', 'classification'}
+        or 'code' in c or 'type' in c or 'status' in c or 'category' in c
+    ):
         return 'code'
-    
+
     # Check for text columns
-    dtype = get_column_datatype(t, c).upper()
-    if any(tt in dtype for tt in ('VARCHAR', 'CHAR', 'TEXT', 'STRING')):
+    if any(tt in datatype for tt in ('VARCHAR', 'CHAR', 'TEXT', 'STRING', 'CLOB', 'ENUM', 'SET')):
         return 'text'
-    
+
     return 'unknown'
 
 
@@ -1996,6 +2052,7 @@ __all__ = [
     'get_column_role_tags',
     'get_column_alias_tags',
     'get_column_stats',
+    'get_column_semantics',
     'get_anchor_columns',
     'is_transaction_table',
     'get_fk_relationships',
@@ -2006,6 +2063,7 @@ __all__ = [
     # New functions for schema-agnostic column inference
     'get_id_column',
     'get_name_column',
+    'get_preferred_name_column',
     'get_all_mentioned_tables',
     'is_table_mentioned',
     # Synonym expansion utilities
