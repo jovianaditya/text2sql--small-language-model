@@ -680,6 +680,230 @@ class SchemaAnalyzer:
         """Return the preferred display/name column for a table."""
         return get_name_column(table)
 
+    def get_table_role(self, table: str) -> str:
+        """Return the stable semantic role/classification for a table."""
+        return self.get_table_type(table)
+
+    def get_relationship_cardinality(
+        self,
+        source_table: str,
+        target_table: str,
+        source_column: str = "",
+        target_column: str = "",
+    ) -> str:
+        """Return the best-known cardinality label between two tables."""
+        return str(
+            self.get_relationship_details(
+                source_table,
+                target_table,
+                source_column=source_column,
+                target_column=target_column,
+            ).get("cardinality", "unknown")
+            or "unknown"
+        ).strip().lower()
+
+    def get_relationship_details(
+        self,
+        source_table: str,
+        target_table: str,
+        source_column: str = "",
+        target_column: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Return a stable relationship summary between two tables when a direct
+        FK edge is known or can be inferred from the merged FK graph.
+        """
+        src_table = str(source_table or "").strip().lower()
+        tgt_table = str(target_table or "").strip().lower()
+        src_col = str(source_column or "").strip().lower()
+        tgt_col = str(target_column or "").strip()
+        if not src_table or not tgt_table:
+            return {}
+
+        def _optional_signal(table_name: str, column_name: str) -> Optional[bool]:
+            if not table_name or not column_name:
+                return None
+            desc = str(self.get_column_description(table_name, column_name) or "").strip().lower()
+            if re.search(r"\b(?:optional|nullable|may\s+be\s+null|can\s+be\s+null)\b", desc, flags=re.I):
+                return True
+            if re.search(r"\b(?:required|not\s+null|must\s+have)\b", desc, flags=re.I):
+                return False
+            return None
+
+        def _direct_edge_details(
+            edge_source_table: str,
+            edge_target_table: str,
+            edge_source_col: str,
+            edge_target_col: str,
+            *,
+            reverse: bool,
+        ) -> Dict[str, Any]:
+            source_role_signals = _column_role_signal_set(edge_source_table, edge_source_col)
+            target_role_signals = _column_role_signal_set(edge_target_table, edge_target_col)
+            source_col_is_unique = bool(
+                self._column_primary_key_hints.get(f"{edge_source_table}.{edge_source_col}")
+                or {"pk", "primary_key"}.intersection(source_role_signals)
+            )
+            target_col_is_unique = bool(
+                self._column_primary_key_hints.get(f"{edge_target_table}.{edge_target_col.lower()}")
+                or {"pk", "primary_key"}.intersection(target_role_signals)
+                or str(get_id_column(edge_target_table) or "").strip().lower() == str(edge_target_col or "").strip().lower()
+            )
+            if reverse:
+                cardinality = "one_to_many"
+                if source_col_is_unique and target_col_is_unique:
+                    cardinality = "one_to_one"
+                source_out_col = edge_target_col
+                target_out_col = self._column_original_case.get(f"{edge_source_table}.{edge_source_col}", edge_source_col)
+            else:
+                cardinality = "many_to_one"
+                if source_col_is_unique and target_col_is_unique:
+                    cardinality = "one_to_one"
+                source_out_col = self._column_original_case.get(f"{edge_source_table}.{edge_source_col}", edge_source_col)
+                target_out_col = edge_target_col
+            return {
+                "source_table": src_table,
+                "target_table": tgt_table,
+                "source_column": source_out_col,
+                "target_column": target_out_col,
+                "fk_table": edge_source_table,
+                "fk_column": self._column_original_case.get(f"{edge_source_table}.{edge_source_col}", edge_source_col),
+                "pk_table": edge_target_table,
+                "pk_column": edge_target_col,
+                "direction": "reverse" if reverse else "forward",
+                "cardinality": cardinality,
+                "optional": _optional_signal(edge_source_table, edge_source_col),
+                "source_table_role": self.get_table_role(src_table),
+                "target_table_role": self.get_table_role(tgt_table),
+            }
+
+        if src_col:
+            mapped_target = str(self._fk_relationships.get(src_table, {}).get(src_col, "")).strip().lower()
+            if mapped_target == tgt_table:
+                exact_target_col = tgt_col or self.get_fk_target_column(src_table, src_col) or get_id_column(tgt_table) or ""
+                return _direct_edge_details(src_table, tgt_table, src_col, exact_target_col, reverse=False)
+
+        candidate_forward = [
+            fk_col
+            for fk_col, mapped_target in (self._fk_relationships.get(src_table, {}) or {}).items()
+            if str(mapped_target or "").strip().lower() == tgt_table
+        ]
+        if len(candidate_forward) == 1:
+            fk_col = candidate_forward[0]
+            exact_target_col = tgt_col or self.get_fk_target_column(src_table, fk_col) or get_id_column(tgt_table) or ""
+            return _direct_edge_details(src_table, tgt_table, fk_col, exact_target_col, reverse=False)
+
+        candidate_reverse = [
+            fk_col
+            for fk_col, mapped_target in (self._fk_relationships.get(tgt_table, {}) or {}).items()
+            if str(mapped_target or "").strip().lower() == src_table
+        ]
+        if len(candidate_reverse) == 1:
+            fk_col = candidate_reverse[0]
+            exact_target_col = tgt_col or self.get_fk_target_column(tgt_table, fk_col) or get_id_column(src_table) or ""
+            return _direct_edge_details(tgt_table, src_table, fk_col, exact_target_col, reverse=True)
+
+        return {
+            "source_table": src_table,
+            "target_table": tgt_table,
+            "source_column": self._column_original_case.get(f"{src_table}.{src_col}", src_col) if src_col else "",
+            "target_column": tgt_col,
+            "source_table_role": self.get_table_role(src_table),
+            "target_table_role": self.get_table_role(tgt_table),
+            "cardinality": "unknown",
+            "optional": None,
+        }
+
+    def get_preferred_temporal_column(self, table: str, intent_hint: Any = "") -> Optional[str]:
+        """Return the best temporal column for a table, optionally guided by intent text."""
+        table_l = str(table or "").strip().lower()
+        date_cols = list(get_filterable_date_columns(table_l) or [])
+        if not date_cols:
+            return None
+        if len(date_cols) == 1:
+            return date_cols[0]
+
+        hint_tokens = _semantic_hint_tokens(intent_hint)
+        if not hint_tokens:
+            return date_cols[0]
+
+        best_col = None
+        best_score = 0.0
+        for col in date_cols:
+            col_tokens = _column_semantic_tokens(table_l, col)
+            overlap = hint_tokens.intersection(col_tokens)
+            if not overlap:
+                continue
+            score = float(len(overlap))
+            role_signals = _column_role_signal_set(table_l, col)
+            if {"transaction_date", "event_date", "created_at", "created_date", "temporal"}.intersection(role_signals):
+                score += 0.5
+            if score > best_score:
+                best_col = col
+                best_score = score
+        return best_col or date_cols[0]
+
+    def get_metric_candidates(self, table: str, intent_terms: Any = "") -> List[str]:
+        """Return ordered metric/measure candidate columns for a table."""
+        table_l = str(table or "").strip().lower()
+        metric_cols = list(get_aggregatable_columns(table_l) or [])
+        if not metric_cols:
+            return []
+
+        hint_tokens = _semantic_hint_tokens(intent_terms)
+        if not hint_tokens:
+            return metric_cols
+
+        scored: List[Tuple[float, str]] = []
+        for col in metric_cols:
+            score = 0.0
+            overlap = hint_tokens.intersection(_column_semantic_tokens(table_l, col))
+            if overlap:
+                score += float(len(overlap))
+            role_signals = _column_role_signal_set(table_l, col)
+            if {"metric", "measure", "amount", "quantity", "price", "monetary"}.intersection(role_signals):
+                score += 0.5
+            scored.append((score, col))
+
+        scored.sort(key=lambda item: (-item[0], metric_cols.index(item[1]), item[1]))
+        return [col for _, col in scored]
+
+    def get_enum_value_profile(self, table: str, column: str) -> Dict[str, Any]:
+        """Return structured categorical/value-profile metadata for a column."""
+        table_l = str(table or "").strip().lower()
+        col_l = str(column or "").strip().lower()
+        if not table_l or not col_l:
+            return {}
+
+        description = self.get_column_description(table_l, col_l)
+        semantic_type = get_column_semantic_type(table_l, col_l)
+        role_signals = _column_role_signal_set(table_l, col_l)
+        stats = self.get_column_stats(table_l, col_l)
+        distinct_count = stats.get("distinct_count")
+        sample_value = stats.get("sample_value")
+        enum_values = _extract_enum_values_from_text(description)
+
+        categorical_role = bool(
+            {"status", "category", "type", "enum", "classification", "code", "state"}.intersection(role_signals)
+            or semantic_type == "code"
+        )
+
+        return {
+            "table": table_l,
+            "column": self._column_original_case.get(f"{table_l}.{col_l}", str(column or "").strip()),
+            "semantic_type": semantic_type,
+            "primary_role": self.get_column_primary_role(table_l, col_l),
+            "role_tags": self.get_column_role_tags(table_l, col_l),
+            "datatype": str(self._column_datatypes.get(table_l, {}).get(col_l, "")).upper().strip(),
+            "description": description,
+            "sample_value": sample_value,
+            "distinct_count": distinct_count,
+            "enumerated_values": enum_values,
+            "has_explicit_enum_values": bool(enum_values),
+            "categorical_role": categorical_role,
+            "likely_categorical": bool(categorical_role or enum_values),
+        }
+
     def get_anchor_columns(self, table: str) -> List[str]:
         """
         Get key columns for scoring boost (Role: Metric).
@@ -987,9 +1211,44 @@ def get_table_type(table: str) -> str:
     return get_schema_analyzer().get_table_type(table)
 
 
+def get_table_role(table: str) -> str:
+    """Get the stable semantic role/classification for a table."""
+    return get_schema_analyzer().get_table_role(table)
+
+
 def get_singular_form(table: str) -> str:
     """Get singular form of table name."""
     return get_schema_analyzer().get_singular_form(table)
+
+
+def get_relationship_cardinality(
+    source_table: str,
+    target_table: str,
+    source_column: str = "",
+    target_column: str = "",
+) -> str:
+    """Get the best-known relationship cardinality label between two tables."""
+    return get_schema_analyzer().get_relationship_cardinality(
+        source_table,
+        target_table,
+        source_column=source_column,
+        target_column=target_column,
+    )
+
+
+def get_relationship_details(
+    source_table: str,
+    target_table: str,
+    source_column: str = "",
+    target_column: str = "",
+) -> Dict[str, Any]:
+    """Get structured relationship details between two tables when known."""
+    return get_schema_analyzer().get_relationship_details(
+        source_table,
+        target_table,
+        source_column=source_column,
+        target_column=target_column,
+    )
 
 # ==================== DYNAMIC COLUMN INFERENCE =========================
 
@@ -1269,6 +1528,21 @@ def get_name_column(table: str) -> Optional[str]:
 def get_preferred_name_column(table: str) -> Optional[str]:
     """Get the preferred display/name column for a table."""
     return get_schema_analyzer().get_preferred_name_column(table)
+
+
+def get_preferred_temporal_column(table: str, intent_hint: Any = "") -> Optional[str]:
+    """Get the preferred temporal/date column for a table."""
+    return get_schema_analyzer().get_preferred_temporal_column(table, intent_hint=intent_hint)
+
+
+def get_metric_candidates(table: str, intent_terms: Any = "") -> List[str]:
+    """Get ordered metric/measure candidate columns for a table."""
+    return get_schema_analyzer().get_metric_candidates(table, intent_terms=intent_terms)
+
+
+def get_enum_value_profile(table: str, column: str) -> Dict[str, Any]:
+    """Get categorical/value-profile metadata for a column."""
+    return get_schema_analyzer().get_enum_value_profile(table, column)
 
 
 def get_all_mentioned_tables(question: str) -> Set[str]:
@@ -1803,17 +2077,32 @@ def get_filterable_date_columns(table: str) -> List[str]:
     return [_get_original_case(t, col) for _, col in scored]
 
 
-def _question_semantic_tokens(question: str) -> Set[str]:
-    q = (question or "").lower()
+def _semantic_hint_tokens(intent_hint: Any) -> Set[str]:
+    if intent_hint is None:
+        return set()
+    if isinstance(intent_hint, str):
+        parts = [intent_hint]
+    elif isinstance(intent_hint, (list, tuple, set)):
+        parts = [str(item or "") for item in intent_hint]
+    else:
+        parts = [str(intent_hint or "")]
+
+    joined = " ".join(part for part in parts if str(part or "").strip()).strip().lower()
+    if not joined:
+        return set()
     return {
         tok
-        for tok in re.findall(r"[a-z0-9]+", q)
+        for tok in re.findall(r"[a-z0-9]+", joined)
         if tok and tok not in {
             "the", "a", "an", "of", "for", "to", "by", "in", "on", "at",
             "with", "without", "and", "or", "show", "list", "find", "give",
             "return", "display", "each", "every", "per", "all",
         }
     }
+
+
+def _question_semantic_tokens(question: str) -> Set[str]:
+    return _semantic_hint_tokens(question)
 
 
 def _column_semantic_tokens(table: str, column: str) -> Set[str]:
@@ -1851,6 +2140,31 @@ def _column_semantic_tokens(table: str, column: str) -> Set[str]:
         )
         tokens.update(tok for tok in re.findall(r"[a-z0-9]+", normalized) if tok and not tok.isdigit())
     return tokens
+
+
+def _extract_enum_values_from_text(text: str) -> List[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    candidates: List[str] = []
+    patterns = [
+        r"\(\s*e\.g\.,?\s*([^)]+?)\s*\)",
+        r"\be\.g\.,?\s*([^.;]+)",
+        r"\bi\.e\.,?\s*([^.;]+)",
+    ]
+    for pat in patterns:
+        match = re.search(pat, raw, flags=re.I)
+        if not match:
+            continue
+        parts = [part.strip(" '\"") for part in str(match.group(1) or "").split(",")]
+        for part in parts:
+            clean = re.sub(r"\s+", " ", str(part or "").strip())
+            if clean and clean not in candidates:
+                candidates.append(clean)
+        if candidates:
+            break
+    return candidates
 
 
 def _best_semantic_numeric_column(table: str, question: str, columns: List[str]) -> Optional[str]:
@@ -2059,11 +2373,17 @@ __all__ = [
     'get_fk_target_column',
     'find_table_by_keyword',
     'get_table_type',
+    'get_table_role',
     'get_singular_form',
+    'get_relationship_cardinality',
+    'get_relationship_details',
     # New functions for schema-agnostic column inference
     'get_id_column',
     'get_name_column',
     'get_preferred_name_column',
+    'get_preferred_temporal_column',
+    'get_metric_candidates',
+    'get_enum_value_profile',
     'get_all_mentioned_tables',
     'is_table_mentioned',
     # Synonym expansion utilities
@@ -2084,5 +2404,6 @@ __all__ = [
     'infer_best_order_column',
     'infer_best_aggregate_column',
     'get_column_semantic_type',
+    'get_column_semantics',
     'get_table_column_profile',
 ]
