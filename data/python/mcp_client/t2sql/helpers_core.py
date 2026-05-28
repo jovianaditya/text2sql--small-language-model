@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Pattern, Sequence, Set, Tuple
 # ======================================================================
 from .schema_analyzer import (
     get_name_column,
+    get_preferred_name_column,
     get_id_column,
     get_all_tables,
     get_column_entity_variants,
@@ -24,6 +25,8 @@ from .schema_analyzer import (
     get_transaction_tables,
     get_fk_relationships,
     get_column_role,
+    get_column_semantics,
+    get_column_synonyms,
     get_column_datatype,
     get_column_description,
     get_columns_by_role,
@@ -6781,7 +6784,7 @@ def _display_name_column_for_table(table: str) -> Optional[str]:
     if not table_l:
         return None
 
-    name_col = get_name_column(table_l)
+    name_col = get_preferred_name_column(table_l) or get_name_column(table_l)
     id_col = get_id_column(table_l)
     if not name_col or not id_col:
         return None
@@ -6818,18 +6821,27 @@ def _display_name_column_for_table(table: str) -> Optional[str]:
         if len(compact_term) >= 4 and compact_term in col_compact:
             return None
 
+    semantic_view: Dict[str, Any] = {}
     try:
-        analyzer = get_schema_analyzer()
+        semantic_view = get_column_semantics(table_l, col_l) or {}
     except Exception:
-        analyzer = None
-    if analyzer is not None:
-        try:
-            syns = (analyzer._column_synonyms.get(f"{table_l}.{col_l}", []) or [])
-        except Exception:
-            syns = []
-        syn_blob = " ".join(str(x).lower() for x in syns)
-        if any_phrase_in_text(syn_blob, component_phrase_hints):
-            return None
+        semantic_view = {}
+    semantic_texts = [
+        str(x).strip().lower()
+        for x in (semantic_view.get("alias_tags") or [])
+        if str(x).strip()
+    ]
+    try:
+        semantic_texts.extend(
+            str(x).strip().lower()
+            for x in (get_column_synonyms(table_l, col_l) or [])
+            if str(x).strip()
+        )
+    except Exception:
+        pass
+    syn_blob = " ".join(semantic_texts)
+    if any_phrase_in_text(syn_blob, component_phrase_hints):
+        return None
 
     return name_col
 
@@ -7197,20 +7209,35 @@ def _ensure_entity_id_and_name_if_requested(sql: str, question: str) -> str:
                 h = re.sub(r"[^a-z0-9]", "", str(hint or "").lower())
                 if len(h) >= 4 and h in col_compact:
                     return True
-            if analyzer is not None:
-                try:
-                    role = str((analyzer._column_roles.get(t, {}) or {}).get(c, "")).strip().lower()
-                except Exception:
-                    role = ""
-                if role == "name":
-                    return True
-                try:
-                    syns = (analyzer._column_synonyms.get(f"{t}.{c}", []) or [])
-                except Exception:
-                    syns = []
-                syn_blob = " ".join(str(x).lower() for x in syns)
-                if any_phrase_in_text(syn_blob, name_component_synonym_hint_phrases):
-                    return True
+            semantic_view: Dict[str, Any] = {}
+            try:
+                semantic_view = get_column_semantics(t, c) or {}
+            except Exception:
+                semantic_view = {}
+            primary_role = str(semantic_view.get("primary_role") or "").strip().lower()
+            role_tags = {
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            }
+            if primary_role == "name" or "name" in role_tags:
+                return True
+            semantic_texts = [
+                str(x).strip().lower()
+                for x in (semantic_view.get("alias_tags") or [])
+                if str(x).strip()
+            ]
+            try:
+                semantic_texts.extend(
+                    str(x).strip().lower()
+                    for x in (get_column_synonyms(t, c) or [])
+                    if str(x).strip()
+                )
+            except Exception:
+                pass
+            syn_blob = " ".join(semantic_texts)
+            if any_phrase_in_text(syn_blob, name_component_synonym_hint_phrases):
+                return True
             return False
 
         name_component_cols = {c for c in table_cols if _is_name_component_column(c)}
@@ -9943,21 +9970,36 @@ def _drop_redundant_raw_name_columns_when_concat_present(sql: str, question: str
             if _matches_name_token_hint(c, toks, name_component_token_hints):
                 out.add(c)
                 continue
-            if analyzer is not None:
-                try:
-                    role = str((analyzer._column_roles.get(t_l, {}) or {}).get(c, "")).strip().lower()
-                except Exception:
-                    role = ""
-                if role == "name":
-                    out.add(c)
-                    continue
-                try:
-                    syns = (analyzer._column_synonyms.get(f"{t_l}.{c}", []) or [])
-                except Exception:
-                    syns = []
-                syn_blob = " ".join(str(x).lower() for x in syns)
-                if any_phrase_in_text(syn_blob, name_component_synonym_hint_phrases):
-                    out.add(c)
+            semantic_view: Dict[str, Any] = {}
+            try:
+                semantic_view = get_column_semantics(t_l, c) or {}
+            except Exception:
+                semantic_view = {}
+            primary_role = str(semantic_view.get("primary_role") or "").strip().lower()
+            role_tags = {
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            }
+            if primary_role == "name" or "name" in role_tags:
+                out.add(c)
+                continue
+            semantic_texts = [
+                str(x).strip().lower()
+                for x in (semantic_view.get("alias_tags") or [])
+                if str(x).strip()
+            ]
+            try:
+                semantic_texts.extend(
+                    str(x).strip().lower()
+                    for x in (get_column_synonyms(t_l, c) or [])
+                    if str(x).strip()
+                )
+            except Exception:
+                pass
+            syn_blob = " ".join(semantic_texts)
+            if any_phrase_in_text(syn_blob, name_component_synonym_hint_phrases):
+                out.add(c)
         name_cols_cache[t_l] = out
         return out
 
@@ -31376,22 +31418,40 @@ def _rewrite_latest_year_derived_subquery_misuse(sql: str, question: str, ctx: s
                 return set()
         return set(allowed_cols.get(table_lower, set()))
 
-    def _column_role(table_name: str, col_name: str) -> str:
+    def _column_semantic_view(table_name: str, col_name: str) -> Dict[str, Any]:
         table_lower = _plain_table_name(table_name).lower()
         col_lower = str(col_name or "").strip("`").lower()
-        if not analyzer or not table_lower or not col_lower:
-            return ""
+        if not table_lower or not col_lower:
+            return {}
         try:
-            return str((analyzer._column_roles.get(table_lower, {}) or {}).get(col_lower, "")).strip().lower()
+            return get_column_semantics(table_lower, col_lower) or {}
         except Exception:
-            return ""
+            return {}
 
     def _is_temporal_column(table_name: str, col_name: str) -> bool:
         col_lower = str(col_name or "").strip("`").lower()
         if not col_lower:
             return False
-        role = _column_role(table_name, col_name)
-        if role in {"date", "datetime", "timestamp", "time"}:
+        semantic_view = _column_semantic_view(table_name, col_name)
+        primary_role = str(semantic_view.get("primary_role") or "").strip().lower()
+        semantic_type = str(semantic_view.get("semantic_type") or "").strip().lower()
+        datatype = str(semantic_view.get("datatype") or "").strip().lower()
+        role_tags = {
+            str(tag).strip().lower()
+            for tag in (semantic_view.get("role_tags") or [])
+            if str(tag).strip()
+        }
+        if (
+            semantic_view.get("is_date")
+            or primary_role in {"date", "datetime", "timestamp", "time"}
+            or semantic_type in {"date", "datetime", "timestamp", "time"}
+            or datatype in {"date", "datetime", "timestamp", "time"}
+            or {
+                "date", "datetime", "timestamp", "time",
+                "temporal", "event_date", "transaction_date",
+                "created_at", "created_date",
+            }.intersection(role_tags)
+        ):
             return True
         return (
             "date" in col_lower

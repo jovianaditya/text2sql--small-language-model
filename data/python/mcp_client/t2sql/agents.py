@@ -456,12 +456,15 @@ def _attempt_confidence_retry(
 from .schema_analyzer import (
     get_all_tables,
     get_column_description,
+    get_column_semantics,
+    get_column_synonyms,
     get_column_role,
     get_singular_form,
     get_schema_analyzer,
     get_id_column,
     get_name_column,
     get_fk_relationships,
+    get_metric_candidates,
     get_transaction_tables,
 )
 from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
@@ -2085,7 +2088,6 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
         }
         return toks
 
-    analyzer = get_schema_analyzer()
     target_tokens = _tokens(target_phrase)
     if not target_tokens:
         return sql
@@ -2097,16 +2099,26 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
         if not col_name:
             continue
         semantic_texts = {col_name, col_name.replace("_", " ")}
+        semantic_view: Dict[str, Any] = {}
         try:
-            for syn in analyzer.get_column_synonyms(table_name, col_name):
+            semantic_view = get_column_semantics(table_name, col_name) or {}
+        except Exception:
+            semantic_view = {}
+        semantic_texts.update(
+            str(x).strip()
+            for x in (semantic_view.get("alias_tags") or [])
+            if str(x).strip()
+        )
+        try:
+            for syn in get_column_synonyms(table_name, col_name) or []:
                 syn_s = str(syn or "").strip()
                 if syn_s:
                     semantic_texts.add(syn_s)
-            desc = str(get_column_description(table_name, col_name) or "").strip()
-            if desc:
-                semantic_texts.add(desc)
         except Exception:
             pass
+        desc = str(semantic_view.get("description") or get_column_description(table_name, col_name) or "").strip()
+        if desc:
+            semantic_texts.add(desc)
         col_tokens: Set[str] = set()
         for text in semantic_texts:
             col_tokens.update(_tokens(text))
@@ -2118,10 +2130,25 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
         score = float(len(overlap))
         if target_tokens.issubset(col_tokens):
             score += 2.0
-        role = str(get_column_role(table_name, col_name) or "").strip().lower()
-        if role in {"name", "text", "code"}:
+        primary_role = str(semantic_view.get("primary_role") or get_column_role(table_name, col_name) or "").strip().lower()
+        semantic_type = str(semantic_view.get("semantic_type") or "").strip().lower()
+        role_signals = {
+            primary_role,
+            semantic_type,
+            *[
+                str(tag).strip().lower()
+                for tag in (semantic_view.get("role_tags") or [])
+                if str(tag).strip()
+            ],
+        }
+        if semantic_view.get("is_name") or {"name", "text", "code"}.intersection(role_signals):
             score += 0.5
-        if role in {"metric", "date"}:
+        if (
+            (semantic_view.get("is_numeric") and not semantic_view.get("is_identifier"))
+            or {"metric", "measure", "amount", "quantity", "price", "monetary"}.intersection(role_signals)
+            or semantic_view.get("is_date")
+            or {"date", "datetime", "timestamp", "time", "temporal"}.intersection(role_signals)
+        ):
             score -= 0.5
         if score > best_score:
             best_col = col_name
@@ -5867,6 +5894,14 @@ def _contract_metric_terms(question_tokens: Optional[Set[str]] = None) -> Set[st
                 cols = list(analyzer.get_table_columns(t)) if analyzer is not None else []
             except Exception:
                 cols = []
+            try:
+                metric_cols = {
+                    str(c).strip().lower()
+                    for c in (get_metric_candidates(t) or [])
+                    if str(c).strip()
+                }
+            except Exception:
+                metric_cols = set()
             for col in cols:
                 c = str(col or "").strip()
                 if not c:
@@ -5874,14 +5909,27 @@ def _contract_metric_terms(question_tokens: Optional[Set[str]] = None) -> Set[st
                 c_low = c.lower()
                 if c_low.endswith(("id", "number", "code", "key")):
                     continue
-                role = ""
-                try:
-                    if analyzer is not None:
-                        role = str(analyzer._column_roles.get(t, {}).get(c_low, "") or "").lower()
-                except Exception:
-                    role = ""
                 col_terms = _contract_identifier_terms(c)
-                if role in {"metric", "measure", "amount", "quantity"} or col_terms.intersection(terms):
+                semantic_view: Dict[str, Any] = {}
+                try:
+                    semantic_view = get_column_semantics(t, c_low) or {}
+                except Exception:
+                    semantic_view = {}
+                role_signals = {
+                    str(semantic_view.get("primary_role") or "").strip().lower(),
+                    str(semantic_view.get("semantic_type") or "").strip().lower(),
+                    *[
+                        str(tag).strip().lower()
+                        for tag in (semantic_view.get("role_tags") or [])
+                        if str(tag).strip()
+                    ],
+                }
+                if (
+                    c_low in metric_cols
+                    or (semantic_view.get("is_numeric") and not semantic_view.get("is_identifier"))
+                    or {"metric", "measure", "amount", "quantity", "price", "monetary"}.intersection(role_signals)
+                    or col_terms.intersection(terms)
+                ):
                     schema_enriched = True
                     terms.update(col_terms)
 
