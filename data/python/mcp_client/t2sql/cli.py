@@ -26,7 +26,7 @@ def main():
         raise RuntimeError(
             "No sparse JSONL input found.\n"
             "Set SPARSE_METADATA_JSONL to the lexical metadata file, for example:\n"
-            "  • ./metadata_jsonl/classicmodels_sparse.jsonl\n"
+            "  • ./metadata_jsonl/your_dataset_sparse.jsonl\n"
         )
 
     try:

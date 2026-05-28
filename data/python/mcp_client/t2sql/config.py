@@ -142,25 +142,6 @@ def deprecated_env_alias_notes() -> list[str]:
     return out
 
 
-def _profiled_domain_defaults(
-    agnostic_default: list[str],
-    compat_default: list[str],
-) -> list[str]:
-    """
-    Resolve domain-compatibility lexical defaults by profile.
-
-    Profiles:
-      - agnostic / schema_only / none:
-          use the agnostic default set (typically empty or generic-only)
-      - business / business_compat / legacy / compat:
-          keep backward-compatible business-style lexical priors
-    """
-    profile = str(os.getenv("DOMAIN_HEURISTICS_PROFILE", "agnostic") or "agnostic").strip().lower()
-    if profile in {"business", "business_compat", "legacy", "compat"}:
-        return list(compat_default)
-    return list(agnostic_default)
-
-
 def get_domain_heuristics_profile() -> str:
     """
     Return the active lexical-compatibility profile name.
@@ -672,14 +653,11 @@ AGENT_CONTRACT_BASE_METRIC_TERMS = set(
 
 # Domain-oriented lexical priors live separately from generic metric cues so the
 # core pipeline can remain schema-driven while still allowing an optional
-# business-compatibility profile through DOMAIN_HEURISTICS_PROFILE.
+# business-compatibility profile through t2sql_config.yml profile overlays.
 AGENT_CONTRACT_DOMAIN_METRIC_FALLBACK_TERMS = set(
     _env_json_list(
         "AGENT_CONTRACT_DOMAIN_METRIC_FALLBACK_TERMS",
-        _profiled_domain_defaults(
-            [],
-            ["payment", "sales", "revenue", "stock", "credit"],
-        ),
+        [],
     )
 )
 # Backward-compatible alias used by the existing pipeline.
@@ -737,10 +715,7 @@ INTENT_IR_BASE_NUMERIC_HINTS = tuple(
 INTENT_IR_DOMAIN_NUMERIC_FALLBACK_HINTS = set(
     _env_json_list(
         "INTENT_IR_DOMAIN_NUMERIC_FALLBACK_HINTS",
-        _profiled_domain_defaults(
-            [],
-            ["stock", "msrp", "revenue", "sales"],
-        ),
+        [],
     )
 )
 INTENT_IR_LEGACY_NUMERIC_FALLBACK_HINTS = set(
@@ -760,10 +735,7 @@ HELPERS_EXISTENCE_SUPPORT_VERBS_GENERIC = set(
 HELPERS_EXISTENCE_SUPPORT_VERBS_DOMAIN = set(
     _env_json_list(
         "HELPERS_EXISTENCE_SUPPORT_VERBS_DOMAIN",
-        _profiled_domain_defaults(
-            [],
-            ["placed", "paid", "ordered", "purchased", "bought"],
-        ),
+        [],
     )
 )
 HELPERS_EXISTENCE_COMPAT_VERBS = set(
@@ -832,24 +804,22 @@ DOMAIN_HEURISTICS_PROFILE = get_domain_heuristics_profile()
 HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES = tuple(
     _env_json_list(
         "HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES",
-        list(
-            dict.fromkeys(
-                [
-                    "including",
-                    "with no",
-                    "without any",
-                    "without",
-                    "even if no",
-                    "include those without",
-                    "termasuk",
-                    "meskipun tidak",
-                    "walaupun tidak",
-                    "yang tidak punya",
-                    "tanpa",
-                    "belum",
-                    *_profiled_domain_defaults([], ["never paid"]),
-                ]
-            )
+        config_default_list(
+            "helpers_inner_join_include_zero_overrides",
+            [
+                "including",
+                "with no",
+                "without any",
+                "without",
+                "even if no",
+                "include those without",
+                "termasuk",
+                "meskipun tidak",
+                "walaupun tidak",
+                "yang tidak punya",
+                "tanpa",
+                "belum",
+            ],
         ),
     )
 )
@@ -857,19 +827,7 @@ HELPERS_INNER_JOIN_INCLUDE_ZERO_OVERRIDES = tuple(
 HELPERS_INNER_JOIN_DOMAIN_OBJECT_TERMS = set(
     _env_json_list(
         "HELPERS_INNER_JOIN_DOMAIN_OBJECT_TERMS",
-        _profiled_domain_defaults(
-            [],
-            [
-                "order",
-                "orders",
-                "payment",
-                "payments",
-                "transaction",
-                "transactions",
-                "purchase",
-                "purchases",
-            ],
-        ),
+        [],
     )
 )
 HELPERS_INNER_JOIN_COMPAT_OBJECT_TERMS = set(
@@ -896,10 +854,7 @@ HELPERS_ROLLUP_GENERIC_METRIC_TERMS = set(
 HELPERS_ROLLUP_DOMAIN_METRIC_TERMS = set(
     _env_json_list(
         "HELPERS_ROLLUP_DOMAIN_METRIC_TERMS",
-        _profiled_domain_defaults(
-            [],
-            ["revenue", "sales", "paid", "payment"],
-        ),
+        [],
     )
 )
 
@@ -932,10 +887,7 @@ HELPERS_DUAL_FACT_GENERIC_METRIC_TERMS = set(
 HELPERS_DUAL_FACT_DOMAIN_METRIC_TERMS = set(
     _env_json_list(
         "HELPERS_DUAL_FACT_DOMAIN_METRIC_TERMS",
-        _profiled_domain_defaults(
-            [],
-            ["revenue", "sale", "sales", "paid", "payment"],
-        ),
+        [],
     )
 )
 
@@ -1660,7 +1612,7 @@ AGENT_ROUTER_GENERIC_CROSS_TABLE_EXCLUSION_TERMS = _env_json_list(
 
 AGENT_ROUTER_DOMAIN_CROSS_TABLE_EXCLUSION_TERMS = _env_json_list(
     "AGENT_ROUTER_DOMAIN_CROSS_TABLE_EXCLUSION_TERMS",
-    _profiled_domain_defaults([], ["never ordered", "never paid"]),
+    [],
 )
 
 AGENT_ROUTER_CROSS_TABLE_EXCLUSION_TERMS = _env_json_list(

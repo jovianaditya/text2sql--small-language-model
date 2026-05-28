@@ -160,7 +160,9 @@ class SchemaAnalyzer:
         tags_alias = self._normalize_string_list(metadata.get("tags_alias"))
         primary_role = str(metadata.get("primary_role", "") or "").strip().lower()
 
-        # Extract synonyms
+        # Structured alias tags are primary. Parsing free-text "Synonyms:" is a
+        # compatibility fallback for older metadata exports that do not yet
+        # carry explicit alias tags.
         text = data.get("text", "")
         parsed_synonyms: List[str] = []
         synonyms_match = re.search(r'Synonyms:\s*(.+?)\.', text)
@@ -209,7 +211,8 @@ class SchemaAnalyzer:
             fk_match or re.search(r"\bforeign\s+key\b", combined_key_text)
         )
 
-        # Extract column role
+        # Structured primary_role / tags_role are primary. Parsing free-text
+        # "Role:" remains a compatibility fallback for older metadata exports.
         parsed_role = str(self._next_field_after(text, "Role:") or "").strip().lower()
         effective_role = primary_role or (tags_role[0] if tags_role else "") or parsed_role
         if effective_role:
@@ -906,14 +909,15 @@ class SchemaAnalyzer:
 
     def get_anchor_columns(self, table: str) -> List[str]:
         """
-        Get key columns for scoring boost (Role: Metric).
+        Get key columns for scoring boost.
 
         These columns are used for boosting table relevance in retrieval.
         """
         table = table.lower()
         anchors = []
 
-        for col, role in self._column_roles.get(table, {}).items():
+        for col in self._table_columns.get(table, []):
+            role = self.get_column_primary_role(table, col)
             role_tags = set(self.get_column_role_tags(table, col))
             if role == "metric" or role == "measure" or {"metric", "measure"}.intersection(role_tags):
                 anchors.append(col)
@@ -1721,7 +1725,10 @@ def get_column_datatype(table: str, column: str) -> str:
 
 def get_column_role(table: str, column: str) -> str:
     """
-    Get column role from schema metadata.
+    Get the legacy single-string role view for a column.
+
+    Compatibility helper only. New semantic logic should prefer
+    `get_column_semantics()` or `get_column_primary_role()`.
     
     Returns role string (e.g., 'metric', 'dimension', 'id')
     or empty string if not found.
@@ -1738,9 +1745,17 @@ def get_column_role(table: str, column: str) -> str:
     analyzer = get_schema_analyzer()
     t = (table or "").lower().strip()
     c = (column or "").lower().strip()
-    
+
+    primary_role = str(analyzer.get_column_primary_role(t, c) or "").lower().strip()
+    if primary_role:
+        return primary_role
+
+    role_tags = analyzer.get_column_role_tags(t, c)
+    if role_tags:
+        return str(role_tags[0] or "").lower().strip()
+
     roles = analyzer._column_roles.get(t, {})
-    return str(roles.get(c, "") or analyzer.get_column_primary_role(t, c) or "").lower().strip()
+    return str(roles.get(c, "") or "").lower().strip()
 
 
 # ==================== ENHANCED COLUMN ROLE DETECTION ===================

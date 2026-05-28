@@ -412,6 +412,19 @@ config:
     - \bevery\b
     - \bin\s+each\b
     - \bgrouped\s+by\b
+    helpers_inner_join_include_zero_overrides:
+    - including
+    - with no
+    - without any
+    - without
+    - even if no
+    - include those without
+    - termasuk
+    - meskipun tidak
+    - walaupun tidak
+    - yang tidak punya
+    - tanpa
+    - belum
     helpers_hierarchical_collection_possessives:
     - their
     - its
@@ -776,10 +789,52 @@ profiles:
   business:
     config:
       lists:
+        agent_contract_domain_metric_fallback_terms:
+        - payment
+        - sales
+        - revenue
+        - stock
+        - credit
+        agent_router_domain_cross_table_exclusion_terms:
+        - never ordered
+        - never paid
+        helpers_dual_fact_domain_metric_terms:
+        - revenue
+        - sale
+        - sales
+        - paid
+        - payment
+        helpers_existence_support_verbs_domain:
+        - placed
+        - paid
+        - ordered
+        - purchased
+        - bought
+        helpers_inner_join_domain_object_terms:
+        - order
+        - orders
+        - payment
+        - payments
+        - transaction
+        - transactions
+        - purchase
+        - purchases
+        helpers_inner_join_include_zero_overrides:
+        - never paid
+        helpers_rollup_domain_metric_terms:
+        - revenue
+        - sales
+        - paid
+        - payment
         helpers_semantic_alias_listprice_include_terms:
         - msrp
         helpers_semantic_alias_price_exclude_terms:
         - msrp
+        intent_ir_domain_numeric_fallback_hints:
+        - stock
+        - msrp
+        - revenue
+        - sales
         retrieval_numeric_pattern_keywords:
         - stock
       dicts:
