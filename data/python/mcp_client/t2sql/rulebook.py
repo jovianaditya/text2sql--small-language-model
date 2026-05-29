@@ -130,13 +130,6 @@ def _load_rules() -> Dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     return data
-
-
-def reset_rulebook_cache() -> None:
-    _load_rules.cache_clear()
-    _load_config.cache_clear()
-
-
 @lru_cache(maxsize=1)
 def _load_config() -> Dict[str, Any]:
     path_raw = (
@@ -1505,19 +1498,3 @@ def question_wants_combined_full_name(question: str) -> bool:
     except Exception:
         gap = 48
     return _has_proximity_between_phrase_sets(q, verbs, name_terms, gap)
-
-
-def rulebook_debug_snapshot() -> Dict[str, Any]:
-    return {
-        "path": os.getenv("T2SQL_RULES_PATH", "").strip() or str(_default_rules_path()),
-        "loaded": bool(_load_rules()),
-        "name_component_lexical_tokens": sorted(name_component_lexical_tokens()),
-        "name_component_synonym_hints": sorted(name_component_synonym_hints()),
-        "retrieval_extra_stopwords_count": len(retrieval_extra_stopwords()),
-        "retrieval_generic_mention_terms_count": len(retrieval_generic_mention_terms()),
-        "retrieval_join_signals_count": len(retrieval_join_signals()),
-        "ordering_desc_terms_count": len(ordering_direction_desc_terms()),
-        "ordering_asc_terms_count": len(ordering_direction_asc_terms()),
-        "semantic_phrase_stopwords_count": len(semantic_phrase_token_stopwords()),
-        "order_term_stopwords_count": len(order_term_token_stopwords()),
-    }

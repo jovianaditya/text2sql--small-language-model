@@ -11,7 +11,7 @@
 import re
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Pattern, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
 # ======================================================================
@@ -143,26 +143,6 @@ from .rulebook import (
 # ======================================================================
 # ================== REGEX PATTERN CACHING UTILITIES ===================
 # ======================================================================
-# LRU-cached regex compilation to reduce redundant re.compile() calls
-_REGEX_CACHE_SIZE = 2048
-
-
-@lru_cache(maxsize=_REGEX_CACHE_SIZE)
-def compile_pattern(pattern: str, flags: int = 0) -> Pattern[str]:
-    """LRU-cached regex pattern compilation."""
-    return re.compile(pattern, flags)
-
-
-def cached_search(pattern: str, string: str, flags: int = 0) -> Optional[re.Match[str]]:
-    """Regex search with cached pattern compilation."""
-    return compile_pattern(pattern, flags).search(string)
-
-
-def cached_match(pattern: str, string: str, flags: int = 0) -> Optional[re.Match[str]]:
-    """Regex match with cached pattern compilation."""
-    return compile_pattern(pattern, flags).match(string)
-
-
 def _question_has_grouping_intent(question: str) -> bool:
     """
     Shared lexical grouping cue detector used by lightweight guardrails.
@@ -191,21 +171,6 @@ def _question_has_count_intent(question: str) -> bool:
     if any(term in q for term in HELPERS_COUNT_INTENT_TERMS):
         return True
     return bool(re.search(r"\bcount(?:ing)?\b", q, flags=re.I))
-
-
-def cached_sub(pattern: str, repl: str, string: str, count: int = 0, flags: int = 0) -> str:
-    """Regex substitution with cached pattern compilation."""
-    return compile_pattern(pattern, flags).sub(repl, string, count=count)
-
-
-def cached_findall(pattern: str, string: str, flags: int = 0) -> list:
-    """Regex findall with cached pattern compilation."""
-    return compile_pattern(pattern, flags).findall(string)
-
-
-def cached_split(pattern: str, string: str, maxsplit: int = 0, flags: int = 0) -> list[str]:
-    """Regex split with cached pattern compilation."""
-    return compile_pattern(pattern, flags).split(string, maxsplit=maxsplit)
 
 
 def _semantic_question_tokens(text: str) -> Set[str]:

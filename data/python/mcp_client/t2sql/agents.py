@@ -78,7 +78,6 @@ from .config import (
     AGENT_GIBBERISH_HAS_SEPARATOR_PATTERN,
     AGENT_TABLE_VARIANT_MIN_TAIL_LEN,
     AGENT_COLUMN_ORDERED_TOKEN,
-    AGENT_COLUMN_ORDERED_BY_PATTERN,
     AGENT_MISSING_COL_SUFFIX_SYNONYMS,
     AGENT_REGEX_TRIGGERS,
     AGENT_ROUTER_MATH_KEYWORDS,
@@ -150,7 +149,6 @@ from .config import (
     AGENT_ROUTER_COMPLEX_SUBQUERY_CUE_PATTERN,
     AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_FROM_PATTERN,
     AGENT_DRAFT_SELECT_FROM_PATTERN,
-    AGENT_DRAFT_STRIP_DESC_ASC_BEFORE_COMMA_PATTERN,
     AGENT_DRAFT_LIMIT_NULL_ZERO_PATTERN,
     AGENT_DRAFT_LIMIT_CAPTURE_PATTERN,
     AGENT_DRAFT_LIMIT_REMOVE_PATTERN,
@@ -218,7 +216,7 @@ from .config import (
 )
 from .llm_utils import build_llm_json, build_llm_repair
 from .state import RAGState
-from .utils import _dbg_print_two, try_llm_json, try_llm_sql_text, build_router_schema
+from .utils import _dbg_print_two, try_llm_json, try_llm_sql_text
 from .generation import regenerate_with_extra_constraint
 from .retrieval import build_expanded_context_from_state
 from .intent_ir import build_intent_ir, is_ir_plannable
@@ -467,8 +465,8 @@ from .schema_analyzer import (
     get_metric_candidates,
     get_transaction_tables,
 )
-from .helpers_main import (get_single_allowed_table, validate_identifiers, _get_requires_regex, _regex_requirement_ok,
-    _regex_requirement_ok, _get_qtype, make_router_prompt, make_generation_prompt, sanitize_notes, normalize_sql_pipeline,
+from .helpers_main import (validate_identifiers, _regex_requirement_ok,
+    make_generation_prompt, normalize_sql_pipeline,
     _find_tables_with_implicit_columns, _extract_fk_from_context, _ordered_token_is_sort_only_context)
 from .helpers_core import (
     has_join,
@@ -489,7 +487,6 @@ from .helpers_core import (
     _question_wants_count_distinct,
     _ensure_reasonable_distinct,
     _ensure_reasonable_count_distinct,
-    _rewrite_missing_joined_agg_threshold_filter,
     _question_requires_regex,
     _question_requires_structural_regex,
     _question_requires_word_boundary_regex,

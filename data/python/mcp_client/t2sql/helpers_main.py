@@ -28,7 +28,6 @@ from .config import (
     AGENT_COLUMN_ORDERED_BY_PATTERN,
     AGENT_COLUMN_ORDERED_TOKEN,
     AGENT_AST_GUARDS_ENABLED,
-    AGENT_AST_GUARDS_DEBUG,
     AGENT_AST_SEMANTIC_FIRST,
     AGENT_NORMALIZE_REWRITE_BUDGET,
     AGENT_NORMALIZE_EARLY_STOP,
@@ -102,7 +101,7 @@ from .helpers_core import (
     _ast_normalize_cosmetic_aliases,
     _ast_normalize_from_aliases,
     # phase 3
-    _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _ensure_explicit_simple_projection_columns, _prune_non_primary_dimensions_for_primary_aggregate, _drop_unrequested_nonprimary_identifier_group_keys, _drop_redundant_raw_name_columns_when_concat_present, _wants_name_only,
+    _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _ensure_explicit_simple_projection_columns, _prune_non_primary_dimensions_for_primary_aggregate, _drop_unrequested_nonprimary_identifier_group_keys, _drop_redundant_raw_name_columns_when_concat_present,
     _align_requested_description_variant, _align_requested_joined_description_variant, _drop_unrequested_difference_operand_columns,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
@@ -207,7 +206,7 @@ from .helpers_core import (
     _fix_raw_column_where_to_having,
     _add_missing_count_for_group_by,
     # phase 5 — Pattern, REGEXP, and Predicate Normalization
-    _guardrail_fix_like_regex_anchors, _rewrite_simple_regexp_to_like, _canonicalize_structural_regex, _canonicalize_boundary_regex, _guardrail_fix_mysql_regexp_literals,
+    _guardrail_fix_like_regex_anchors, _canonicalize_structural_regex, _canonicalize_boundary_regex, _guardrail_fix_mysql_regexp_literals,
     _rewrite_regex_filter_to_case_bucket, _rewrite_half_open_between_bounds,
     # phase 6
     _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _strip_redundant_distinct_in_in_not_in_subqueries, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
@@ -285,20 +284,6 @@ try:
     }
 except Exception:
     _TABLE_SINGULAR_ROOTS = set()
-# ======================================================================
-# ============================ WHITELIST ===============================
-# ======================================================================
-def get_single_allowed_table(ctx: str) -> Optional[str]:
-    """
-    Jika ALLOWED IDENTIFIERS hanya berisi 1 tabel, return nama tabel itu.
-    Kalau >1 atau 0 tabel, return None.
-    """
-    allowed = _parse_allowed_identifiers(ctx)
-    if len(allowed) == 1:
-        return next(iter(allowed.keys()))
-    return None
-
-
 _STRUCTURED_IDENTIFIER_ROLE_TERMS = {
     "id", "identifier", "pk", "fk",
     "primary_key", "foreign_key",
@@ -1981,13 +1966,6 @@ def normalize_anchor_for_simple_inner_join(sql: str, preferred_anchor: Optional[
     tail = m.group("tail") or ""
 
     return f"{prefix}FROM {t2_raw} {a2} JOIN {t1_raw} {a1} ON {on_clause}{tail}"
-
-def sanitize_notes(sql: str, notes: str) -> str:
-    if not notes:
-        return notes
-    if not has_join(sql or ""):
-        return "No joins used."
-    return notes.strip()
 
 def _fix_undefined_alias_typos(sql: str) -> str:
     """
@@ -5104,51 +5082,6 @@ def _find_tables_with_implicit_columns(
 
     return tables_to_add
 
-
-# ======================================================================
-# ================= ROUTING & GENERATION PROMPT BUILDER ================
-# ======================================================================
-def make_router_prompt(question: str, schema_summary: str) -> str:
-    """
-    Prompt Router yang dioptimalkan untuk Model SLM (1.5B/7B).
-    Output JSON: complexity & qtype.
-    """
-    return f"""You are a SQL router. Analyze the question and schema to decide complexity.
-
-Schema Tables: [{schema_summary}]
-
-DEFINITIONS:
-1. COMPLEXITY: "simple"
-   - Single table operations (Filter, Sort, Limit).
-   - Attribute Check (IS NULL/Empty).
-   - FK Filtering (Filtering by ID present in the main table).
-   - Global Rank (ORDER BY ... LIMIT).
-
-2. COMPLEXITY: "complex"
-   - Multi-table Joins.
-   - Relationship Check (e.g. "customers with no orders").
-   - Advanced Logic: "Top N per Group", HAVING, Subqueries.
-
-3. QTYPE:
-   - "lookup": Retrieve rows, Global Sorting.
-   - "aggregate": Math (SUM, AVG, COUNT) with GROUP BY.
-   - "rank": Group-wise ranking (e.g., "Top product PER category").
-
-CRITICAL RULES:
-1. "Missing" or "No" [X]:
-   - If [X] is a COLUMN -> SIMPLE.
-   - If [X] is a separate TABLE -> COMPLEX.
-2. Filtering:
-   - By ID/Code -> SIMPLE.
-   - By Name/Desc -> COMPLEX.
-3. Ranking:
-   - "Highest/Lowest" (Global) -> SIMPLE ("lookup").
-   - "Highest/Lowest PER [Group]" -> COMPLEX ("rank").
-
-Question: {question}
-
-Return JSON object with keys: complexity (simple/complex), qtype (lookup/aggregate/rank).
-"""
 
 # ======================================================================
 # ================ INTENT IR SOFT HINT (IR-INFORMED LLM) ===============

@@ -241,7 +241,7 @@ plausibility, and structural sanity checks.
   syntax/schema/semantic checks is wrong, aggregate/order checks create false
   positives, or retries should be triggered by different evidence
 - **Reads from**: `schema_analyzer.py`
-- **Key functions**: `compute_sql_confidence()`, `format_confidence_report()`
+- **Key functions**: `compute_sql_confidence()`
 - **Depended on by**: `agents.py`
 
 ### `llm_utils.py` — Central LLM Builders

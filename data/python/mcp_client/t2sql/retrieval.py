@@ -9,7 +9,6 @@
 # ======================================================================
 # ====================== STANDARD LIBRARY IMPORT =======================
 # ======================================================================
-import os
 import re
 import json
 import hashlib
@@ -120,7 +119,6 @@ from .config import (
     RETRIEVAL_DEBUG_FOCUS_COLUMNS,
     RETRIEVAL_TABLE_NAME_PREFIX_STRIP_CHARS,
     RETRIEVAL_TABLE_VARIANT_MIN_TAIL_LEN,
-    RETRIEVAL_COLUMN_VARIANT_REPLACEMENTS,
     RETRIEVAL_FK_REFERENCE_PATTERN,
     RETRIEVAL_SINGLE_LOCK_MIN_SCORE_GAP,
     RETRIEVAL_SINGLE_LOCK_MAX_NON_PRIMARY_SPARSE_HITS,
@@ -129,7 +127,6 @@ from .config import (
     RETRIEVAL_TELEMETRY_MAX_ITEMS,
     AGENT_ROUTER_QTYPE_LOOKUP,
     AGENT_ROUTER_QTYPE_AGGREGATE,
-    AGENT_ROUTER_QTYPE_RANK,
     SPARSE_METADATA_JSONL,
 )
 from .state import RAGState

@@ -356,6 +356,67 @@ def _normalize_aliases(aliases: List[str]) -> List[str]:
     return out
 
 
+_TRAILING_NUMBER_CARDINAL_WORDS = {
+    "1": "one",
+    "2": "two",
+    "3": "three",
+    "4": "four",
+    "5": "five",
+}
+
+_TRAILING_NUMBER_ORDINAL_WORDS = {
+    "1": "first",
+    "2": "second",
+    "3": "third",
+    "4": "fourth",
+    "5": "fifth",
+}
+
+
+def _line_number_alias_variants(column: str) -> List[str]:
+    """
+    Add generic human-friendly aliases for columns like addressLine1/addressLine2
+    without hardcoding any specific table name.
+    """
+    col_text = str(column or "").strip()
+    if not col_text:
+        return []
+
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", col_text)
+    spaced = re.sub(r"([A-Za-z])(\d)", r"\1 \2", spaced)
+    spaced = re.sub(r"(\d)([A-Za-z])", r"\1 \2", spaced)
+    spaced = spaced.replace("_", " ")
+    tokens = [tok.lower() for tok in re.findall(r"[A-Za-z0-9]+", spaced)]
+    if len(tokens) < 2:
+        return []
+
+    trailing_num = tokens[-1]
+    if trailing_num not in _TRAILING_NUMBER_CARDINAL_WORDS:
+        return []
+
+    body_tokens = tokens[:-1]
+    if "line" not in body_tokens:
+        return []
+
+    body_phrase = " ".join(body_tokens).strip()
+    if not body_phrase:
+        return []
+
+    variants = [f"{body_phrase} {trailing_num}"]
+
+    cardinal = _TRAILING_NUMBER_CARDINAL_WORDS.get(trailing_num, "")
+    if cardinal:
+        variants.append(f"{body_phrase} {cardinal}")
+
+    ordinal = _TRAILING_NUMBER_ORDINAL_WORDS.get(trailing_num, "")
+    prefix_tokens = [tok for tok in body_tokens if tok != "line"]
+    prefix_phrase = " ".join(prefix_tokens).strip()
+    if ordinal and prefix_phrase:
+        variants.append(f"{ordinal} {prefix_phrase} line")
+
+    return _normalize_aliases(variants)
+
+
 def _primary_role_bucket(role: str) -> str:
     return PRIMARY_ROLE_CANONICAL.get(str(role or "").strip().lower(), "")
 
@@ -453,7 +514,9 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     col = raw_row.get("column")
     desc = str(raw_row.get("description") or "")
     desc_clean = re.sub(r"\s+", " ", desc).strip().rstrip(" .")
-    aliases = _normalize_aliases(raw_row.get("tags_alias", []))
+    aliases = _normalize_aliases(
+        list(raw_row.get("tags_alias", []) or []) + _line_number_alias_variants(col)
+    )
     roles = raw_row.get("tags_role", [])
     normalized_roles = _normalize_roles(roles)
     fk_target = _extract_fk_target(desc_clean)

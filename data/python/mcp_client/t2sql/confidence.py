@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import re
-from functools import lru_cache
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .schema_analyzer import is_numeric_column, is_date_column, get_all_tables
@@ -728,34 +727,3 @@ def compute_sql_confidence(
         "warnings": all_warnings,
         "details": details,
     }
-
-
-def format_confidence_report(result: Dict[str, Any], verbose: bool = False) -> str:
-    """
-    Format confidence result as human-readable string.
-    
-    Args:
-        result: Output from compute_sql_confidence
-        verbose: Include per-signal details
-    
-    Returns:
-        Formatted string report
-    """
-    lines = [
-        f"SQL Confidence: {result['confidence']:.1%}",
-    ]
-    
-    if verbose:
-        lines.append("Signal Scores:")
-        for signal, score in result.get("signals", {}).items():
-            lines.append(f"  - {signal}: {score:.1%}")
-    
-    warnings = result.get("warnings", [])
-    if warnings:
-        lines.append(f"Warnings ({len(warnings)}):")
-        for w in warnings[:5]:  # Limit to first 5
-            lines.append(f"  - {w}")
-        if len(warnings) > 5:
-            lines.append(f"  ... and {len(warnings) - 5} more")
-    
-    return "\n".join(lines)

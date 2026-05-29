@@ -24,8 +24,6 @@ load_dotenv(find_dotenv(), override=False)
 # ======================================================================
 from .config import (
     MCP_BASE,
-    CHROMA_DIR,
-    COLLECTION_NAME,
     CSV_EXPORT_DIR,
     CSV_EXPORT_FILENAME_PREFIX,
     HITL_ENABLED,
@@ -38,10 +36,9 @@ from .config import (
 )
 from .state import make_state
 from .graph import build_app
-from .chroma_embedding import build_vector_store
 from .mcp_execution import query_db, query_db_full
 from .helpers_core import _preexecute_sql_safety_pass
-from .utils import _now, _log_total, _print_banner, display_table_from_json
+from .utils import _now, _log_total, display_table_from_json
 
 def _print_latency_debug(state: dict):
     """
