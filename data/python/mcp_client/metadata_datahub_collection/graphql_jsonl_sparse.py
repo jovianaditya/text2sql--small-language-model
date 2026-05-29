@@ -269,10 +269,104 @@ ROLE_CANONICAL = {
     "binary": "binary",
 }
 
+PRIMARY_ROLE_CANONICAL = {
+    "pk": "pk",
+    "primary_key": "pk",
+    "fk": "fk",
+    "foreign_key": "fk",
+    "id": "id",
+    "identifier": "id",
+    "measure": "measure",
+    "metric": "measure",
+    "date": "date",
+    "datetime": "date",
+    "time": "date",
+    "temporal": "date",
+    "geo": "geo",
+    "contact": "contact",
+    "address": "address",
+    "text": "text",
+    "binary": "binary",
+    "dimension": "dimension",
+    "name": "dimension",
+    "entity_name": "dimension",
+    "status": "dimension",
+    "classification": "dimension",
+}
+
+ROLE_PRIORITY = [
+    "pk",
+    "fk",
+    "id",
+    "measure",
+    "date",
+    "geo",
+    "contact",
+    "address",
+    "text",
+    "dimension",
+    "binary",
+]
+
 
 def normalize_role(role: str) -> str:
     key = str(role or "").strip().lower().replace("-", "_").replace(" ", "_")
     return ROLE_CANONICAL.get(key, key)
+
+
+def _primary_role_bucket(role: str) -> str:
+    return PRIMARY_ROLE_CANONICAL.get(str(role or "").strip().lower(), "")
+
+
+def _infer_fallback_role(raw_row: Dict[str, Any]) -> str:
+    col = str(raw_row.get("column") or "").strip().lower()
+    desc = str(raw_row.get("description") or "").strip().lower()
+    dt = str(raw_row.get("datatype") or "").strip().lower()
+    joined = f"{col} {desc}"
+
+    if re.search(r"\bprimary\s+key\b", desc):
+        return "pk"
+    if re.search(r"\bforeign\s+key\b|\breferences\b", desc):
+        return "fk"
+    if re.search(r"(date|time|year|month|day)", dt) or re.search(r"\b(date|time|year|month|day)\b", col):
+        return "date"
+    if re.search(r"\b(email|phone|fax|contact)\b", joined):
+        return "contact"
+    if re.search(r"\b(address|city|state|postal|zip|country)\b", joined):
+        return "address"
+    if re.search(r"\b(id|code|number)\b", col):
+        return "id"
+    if re.search(r"\b(char|text|clob|json|xml)\b", dt):
+        return "text"
+
+    is_numeric = any(
+        k in dt for k in ("int", "double", "float", "decimal", "numeric", "real", "number", "money")
+    )
+    if is_numeric and re.search(
+        r"\b(amount|price|cost|total|quantity|qty|stock|inventory|volume|balance|rate|ratio|score|limit|percent)\b",
+        joined,
+    ):
+        return "measure"
+
+    return "dimension"
+
+
+def _select_primary_role(raw_row: Dict[str, Any], roles: List[str]) -> str:
+    primary_candidates: List[str] = []
+    seen_primary = set()
+    for role in roles or []:
+        primary = _primary_role_bucket(role)
+        if not primary or primary in seen_primary:
+            continue
+        seen_primary.add(primary)
+        primary_candidates.append(primary)
+
+    for preferred in ROLE_PRIORITY:
+        if preferred in primary_candidates:
+            return preferred
+    if roles:
+        return _primary_role_bucket(roles[0]) or roles[0]
+    return _infer_fallback_role(raw_row)
 
 
 def _sanitize_fragment(x: Any) -> str:
@@ -288,67 +382,6 @@ def _dedupe_keep_order(items: List[str]) -> List[str]:
             seen.add(norm)
             out.append(it)
     return out
-
-
-_TRAILING_NUMBER_CARDINAL_WORDS = {
-    "1": "one",
-    "2": "two",
-    "3": "three",
-    "4": "four",
-    "5": "five",
-}
-
-_TRAILING_NUMBER_ORDINAL_WORDS = {
-    "1": "first",
-    "2": "second",
-    "3": "third",
-    "4": "fourth",
-    "5": "fifth",
-}
-
-
-def _line_number_alias_variants(column: str) -> List[str]:
-    """
-    Add generic human-friendly aliases for columns like addressLine1/addressLine2
-    without hardcoding any specific table name.
-    """
-    col_text = str(column or "").strip()
-    if not col_text:
-        return []
-
-    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", col_text)
-    spaced = re.sub(r"([A-Za-z])(\d)", r"\1 \2", spaced)
-    spaced = re.sub(r"(\d)([A-Za-z])", r"\1 \2", spaced)
-    spaced = spaced.replace("_", " ")
-    tokens = [tok.lower() for tok in re.findall(r"[A-Za-z0-9]+", spaced)]
-    if len(tokens) < 2:
-        return []
-
-    trailing_num = tokens[-1]
-    if trailing_num not in _TRAILING_NUMBER_CARDINAL_WORDS:
-        return []
-
-    body_tokens = tokens[:-1]
-    if "line" not in body_tokens:
-        return []
-
-    body_phrase = " ".join(body_tokens).strip()
-    if not body_phrase:
-        return []
-
-    variants = [f"{body_phrase} {trailing_num}"]
-
-    cardinal = _TRAILING_NUMBER_CARDINAL_WORDS.get(trailing_num, "")
-    if cardinal:
-        variants.append(f"{body_phrase} {cardinal}")
-
-    ordinal = _TRAILING_NUMBER_ORDINAL_WORDS.get(trailing_num, "")
-    prefix_tokens = [tok for tok in body_tokens if tok != "line"]
-    prefix_phrase = " ".join(prefix_tokens).strip()
-    if ordinal and prefix_phrase:
-        variants.append(f"{ordinal} {prefix_phrase} line")
-
-    return _dedupe_keep_order(variants)
 
 
 def _truncate_metadata_sample(value: Any, is_string: bool) -> str:
@@ -376,11 +409,9 @@ def transform_to_sparse_schema(raw_row: Dict[str, Any], table_desc: str = "") ->
     tbl = raw_row.get("table") or ""
     col = raw_row.get("column") or ""
     desc = _sanitize_fragment(raw_row.get("description"))
-    aliases = _dedupe_keep_order(
-        [_sanitize_fragment(a) for a in raw_row.get("tags_alias", []) if _sanitize_fragment(a)]
-        + _line_number_alias_variants(col)
-    )
+    aliases = _dedupe_keep_order([_sanitize_fragment(a) for a in raw_row.get("tags_alias", []) if _sanitize_fragment(a)])
     roles = _dedupe_keep_order([normalize_role(r) for r in raw_row.get("tags_role", []) if str(r or "").strip()])
+    primary_role = _select_primary_role(raw_row, roles)
     
     # --- KEYWORD CONSTRUCTION (Untuk Search BM25) ---
     keywords_list: List[str] = []
@@ -443,6 +474,7 @@ def transform_to_sparse_schema(raw_row: Dict[str, Any], table_desc: str = "") ->
         "table": tbl,
         "column": col,
         "datatype": raw_row.get("datatype"),
+        "primary_role": primary_role,
         "tags_alias": aliases,
         "tags_role": roles,
         # >>> INI PERUBAHANNYA: Masukkan description eksplisit <<<

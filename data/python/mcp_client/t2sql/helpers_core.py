@@ -12494,6 +12494,8 @@ def _add_rank_value_nonnull_filter_from_question(sql: str, question: str) -> str
         return sql
     if not re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", sql, flags=re.I):
         return sql
+    if _question_wants_include_zero(question, ""):
+        return sql
 
     q = str(question or "").lower()
     phrase_terms = _extract_rank_nonnull_value_terms(q)
@@ -17560,6 +17562,18 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
         return sql
     if not _question_wants_winner_row(question):
         return sql
+    # Keep single winner-row priority repair separate from top-N-per-group
+    # ranking queries that intentionally retain multiple rows per partition.
+    m_rank_limit = re.search(
+        r"""(?is)\b(?:where|having)\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?[A-Za-z_][A-Za-z0-9_]*\s*(?:<=|<)\s*(\d+)\b""",
+        sql,
+    )
+    if m_rank_limit:
+        try:
+            if int(m_rank_limit.group(1)) > 1:
+                return sql
+        except Exception:
+            pass
 
     q = (question or "").lower()
     date_primary_same_date_tie = bool(
@@ -17971,6 +17985,22 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
             for alias in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", window_sql, flags=re.I)
             if alias
         }
+
+        def _coerce_window_scope_ref(ref: Optional[str]) -> Optional[str]:
+            ref_s = str(ref or "").strip()
+            if not ref_s:
+                return None
+            if current_aliases:
+                return ref_s
+            m_ref = re.match(
+                r"(?is)^\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$",
+                ref_s,
+            )
+            if not m_ref:
+                return ref_s
+            col_name = str(m_ref.group(1) or "").strip()
+            return col_name or ref_s
+
         qualified_ref_norms = {_norm_expr(ref) for ref in qualified_refs}
         scope_metric_fallbacks = {
             family_name: [
@@ -18064,6 +18094,7 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
                 current_aliases,
                 prefer_functions=True,
             )
+            fb_primary = _coerce_window_scope_ref(fb_primary)
             if not fb_primary:
                 return None
             primary_items.append(_force_dir(fb_primary, desc=True))
@@ -18076,6 +18107,7 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
                 current_aliases,
                 prefer_functions=True,
             )
+            fb_secondary = _coerce_window_scope_ref(fb_secondary)
             if fb_secondary:
                 secondary_items.append(_force_dir(fb_secondary, desc=True))
                 seen_norm.add(_norm_expr(fb_secondary))
@@ -18085,6 +18117,7 @@ def _fix_winner_row_metric_order_priority(sql: str, question: str) -> str:
             if not fb_id:
                 fb_id = _pick_fallback(identifier_fallbacks, seen_norm, current_aliases)
                 fb_id = _coerce_identifier_scope(fb_id)
+            fb_id = _coerce_window_scope_ref(fb_id)
             if fb_id:
                 id_items.append(_force_dir(fb_id, desc=False))
 
@@ -20977,6 +21010,14 @@ def _rewrite_conditional_avg_to_count_with_overall_avg(sql: str, question: str) 
         """,
         flags=re.X,
     )
+    conditional_sum_value_pattern = re.compile(
+        r"""(?is)^\s*
+        SUM\s*\(\s*CASE\s+WHEN\s+(?P<cond>.+?)\s+
+        THEN\s+(?P<then>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<then_col>[A-Za-z_][A-Za-z0-9_]*)`?)\s+
+        ELSE\s+NULL\s+END\s*\)\s*$
+        """,
+        flags=re.X,
+    )
     plain_avg_pattern = re.compile(
         r"""(?is)^\s*AVG\s*\(\s*(?P<expr>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)\s*$"""
     )
@@ -21040,9 +21081,25 @@ def _rewrite_conditional_avg_to_count_with_overall_avg(sql: str, question: str) 
         alias_idx += 1
         avg_alias = f"average_value_{alias_idx}"
 
-    rebuilt_items = list(select_items)
-    rebuilt_items[conditional_idx] = f"SUM(CASE WHEN {conditional_cond} THEN 1 ELSE 0 END) AS {count_alias}"
-    rebuilt_items.insert(conditional_idx + 1, f"AVG({conditional_then}) AS {avg_alias}")
+    rebuilt_items: List[str] = []
+    for idx, item in enumerate(select_items):
+        if idx == conditional_idx:
+            rebuilt_items.append(f"SUM(CASE WHEN {conditional_cond} THEN 1 ELSE 0 END) AS {count_alias}")
+            rebuilt_items.append(f"AVG({conditional_then}) AS {avg_alias}")
+            continue
+
+        expr, _alias = _split_select_expr_alias(item)
+        m_cond_sum = conditional_sum_value_pattern.match(str(expr or "").strip())
+        if m_cond_sum:
+            sum_cond = (m_cond_sum.group("cond") or "").strip()
+            sum_then = (m_cond_sum.group("then") or "").strip()
+            if (
+                re.sub(r"[\s`]+", "", sum_cond).lower() == re.sub(r"[\s`]+", "", conditional_cond).lower()
+                and re.sub(r"[\s`]+", "", sum_then).lower() == re.sub(r"[\s`]+", "", conditional_then).lower()
+            ):
+                continue
+
+        rebuilt_items.append(str(item or "").strip())
 
     out_lines = [
         "SELECT " + ", ".join(str(item or "").strip() for item in rebuilt_items if str(item or "").strip()),
@@ -21052,6 +21109,272 @@ def _rewrite_conditional_avg_to_count_with_overall_avg(sql: str, question: str) 
         out_lines.append(str(parsed["where"]).strip())
     if (parsed.get("groupby") or "").strip():
         out_lines.append("GROUP BY " + str(parsed.get("groupby") or "").strip())
+    if (parsed.get("having") or "").strip():
+        out_lines.append(str(parsed["having"]).strip())
+    if (parsed.get("tail") or "").strip():
+        out_lines.append(str(parsed["tail"]).strip())
+
+    fixed = "\n".join(out_lines).strip()
+    if s.endswith(";") and not fixed.endswith(";"):
+        fixed += ";"
+    return fixed
+
+
+def _rewrite_grouped_total_count_to_metric_sum(sql: str, question: str, ctx: str = "") -> str:
+    """
+    Align grouped single-table aggregate outputs with question-level sum intent
+    when a drafted COUNT(...) occupies a metric-total slot that should be a
+    SUM(metric_column).
+
+    Example family:
+      - COUNT(*) AS total_quantity_ordered  -> SUM(quantityOrdered)
+      - COUNT(*) AS total_amount            -> SUM(amount)
+
+    Conservative scope:
+    - flat single-table GROUP BY only
+    - no JOIN / derived table
+    - SUM intent must be present in the question
+    - query currently lacks SUM(...)
+    - target projection must be a COUNT(...)
+    - alias/question semantics must align with one schema-derived metric column
+    - identifier-like numeric columns are excluded
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q or "group by" not in s.lower():
+        return sql
+
+    parsed = _parse_flat_groupby_clauses(s) or _parse_select_from_groupby(s)
+    if not parsed:
+        return sql
+
+    from_core = str(parsed.get("from_core") or "").strip()
+    if not from_core or re.search(r"(?is)\bjoin\b", from_core) or "(" in from_core:
+        return sql
+
+    m_from = re.match(
+        r"""(?is)^\s*
+        (`?[A-Za-z_][A-Za-z0-9_]*`?(?:\.`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+        (?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?
+        \s*$""",
+        from_core,
+        flags=re.X,
+    )
+    if not m_from:
+        return sql
+
+    raw_table = str(m_from.group(1) or "").replace("`", "").strip()
+    base_table = raw_table.split(".")[-1].lower()
+    alias_raw = str(m_from.group(2) or "").strip()
+    alias_l = alias_raw.lower()
+    if alias_l in {
+        "left", "right", "inner", "outer", "full", "cross", "join",
+        "on", "where", "group", "order", "having", "limit",
+    }:
+        alias_raw = ""
+    metric_qualifier = alias_raw or ""
+
+    select_items = _split_top_level_commas(str(parsed.get("select") or "").strip())
+    if not select_items:
+        return sql
+
+    if not re.search(r"\b(?:total|sum)\b", q, flags=re.I):
+        return sql
+
+    count_intent = bool(re.search(r"\b(?:how\s+many|number\s+of|count)\b", q, flags=re.I))
+    avg_intent = bool(re.search(r"\b(?:avg|average|mean)\b", q, flags=re.I))
+
+    def _tokens(text: Any) -> Set[str]:
+        src = str(text or "")
+        if not src:
+            return set()
+        src = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", src)
+        src = src.replace("_", " ")
+        return {
+            tok for tok in re.findall(r"[a-z0-9]+", src.lower())
+            if tok and tok not in {"as", "the", "a", "an", "of", "per"}
+        }
+
+    q_tokens = _tokens(q)
+    entity_alias_terms: Set[str] = set(_tokens(base_table))
+    singular_base = get_singular_form(base_table)
+    if singular_base:
+        entity_alias_terms.update(_tokens(singular_base))
+    try:
+        for syn in (get_table_synonyms(base_table) or []):
+            entity_alias_terms.update(_tokens(syn))
+    except Exception:
+        pass
+    for group_item in _split_top_level_commas(str(parsed.get("groupby") or "").strip()):
+        expr_s = str(group_item or "").strip()
+        if not expr_s:
+            continue
+        entity_alias_terms.update(_tokens(_extract_alias_or_colname(expr_s) or expr_s))
+
+    def _metric_tokens(table: str, column: str) -> Set[str]:
+        parts: List[str] = [column]
+        try:
+            parts.extend(get_column_entity_variants(table, column) or [])
+        except Exception:
+            pass
+        try:
+            parts.extend(get_column_synonyms(table, column) or [])
+        except Exception:
+            pass
+        try:
+            desc = str(get_column_description(table, column) or "").strip()
+        except Exception:
+            desc = ""
+        if desc:
+            parts.append(desc)
+        out: Set[str] = set()
+        for part in parts:
+            out.update(_tokens(part))
+        return out
+
+    metric_candidates = []
+    try:
+        metric_candidates = list(get_metric_candidates(base_table, intent_terms=question) or [])
+    except Exception:
+        metric_candidates = []
+    if not metric_candidates:
+        try:
+            fallback_metric = infer_best_aggregate_column(base_table, question)
+        except Exception:
+            fallback_metric = None
+        if fallback_metric:
+            metric_candidates = [fallback_metric]
+
+    filtered_metrics: List[str] = []
+    for metric_col in metric_candidates:
+        try:
+            sem = get_column_semantics(base_table, metric_col) or {}
+        except Exception:
+            sem = {}
+        if sem.get("is_identifier", False):
+            continue
+        if not sem.get("is_numeric", False):
+            continue
+        filtered_metrics.append(metric_col)
+    if not filtered_metrics:
+        return sql
+
+    present_aggs: Set[str] = set()
+    existing_sum_targets: Set[str] = set()
+    count_metric_positions: List[Tuple[int, str, str]] = []
+    other_count_present = False
+    count_pat = re.compile(r"(?is)^\s*COUNT\s*\(\s*(.+?)\s*\)\s*$")
+    sum_pat = re.compile(
+        r"""(?is)^\s*SUM\s*\(\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*|`[^`]+`)\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*$"""
+    )
+    avg_pat = re.compile(r"(?is)^\s*AVG\s*\(")
+    count_like_alias_terms = (
+        {
+            tok
+            for term in HELPERS_COUNT_INTENT_TERMS
+            for tok in _tokens(term)
+        }
+        - {
+            tok
+            for term in HELPERS_METRIC_AGG_INTENT_TERMS
+            for tok in _tokens(term)
+        }
+        - set(semantic_question_token_stopwords())
+    )
+
+    for idx, item in enumerate(select_items):
+        expr, alias = _split_select_expr_alias(item)
+        expr_s = str(expr or "").strip()
+        alias_s = str(alias or _extract_alias_or_colname(expr) or "").strip("`")
+
+        m_sum = sum_pat.match(expr_s)
+        if m_sum:
+            present_aggs.add("SUM")
+            existing_sum_targets.add(str(m_sum.group(1) or "").strip("`").lower())
+        elif avg_pat.match(expr_s):
+            present_aggs.add("AVG")
+
+        m_count = count_pat.match(expr_s)
+        if not m_count or not alias_s:
+            continue
+        present_aggs.add("COUNT")
+
+        alias_tokens = _tokens(alias_s)
+        if alias_tokens.intersection(count_like_alias_terms):
+            other_count_present = True
+        count_metric_positions.append((idx, alias_s, expr_s))
+
+    if not count_metric_positions:
+        return sql
+    if "SUM" in present_aggs:
+        return sql
+    if avg_intent and "AVG" not in present_aggs:
+        return sql
+    if count_intent and "COUNT" not in present_aggs:
+        return sql
+
+    def _looks_like_pure_count_slot(alias_tokens: Set[str], metric_tokens: Set[str]) -> bool:
+        if not alias_tokens:
+            return False
+        if alias_tokens.intersection({"total", "sum"}):
+            if not count_intent:
+                return False
+        overlap_without_count = (
+            alias_tokens.intersection(metric_tokens) - count_like_alias_terms
+        )
+        if overlap_without_count:
+            return False
+        entity_overlap = alias_tokens.intersection(entity_alias_terms)
+        if count_intent and entity_overlap and not alias_tokens.intersection(metric_tokens):
+            return True
+        return bool(alias_tokens.intersection(count_like_alias_terms))
+
+    best_rewrite: Optional[Tuple[int, str, str]] = None
+    best_score = 0.0
+    for idx, alias_s, _expr_s in count_metric_positions:
+        alias_tokens = _tokens(alias_s)
+        for metric_col in filtered_metrics:
+            if metric_col.lower() in existing_sum_targets:
+                continue
+            metric_tokens = _metric_tokens(base_table, metric_col)
+            overlap = alias_tokens.intersection(metric_tokens)
+            question_overlap = q_tokens.intersection(metric_tokens)
+            if not overlap and not question_overlap:
+                continue
+            if _looks_like_pure_count_slot(alias_tokens, metric_tokens):
+                continue
+            score = float(len(overlap)) + (0.5 * float(len(question_overlap)))
+            if alias_tokens.intersection({"total", "sum"}):
+                score += 1.0
+            if count_intent and other_count_present:
+                score += 0.5
+            sem = {}
+            try:
+                sem = get_column_semantics(base_table, metric_col) or {}
+            except Exception:
+                sem = {}
+            role_tags = {str(t or "").strip().lower() for t in (sem.get("role_tags") or sem.get("tags_role") or []) if str(t or "").strip()}
+            if role_tags.intersection({"metric", "measure", "amount", "quantity", "price", "monetary"}):
+                score += 0.25
+            if score > best_score:
+                best_score = score
+                best_rewrite = (idx, alias_s, metric_col)
+
+    if not best_rewrite:
+        return sql
+
+    target_idx, target_alias, metric_col = best_rewrite
+    metric_expr = f"{metric_qualifier}.{metric_col}" if metric_qualifier else metric_col
+    rebuilt_items = list(select_items)
+    rebuilt_items[target_idx] = f"SUM({metric_expr}) AS {target_alias}"
+
+    out_lines = [
+        "SELECT " + ", ".join(str(item or "").strip() for item in rebuilt_items if str(item or "").strip()),
+        "FROM " + from_core,
+    ]
+    if (parsed.get("where") or "").strip():
+        out_lines.append(str(parsed["where"]).strip())
+    out_lines.append("GROUP BY " + str(parsed.get("groupby") or "").strip())
     if (parsed.get("having") or "").strip():
         out_lines.append(str(parsed["having"]).strip())
     if (parsed.get("tail") or "").strip():
@@ -26612,6 +26935,7 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
 
     q_low = (question or "").lower()
     include_zero_intent = _question_wants_include_zero(question, ctx)
+    from_expr = sel.args.get("from") or sel.args.get("from_")
 
     def norm_name(e: exp.Expression) -> str:
         try:
@@ -26619,21 +26943,170 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
         except Exception:
             return ""
 
+    alias_to_table = _parse_from_join_aliases(sql)
+    base_table_l = ""
+    base_table_cols: Set[str] = set()
+    schema_analyzer = None
+    schema_id_col = ""
+    if from_expr is not None and not sel.args.get("joins"):
+        outer_tables = [t for t in from_expr.find_all(exp.Table) if isinstance(t, exp.Table)]
+        if len(outer_tables) == 1:
+            try:
+                schema_analyzer = get_schema_analyzer()
+            except Exception:
+                schema_analyzer = None
+            raw_table = str(outer_tables[0].name or "").strip()
+            base_table_l = raw_table.lower()
+            if schema_analyzer is not None and base_table_l:
+                try:
+                    base_table_cols = {
+                        str(col or "").strip().lower()
+                        for col in (schema_analyzer.get_table_columns(base_table_l) or [])
+                        if str(col or "").strip()
+                    }
+                except Exception:
+                    base_table_cols = set()
+            try:
+                schema_id_col = str(get_id_column(base_table_l) or "").strip().lower()
+            except Exception:
+                schema_id_col = ""
+
+    def _expr_binding(e: exp.Expression) -> Tuple[str, str]:
+        if not isinstance(e, exp.Column):
+            return "", ""
+        col_l = str(e.name or "").strip().lower()
+        if not col_l:
+            return "", ""
+        table_ref = str(e.table or "").strip()
+        if table_ref:
+            table_l = str(
+                alias_to_table.get(table_ref)
+                or alias_to_table.get(table_ref.lower())
+                or table_ref
+            ).strip().lower()
+        else:
+            table_l = base_table_l
+        return table_l, col_l
+
+    def _expr_is_schema_valid(e: exp.Expression) -> bool:
+        if not base_table_l or not base_table_cols:
+            return True
+        table_l, col_l = _expr_binding(e)
+        if not table_l or not col_l:
+            return False
+        return table_l == base_table_l and col_l in base_table_cols
+
+    def _expr_semantic_tokens(e: exp.Expression) -> Set[str]:
+        tokens = set(re.findall(r"[a-z0-9]+", norm_name(e)))
+        table_l, col_l = _expr_binding(e)
+        if table_l and col_l:
+            try:
+                sem = get_column_semantics(table_l, col_l) or {}
+            except Exception:
+                sem = {}
+            for part in [col_l, *(sem.get("alias_tags") or []), *(sem.get("role_tags") or []), sem.get("primary_role") or "", sem.get("semantic_type") or ""]:
+                tokens.update(re.findall(r"[a-z0-9]+", str(part or "").replace("_", " ").lower()))
+            try:
+                tokens.update(
+                    tok
+                    for syn in (get_column_synonyms(table_l, col_l) or [])
+                    for tok in re.findall(r"[a-z0-9]+", str(syn or "").replace("_", " ").lower())
+                )
+            except Exception:
+                pass
+        return {tok for tok in tokens if tok}
+
+    def _expr_is_date_like(e: exp.Expression) -> bool:
+        text = norm_name(e)
+        if any(tok in text for tok in ("date", "time", "timestamp", "year", "month", "day")):
+            return True
+        table_l, col_l = _expr_binding(e)
+        if not table_l or not col_l:
+            return False
+        try:
+            sem = get_column_semantics(table_l, col_l) or {}
+        except Exception:
+            sem = {}
+        role_terms = {
+            str(sem.get("primary_role") or "").strip().lower(),
+            str(sem.get("semantic_type") or "").strip().lower(),
+            *[
+                str(tag or "").strip().lower()
+                for tag in (sem.get("role_tags") or [])
+                if str(tag or "").strip()
+            ],
+        }
+        if role_terms.intersection({"date", "datetime", "timestamp", "time", "temporal"}):
+            return True
+        try:
+            dtype = str(get_column_datatype(table_l, col_l) or "").strip().lower()
+        except Exception:
+            dtype = ""
+        return dtype in {"date", "datetime", "timestamp", "time", "year"}
+
+    def _expr_is_numeric_metric(e: exp.Expression) -> bool:
+        table_l, col_l = _expr_binding(e)
+        if not table_l or not col_l:
+            return False
+        try:
+            sem = get_column_semantics(table_l, col_l) or {}
+        except Exception:
+            sem = {}
+        return bool(sem.get("is_numeric", False)) and not bool(sem.get("is_identifier", False))
+
+    def _expr_output_alias(e: exp.Expression, fallback: str = "value") -> str:
+        if isinstance(e, exp.Column) and e.name:
+            return str(e.name)
+        return fallback
+
     # Partition columns:
     # Prefer expressions with lexical overlap to question entities.
     q_tokens = set(re.findall(r"[a-z0-9]+", q_low))
     stop_tokens = set(HELPERS_WINNER_ROW_PARTITION_STOP_TOKENS)
     q_tokens -= stop_tokens
+    identifier_intent = bool(re.search(r"\b(?:id|identifier|number|code|key)\b", q_low, flags=re.I))
+
+    group_exprs = []
+    group_clause = sel.args.get("group")
+    if getattr(group_clause, "expressions", None):
+        group_exprs = [g for g in group_clause.expressions if isinstance(g, exp.Expression)]
+
+    valid_group_exprs: List[exp.Expression] = []
+    candidate_exprs: List[exp.Expression] = []
+    seen_candidate_norms: Set[str] = set()
+    all_candidate_inputs = group_exprs + [item.this if isinstance(item, exp.Alias) else item for item in nonagg_items]
+    for base in all_candidate_inputs:
+        if not isinstance(base, exp.Expression):
+            continue
+        if isinstance(base, (exp.Literal, exp.Star)):
+            continue
+        if base.find(exp.AggFunc):
+            continue
+        if not _expr_is_schema_valid(base):
+            continue
+        base_norm = norm_name(base)
+        if not base_norm or base_norm in seen_candidate_norms:
+            continue
+        seen_candidate_norms.add(base_norm)
+        if any(base_norm == norm_name(g) for g in group_exprs):
+            valid_group_exprs.append(base)
+        candidate_exprs.append(base)
+
+    partition_search_exprs = valid_group_exprs or candidate_exprs
 
     partition_exprs = []
     partition_candidates: List[Tuple[int, exp.Expression]] = []
-    for item in nonagg_items:
-        base = item.this if isinstance(item, exp.Alias) else item
+    for base in partition_search_exprs:
         s = norm_name(base)
-        expr_tokens = set(re.findall(r"[a-z0-9]+", s)) - stop_tokens
+        expr_tokens = _expr_semantic_tokens(base) - stop_tokens
         if expr_tokens and (expr_tokens & q_tokens):
             score = len(expr_tokens & q_tokens)
-            if any(k in s for k in ["id", "number", "code"]):
+            table_l, col_l = _expr_binding(base)
+            if schema_id_col and col_l == schema_id_col:
+                score += 4
+                if identifier_intent:
+                    score += 3
+            elif any(k in s for k in ["id", "number", "code"]):
                 score += 2
             partition_candidates.append((score, base))
 
@@ -26642,27 +27115,70 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
 
     # Fallback: id/number/code-like
     if not partition_exprs:
-        for item in nonagg_items:
-            base = item.this if isinstance(item, exp.Alias) else item
+        for base in partition_search_exprs:
             s = norm_name(base)
-            if any(k in s for k in ["id", "number", "code"]):
+            _table_l, col_l = _expr_binding(base)
+            if (schema_id_col and col_l == schema_id_col) or any(k in s for k in ["id", "number", "code"]):
                 partition_exprs.append(base)
                 break
 
+    if not partition_exprs and base_table_l and schema_id_col:
+        partition_exprs = [exp.column(schema_id_col)]
+
     # Final fallback: first non-agg expression
-    if not partition_exprs:
-        base0 = nonagg_items[0].this if isinstance(nonagg_items[0], exp.Alias) else nonagg_items[0]
+    if not partition_exprs and partition_search_exprs:
+        base0 = partition_search_exprs[0]
         partition_exprs = [base0]
 
     # Tie-breaker: prefer a date-like column among non-agg outputs (excluding partition)
     tie_exprs = []
-    for item in nonagg_items:
-        base = item.this if isinstance(item, exp.Alias) else item
-        s = norm_name(base)
+    for base in candidate_exprs:
         if base in partition_exprs:
             continue
-        if "date" in s:
+        if _expr_is_date_like(base):
             tie_exprs.append(base)
+
+    wants_metric_superlative = bool(
+        re.search(r"\b(?:largest|highest|biggest|greatest|max(?:imum)?|top|best|smallest|lowest|least|min(?:imum)?)\b", q_low, flags=re.I)
+        and metric_alt != r"$^"
+        and re.search(rf"\b{metric_alt}\b", q_low, flags=re.I)
+    )
+    if base_table_l and wants_metric_superlative and _expr_is_date_like(metric_expr):
+        metric_candidate_cols: List[str] = []
+        try:
+            metric_candidate_cols = [
+                str(col or "").strip().lower()
+                for col in (get_metric_candidates(base_table_l, intent_terms=question) or [])
+                if str(col or "").strip()
+            ]
+        except Exception:
+            metric_candidate_cols = []
+        if not metric_candidate_cols:
+            try:
+                fallback_metric = str(infer_best_aggregate_column(base_table_l, question) or "").strip().lower()
+            except Exception:
+                fallback_metric = ""
+            if fallback_metric:
+                metric_candidate_cols = [fallback_metric]
+
+        best_metric_expr: Optional[exp.Expression] = None
+        best_metric_score = -1
+        for item in nonagg_items:
+            base = item.this if isinstance(item, exp.Alias) else item
+            if not isinstance(base, exp.Expression) or not _expr_is_schema_valid(base) or not _expr_is_numeric_metric(base):
+                continue
+            _table_l, col_l = _expr_binding(base)
+            score = 0
+            if metric_candidate_cols and col_l in metric_candidate_cols:
+                score += 5
+            score += len(_expr_semantic_tokens(base) & q_tokens)
+            if score > best_metric_score:
+                best_metric_score = score
+                best_metric_expr = base
+        if best_metric_expr is not None:
+            if not any(norm_name(t) == norm_name(metric_expr) for t in tie_exprs):
+                tie_exprs.insert(0, metric_expr)
+            metric_expr = best_metric_expr
 
     # ORDER BY for window
     metric_desc = (agg_kind == "MAX")
@@ -26679,26 +27195,14 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
     )
 
     order_exprs = []
-    if wants_latest_date and tie_exprs:
+    if wants_latest_date and tie_exprs and not wants_amount_tiebreak:
         date_expr = tie_exprs[0]
         order_exprs.append(exp.Ordered(this=date_expr.copy(), desc=True))
-        if wants_amount_tiebreak:
-            order_exprs.append(exp.Ordered(this=metric_expr.copy(), desc=True))
-            # Stable deterministic tie-break when same date and amount.
-            for item in nonagg_items:
-                base = item.this if isinstance(item, exp.Alias) else item
-                s = norm_name(base)
-                if norm_name(base) in {norm_name(partition_exprs[0]), norm_name(date_expr)}:
-                    continue
-                if any(k in s for k in ["id", "number", "code"]):
-                    order_exprs.append(exp.Ordered(this=base.copy(), desc=False))
-                    break
-        else:
-            order_exprs.append(exp.Ordered(this=metric_expr.copy(), desc=metric_desc))
+        order_exprs.append(exp.Ordered(this=metric_expr.copy(), desc=metric_desc))
     else:
         order_exprs = [exp.Ordered(this=metric_expr.copy(), desc=metric_desc)]
         for te in tie_exprs[:2]:  # keep it short/conservative
-            order_exprs.append(exp.Ordered(this=te.copy(), desc=False))
+            order_exprs.append(exp.Ordered(this=te.copy(), desc=bool(wants_latest_date and _expr_is_date_like(te))))
 
     rn = exp.Window(
         this=exp.RowNumber(),
@@ -26720,6 +27224,9 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
     alias_by_norm: Dict[str, str] = {}
 
     for item in nonagg_items:
+        base_expr = item.this if isinstance(item, exp.Alias) else item
+        if not _expr_is_schema_valid(base_expr):
+            continue
         if isinstance(item, exp.Alias):
             inner_exprs.append(item.copy())
             outer_exprs.append(exp.column(item.alias, table="t"))
@@ -26737,18 +27244,36 @@ def _rewrite_winner_row_aggregate_misuse(sql: str, question: str, ctx: str = "")
             if base_norm:
                 alias_by_norm[base_norm] = name
 
+    partition_norm = norm_name(partition_exprs[0]) if partition_exprs else ""
+    if partition_norm and partition_norm not in alias_by_norm:
+        partition_alias = _expr_output_alias(partition_exprs[0], "group_key")
+        inner_exprs.append(exp.alias_(partition_exprs[0].copy(), partition_alias, quoted=False))
+        outer_exprs.append(exp.column(partition_alias, table="t"))
+        alias_by_norm[partition_norm] = partition_alias
+
     # Add metric
-    inner_exprs.append(exp.alias_(metric_expr.copy(), metric_alias, quoted=False))
-    outer_exprs.append(exp.column(metric_alias, table="t"))
     metric_norm = norm_name(metric_expr)
-    if metric_norm:
+    if metric_norm and metric_norm in alias_by_norm:
+        metric_alias = alias_by_norm[metric_norm]
+    else:
+        metric_alias = _expr_output_alias(metric_expr, metric_alias)
+        inner_exprs.append(exp.alias_(metric_expr.copy(), metric_alias, quoted=False))
+        outer_exprs.append(exp.column(metric_alias, table="t"))
         alias_by_norm[metric_norm] = metric_alias
+
+    if wants_latest_date and tie_exprs:
+        date_expr = tie_exprs[0]
+        date_norm = norm_name(date_expr)
+        if date_norm and date_norm not in alias_by_norm:
+            date_alias = _expr_output_alias(date_expr, "event_date")
+            inner_exprs.append(exp.alias_(date_expr.copy(), date_alias, quoted=False))
+            outer_exprs.append(exp.column(date_alias, table="t"))
+            alias_by_norm[date_norm] = date_alias
 
     # Add rn
     inner_exprs.append(exp.alias_(rn, "rn", quoted=False))
 
     # Rebuild inner FROM/WHERE from original query
-    from_expr = sel.args.get("from") or sel.args.get("from_")
     if not from_expr:
         return sql
     inner = exp.Select(expressions=inner_exprs)
@@ -36040,6 +36565,89 @@ def _rewrite_two_table_grouped_temporal_exclusion(sql: str, question: str, ctx: 
             if any(k in c for k in ("date", "time", "timestamp"))
         ]
 
+    def _split_expr_alias_local(item: str) -> Tuple[str, str]:
+        m = re.match(
+            r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+            (item or "").strip(),
+        )
+        if not m:
+            return (item or "").strip(), ""
+        return (m.group(1) or "").strip(), (m.group(2) or "").strip().strip("`'\"")
+
+    def _parse_simple_col_local(expr: str) -> Optional[Tuple[str, str]]:
+        m = re.match(
+            r"""(?is)^\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$""",
+            (expr or "").strip(),
+        )
+        if not m:
+            return None
+        return (m.group(1) or "").strip(), (m.group(2) or "").strip()
+
+    def _align_requested_entity_name_projection(
+        select_text: str,
+        group_text: str,
+        entity_alias: str,
+        entity_table: str,
+    ) -> Tuple[str, str]:
+        if not re.search(r"\bname\b", question or "", flags=re.I):
+            return select_text, group_text
+
+        try:
+            name_col = str(get_name_column(entity_table) or "").strip()
+        except Exception:
+            name_col = ""
+        if not name_col:
+            return select_text, group_text
+
+        name_expr = f"{entity_alias}.{name_col}"
+        select_items = _split_top_level_commas(select_text or "")
+        if not select_items:
+            return select_text, group_text
+
+        has_preferred_name = any(
+            (ref := _parse_simple_col_local(_split_expr_alias_local(item)[0]))
+            and str(ref[0] or "").lower() == entity_alias.lower()
+            and str(ref[1] or "").lower() == name_col.lower()
+            for item in select_items
+        )
+
+        updated_select_items: List[str] = []
+        preferred_name_seen = False
+        last_entity_idx = -1
+        for item in select_items:
+            expr, alias = _split_expr_alias_local(item)
+            ref = _parse_simple_col_local(expr)
+            if ref and str(ref[0] or "").lower() == entity_alias.lower():
+                last_entity_idx = len(updated_select_items)
+                if str(ref[1] or "").lower() == name_col.lower():
+                    if preferred_name_seen:
+                        continue
+                    preferred_name_seen = True
+                    updated_select_items.append(item.strip())
+                    continue
+                if alias and re.search(r"\bname\b", alias, flags=re.I):
+                    if has_preferred_name or preferred_name_seen:
+                        continue
+                    preferred_name_seen = True
+                    updated_select_items.append(name_expr)
+                    continue
+            updated_select_items.append(item.strip())
+
+        if not preferred_name_seen:
+            insert_idx = last_entity_idx + 1 if last_entity_idx >= 0 else len(updated_select_items)
+            updated_select_items.insert(insert_idx, name_expr)
+
+        group_items = [g.strip() for g in _split_top_level_commas(group_text or "") if g.strip()]
+        if not any(
+            (ref := _parse_simple_col_local(item))
+            and str(ref[0] or "").lower() == entity_alias.lower()
+            and str(ref[1] or "").lower() == name_col.lower()
+            for item in group_items
+        ):
+            group_items.append(name_expr)
+
+        return ", ".join(updated_select_items), ", ".join(group_items)
+
     fk_map_raw = {}
     try:
         fk_map_raw = get_fk_relationships() or {}
@@ -36196,6 +36804,13 @@ def _rewrite_two_table_grouped_temporal_exclusion(sql: str, question: str, ctx: 
         f"  WHERE {anti_bridge_alias}.{bridge_outer_col} = {outer_alias}.{outer_id_col}\n"
         f"    AND YEAR({anti_temporal_alias}.{temporal_col}) = {exclude_year}\n"
         ")"
+    )
+
+    select_part, groupby_part = _align_requested_entity_name_projection(
+        select_part,
+        groupby_part,
+        outer_alias,
+        outer_table,
     )
 
     tail_clause = f"\n{tail_part}" if tail_part else ""
@@ -39513,11 +40128,19 @@ def _drop_unrequested_temporal_filters(sql: str, question: str, ctx: str = "") -
 def _rewrite_missing_temporal_exclusion_from_null_filter(sql: str, question: str, ctx: str = "") -> str:
     """
     Synthesize a correlated NOT EXISTS filter for grouped exclusion questions
-    when the draft uses a temporal NULL shortcut instead of true anti-existence.
+    when the draft either:
+    - uses a temporal NULL shortcut instead of true anti-existence, or
+    - already exposes the correct entity -> bridge -> temporal join path and
+      positive temporal scope, but omits the anti-existence filter entirely.
 
     Canonical near-miss:
       WHERE YEAR(t.orderDate) = 2004
         AND YEAR(t.shippedDate) IS NULL
+
+    Or:
+      WHERE YEAR(t.orderDate) = 2004
+      GROUP BY ...
+      -- missing NOT EXISTS for the excluded year
 
     Rewritten to:
       WHERE YEAR(t.orderDate) = 2004
@@ -39715,9 +40338,6 @@ def _rewrite_missing_temporal_exclusion_from_null_filter(sql: str, question: str
             continue
         null_idx = idx
         break
-    if null_idx < 0:
-        return sql
-
     eq_pairs: List[Tuple[str, str, str, str]] = []
     for match in re.finditer(
         r"""(?is)`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?""",
@@ -39843,6 +40463,75 @@ def _rewrite_missing_temporal_exclusion_from_null_filter(sql: str, question: str
 
     anti_bridge_alias = _pick_alias("anti_src")
     anti_temporal_alias = _pick_alias("anti_dt")
+
+    def _rewrite_redundant_temporal_case_metric_select(select_text: str) -> str:
+        q_low = (question or "").lower()
+        if not re.search(r"\b(?:total|sum(?:\s+of)?|combined|aggregate(?:d)?)\b", q_low, flags=re.I):
+            return select_text
+
+        try:
+            metric_candidates = {
+                str(col or "").strip().lower()
+                for col in (get_metric_candidates(_plain_table_name(bridge_table), intent_terms=question) or [])
+                if str(col or "").strip()
+            }
+        except Exception:
+            metric_candidates = set()
+
+        def _split_expr_alias(item: str) -> Tuple[str, str]:
+            m = re.match(
+                r"""(?is)^\s*(.*?)\s+AS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+                (item or "").strip(),
+            )
+            if not m:
+                return (item or "").strip(), ""
+            return (m.group(1) or "").strip(), (m.group(2) or "").strip()
+
+        case_metric_pat = re.compile(
+            rf"""(?is)^\s*
+            (?:MAX|SUM)\s*\(\s*CASE\s+WHEN\s+
+            (?:
+                YEAR\s*\(\s*`?{re.escape(temporal_alias)}`?\s*\.\s*`?{re.escape(temporal_col)}`?\s*\)\s*=\s*{re.escape(include_year)}
+              |
+                `?{re.escape(temporal_alias)}`?\s*\.\s*`?{re.escape(temporal_col)}`?\s*=\s*['"]{re.escape(include_year)}-\d{{2}}-\d{{2}}['"]
+            )
+            \s+THEN\s+`?{re.escape(bridge_alias)}`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?
+            \s+ELSE\s+(?:0|NULL)\s+END\s*\)\s*$""",
+            flags=re.X,
+        )
+
+        rebuilt_items: List[str] = []
+        changed = False
+        for item in _split_top_level_commas(select_text or ""):
+            expr, alias = _split_expr_alias(item)
+            m_case = case_metric_pat.match(expr)
+            if not m_case:
+                rebuilt_items.append(item.strip())
+                continue
+
+            metric_col = str(m_case.group(1) or "").strip()
+            metric_ok = False
+            if metric_candidates:
+                metric_ok = metric_col.lower() in metric_candidates
+            else:
+                try:
+                    metric_ok = bool(is_numeric_column(_plain_table_name(bridge_table), metric_col))
+                except Exception:
+                    metric_ok = False
+            if not metric_ok:
+                rebuilt_items.append(item.strip())
+                continue
+
+            changed = True
+            if alias:
+                rebuilt_items.append(f"SUM({bridge_alias}.{metric_col}) AS {alias}")
+            else:
+                rebuilt_items.append(f"SUM({bridge_alias}.{metric_col})")
+
+        if not changed:
+            return select_text
+        return ", ".join(rebuilt_items)
+
     anti_not_exists = (
         "NOT EXISTS (\n"
         "  SELECT 1\n"
@@ -39854,19 +40543,28 @@ def _rewrite_missing_temporal_exclusion_from_null_filter(sql: str, question: str
         ")"
     )
 
-    remaining_conds = [
-        str(cond or "").strip()
-        for idx, cond in enumerate(conjuncts)
-        if idx != null_idx and str(cond or "").strip()
-    ]
+    remaining_conds: List[str] = []
+    seen_cond_norms: Set[str] = set()
+    for idx, cond in enumerate(conjuncts):
+        cond_s = str(cond or "").strip()
+        if not cond_s:
+            continue
+        if null_idx >= 0 and idx == null_idx:
+            continue
+        norm = re.sub(r"[\s`]+", "", cond_s.lower())
+        if norm in seen_cond_norms:
+            continue
+        seen_cond_norms.add(norm)
+        remaining_conds.append(cond_s)
     if not remaining_conds:
         return sql
     remaining_conds.append(anti_not_exists)
 
+    rebuilt_select = _rewrite_redundant_temporal_case_metric_select(str(parsed.get('select') or "").strip())
     having_clause = f"\nHAVING {str(parsed.get('having') or '').strip()}" if str(parsed.get("having") or "").strip() else ""
     tail_clause = f"\n{str(parsed.get('tail') or '').strip()}" if str(parsed.get("tail") or "").strip() else ""
     fixed = (
-        f"SELECT {str(parsed.get('select') or '').strip()}\n"
+        f"SELECT {rebuilt_select}\n"
         f"FROM {from_core}\n"
         f"WHERE {' AND '.join(remaining_conds)}\n"
         f"GROUP BY {groupby_part}"
@@ -48929,6 +49627,7 @@ def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
         s,
         flags=re.I,
     )
+    s = _canonicalize_unsafe_output_aliases(s)
     group_pos = _find_top_level_clause(s, "group by")
     if group_pos >= 0:
         group_end_candidates = [

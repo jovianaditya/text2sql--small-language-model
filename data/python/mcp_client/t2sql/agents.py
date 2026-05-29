@@ -8345,7 +8345,11 @@ def _should_use_router_scoped_draft_context(
         return False
 
     return bool(
-        (decision.get("is_explicit_rank_function", False) or decision.get("is_window_aggregate", False))
+        (
+            decision.get("is_explicit_rank_function", False)
+            or decision.get("is_window_aggregate", False)
+            or decision.get("is_ranking", False)
+        )
         and not decision.get("is_ordinal_ranking", False)
         and not decision.get("is_winner_row", False)
         and not decision.get("has_exclusion", False)

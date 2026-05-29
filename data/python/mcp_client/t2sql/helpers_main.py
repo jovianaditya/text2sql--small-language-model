@@ -120,6 +120,7 @@ from .helpers_core import (
     _rewrite_comparison_count_metrics,
     _rewrite_conditional_sum_value_to_count,
     _rewrite_conditional_avg_to_count_with_overall_avg,
+    _rewrite_grouped_total_count_to_metric_sum,
     _rewrite_conditional_null_breakdown_metrics,
     _coalesce_zero_fill_conditional_sums,
     _wrap_same_level_window_rank_filter,
@@ -9899,6 +9900,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _repair_unbalanced_select_item_parentheses(s)
         if DEBUG_WR: print("[REFINER - PH4] after select-item parenthesis fix:", s)
 
+        ast_window_semantics_sql = s
+        ast_window_semantics_meta = {"parse_ok": False, "handled_scope": False, "fixes": []}
         if ast_parseable:
             ast_window_semantics_sql, ast_window_semantics_meta = _ast_rewrite_window_semantics(s, question)
             ast_window_semantics_handled_scope = bool(
@@ -10114,6 +10117,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
 
         s = _rewrite_conditional_avg_to_count_with_overall_avg(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after conditional-avg->count+avg fix: {s}")
+
+        s = _rewrite_grouped_total_count_to_metric_sum(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after grouped total-count->sum fix: {s}")
 
         s = _rewrite_conditional_null_breakdown_metrics(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after conditional null-breakdown fix: {s}")

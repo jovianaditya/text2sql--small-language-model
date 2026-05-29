@@ -356,67 +356,6 @@ def _normalize_aliases(aliases: List[str]) -> List[str]:
     return out
 
 
-_TRAILING_NUMBER_CARDINAL_WORDS = {
-    "1": "one",
-    "2": "two",
-    "3": "three",
-    "4": "four",
-    "5": "five",
-}
-
-_TRAILING_NUMBER_ORDINAL_WORDS = {
-    "1": "first",
-    "2": "second",
-    "3": "third",
-    "4": "fourth",
-    "5": "fifth",
-}
-
-
-def _line_number_alias_variants(column: str) -> List[str]:
-    """
-    Add generic human-friendly aliases for columns like addressLine1/addressLine2
-    without hardcoding any specific table name.
-    """
-    col_text = str(column or "").strip()
-    if not col_text:
-        return []
-
-    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", col_text)
-    spaced = re.sub(r"([A-Za-z])(\d)", r"\1 \2", spaced)
-    spaced = re.sub(r"(\d)([A-Za-z])", r"\1 \2", spaced)
-    spaced = spaced.replace("_", " ")
-    tokens = [tok.lower() for tok in re.findall(r"[A-Za-z0-9]+", spaced)]
-    if len(tokens) < 2:
-        return []
-
-    trailing_num = tokens[-1]
-    if trailing_num not in _TRAILING_NUMBER_CARDINAL_WORDS:
-        return []
-
-    body_tokens = tokens[:-1]
-    if "line" not in body_tokens:
-        return []
-
-    body_phrase = " ".join(body_tokens).strip()
-    if not body_phrase:
-        return []
-
-    variants = [f"{body_phrase} {trailing_num}"]
-
-    cardinal = _TRAILING_NUMBER_CARDINAL_WORDS.get(trailing_num, "")
-    if cardinal:
-        variants.append(f"{body_phrase} {cardinal}")
-
-    ordinal = _TRAILING_NUMBER_ORDINAL_WORDS.get(trailing_num, "")
-    prefix_tokens = [tok for tok in body_tokens if tok != "line"]
-    prefix_phrase = " ".join(prefix_tokens).strip()
-    if ordinal and prefix_phrase:
-        variants.append(f"{ordinal} {prefix_phrase} line")
-
-    return _normalize_aliases(variants)
-
-
 def _primary_role_bucket(role: str) -> str:
     return PRIMARY_ROLE_CANONICAL.get(str(role or "").strip().lower(), "")
 
@@ -514,9 +453,7 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     col = raw_row.get("column")
     desc = str(raw_row.get("description") or "")
     desc_clean = re.sub(r"\s+", " ", desc).strip().rstrip(" .")
-    aliases = _normalize_aliases(
-        list(raw_row.get("tags_alias", []) or []) + _line_number_alias_variants(col)
-    )
+    aliases = _normalize_aliases(raw_row.get("tags_alias", []))
     roles = raw_row.get("tags_role", [])
     normalized_roles = _normalize_roles(roles)
     fk_target = _extract_fk_target(desc_clean)
@@ -536,11 +473,6 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
     ):
         sample_sentence = f"Example value: {sample_raw}."
 
-    role_tags_sentence = ""
-    visible_role_tags = [role for role in normalized_roles if role and role != primary_role]
-    if visible_role_tags:
-        role_tags_sentence = f"Role tags: {', '.join(visible_role_tags)}."
-
     # 4. Context Injection (Table Description)
     # Jika DataHub punya deskripsi tabel, masukkan ke embedding kolom
     table_part = f"Table: {tbl}."
@@ -552,15 +484,14 @@ def transform_to_dense_schema(raw_row: Dict[str, Any], table_desc: str = "") -> 
             table_part = f"Table: {tbl} (Context: {clean_tbl_desc})."
 
     # 5. Build Embedding Sentence
+    alias_phrases = [f"{alias}." for alias in aliases if str(alias or "").strip()]
     text_parts = [
         table_part,
         f"Column: {col}.",
-        f"Description: {desc_clean}." if desc_clean else "",
-        f"Role: {primary_role}." if primary_role else "",
-        role_tags_sentence,
+        f"{desc_clean}." if desc_clean else "",
         f"FK to {fk_target}." if (fk_target and not _has_fk_literal(desc_clean, fk_target)) else "",
-        f"Synonyms: {', '.join(aliases)}." if aliases else "",
-        sample_sentence
+        *alias_phrases,
+        sample_sentence,
     ]
     full_text = " ".join([p for p in text_parts if p]).strip()
 
