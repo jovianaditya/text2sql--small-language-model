@@ -160,33 +160,13 @@ class SchemaAnalyzer:
         tags_alias = self._normalize_string_list(metadata.get("tags_alias"))
         primary_role = str(metadata.get("primary_role", "") or "").strip().lower()
 
-        # Structured alias tags are primary. Parsing free-text "Synonyms:" is a
-        # compatibility fallback for older metadata exports that do not yet
-        # carry explicit alias tags.
         text = data.get("text", "")
-        parsed_synonyms: List[str] = []
-        synonyms_match = re.search(r'Synonyms:\s*(.+?)\.', text)
-        if synonyms_match:
-            synonyms_str = synonyms_match.group(1).strip()
-            parsed_synonyms = [s.strip().lower() for s in synonyms_str.split(",") if str(s or "").strip()]
         self._column_alias_tags[table.lower()][column.lower()] = tags_alias
-        self._column_synonyms[f"{table.lower()}.{column.lower()}"] = self._merge_unique_strings(
-            tags_alias,
-            parsed_synonyms,
-        )
+        self._column_synonyms[f"{table.lower()}.{column.lower()}"] = self._merge_unique_strings(tags_alias)
 
-        # Extract FK info.
-        # Dense JSONL entries often store FK cues in `text` while sparse entries
-        # use `metadata.description`, so parse both sources.
+        # Extract FK info from structured description and dense text.
         description = metadata.get("description", "")
-        description_from_text = self._next_field_after(text, "Description:")
         merged_description = str(description or "").strip()
-        if description_from_text:
-            if merged_description:
-                if description_from_text.lower() not in merged_description.lower():
-                    merged_description = f"{merged_description}. {description_from_text}".strip(" .")
-            else:
-                merged_description = str(description_from_text).strip()
         self._column_descriptions[table.lower()][column.lower()] = merged_description
 
         fk_source = f"{description} {text}"
@@ -211,10 +191,7 @@ class SchemaAnalyzer:
             fk_match or re.search(r"\bforeign\s+key\b", combined_key_text)
         )
 
-        # Structured primary_role / tags_role are primary. Parsing free-text
-        # "Role:" remains a compatibility fallback for older metadata exports.
-        parsed_role = str(self._next_field_after(text, "Role:") or "").strip().lower()
-        effective_role = primary_role or (tags_role[0] if tags_role else "") or parsed_role
+        effective_role = primary_role or (tags_role[0] if tags_role else "")
         if effective_role:
             self._column_roles[table.lower()][column.lower()] = effective_role
             self._column_primary_roles[table.lower()][column.lower()] = effective_role
@@ -401,56 +378,6 @@ class SchemaAnalyzer:
                 + preview_text,
                 RuntimeWarning,
             )
-
-    def _next_field_after(self, text: str, field: str) -> Optional[str]:
-        """Extract the value of a field after a given marker."""
-        src = str(text or "")
-        if not src or not field:
-            return None
-
-        lowered = src.lower()
-        marker = field.lower()
-        start = lowered.find(marker)
-        if start < 0:
-            return None
-
-        value_start = start + len(field)
-        tail = src[value_start:].lstrip()
-        if not tail:
-            return None
-
-        # Dense metadata uses labeled sections such as:
-        # Table: ... Column: ... Description: ... Synonyms: ... Example value: ...
-        # Stop at the next known field marker instead of the first period so
-        # abbreviations like "e.g." do not truncate the description.
-        next_markers = [
-            "Table:",
-            "Column:",
-            "Description:",
-            "Role:",
-            "Synonyms:",
-            "Example value:",
-            "Context:",
-        ]
-        end = len(tail)
-        tail_lower = tail.lower()
-        for candidate in next_markers:
-            candidate_lower = candidate.lower()
-            if candidate_lower == marker:
-                continue
-            idx = tail_lower.find(candidate_lower)
-            if idx >= 0 and idx < end:
-                end = idx
-
-        value = tail[:end].strip()
-        if not value:
-            return None
-
-        if field.strip().lower() == "role:":
-            value = re.split(r"\.(?:\s|$)", value, maxsplit=1)[0].strip()
-
-        return value.strip(" .")
-        
 
     def _infer_table_types(self):
         """
@@ -671,9 +598,6 @@ class SchemaAnalyzer:
     def get_column_description(self, table: str, column: str) -> str:
         """
         Get description text for a specific column from metadata.
-
-        Returns merged metadata.description and parsed "Description:" text
-        when available.
         """
         t = (table or "").lower().strip()
         c = (column or "").lower().strip()
