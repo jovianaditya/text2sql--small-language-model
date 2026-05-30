@@ -266,7 +266,12 @@ def _column_structured_metadata(table: str, column: str, metadata: Optional[Dict
         or []
     )
 
-    primary_role = ""
+    raw_primary_role = str(
+        nested_meta.get("primary_role")
+        or md.get("primary_role")
+        or ""
+    ).strip().lower()
+    primary_role = raw_primary_role
     role_tags: List[str] = []
     alias_tags: List[str] = []
     stats = _normalize_stats_dict(nested_meta.get("stats") or md.get("stats"))
@@ -285,9 +290,11 @@ def _column_structured_metadata(table: str, column: str, metadata: Optional[Dict
 
     if table_l and col_s:
         try:
-            primary_role = str(get_column_primary_role(table_l, col_s) or "").strip().lower()
+            schema_primary_role = str(get_column_primary_role(table_l, col_s) or "").strip().lower()
         except Exception:
-            primary_role = ""
+            schema_primary_role = ""
+        if schema_primary_role:
+            primary_role = schema_primary_role
         try:
             role_tags = _parse_str_or_list_lower(get_column_role_tags(table_l, col_s) or [])
         except Exception:
@@ -932,35 +939,8 @@ def _build_cards(
         if col_meta.get("description"):
             desc = str(col_meta.get("description") or "").strip()
 
-        # 2. PRIORITY 2: Parsing Teks Dokumen (Hasil Dense JSONL Anda)
-        # JSONL Dense Anda formatnya: "Table: ... Description: <ISI>.. Primary Key..."
-        if not desc:
-            # Di retrieve_node, teks dokumen disimpan di key "doc" atau "text"
-            doc_text = it.get("doc") or it.get("text") or it.get("document") or ""
-            
-            if RETRIEVAL_DOC_DESCRIPTION_MARKER in doc_text:
-                try:
-                    # Ambil teks setelah marker description.
-                    start = doc_text.find(RETRIEVAL_DOC_DESCRIPTION_MARKER) + len(RETRIEVAL_DOC_DESCRIPTION_MARKER)
-                    
-                    # Cari batas akhir. Di data Dense Anda, batasnya adalah ".. " (titik dua kali)
-                    end = doc_text.find(RETRIEVAL_DOC_DESC_END_MARKER, start)
-                    
-                    # Backup boundaries jika ".. " tidak ketemu
-                    if end == -1: end = doc_text.find(RETRIEVAL_DOC_SYNONYMS_MARKER, start)
-                    if end == -1: end = doc_text.find(RETRIEVAL_DOC_PRIMARY_KEY_MARKER, start)
-                    
-                    # Jika ketemu batas, potong stringnya
-                    if end != -1:
-                        desc = doc_text[start:end].strip()
-                    else:
-                        # Fallback truncation length is configurable.
-                        desc = doc_text[start:start + RETRIEVAL_DENSE_DESC_FALLBACK_LEN].strip()
-                except:
-                    pass
-
-        # 3. PRIORITY 3: Fallback Regex (Manusiakan Nama Kolom)
-        # Jaga-jaga jika Priority 1 & 2 gagal total
+        # 2. PRIORITY 2: Fallback Regex (Manusiakan Nama Kolom)
+        # Jaga-jaga jika deskripsi terstruktur tidak tersedia
         if not desc:
             # "productCode" -> "product Code" -> "product code"
             s1 = re.sub(RETRIEVAL_DESC_CAMEL_SPLIT_PATTERN_1, r'\1 \2', column)
