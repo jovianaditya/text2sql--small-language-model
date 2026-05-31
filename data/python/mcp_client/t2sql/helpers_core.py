@@ -41813,18 +41813,6 @@ def _question_requires_structural_regex(question: str) -> bool:
     return any(re.search(pat, q, flags=re.I) for pat in structural_patterns)
 
 
-def _question_requires_two_word_space_pattern(question: str) -> bool:
-    q = (question or "").lower()
-    patterns = [
-        r"\bconsists?\s+of\s+(?:exactly\s+)?two\s+words?\b",
-        r"\bmade\s+up\s+of\s+(?:exactly\s+)?two\s+words?\b",
-        r"\bhas\s+(?:exactly\s+)?two\s+words?\b",
-        r"\bexactly\s+two\s+words?\b",
-        r"\btwo\s+words?\b(?:\s+separated\s+by\s+(?:a\s+)?space)?",
-    ]
-    return any(re.search(pat, q, flags=re.I) for pat in patterns)
-
-
 def _extract_structural_word_count(question: str) -> Optional[int]:
     q = (question or "").lower()
     word_to_num = {
@@ -41938,53 +41926,6 @@ def _question_requires_regex(question: str) -> bool:
         return True
 
     return False
-
-def _should_prefer_like_over_regexp(question: str) -> bool:
-    q = (question or "").lower()
-
-    # kalau boundary atau strict structure → jangan rewrite
-    if _question_requires_word_boundary_regex(question):
-        return False
-    if _question_requires_regex(question):
-        return False
-
-    # prefix/suffix/contains sederhana → LIKE ok
-    simple_signals = [
-        "starts with", "start with", "begins with", "begin with", "diawali", "awalan", "prefix",
-        "ends with", "end with", "diakhiri", "suffix",
-        "contains", "contain", "mengandung",
-    ]
-    return any(s in q for s in simple_signals)
-
-def _rewrite_simple_regexp_to_like(sql: str, question: str) -> str:
-    """
-    Jika pertanyaan hanya butuh LIKE, tapi LLM menghasilkan:
-      col REGEXP '^X'  -> col LIKE 'X%'
-      col REGEXP 'X$'  -> col LIKE '%X'
-    Hanya rewrite untuk pattern sederhana tanpa metachar kompleks.
-    """
-    if not sql or not _should_prefer_like_over_regexp(question):
-        return sql
-
-    # REGEXP '^196' di atas: replace("REGEXP","LIKE") belum terjadi karena r"\1" literal.
-    # Jadi kita lakukan rewrite yang lebih eksplisit agar tidak ambigu:
-    sql = re.sub(
-        r"(\bWHERE\b.*?\b)((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)\s+REGEXP\s+'\^([A-Za-z0-9 _-]+)'",
-        r"\1\2 LIKE '\3%",
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    # REGEXP '196$' => LIKE '%196'
-    sql = re.sub(
-        r"(\bWHERE\b.*?\b)((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)\s+REGEXP\s+'([A-Za-z0-9 _-]+)\$'",
-        r"\1\2 LIKE '%\3'",
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    return sql
-
 
 def _canonicalize_structural_regex(sql: str, question: str) -> str:
     """

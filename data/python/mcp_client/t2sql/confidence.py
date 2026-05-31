@@ -468,68 +468,6 @@ def _validate_aggregate_columns(sql: str) -> List[str]:
                 warnings.append(f"{agg_func}({col}) may use non-numeric column")
     
     return warnings
-
-
-def _validate_order_columns(sql: str) -> List[str]:
-    """
-    Validate that columns used in ORDER BY are orderable (numeric or date).
-    
-    Returns:
-        List of warning messages for non-orderable ORDER BY columns
-    """
-    warnings: List[str] = []
-    
-    # Extract ORDER BY clause
-    order_match = re.search(r'ORDER\s+BY\s+(.+?)(?:LIMIT|$)', sql, re.IGNORECASE | re.DOTALL)
-    if not order_match:
-        return warnings
-    
-    order_clause = order_match.group(1).strip()
-    
-    # Get all known tables
-    all_tables = {t.lower() for t in get_all_tables()}
-    
-    # Extract column references (skip ASC, DESC, numbers, expressions)
-    col_pattern = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\b')
-    
-    for match in col_pattern.finditer(order_clause):
-        col_ref = match.group(1)
-        if col_ref.upper() in ('ASC', 'DESC', 'NULLS', 'FIRST', 'LAST'):
-            continue
-        
-        # Parse table.column or just column
-        if '.' in col_ref:
-            table_or_alias, col = col_ref.split('.', 1)
-            table_or_alias = table_or_alias.lower()
-            col = col.lower()
-        else:
-            table_or_alias = None
-            col = col_ref.lower()
-        
-        # Try to find the table
-        table = None
-        if table_or_alias and table_or_alias in all_tables:
-            table = table_or_alias
-        elif not table_or_alias:
-            # Try to find the table from FROM clause
-            from_match = re.search(r'\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)', sql, re.IGNORECASE)
-            if from_match:
-                t = from_match.group(1).lower()
-                if t in all_tables:
-                    table = t
-        
-        # Validate if we found the table
-        if table:
-            if not is_numeric_column(table, col) and not is_date_column(table, col):
-                # Only warn if column looks like it should be orderable
-                name_like = col.endswith('name') or col.endswith('code')
-                if not name_like:
-                    # This column might not be ideal for ORDER BY, but not always a problem
-                    pass  # Don't warn - could be intentional
-
-    return warnings
-
-
 def _check_structure_plausible(sql: str, question: str) -> Tuple[float, List[str]]:
     """
     Check if SQL structure matches question intent (schema-agnostic).

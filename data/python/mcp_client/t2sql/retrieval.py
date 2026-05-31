@@ -51,16 +51,11 @@ from .config import (
     RETRIEVAL_STATS_KEY_DISTINCT_COUNT,
     RETRIEVAL_META_DESCRIPTION_KEY,
     RETRIEVAL_META_KEYWORDS_KEY,
-    RETRIEVAL_DOC_DESCRIPTION_MARKER,
-    RETRIEVAL_DOC_DESC_END_MARKER,
-    RETRIEVAL_DOC_SYNONYMS_MARKER,
-    RETRIEVAL_DOC_PRIMARY_KEY_MARKER,
     RETRIEVAL_DESC_KEYWORD_HEAD_WORDS,
     RETRIEVAL_CARDS_MAX_DOCS,
     RETRIEVAL_CARDS_MAX_INJECT,
     RETRIEVAL_CARDS_DESC_MAX_LEN,
     RETRIEVAL_CARDS_DEBUG_PREVIEW_COUNT,
-    RETRIEVAL_DENSE_DESC_FALLBACK_LEN,
     RETRIEVAL_SPARSE_DEBUG_PREVIEW_LIMIT,
     RETRIEVAL_RETRIEVE_DEBUG_MAX_SHOW,
     RETRIEVAL_AUTO_INJECT_BONUS_DELTA,
@@ -1768,39 +1763,6 @@ def _augment_allowed_with_fk_path_columns(
                     allowed[right].append(fk_name)
 
 
-def _infer_bridge_tables(
-    selected_tables: set,
-    allowed: Dict[str, List[str]],
-    reranked: List[Dict[str, Any]],
-) -> set:
-    """
-    Infer bridge tables needed to connect selected tables.
-
-    Uses FK information from column metadata to detect bridge tables.
-    For example:
-    - customers + orderdetails → need orders (bridge table)
-    - orders + products → need orderdetails (bridge table)
-
-    Args:
-        selected_tables: Set of lowercase table names already selected
-        allowed: Dict mapping table names to their allowed columns
-        reranked: List of reranked column results with metadata
-
-    Returns:
-        Set of lowercase bridge table names to add
-    """
-    if len(selected_tables) < 2:
-        return set()
-    bridge_tables = set()
-    selected_lower = {t.lower() for t in selected_tables}
-    paths, _fk_graph = _infer_bridge_paths(selected_tables, allowed, reranked)
-    for path in paths:
-        for bridge in path[1:-1]:
-            if bridge not in selected_lower:
-                bridge_tables.add(bridge)
-
-    return bridge_tables
-
 def _find_fk_path(
     start: str,
     end: str,
@@ -1946,26 +1908,6 @@ def _detect_primary_entity_table(question: str) -> Optional[str]:
         if _text_mentions_table(q, table, include_synonyms=False):
             return table
     return None
-
-
-def _is_table_mentioned(question: str, table: str) -> bool:
-    """
-    Check if a table is mentioned in the question using schema metadata.
-
-    Dynamic replacement for hardcoded mention checks like:
-    - mentions_customer = any(k in q for k in ["customer", "customers", "pelanggan"])
-    - mentions_product = any(k in q for k in ["product", "products", "produk"])
-
-    Args:
-        question: User question text
-        table: Table name to check (lowercase)
-
-    Returns:
-        True if table is mentioned, False otherwise
-    """
-    if not question or not table:
-        return False
-    return _text_mentions_table(question.lower(), table, include_synonyms=False)
 
 
 def _should_lock_single_table_ctx(question: str, qtype: str) -> bool:

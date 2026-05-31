@@ -1210,13 +1210,6 @@ def _column_role_signal_set(table: str, column: str) -> Set[str]:
     return {s for s in signals if s}
 
 
-def _column_has_role_signal(table: str, column: str, *signals: str) -> bool:
-    signal_set = _column_role_signal_set(table, column)
-    if not signal_set:
-        return False
-    return any(str(signal or "").strip().lower() in signal_set for signal in signals)
-
-
 def _stats_support_numeric(table: str, column: str) -> bool:
     stats = get_column_stats(table, column)
     if not stats:

@@ -912,34 +912,6 @@ def _regex_alt_from_terms(terms: Set[str]) -> str:
             continue
         pieces.append(re.escape(term).replace(r"\ ", r"\s+"))
     return "|".join(dict.fromkeys(pieces))
-
-
-def _schema_entity_head_tokens() -> Set[str]:
-    global _SCHEMA_ENTITY_HEAD_TOKEN_CACHE
-    if _SCHEMA_ENTITY_HEAD_TOKEN_CACHE is not None:
-        return set(_SCHEMA_ENTITY_HEAD_TOKEN_CACHE)
-
-    tokens: Set[str] = set()
-    try:
-        tables = list(get_all_tables() or [])
-    except Exception:
-        tables = []
-
-    for table in tables:
-        table_l = str(table or "").strip().lower()
-        if not table_l:
-            continue
-        candidates = {table_l, _safe_get_singular_form(table_l)}
-        candidates.update(_safe_get_table_synonyms(table_l))
-        for candidate in candidates:
-            head_tokens = _tokenize_for_match(_camel_to_words(str(candidate or "")), stop_tokens=_FUNCTION_WORD_TOKENS)
-            if head_tokens and len(head_tokens[0]) >= 3:
-                tokens.add(head_tokens[0])
-
-    _SCHEMA_ENTITY_HEAD_TOKEN_CACHE = tokens
-    return set(tokens)
-
-
 def _schema_groupable_terms() -> Set[str]:
     global _SCHEMA_GROUPABLE_TERM_CACHE
     if _SCHEMA_GROUPABLE_TERM_CACHE is not None:
@@ -1598,16 +1570,6 @@ def _prefer_numeric_column_from_question(
 def _table_entity_pattern(table: str) -> str:
     alts = sorted((_table_variants(table) or {table}), key=len, reverse=True)
     return "|".join(re.escape(a).replace(r"\ ", r"\s+") for a in alts if a)
-
-
-def _question_mentions_entity(question: str, table: str) -> bool:
-    q = (question or "").lower()
-    if not q:
-        return False
-    pat = _table_entity_pattern(table)
-    if not pat:
-        return False
-    return bool(re.search(rf"\b(?:{pat})\b", q, flags=re.I))
 
 
 def _wants_distinct_projection(question: str) -> bool:

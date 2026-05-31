@@ -917,19 +917,6 @@ def _get_qtype(state: "RAGState") -> str:
     state["qtype"] = qtype
     return qtype
 
-def _get_requires_regex(state: "RAGState") -> bool:
-    q = state.get("question", "") or ""
-    cached_q = state.get("_requires_regex_q")
-
-    # cache valid hanya jika question sama dan value bool
-    if cached_q == q and isinstance(state.get("requires_regex"), bool):
-        return state["requires_regex"]
-
-    needs = _question_requires_regex(q)
-    state["requires_regex"] = needs
-    state["_requires_regex_q"] = q
-    return needs
-
 def _regex_requirement_ok(
     sql: str,
     requires_regex: bool,
@@ -1810,90 +1797,6 @@ def _question_has_direct_entity_existence_signal(question: str, table: str) -> b
 
     inflected_mentions = _iter_inflected_entity_mentions(q_sem, table)
     return any(not is_negated for _, is_negated in inflected_mentions)
-
-
-def _is_simple_single_table_lookup(question: str, table: str) -> bool:
-    """
-    Generic non-aggregate lookup detector for a single subject table.
-    """
-    q = (question or "").lower()
-    t = (table or "").strip().lower()
-    if not q or not t:
-        return False
-
-    if not _table_mentioned(q, t, include_synonyms=True):
-        return False
-
-    aggregate_terms = ["total", "sum", "avg", "average", "mean", "count", "berapa banyak", "how many"]
-    if any(term in q for term in aggregate_terms):
-        return False
-
-    return True
-
-
-def _related_tables_for(table: str) -> Set[str]:
-    t = (table or "").strip().lower()
-    if not t:
-        return set()
-
-    related: Set[str] = set()
-    try:
-        fk_map = get_fk_relationships() or {}
-    except Exception:
-        fk_map = {}
-
-    for src_table, src_targets in fk_map.items():
-        src = (src_table or "").strip().lower()
-        if not src:
-            continue
-        for target_table in (src_targets or {}).values():
-            tgt = (target_table or "").strip().lower()
-            if not tgt:
-                continue
-            if src == t and tgt != t:
-                related.add(tgt)
-            if tgt == t and src != t:
-                related.add(src)
-
-    return related
-
-
-def _is_simple_table_identifier_lookup(question: str, table: str) -> bool:
-    """
-    Generic identifier-list lookup detector for a single table.
-    """
-    q = (question or "").lower()
-    t = (table or "").strip().lower()
-    if not _is_simple_single_table_lookup(question, t):
-        return False
-
-    id_col = get_id_column(t)
-    id_col_lower = (id_col or "").lower()
-    id_col_spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", id_col or "").replace("_", " ").lower()
-    entity_candidates = _table_mention_candidates(t, include_synonyms=True)
-    entity_alt = "|".join(
-        sorted((re.escape(c).replace(r"\ ", r"\s+") for c in entity_candidates), key=len, reverse=True)
-    )
-    mentions_identifier = bool(
-        (id_col_lower and re.search(rf"\b{re.escape(id_col_lower)}\b", q))
-        or (id_col_spaced and id_col_spaced in q)
-        or (
-            entity_alt
-            and re.search(
-                rf"\b(?:{entity_alt})\b(?:[\s,;:()'\"-]+\w+){{0,2}}[\s,;:()'\"-]+(?:id|ids|number|numbers|code|codes|nomor|kode|no)\b",
-                q,
-                flags=re.I,
-            )
-        )
-    )
-    if not mentions_identifier:
-        return False
-
-    for related_table in _related_tables_for(t):
-        if _table_mentioned(q, related_table, include_synonyms=True):
-            return False
-
-    return True
 
 
 # ======================================================================

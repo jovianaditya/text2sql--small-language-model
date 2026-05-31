@@ -14,13 +14,11 @@
 # ======================================================================
 from __future__ import annotations
 import re
-import hashlib
 import glob
 import json
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
-from collections import defaultdict
 from tabulate import tabulate
 # ======================================================================
 # ======================== LOCAL MODULE IMPORT =========================
@@ -149,15 +147,6 @@ def _parse_str_or_list_lower(x: Any) -> List[str]:
     else:
         return [str(x).lower()]
 
-def _extract_roles_aliases(md: Dict[str, Any]) -> tuple[List[str], List[str]]:
-    """
-    Helper untuk ambil roles & aliases dalam bentuk list lowercase.
-    Dipakai supaya nggak duplikasi pola get(tags_role/roles) & get(tags_alias/aliases).
-    """
-    roles = _parse_str_or_list_lower(md.get("tags_role") or md.get("roles") or [])
-    aliases = _parse_str_or_list_lower(md.get("tags_alias") or md.get("aliases") or [])
-    return roles, aliases
-
 def _extract_aliases_for_map(md: Dict[str, Any]) -> List[str]:
     """
     Ambil aliases dari metadata (aliases/tags_alias/synonyms),
@@ -173,88 +162,6 @@ def _extract_aliases_for_map(md: Dict[str, Any]) -> List[str]:
 VOLATILE_KEYS = {
     "_source", "updated_at", "lastModified", "timestamp", "ts"
 }
-
-def _norm_str(s: Any) -> str:
-    s = "" if s is None else str(s)
-    # rapikan whitespace tanpa mengubah isi
-    s = "\n".join(re.sub(r"[ \t]{2,}", " ", line.rstrip()) for line in s.splitlines())
-    return s.strip()
-
-def _norm_list(x: Any) -> List[str]:
-    # list stabil: json->list bila string JSON, trim, dedup casefold, lalu sort
-    if isinstance(x, str):
-        try:
-            j = json.loads(x)
-            x = j if isinstance(j, list) else [x]
-        except Exception:
-            x = [x]
-    elif not isinstance(x, list):
-        x = [x]
-    cleaned, seen = [], set()
-    for v in x:
-        s = _norm_str(v)
-        k = s.casefold()
-        if s and k not in seen:
-            seen.add(k)
-            cleaned.append(s)
-    return sorted(cleaned, key=str.casefold)
-
-def _stable_json(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-def _coerce_json_like(v: Any) -> Any:
-    if isinstance(v, str):
-        s = v.strip()
-        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-            try:
-                v = json.loads(s)
-            except Exception:
-                return v
-        else:
-            return v
-    if isinstance(v, list):
-        return _norm_list(v)
-    return v
-
-def _sanitize_for_compare(meta: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in (meta or {}).items():
-        if k in VOLATILE_KEYS or k == "_canon_hash":
-            continue
-        vv = _coerce_json_like(v)
-        out[k] = vv
-    return out
-
-def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in (meta or {}).items():
-        if k in VOLATILE_KEYS:
-            continue
-        if isinstance(v, (str, int, float, bool)) or v is None:
-            out[k] = _norm_str(v) if isinstance(v, str) else v
-        elif isinstance(v, list):
-            out[k] = _stable_json(_norm_list(v))
-        elif isinstance(v, dict):
-            out[k] = _stable_json(v)
-        else:
-            out[k] = _norm_str(v)
-    return out
-
-def _canon_doc(s: str) -> str:
-    return "\n".join(line.rstrip() for line in (s or "").splitlines()).strip()
-
-def _canon_meta(d: Dict[str, Any]) -> str:
-    try:
-        normalized = _sanitize_for_compare(d or {})
-        return _stable_json(normalized)
-    except Exception:
-        return str(d or {})
-
-def _compute_canon_hash(doc: str, meta: Dict[str, Any]) -> str:
-    a = _canon_doc(doc or "")
-    b = _canon_meta(meta or {})
-    payload = f"{a}\n{b}".encode("utf-8")
-    return hashlib.sha1(payload).hexdigest()
 
 # ======================================================================
 # ================== CLI OUTPUT HELPERS (TABLE PREVIEW) ================

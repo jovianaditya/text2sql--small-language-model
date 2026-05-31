@@ -31,25 +31,6 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     """Robust JSON extractor (delegates to utils helper)."""
     return _utils_extract_json_object(text)
 
-def _validate_sql_notes(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Validate that object has at least sql or notes field."""
-    if not isinstance(obj, dict):
-        return None
-    sql = (obj.get("sql") or "").strip()
-    notes = (obj.get("notes") or "").strip()
-
-    # minimal sanity: must have at least sql or notes
-    if not sql and not notes:
-        return None
-
-    # optional extra sanity: if sql exists, it should look like SQL
-    if sql:
-        low = sql.lower()
-        if "select" not in low and "with" not in low:
-            # allow rare cases, but usually reject junk
-            return None
-
-    return {"sql": sql, "notes": notes}
 # ======================================================================
 # ===================== CONSTRAINTED REGENERATION (REPAIR) ==============
 # ======================================================================
