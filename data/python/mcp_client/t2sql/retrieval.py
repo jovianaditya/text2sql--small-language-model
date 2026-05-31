@@ -2664,6 +2664,26 @@ def retrieve_node(state: RAGState) -> RAGState:
     retrieval_snapshot["evidence_score"] = float(evidence_strength.get("score", 0.0))
     retrieval_snapshot["evidence_tier"] = str(evidence_strength.get("tier") or "weak")
 
+    print(
+        "[RETRIEVE] "
+        f"qtype={retrieval_snapshot['qtype'] or 'unknown'} "
+        f"sparse={retrieval_snapshot['sparse_candidates']} "
+        f"dense={retrieval_snapshot['dense_candidates']} "
+        f"reranked={retrieval_snapshot['reranked_candidates']} "
+        f"allowed_tables={retrieval_snapshot['allowed_tables_before_filter']}->"
+        f"{retrieval_snapshot['allowed_tables_after_filter']} "
+        f"allowed_cols={retrieval_snapshot['allowed_columns_before_filter']}->"
+        f"{retrieval_snapshot['allowed_columns_after_filter']} "
+        f"evidence={retrieval_snapshot['evidence_tier']}("
+        f"{retrieval_snapshot['evidence_score']:.2f})"
+    )
+    print(
+        "[RETRIEVE - PREVIEW] "
+        f"sparse={retrieval_snapshot['sparse_preview'] or ['none']} "
+        f"dense={retrieval_snapshot['dense_preview'] or ['none']} "
+        f"rerank={retrieval_snapshot['rerank_preview'] or ['none']}"
+    )
+
     state["context"] = context
     state["retrieval_context_mode"] = "primary"
     state["retrieval_retry_used"] = False

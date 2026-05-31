@@ -8357,6 +8357,44 @@ def _should_use_router_scoped_draft_context(
     )
 
 
+def _retrieval_snapshot_supports_compact_draft_scope(snapshot: Dict[str, Any]) -> bool:
+    evidence_tier = str((snapshot or {}).get("evidence_tier") or "").strip().lower()
+    if evidence_tier == "weak":
+        return False
+    return int((snapshot or {}).get("allowed_tables_after_filter", 0) or 0) > 0
+
+
+def _resolve_ir_scoped_draft_tables(
+    intent_ir: Dict[str, Any],
+    *,
+    primary_table: str = "",
+    router_tables: Optional[List[str]] = None,
+) -> List[str]:
+    subject_table = str(intent_ir.get("subject_entity") or "").strip().lower()
+    mentioned_tables = [
+        str(table or "").strip().lower()
+        for table in (intent_ir.get("mentioned_tables") or [])
+        if str(table or "").strip()
+    ]
+    routed_tables = [
+        str(table or "").strip().lower()
+        for table in (router_tables or [])
+        if str(table or "").strip()
+    ]
+    primary_lower = str(primary_table or "").strip().lower()
+
+    if primary_lower and len(routed_tables) == 1 and routed_tables[0] != primary_lower:
+        return []
+    if primary_lower and subject_table and subject_table != primary_lower and len(routed_tables) <= 1:
+        return []
+
+    compact_tables: List[str] = []
+    for table_name in [subject_table, primary_lower, *routed_tables, *mentioned_tables]:
+        if table_name and table_name not in compact_tables:
+            compact_tables.append(table_name)
+    return compact_tables
+
+
 def _make_case_bucketing_ultra_minimal_prompt(question: str, ctx: str) -> str:
     prompt_lines = [
         "Return exactly one valid MySQL SELECT query on a single line.",
@@ -9495,6 +9533,10 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     state["ambiguity_signals"] = []
     state["cannot_answer"] = False
     state["cannot_answer_reason"] = ""
+    low_risk_single_table_lookup = False
+    lookup_subject_focused = False
+    family_ir_preferred = False
+    table_count = 0
 
     # ------------------------------------------------------------------
     # IR-FIRST deterministic planning (schema-agnostic)
@@ -9962,6 +10004,10 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     # Segala aturan heuristik (Anti-MAX, Anti-1055, Anti-Inner Join) sudah diurus di sana.
     # Pass state for dynamic join context from retrieval results
     draft_ctx = ctx
+    retrieval_snapshot = dict(state.get("retrieval_snapshot") or {})
+    orig_table_count = len(_parse_allowed_identifiers(ctx or ""))
+    draft_context_mode = "full"
+    draft_context_table_count = orig_table_count
     prompt_state: Dict[str, Any] = dict(state)
     if _should_use_router_scoped_draft_context(
         ctx=ctx,
@@ -9971,14 +10017,48 @@ def draft_sql_agent(state: RAGState) -> RAGState:
     ):
         narrowed_ctx = _narrow_context_to_tables(ctx, state.get("router_tables") or [])
         if narrowed_ctx and narrowed_ctx != ctx:
-            orig_table_count = len(_parse_allowed_identifiers(ctx or ""))
             narrowed_table_count = len(_parse_allowed_identifiers(narrowed_ctx))
             draft_ctx = narrowed_ctx
+            draft_context_mode = "router_scoped"
+            draft_context_table_count = narrowed_table_count
             prompt_state["context"] = draft_ctx
             print(
                 "[DRAFTER] Router-scoped context applied: "
                 f"{narrowed_table_count}/{orig_table_count} tables kept for draft prompt"
             )
+    elif (
+        bool(state.get("ir_plannable", False))
+        and (low_risk_single_table_lookup or lookup_subject_focused or family_ir_preferred)
+        and table_count > 0
+        and table_count <= int(AGENT_IR_MAX_TABLES)
+        and _retrieval_snapshot_supports_compact_draft_scope(retrieval_snapshot)
+    ):
+        narrowed_tables = _resolve_ir_scoped_draft_tables(
+            state.get("intent_ir") or {},
+            primary_table=str(state.get("primary_table") or "").strip(),
+            router_tables=state.get("router_tables") or [],
+        )
+        if 0 < len(narrowed_tables) < orig_table_count:
+            narrowed_ctx = _narrow_context_to_tables(ctx, narrowed_tables)
+            if narrowed_ctx and narrowed_ctx != ctx:
+                narrowed_table_count = len(_parse_allowed_identifiers(narrowed_ctx))
+                draft_ctx = narrowed_ctx
+                draft_context_mode = "ir_scoped"
+                draft_context_table_count = narrowed_table_count
+                prompt_state["context"] = draft_ctx
+                print(
+                    "[DRAFTER] IR-scoped context applied: "
+                    f"{narrowed_table_count}/{orig_table_count} tables kept for draft prompt "
+                    f"(scope={narrowed_tables})"
+                )
+
+    print(
+        "[DRAFTER - CONTEXT] "
+        f"mode={draft_context_mode} "
+        f"tables={draft_context_table_count}/{orig_table_count} "
+        f"retrieval_evidence={str(retrieval_snapshot.get('evidence_tier') or 'unknown')}("
+        f"{float(retrieval_snapshot.get('evidence_score') or 0.0):.2f})"
+    )
 
     prompt = make_generation_prompt(draft_ctx, question, decision, prompt_state)
     if prompt_state is not state:
@@ -10325,6 +10405,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     retrieval_retry_used = bool(state.get("retrieval_retry_used", False))
     retrieval_retry_reason = str(state.get("retrieval_retry_reason") or "")
     retrieval_expanded_table_count = int(state.get("retrieval_expanded_table_count") or 0)
+    regeneration_attempts_summary: List[str] = []
 
     # DYNAMIC MODEL SELECTION berdasarkan draft quality
     draft_model = state.get("target_model") or SMALL_MODEL  # Track model asal
@@ -11972,6 +12053,11 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 current_attempt = fallback_7b
 
         if attempts:
+            regeneration_attempts_summary = [
+                f"{'7B' if str(a.get('model') or '') == LARGE_MODEL else '3B'}:"
+                f"{str(a.get('tag') or 'unknown')}:{'pass' if bool(a.get('gate_accepted', False)) else 'fail'}"
+                for a in attempts
+            ]
             accepted_attempt = next(
                 (a for a in attempts if bool(a.get("gate_accepted", False))),
                 None,
@@ -12114,6 +12200,24 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         else:
             retry_reason = str(retry_result.get("reason") or "not_accepted").strip()
             corrections.append(f"Confidence retry attempted ({retry_reason})")
+
+    if regeneration_attempts_summary:
+        print(
+            "[REFINER - RETRY] attempts="
+            + ", ".join(regeneration_attempts_summary)
+        )
+    print(
+        "[REFINER - SUMMARY] "
+        f"draft_changed={str(draft_sql).strip() != str(final_sql).strip()} "
+        f"final_gate_pass={final_gate_pass} "
+        f"reasons={final_gate_reasons or ['none']} "
+        f"tags={final_gate_reason_tags or ['none']} "
+        f"final_model={final_model or 'unknown'} "
+        f"retrieval_mode={retrieval_context_mode} "
+        f"retrieval_retry={retrieval_retry_used} "
+        f"rescue_7b={bool(rescue_7b_used)} "
+        f"confidence_retry={bool(confidence_retry_used)}"
+    )
 
     return {
         **state,
