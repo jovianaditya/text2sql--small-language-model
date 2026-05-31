@@ -1129,11 +1129,6 @@ def get_fk_target_column(table: str, column: str) -> str:
     return get_schema_analyzer().get_fk_target_column(table, column)
 
 
-def find_table_by_keyword(keyword: str) -> Optional[str]:
-    """Find table by searching through metadata."""
-    return get_schema_analyzer().find_table_by_synonym(keyword)
-
-
 def get_table_type(table: str) -> str:
     """Get inferred table type."""
     return get_schema_analyzer().get_table_type(table)
@@ -1464,61 +1459,6 @@ def get_metric_candidates(table: str, intent_terms: Any = "") -> List[str]:
 def get_enum_value_profile(table: str, column: str) -> Dict[str, Any]:
     """Get categorical/value-profile metadata for a column."""
     return get_schema_analyzer().get_enum_value_profile(table, column)
-
-
-def get_all_mentioned_tables(question: str) -> Set[str]:
-    """
-    Get all tables mentioned in the question using schema metadata.
-
-    Uses table name, singular form, and synonyms from JSONL.
-
-    Args:
-        question: User question text
-
-    Returns:
-        Set of table names that are mentioned
-    """
-    if not question:
-        return set()
-
-    analyzer = get_schema_analyzer()
-    q = question.lower()
-
-    mentioned = set()
-    for table in analyzer._tables:
-        # Direct match
-        if table in q:
-            mentioned.add(table)
-            continue
-
-        # Singular form
-        singular = get_singular_form(table)
-        if singular and singular in q:
-            mentioned.add(table)
-            continue
-
-        # Synonyms from metadata
-        synonyms = analyzer.get_table_synonyms(table)
-        for syn in synonyms:
-            if syn in q:
-                mentioned.add(table)
-                break
-
-    return mentioned
-
-
-def is_table_mentioned(question: str, table: str) -> bool:
-    """
-    Check if a table is mentioned in the question using schema metadata.
-
-    Args:
-        question: User question text
-        table: Table name to check
-
-    Returns:
-        True if table is mentioned, False otherwise
-    """
-    return table.lower() in get_all_mentioned_tables(question)
 
 
 def get_all_entity_variants(table: str) -> Set[str]:
@@ -1913,22 +1853,6 @@ def get_columns_by_role(table: str, role: str) -> List[str]:
     return result
 
 
-def get_orderable_columns(table: str) -> List[str]:
-    """
-    Get columns suitable for ORDER BY (numeric + date columns).
-    
-    These columns make semantic sense for sorting results.
-    
-    Args:
-        table: Table name
-    
-    Returns:
-        List of orderable column names (original case)
-    """
-    numeric_cols = get_columns_by_role(table, 'numeric')
-    date_cols = get_columns_by_role(table, 'date')
-    return list(dict.fromkeys(date_cols + numeric_cols))
-
 
 def get_aggregatable_columns(table: str) -> List[str]:
     """
@@ -1962,19 +1886,6 @@ def get_aggregatable_columns(table: str) -> List[str]:
 
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [_get_original_case(t, col) for _, col in scored]
-
-
-def get_joinable_columns(table: str) -> List[str]:
-    """
-    Get columns suitable for JOIN conditions (ID columns + FK columns).
-    
-    Args:
-        table: Table name
-    
-    Returns:
-        List of joinable column names (original case)
-    """
-    return get_columns_by_role(table, 'id')
 
 
 def get_filterable_date_columns(table: str) -> List[str]:
@@ -2123,52 +2034,6 @@ def _best_semantic_numeric_column(table: str, question: str, columns: List[str])
     return best_col
 
 
-def infer_best_order_column(table: str, question: str) -> Optional[str]:
-    """
-    Infer the best column to ORDER BY based on question context.
-    
-    Strategy:
-    1. If question mentions 'date', 'time', 'recent', 'latest' → date column
-    2. If question semantically overlaps with a numeric column → numeric column
-    3. If question asks for 'highest', 'lowest', 'top' → first numeric column
-    4. Fallback: first orderable column
-    
-    Args:
-        table: Table name
-        question: Question text
-    
-    Returns:
-        Best column name for ordering, or None
-    """
-    q = (question or "").lower()
-    
-    # Check for temporal ordering
-    temporal_keywords = ('date', 'time', 'recent', 'latest', 'newest', 'oldest', 
-                        'first', 'last', 'before', 'after')
-    date_cols = get_filterable_date_columns(table)
-    if any(kw in q for kw in temporal_keywords):
-        semantic_date = _best_semantic_numeric_column(table, question, date_cols)
-        if semantic_date:
-            return semantic_date
-        if date_cols:
-            return date_cols[0]
-    
-    numeric_cols = get_aggregatable_columns(table)
-    semantic_numeric = _best_semantic_numeric_column(table, question, numeric_cols)
-    if semantic_numeric:
-        return semantic_numeric
-    
-    # Generic highest/lowest/top → first numeric column
-    rank_keywords = ('highest', 'lowest', 'top', 'best', 'worst', 'most', 'least')
-    if any(kw in q for kw in rank_keywords):
-        if numeric_cols:
-            return numeric_cols[0]
-    
-    # Fallback
-    orderable = date_cols + [col for col in get_orderable_columns(table) if col not in date_cols]
-    return orderable[0] if orderable else None
-
-
 def infer_best_aggregate_column(table: str, question: str) -> Optional[str]:
     """
     Infer the best column for aggregation based on question context.
@@ -2252,38 +2117,6 @@ def get_column_semantic_type(table: str, column: str) -> str:
     return 'unknown'
 
 
-def get_table_column_profile(table: str) -> Dict[str, List[str]]:
-    """
-    Get complete column profile for a table, organized by semantic type.
-    
-    Returns dict with:
-    - 'id': ID/key columns
-    - 'metric': Numeric columns
-    - 'date': Date columns
-    - 'name': Name columns
-    - 'code': Code/category columns
-    - 'text': Other text columns
-    
-    Args:
-        table: Table name
-    
-    Returns:
-        Dict mapping semantic type to list of column names
-    """
-    analyzer = get_schema_analyzer()
-    t = (table or "").lower()
-    columns = analyzer._table_columns.get(t, [])
-    
-    profile: Dict[str, List[str]] = defaultdict(list)
-    
-    for col in columns:
-        sem_type = get_column_semantic_type(t, col)
-        original_col = _get_original_case(t, col)
-        profile[sem_type].append(original_col)
-    
-    return dict(profile)
-
-
 # Export convenience
 __all__ = [
     'SchemaAnalyzer',
@@ -2303,7 +2136,6 @@ __all__ = [
     'is_transaction_table',
     'get_fk_relationships',
     'get_fk_target_column',
-    'find_table_by_keyword',
     'get_table_type',
     'get_table_role',
     'get_singular_form',
@@ -2316,8 +2148,6 @@ __all__ = [
     'get_preferred_temporal_column',
     'get_metric_candidates',
     'get_enum_value_profile',
-    'get_all_mentioned_tables',
-    'is_table_mentioned',
     # Synonym expansion utilities
     'get_all_entity_variants',
     'get_column_entity_variants',
@@ -2329,13 +2159,9 @@ __all__ = [
     'is_id_column',
     'is_name_column',
     'get_columns_by_role',
-    'get_orderable_columns',
     'get_aggregatable_columns',
-    'get_joinable_columns',
     'get_filterable_date_columns',
-    'infer_best_order_column',
     'infer_best_aggregate_column',
     'get_column_semantic_type',
     'get_column_semantics',
-    'get_table_column_profile',
 ]
