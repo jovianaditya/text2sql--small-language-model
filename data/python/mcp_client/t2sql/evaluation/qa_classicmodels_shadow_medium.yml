@@ -1,0 +1,154 @@
+cases:
+  - id: SM1
+    difficulty: medium
+    question: "Group payments by payment year. Return the payment year, payment count, total amount, and highest payment amount. Keep only years whose total amount is above 500000. Sort by payment year ascending."
+    groundtruth_sql: |
+      SELECT
+        YEAR(paymentDate) AS payment_year,
+        COUNT(*) AS payment_count,
+        SUM(amount) AS total_amount,
+        MAX(amount) AS highest_payment_amount
+      FROM payments
+      GROUP BY YEAR(paymentDate)
+      HAVING SUM(amount) > 500000
+      ORDER BY payment_year ASC;
+  - id: SM2
+    difficulty: medium
+    question: "Summarize employees by office code. Return the office code, employee count, how many employees report to a manager, and the highest employee number. Sort by employee count descending, then office code."
+    groundtruth_sql: |
+      SELECT
+        officeCode,
+        COUNT(*) AS employee_count,
+        SUM(CASE WHEN reportsTo IS NOT NULL THEN 1 ELSE 0 END) AS managed_employee_count,
+        MAX(employeeNumber) AS highest_employee_number
+      FROM employees
+      GROUP BY officeCode
+      ORDER BY employee_count DESC, officeCode ASC;
+  - id: SM3
+    difficulty: medium
+    question: "Find countries with at least 2 customers whose average credit limit is below 80000. Return the country, customer count, average credit limit, and highest credit limit. Order by average credit limit ascending, then country."
+    groundtruth_sql: |
+      SELECT
+        country,
+        COUNT(*) AS customer_count,
+        AVG(creditLimit) AS average_credit_limit,
+        MAX(creditLimit) AS highest_credit_limit
+      FROM customers
+      GROUP BY country
+      HAVING COUNT(*) >= 2
+         AND AVG(creditLimit) < 80000
+      ORDER BY average_credit_limit ASC, country ASC;
+  - id: SM4
+    difficulty: medium
+    question: "For each customer number in payments, return the payment row with the earliest payment date. If there is a tie on date, keep the row with the larger amount. Include the check number, payment amount, and payment date."
+    groundtruth_sql: |
+      SELECT
+        pmt.customerNumber,
+        pmt.checkNumber,
+        pmt.amount,
+        pmt.paymentDate
+      FROM (
+        SELECT
+          customerNumber,
+          checkNumber,
+          amount,
+          paymentDate,
+          ROW_NUMBER() OVER (
+            PARTITION BY customerNumber
+            ORDER BY paymentDate ASC, amount DESC, checkNumber ASC
+          ) AS rn
+        FROM payments
+      ) AS pmt
+      WHERE pmt.rn = 1;
+  - id: SM5
+    difficulty: medium
+    question: "Within each customer in payments, compute a running total of payment amount ordered by payment date, then check number. Return the customer number, payment date, check number, amount, and running payment total. Sort by customer number, payment date, then check number."
+    groundtruth_sql: |
+      SELECT
+        customerNumber,
+        paymentDate,
+        checkNumber,
+        amount,
+        SUM(amount) OVER (
+          PARTITION BY customerNumber
+          ORDER BY paymentDate ASC, checkNumber ASC
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS running_payment_total
+      FROM payments
+      ORDER BY customerNumber ASC, paymentDate ASC, checkNumber ASC;
+  - id: SM6
+    difficulty: medium
+    question: "Inside each order status, return the order number, order date, and the previous order date when orders are sorted from earliest to latest. Sort the final result by status, then order date, then order number."
+    groundtruth_sql: |
+      SELECT
+        status,
+        orderNumber,
+        orderDate,
+        LAG(orderDate) OVER (
+          PARTITION BY status
+          ORDER BY orderDate ASC, orderNumber ASC
+        ) AS previous_order_date
+      FROM orders
+      ORDER BY status ASC, orderDate ASC, orderNumber ASC;
+  - id: SM7
+    difficulty: medium
+    question: "Bucket customers into three credit limit bands (No Credit for NULL, Standard for below 100000, High for 100000 or more). Return the credit band and number of customers, ordered by customer count descending, then credit band."
+    groundtruth_sql: |
+      SELECT
+        CASE
+          WHEN creditLimit IS NULL THEN 'No Credit'
+          WHEN creditLimit < 100000 THEN 'Standard'
+          ELSE 'High'
+        END AS credit_band,
+        COUNT(*) AS customer_count
+      FROM customers
+      GROUP BY
+        CASE
+          WHEN creditLimit IS NULL THEN 'No Credit'
+          WHEN creditLimit < 100000 THEN 'Standard'
+          ELSE 'High'
+        END
+      ORDER BY customer_count DESC, credit_band ASC;
+  - id: SM8
+    difficulty: medium
+    question: "Group products by the first letter of the vendor name. Return the vendor initial, product count, and average listed price. Keep only initials with at least 2 products. Order by average listed price descending, then vendor initial."
+    groundtruth_sql: |
+      SELECT
+        LEFT(productVendor, 1) AS vendor_initial,
+        COUNT(*) AS product_count,
+        AVG(MSRP) AS average_listed_price
+      FROM products
+      GROUP BY LEFT(productVendor, 1)
+      HAVING COUNT(*) >= 2
+      ORDER BY average_listed_price DESC, vendor_initial ASC;
+  - id: SM9
+    difficulty: medium
+    question: "Show order detail rows where the price per item is above the average price per item for the same product code. Return the order number, product code, order line number, and price per item. Sort by product code, then price per item descending, then order number."
+    groundtruth_sql: |
+      SELECT
+        od.orderNumber,
+        od.productCode,
+        od.orderLineNumber,
+        od.priceEach
+      FROM orderdetails AS od
+      WHERE od.priceEach > (
+        SELECT AVG(od2.priceEach)
+        FROM orderdetails AS od2
+        WHERE od2.productCode = od.productCode
+      )
+      ORDER BY od.productCode ASC, od.priceEach DESC, od.orderNumber ASC;
+  - id: SM10
+    difficulty: medium
+    question: "For each product line, rank products from the lowest MSRP to the highest MSRP. Return the product line, product code, product name, MSRP, and the dense rank inside the product line. Sort by product line, then rank, then product code."
+    groundtruth_sql: |
+      SELECT
+        productLine,
+        productCode,
+        productName,
+        MSRP,
+        DENSE_RANK() OVER (
+          PARTITION BY productLine
+          ORDER BY MSRP ASC
+        ) AS msrp_dense_rank_in_line
+      FROM products
+      ORDER BY productLine ASC, msrp_dense_rank_in_line ASC, productCode ASC;

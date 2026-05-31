@@ -41716,6 +41716,15 @@ def _guardrail_fix_like_regex_anchors(sql: str, question: str) -> str:
         "contains", "contain",
         "mengandung"
     ])
+    negated_starts = bool(
+        re.search(r"\b(?:doesn['’]?t|does\s+not|do\s+not|not)\s+(?:start(?:s)?|begin(?:s)?)\s+with\b", q)
+    )
+    negated_ends = bool(
+        re.search(r"\b(?:doesn['’]?t|does\s+not|do\s+not|not)\s+end(?:s)?\s+with\b", q)
+    )
+    pure_starts = starts and not ends and not contains
+    pure_ends = ends and not starts and not contains
+    col_pat = r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+)"
 
     # Rewrite LIKE '^X' -> LIKE 'X%'
     def repl_starts(m: re.Match) -> str:
@@ -41755,6 +41764,86 @@ def _guardrail_fix_like_regex_anchors(sql: str, question: str) -> str:
         sql = re.sub(
             r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+)LIKE\s+'\^([^']*)'",
             lambda m: f"{m.group(1)}LIKE '{m.group(2)}%'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    if negated_ends:
+        sql = re.sub(
+            rf"NOT\s+{col_pat}LIKE\s+'(_+)([^'%_]+)'",
+            lambda m: f"NOT {m.group(1)}LIKE '%{m.group(3)}'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            rf"{col_pat}NOT\s+LIKE\s+'(_+)([^'%_]+)'",
+            lambda m: f"{m.group(1)}NOT LIKE '%{m.group(3)}'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    if negated_starts:
+        sql = re.sub(
+            rf"NOT\s+{col_pat}LIKE\s+'([^'%_]+)(_+)'",
+            lambda m: f"NOT {m.group(1)}LIKE '{m.group(2)}%'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            rf"{col_pat}NOT\s+LIKE\s+'([^'%_]+)(_+)'",
+            lambda m: f"{m.group(1)}NOT LIKE '{m.group(2)}%'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    if contains and negated_ends:
+        sql = re.sub(
+            rf"{col_pat}LIKE\s+'%([^'%_]+)'\s+AND\s+NOT\s+\1LIKE\s+'%\2'",
+            lambda m: f"{m.group(1)}LIKE '%{m.group(2)}%' AND NOT {m.group(1)}LIKE '%{m.group(2)}'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            rf"{col_pat}LIKE\s+'%([^'%_]+)'\s+AND\s+\1NOT\s+LIKE\s+'%\2'",
+            lambda m: f"{m.group(1)}LIKE '%{m.group(2)}%' AND {m.group(1)}NOT LIKE '%{m.group(2)}'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    if contains and negated_starts:
+        sql = re.sub(
+            rf"{col_pat}LIKE\s+'([^'%_]+)%'\s+AND\s+NOT\s+\1LIKE\s+'\2%'",
+            lambda m: f"{m.group(1)}LIKE '%{m.group(2)}%' AND NOT {m.group(1)}LIKE '{m.group(2)}%'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            rf"{col_pat}LIKE\s+'([^'%_]+)%'\s+AND\s+\1NOT\s+LIKE\s+'\2%'",
+            lambda m: f"{m.group(1)}LIKE '%{m.group(2)}%' AND {m.group(1)}NOT LIKE '{m.group(2)}%'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    # Rewrite reversed simple wildcard direction when the question semantics are
+    # unambiguous. This keeps the fix bounded to pure starts-with / ends-with
+    # questions and avoids changing contains-style predicates.
+    if pure_ends:
+        sql = re.sub(
+            r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+(?:NOT\s+)?LIKE\s+)'([^'%_]+)%'",
+            lambda m: f"{m.group(1)}'%{m.group(2)}'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+            r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+(?:NOT\s+)?LIKE\s+)'_+([^'%_]+)%'",
+            lambda m: f"{m.group(1)}'%{m.group(2)}'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+    if pure_starts:
+        sql = re.sub(
+            r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+(?:NOT\s+)?LIKE\s+)'%([^'%_]+)'",
+            lambda m: f"{m.group(1)}'{m.group(2)}%'",
             sql,
             flags=re.IGNORECASE,
         )
@@ -49414,8 +49503,21 @@ def _drop_raw_column_covered_by_function(sql: str, question: str) -> str:
     if not sql:
         return sql
 
-    # Quick check: must have a function call in SELECT
-    if not re.search(r"\b(?:LEFT|RIGHT|SUBSTRING|SUBSTR|MID)\s*\(", sql, flags=re.I):
+    null_fill_projection_requested = bool(
+        re.search(r"\b(?:missing|null|empty|blank)\b", question or "", flags=re.I)
+        and re.search(r"\b(?:if|when|whenever)\b", question or "", flags=re.I)
+        and re.search(r"\b(?:display|show|return|use)\b", question or "", flags=re.I)
+        and (
+            re.search(r"""["'“”][^"'“”]{1,40}["'“”]""", question or "")
+            or re.search(r"\b(?:n/?a|none|unknown|zero)\b", question or "", flags=re.I)
+        )
+    )
+
+    # Quick check: must have a relevant function/display transform in SELECT
+    if not re.search(r"\b(?:LEFT|RIGHT|SUBSTRING|SUBSTR|MID)\s*\(", sql, flags=re.I) and not (
+        null_fill_projection_requested
+        and re.search(r"\b(?:CASE\s+WHEN|COALESCE|IFNULL|NULLIF)\b", sql, flags=re.I)
+    ):
         return sql
 
     m_sel = re.search(r"(?is)\bSELECT\b\s+(.*?)\s+\bFROM\b", sql)
@@ -49436,6 +49538,20 @@ def _drop_raw_column_covered_by_function(sql: str, question: str) -> str:
         r"(?:[A-Za-z_][A-Za-z0-9_]*\.)?"
         r"([A-Za-z_][A-Za-z0-9_]*)\s*[,)]",
     )
+    null_fill_col_pats = [
+        re.compile(
+            r"(?is)\bNULLIF\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)\s*,"
+        ),
+        re.compile(
+            r"(?is)\bIFNULL\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)\s*,"
+        ),
+        re.compile(
+            r"(?is)\bCOALESCE\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)\s*,"
+        ),
+        re.compile(
+            r"(?is)\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)\s+IS\s+NULL\b"
+        ),
+    ]
 
     for idx, item in enumerate(items):
         stripped = item.strip()
@@ -49444,16 +49560,26 @@ def _drop_raw_column_covered_by_function(sql: str, question: str) -> str:
         if m_func:
             func_col = m_func.group(1).strip("`").lower()
             func_cols.setdefault(func_col, []).append(idx)
-        else:
-            # Check if this is a plain column (no function, no expression)
-            m_plain = re.match(
-                r"^(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?([A-Za-z_][A-Za-z0-9_]*)`?"
-                r"(?:\s+AS\s+.+)?$",
-                stripped, flags=re.I,
-            )
-            if m_plain:
-                raw_col = m_plain.group(1).strip("`").lower()
-                raw_col_indices.setdefault(raw_col, []).append(idx)
+        elif null_fill_projection_requested:
+            null_fill_cols: Set[str] = set()
+            for pat in null_fill_col_pats:
+                for match in pat.finditer(stripped):
+                    func_col = str(match.group(1) or "").strip("`").lower()
+                    if func_col:
+                        null_fill_cols.add(func_col)
+            if null_fill_cols:
+                for func_col in sorted(null_fill_cols):
+                    func_cols.setdefault(func_col, []).append(idx)
+                continue
+        # Check if this is a plain column (no function, no expression)
+        m_plain = re.match(
+            r"^(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?([A-Za-z_][A-Za-z0-9_]*)`?"
+            r"(?:\s+AS\s+.+)?$",
+            stripped, flags=re.I,
+        )
+        if m_plain:
+            raw_col = m_plain.group(1).strip("`").lower()
+            raw_col_indices.setdefault(raw_col, []).append(idx)
 
     # Find raw columns that are also used inside functions
     to_drop: Set[int] = set()

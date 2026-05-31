@@ -6000,6 +6000,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             return f"{t}.{c} is_not_null_or_empty"
         if op == "not_in" and isinstance(val, list) and val:
             return f"{t}.{c} not_in {val}"
+        if op == "in" and isinstance(val, list) and val:
+            return f"{t}.{c} in {val}"
+        if op == "eq" and val is not None:
+            return f"{t}.{c} eq {val}"
         if op == "between" and val is not None and val2 is not None:
             return f"{t}.{c} between {val} and {val2}"
         if op == "month_between" and val is not None and val2 is not None:
@@ -6107,6 +6111,14 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         tail = str(matches[-1].group(1) or "").strip()
         if not tail:
             return []
+        tail = re.split(
+            r"\b(?:sort|sorted|order|ordered)\s+by\b",
+            tail,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip()
+        if not tail:
+            return []
         if "," not in tail and not re.search(r"\band\b", tail, flags=re.I):
             return []
 
@@ -6117,6 +6129,12 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 continue
             seg = re.sub(
                 r"^(?:their|the|all|any|its|his|her|our|your)\s+",
+                "",
+                seg,
+                flags=re.I,
+            ).strip()
+            seg = re.sub(
+                r"^(?:and|or|then)\s+",
                 "",
                 seg,
                 flags=re.I,
@@ -7779,6 +7797,23 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     # --- 1. BANGUN CONSTRAINT DINAMIS ---
     constraints = []
 
+    if intent_hint_preview:
+        symbolic_filter_hint_present = bool(
+            re.search(
+                r"\b(?:eq|in|not_in|like_prefix|like_suffix|like_contains|"
+                r"not_like_prefix|not_like_suffix|not_like_contains|"
+                r"is_null_or_empty|is_not_null_or_empty)\b",
+                intent_hint_preview,
+            )
+        )
+        if symbolic_filter_hint_present:
+            constraints.append(
+                "INTENT HINT FILTER SEMANTICS (CRITICAL): If the Intent IR Hint shows symbolic filter operators such as "
+                "`eq`, `in`, `not_in`, `like_prefix`, `like_suffix`, `like_contains`, `is_null_or_empty`, or `is_not_null_or_empty`, "
+                "preserve their exact row-filter meaning in SQL. Respect the shown AND/OR structure exactly. "
+                "Do NOT weaken a positive filter into a tautology by mixing it with its opposite condition."
+            )
+
     # === [PRIORITY 1] TOP N GLOBAL RANKING RULE (FIRST - before all other rules) ===
     # Detect "Top N" or "N highest/lowest" pattern that should use ORDER BY + LIMIT
     # This is DIFFERENT from ordinal ranking ("second highest per group")
@@ -7829,6 +7864,25 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "use COUNT(DISTINCT target_column). "
             "Do NOT use plain COUNT(*) or COUNT(id) for that metric. "
             "Do NOT GROUP BY the distinct target column unless the question explicitly asks to display that column."
+        )
+    null_fill_projection_requested = bool(
+        re.search(r"\b(?:missing|null|empty|blank)\b", question, flags=re.I)
+        and re.search(r"\b(?:if|when|whenever)\b", question, flags=re.I)
+        and re.search(r"\b(?:display|show|return|use)\b", question, flags=re.I)
+        and (
+            re.search(r"""["'“”][^"'“”]{1,40}["'“”]""", question)
+            or re.search(r"\b(?:n/?a|none|unknown|zero)\b", question, flags=re.I)
+        )
+    )
+    if null_fill_projection_requested:
+        constraints.append(
+            "NULL-FILL DISPLAY RULE (CRITICAL): When the question asks to display a replacement value when a column is missing, null, empty, or blank, "
+            "return ONE displayed expression for that requested column using COALESCE, IFNULL, NULLIF, or CASE WHEN. "
+            "Do NOT return both the raw source column and the displayed replacement version unless the question explicitly asks for both. "
+            "If you add an alias, use a simple SQL-safe identifier with underscores, not a natural-language sentence."
+        )
+        constraints.append(
+            "NULL-FILL DISPLAY RULE (CRITICAL): Keep every explicitly requested companion column and keep any explicitly requested final ORDER BY."
         )
     requires_boundary_regex = _question_requires_word_boundary_regex(question)
     requires_regex = _question_requires_regex(question)
@@ -10300,6 +10354,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         re.search(r"\b(?:regexp_like|regexp|rlike)\b", s, flags=re.I)
         or _question_requires_structural_regex(question)
         or _question_requires_word_boundary_regex(question)
+        or re.search(r"\b(?:start(?:s)?|begin(?:s)?|end(?:s)?)\s+with\b", question or "", flags=re.I)
     ):
         s = _guardrail_fix_like_regex_anchors(s, question)
         s = _canonicalize_boundary_regex(s, question)

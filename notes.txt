@@ -61,19 +61,19 @@ docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluatio
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset t2sql/devset/qa_classicmodels_devset_mix.yml --output results_easy_mix.xlsx --easy --warmup-models small" 2>&1 | tee run_easy_mix.log
 
 # PRIMARY EVALUATION SCENARIO P1
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/evaluation/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p1.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p1.log
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/evaluation/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p1.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p1.log
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/evaluation/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p1.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p1.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/development/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p1.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p1.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/development/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p1.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p1.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/development/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p1.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p1.log
 
 # PRIMARY EVALUATION SCENARIO P2
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/evaluation/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p2.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p2.log
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/evaluation/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p2.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p2.log
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/evaluation/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p2.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p2.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/development/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p2.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p2.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/development/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p2.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p2.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/development/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p2.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p2.log
 
 # PRIMARY EVALUATION SCENARIO P3
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/evaluation/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p3.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p3.log
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/evaluation/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p3.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p3.log
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/evaluation/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p3.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p3.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/development/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p3.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p3.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/development/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p3.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p3.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/development/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p3.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p3.log
 
 # tmux
 # new session

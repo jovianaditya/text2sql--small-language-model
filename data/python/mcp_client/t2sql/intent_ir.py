@@ -229,7 +229,11 @@ def _normalize_categorical_literal_value(
     raw = re.sub(r"^(?:either\s+the|either|the)\s+", "", raw, flags=re.I).strip()
     raw = re.sub(r"\s+(?:territories|territory|regions|region)\s*$", "", raw, flags=re.I).strip()
 
-    col_words = set(re.findall(r"[a-z0-9]+", _camel_to_words(column or "").lower()))
+    ordered_col_words = [
+        tok for tok in re.findall(r"[a-z0-9]+", _camel_to_words(column or "").lower())
+        if tok
+    ]
+    col_words = set(ordered_col_words)
     if col_words:
         suffix_terms = set()
         for tok in col_words:
@@ -238,6 +242,27 @@ def _normalize_categorical_literal_value(
                 suffix_terms.add(tok[:-1] + "ies")
             else:
                 suffix_terms.add(tok + "s")
+        def _norm_term(token: str) -> str:
+            t = str(token or "").strip().lower()
+            if not t:
+                return ""
+            if t.endswith("ies") and len(t) > 3:
+                return t[:-3] + "y"
+            if t.endswith("ses") and len(t) > 3:
+                return t[:-2]
+            if t.endswith("s") and len(t) > 2 and not t.endswith(("ss", "us")):
+                return t[:-1]
+            return t
+        raw_parts = [part for part in raw.split() if part]
+        raw_norm_words = [_norm_term(part) for part in raw_parts]
+        lead_count = 0
+        for norm_word in raw_norm_words:
+            if norm_word and norm_word in col_words:
+                lead_count += 1
+                continue
+            break
+        if 0 < lead_count < len(raw_parts):
+            raw = " ".join(raw_parts[lead_count:]).strip(" \t\r\n'\".,;:!?")
         raw_words = re.findall(r"[a-z0-9]+", raw.lower())
         if raw_words and raw_words[-1] in suffix_terms and len(raw_words) >= 2:
             kept_words = raw.split()
@@ -776,6 +801,36 @@ def _derive_filter_logic(question: str, filters: Sequence[IRFilter]) -> str:
         q,
         flags=re.I,
     )
+    for flt in (filters or []):
+        op = str(getattr(flt, "op", "") or "").strip().lower()
+        values = getattr(flt, "value", None)
+        if op not in {"in", "not_in"} or not isinstance(values, list) or len(values) < 2:
+            continue
+        clean_values = [
+            re.sub(r"\s+", " ", str(v or "").strip().lower())
+            for v in values
+            if str(v or "").strip()
+        ]
+        if len(clean_values) < 2:
+            continue
+        alt_values = sorted(
+            {
+                re.escape(v).replace(r"\ ", r"\s+")
+                for v in clean_values
+                if v
+            },
+            key=len,
+            reverse=True,
+        )
+        if len(alt_values) < 2:
+            continue
+        value_alt = "|".join(alt_values)
+        sanitized = re.sub(
+            rf"\b(?:{value_alt})(?:\s*(?:,|/)\s*(?:{value_alt}))*\s*(?:or|and)\s*(?:{value_alt})\b",
+            " ",
+            sanitized,
+            flags=re.I,
+        )
     has_but = bool(re.search(r"\bbut\b", sanitized, flags=re.I))
     has_and = bool(re.search(r"\band\b", sanitized, flags=re.I))
     has_or = bool(re.search(r"\bor\b", sanitized, flags=re.I))
@@ -845,6 +900,15 @@ def _prune_redundant_filters(filters: Sequence[IRFilter], filter_logic: str = ""
             for _, f in entries
             if str(f.op or "").strip().lower() == "in" and isinstance(f.value, list)
         ]
+        not_in_values = [
+            {
+                str(v or "").strip().lower()
+                for v in (f.value or [])
+                if str(v or "").strip()
+            }
+            for _, f in entries
+            if str(f.op or "").strip().lower() == "not_in" and isinstance(f.value, list)
+        ]
 
         for idx, flt in entries:
             op = str(flt.op or "").strip().lower()
@@ -871,6 +935,10 @@ def _prune_redundant_filters(filters: Sequence[IRFilter], filter_logic: str = ""
                 continue
 
             if logic_l == "or" and any(val_l in values for values in in_values):
+                drop_indexes.add(idx)
+                continue
+
+            if any(val_l in values for values in not_in_values):
                 drop_indexes.add(idx)
 
     return [flt for idx, flt in enumerate(pruned) if idx not in drop_indexes]
@@ -1347,6 +1415,14 @@ def _extract_projection_segments(question: str) -> List[str]:
     tail = str(matches[-1].group(1) or "").strip()
     if not tail:
         return []
+    tail = re.split(
+        r"\b(?:sort|sorted|order|ordered)\s+by\b",
+        tail,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip()
+    if not tail:
+        return []
     if "," not in tail and not re.search(r"\band\b", tail, flags=re.I):
         return []
 
@@ -1357,6 +1433,12 @@ def _extract_projection_segments(question: str) -> List[str]:
             continue
         seg = re.sub(
             r"^(?:their|the|all|any|its|his|her|our|your)\s+",
+            "",
+            seg,
+            flags=re.I,
+        ).strip()
+        seg = re.sub(
+            r"^(?:and|or|then)\s+",
             "",
             seg,
             flags=re.I,
@@ -2755,8 +2837,8 @@ def _detect_dimensions(
                 )
             )
 
-    # Generic "name" request without explicit entity token.
-    if subject and re.search(r"\bname(s)?\b", q):
+    # Generic "name" request without an explicit projection list.
+    if subject and not _extract_projection_segments(question) and re.search(r"\bname(s)?\b", q):
         name_col = _best_name_column(subject, allowed)
         if name_col:
             add_dim(IRDimension(table=subject, column=name_col))
@@ -3435,6 +3517,9 @@ def _detect_filters(
                 )
                 if not match:
                     continue
+                prefix_local = q_raw[max(0, int(match.start()) - 40):int(match.start())]
+                if re.search(r"\b(?:not\s+in|excluding|except(?:\s+for)?|outside)\s+$", prefix_local, flags=re.I):
+                    continue
 
                 raw_value = str(match.group(1) or "").strip(" \t\r\n'\".,;:!?")
                 if not raw_value:
@@ -3452,7 +3537,6 @@ def _detect_filters(
                     str(subject or "").strip().lower(),
                     str(_safe_get_singular_form(subject) or "").strip().lower(),
                 }
-                prefix_local = q_raw[max(0, int(match.start()) - 32):int(match.start())]
                 if (
                     aggregate_query_like
                     and raw_value_l in scope_terms
@@ -3787,38 +3871,39 @@ def _detect_filters(
         if not raw_value or _looks_like_nonliteral_category_phrase(raw_value):
             return None
 
-        target = None
-        prefix = q_raw[max(0, match.start() - 96):match.start()]
-        prefix_l = re.sub(r"\s+", " ", prefix.strip().lower())
-        best_exact = None
-        best_exact_len = -1
-        best_exact_pos = -1
-        for column in allowed.get(subject, set()):
-            if not _supports_categorical_text_filter(subject, column):
-                continue
-            for variant in sorted(_column_variants(subject, column), key=len, reverse=True):
-                variant_l = str(variant or "").strip().lower()
-                if not variant_l:
+        target = _pick_explicit_text_target_column(match.start())
+        if not target:
+            prefix = q_raw[max(0, match.start() - 96):match.start()]
+            prefix_l = re.sub(r"\s+", " ", prefix.strip().lower())
+            best_exact = None
+            best_exact_len = -1
+            best_exact_pos = -1
+            for column in allowed.get(subject, set()):
+                if not _supports_categorical_text_filter(subject, column):
                     continue
-                pos = _phrase_pos(prefix_l, variant_l)
-                if pos < 0:
-                    continue
-                if pos > best_exact_pos or (pos == best_exact_pos and len(variant_l) > best_exact_len):
-                    best_exact = column
-                    best_exact_len = len(variant_l)
-                    best_exact_pos = pos
-                    break
-        if best_exact:
-            target = (subject, best_exact)
+                for variant in sorted(_column_variants(subject, column), key=len, reverse=True):
+                    variant_l = str(variant or "").strip().lower()
+                    if not variant_l:
+                        continue
+                    pos = _phrase_pos(prefix_l, variant_l)
+                    if pos < 0:
+                        continue
+                    if pos > best_exact_pos or (pos == best_exact_pos and len(variant_l) > best_exact_len):
+                        best_exact = column
+                        best_exact_len = len(variant_l)
+                        best_exact_pos = pos
+                        break
+            if best_exact:
+                target = (subject, best_exact)
 
-        matched = _best_semantic_column_match(
-            text=prefix,
-            table=subject,
-            allowed=allowed,
-            min_score=1.0,
-        )
-        if not target and matched and _supports_categorical_text_filter(subject, matched):
-            target = (subject, matched)
+            matched = _best_semantic_column_match(
+                text=prefix,
+                table=subject,
+                allowed=allowed,
+                min_score=1.0,
+            )
+            if not target and matched and _supports_categorical_text_filter(subject, matched):
+                target = (subject, matched)
         if not target:
             target = _pick_text_target_column(anchor_pos=match.start())
         if not target:
@@ -3854,12 +3939,12 @@ def _detect_filters(
         if not raw_value or _looks_like_nonliteral_category_phrase(raw_value):
             return None
 
-        target = None
+        target = _pick_explicit_text_target_column(match.start())
         name_suffix_intent = bool(
             re.search(r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+\bend(?:s)?\b", q, flags=re.I)
             or re.search(r"\bend(?:s)?\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+\bnames?\b", q, flags=re.I)
         )
-        if name_suffix_intent:
+        if not target and name_suffix_intent:
             name_col = _best_name_column(subject, allowed)
             if name_col:
                 target = (subject, name_col)
@@ -3894,12 +3979,12 @@ def _detect_filters(
         if not raw_value or _looks_like_nonliteral_category_phrase(raw_value):
             return None
 
-        target = None
+        target = _pick_explicit_text_target_column(match.start())
         name_prefix_intent = bool(
             re.search(r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+(?:start(?:s)?|begin(?:s)?)\b", q, flags=re.I)
             or re.search(r"\b(?:start(?:s)?|begin(?:s)?)\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+\bnames?\b", q, flags=re.I)
         )
-        if name_prefix_intent:
+        if not target and name_prefix_intent:
             name_col = _best_name_column(subject, allowed)
             if name_col:
                 target = (subject, name_col)
@@ -4002,7 +4087,7 @@ def _detect_filters(
                 continue
             seen_pairs.add(key)
             candidate_pairs.append(key)
-        clause_stop = r"(?:[.,;:!?]|\s+(?:return|show|list|display|include|give|sort|order|ordered|sorted|where|having)\b|$)"
+        clause_stop = r"(?:[.,;:!?]|\s+(?:and|or|but|return|show|list|display|include|give|sort|order|ordered|sorted|where|having)\b|$)"
         for t, c in candidate_pairs:
             for variant in _column_variants(t, c):
                 c_pat = re.escape(variant).replace(r"\ ", r"\s+")
@@ -4051,6 +4136,65 @@ def _detect_filters(
                     flags=re.I,
                 ):
                     return (t, c)
+        return None
+
+    def _find_required_self_fk_parent_column() -> Optional[Tuple[str, str]]:
+        q_l = str(q or "").strip().lower()
+        if not q_l or not subject:
+            return None
+
+        parent_role_terms = {
+            "manager", "supervisor", "parent", "leader", "boss", "mentor", "owner",
+        }
+        if not (
+            re.search(r"\breport(?:s|ing)?\s+to\b", q_l, flags=re.I)
+            or (
+                re.search(r"\b(?:with|has|have|having|under|managed\s+by)\b", q_l, flags=re.I)
+                and any(re.search(rf"\b{re.escape(term)}\b", q_l, flags=re.I) for term in parent_role_terms)
+            )
+        ):
+            return None
+
+        try:
+            fk = get_fk_relationships() or {}
+        except Exception:
+            fk = {}
+
+        subject_fk_map = None
+        for src, fmap in (fk or {}).items():
+            if str(src or "").strip().lower() == str(subject).strip().lower():
+                subject_fk_map = fmap or {}
+                break
+        if not subject_fk_map:
+            return None
+
+        candidate_cols: List[str] = []
+        allowed_cols = {str(c or "").strip().lower(): str(c or "").strip() for c in allowed.get(subject, set())}
+        for fk_col, tgt_table in subject_fk_map.items():
+            fk_col_l = str(fk_col or "").strip().lower()
+            tgt_l = str(tgt_table or "").strip().lower()
+            if not fk_col_l or tgt_l != str(subject).strip().lower():
+                continue
+            canonical = allowed_cols.get(fk_col_l, str(fk_col or "").strip())
+            if canonical:
+                candidate_cols.append(canonical)
+        if not candidate_cols:
+            return None
+
+        q_tokens = set(_tokenize_for_match(q_l, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+        best_col = ""
+        best_score = -1
+        for col in candidate_cols:
+            role_tokens = _column_semantic_tokens(subject, col).union(_column_descriptor_tokens(subject, col))
+            score = len(q_tokens.intersection(role_tokens))
+            if score > best_score:
+                best_score = score
+                best_col = col
+
+        if best_col and best_score > 0:
+            return (subject, best_col)
+        if len(candidate_cols) == 1:
+            return (subject, candidate_cols[0])
         return None
 
     def _subject_projection_comparable_columns() -> List[str]:
@@ -4596,22 +4740,26 @@ def _detect_filters(
             return projected_candidates[0]
         return None
 
+    def _membership_intro_is_negative(match_obj: Optional[re.Match]) -> bool:
+        intro = str(match_obj.group("intro") or "").strip().lower() if match_obj else ""
+        return bool(intro and intro.startswith(("outside", "excluding", "except")))
+
     location_match = re.search(
-        r"\b(?:in|from)\s+([A-Za-z][A-Za-z\s-]{1,40}?)"
+        r"\b(?P<intro>in|from|outside|excluding|except(?:\s+for)?)\s+(?P<value>[A-Za-z][A-Za-z\s-]{1,40}?)"
         r"(?=\s+(?:ordered|sorted|grouped|having|where|with|without|show|return|list|display|include|give)\b"
-        r"|\s+and\s+(?:show|return|list|display|include|give)\b|[.,;:!?]|\s*$)",
+        r"|\s+and\s+(?:show|return|list|display|include|give)\b|\s+(?:whose|that|which)\b|[.,;:!?]|\s*$)",
         q_raw,
         flags=re.I,
     )
     location_list_match = re.search(
-        r"\b(?:in|from)\s+([A-Za-z][A-Za-z\s-]{1,80}?(?:\s*,\s*[A-Za-z][A-Za-z\s-]{1,40})*(?:\s*,?\s*(?:or|and)\s+[A-Za-z][A-Za-z\s-]{1,40})+)"
+        r"\b(?P<intro>in|from|outside|excluding|except(?:\s+for)?)\s+(?P<value>[A-Za-z][A-Za-z\s-]{1,80}?(?:\s*,\s*[A-Za-z][A-Za-z\s-]{1,40})*(?:\s*,?\s*(?:or|and)\s+[A-Za-z][A-Za-z\s-]{1,40})+)"
         r"(?=\s+(?:ordered|sorted|grouped|having|where|with|without|show|return|list|display|include|give)\b"
-        r"|\s+and\s+(?:show|return|list|display|include|give)\b|[.,;:!?]|\s*$)",
+        r"|\s+and\s+(?:show|return|list|display|include|give)\b|\s+(?:whose|that|which)\b|[.,;:!?]|\s*$)",
         q_raw,
         flags=re.I,
     )
     if location_list_match:
-        raw_list = str(location_list_match.group(1) or "").strip().strip(".,;:!?")
+        raw_list = str(location_list_match.group("value") or "").strip().strip(".,;:!?")
         raw_list = re.split(
             r"\b(?:show|return|list|display|include|give)\b",
             raw_list,
@@ -4637,11 +4785,14 @@ def _detect_filters(
                     for v in values
                     if _normalize_categorical_literal_value(v, column=target_col)
                 ]
-                op = "not_in" if _has_negated_membership_prefix(location_list_match.start()) else "in"
+                op = "not_in" if (
+                    _membership_intro_is_negative(location_list_match)
+                    or _has_negated_membership_prefix(location_list_match.start())
+                ) else "in"
                 add_filter(IRFilter(table=subject, column=target_col, op=op, value=values))
                 location_match = None
     if location_match:
-        loc = location_match.group(1).strip().strip(".,;:!?")
+        loc = str(location_match.group("value") or "").strip().strip(".,;:!?")
         loc_low = loc.lower()
         stop_loc = {
             "the", "a", "an", "that", "this", "those", "these",
@@ -4677,7 +4828,10 @@ def _detect_filters(
             if target_col:
                 norm_loc = _normalize_categorical_literal_value(loc, column=target_col)
                 if norm_loc:
-                    if _has_negated_membership_prefix(location_match.start()):
+                    if (
+                        _membership_intro_is_negative(location_match)
+                        or _has_negated_membership_prefix(location_match.start())
+                    ):
                         add_filter(IRFilter(table=subject, column=target_col, op="not_in", value=[norm_loc]))
                     else:
                         add_filter(IRFilter(table=subject, column=target_col, op="eq", value=norm_loc))
@@ -4768,6 +4922,16 @@ def _detect_filters(
         null_like_target = _find_null_like_target_column()
         if null_like_target:
             add_filter(IRFilter(table=null_like_target[0], column=null_like_target[1], op="is_null_or_empty"))
+
+        self_fk_parent_target = _find_required_self_fk_parent_column()
+        if self_fk_parent_target:
+            add_filter(
+                IRFilter(
+                    table=self_fk_parent_target[0],
+                    column=self_fk_parent_target[1],
+                    op="is_not_null_or_empty",
+                )
+            )
 
         non_null_like_target = _find_non_null_like_target_column()
         if non_null_like_target:
@@ -4885,12 +5049,12 @@ def _detect_filters(
                 "twelve",
             }:
                 token = ""
-            target = None
+            target = _pick_explicit_text_target_column(m_prefix.start())
             name_prefix_intent = bool(
                 re.search(r"\bnames?\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+(?:start(?:s)?|begin(?:s)?)\b", q)
                 or re.search(r"\b(?:start(?:s)?|begin(?:s)?)\b(?:[\s,;:()'\"-]+\w+){0,4}[\s,;:()'\"-]+\bnames?\b", q)
             )
-            if name_prefix_intent:
+            if not target and name_prefix_intent:
                 name_col = _best_name_column(subject, allowed)
                 if name_col:
                     target = (subject, name_col)

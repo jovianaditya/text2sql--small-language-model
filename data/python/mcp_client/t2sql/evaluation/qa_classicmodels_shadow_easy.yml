@@ -1,0 +1,126 @@
+cases:
+  - id: SE1
+    difficulty: easy
+    question: "Show customers whose contact first name ends with the letter a. Return the customer name, contact first name, country, and phone, sorted by contact first name ascending, then customer name ascending."
+    groundtruth_sql: |
+      SELECT
+        customerName,
+        contactFirstName,
+        country,
+        phone
+      FROM customers
+      WHERE contactFirstName LIKE '%a'
+      ORDER BY contactFirstName ASC, customerName ASC;
+  - id: SE2
+    difficulty: easy
+    question: "Find customers outside the USA and Canada whose credit limit is between 50000 and 100000, inclusive. Return the customer number, customer name, country, and credit limit, sorted by credit limit descending."
+    groundtruth_sql: |
+      SELECT
+        customerNumber,
+        customerName,
+        country,
+        creditLimit
+      FROM customers
+      WHERE country NOT IN ('USA', 'Canada')
+        AND creditLimit BETWEEN 50000 AND 100000
+      ORDER BY creditLimit DESC;
+  - id: SE3
+    difficulty: easy
+    question: "Show employees who report to a manager and work in office 1 or 6. Return the employee number, first name, last name, office code, and manager employee number, sorted by office code ascending, then employee number ascending."
+    groundtruth_sql: |
+      SELECT
+        employeeNumber,
+        firstName,
+        lastName,
+        officeCode,
+        reportsTo
+      FROM employees
+      WHERE reportsTo IS NOT NULL
+        AND officeCode IN ('1', '6')
+      ORDER BY officeCode ASC, employeeNumber ASC;
+  - id: SE4
+    difficulty: easy
+    question: "Find offices whose postal code starts with 7. Return the office code, city, country, postal code, and territory, sorted by postal code ascending."
+    groundtruth_sql: |
+      SELECT
+        officeCode,
+        city,
+        country,
+        postalCode,
+        territory
+      FROM offices
+      WHERE postalCode LIKE '7%'
+      ORDER BY postalCode ASC;
+  - id: SE5
+    difficulty: easy
+    question: "Show orders placed on Monday. Return the order number, order date, and status, sorted by order date ascending."
+    groundtruth_sql: |
+      SELECT
+        orderNumber,
+        orderDate,
+        status
+      FROM orders
+      WHERE DAYOFWEEK(orderDate) = 2
+      ORDER BY orderDate ASC;
+  - id: SE6
+    difficulty: easy
+    question: "Find orders that already have a shipped date and are not in status Cancelled. Return the order number, order date, shipped date, and status, sorted by shipped date descending."
+    groundtruth_sql: |
+      SELECT
+        orderNumber,
+        orderDate,
+        shippedDate,
+        status
+      FROM orders
+      WHERE shippedDate IS NOT NULL
+        AND status <> 'Cancelled'
+      ORDER BY shippedDate DESC;
+  - id: SE7
+    difficulty: easy
+    question: "Show payments made in 2004 where the amount is at least 50000. Return the customer number, check number, payment date, and amount, sorted by amount descending, then payment date descending."
+    groundtruth_sql: |
+      SELECT
+        customerNumber,
+        checkNumber,
+        paymentDate,
+        amount
+      FROM payments
+      WHERE YEAR(paymentDate) = 2004
+        AND amount >= 50000
+      ORDER BY amount DESC, paymentDate DESC;
+  - id: SE8
+    difficulty: easy
+    question: "Find products whose names start with 195. Return the product code, product name, product scale, and buy price, sorted by product name ascending."
+    groundtruth_sql: |
+      SELECT
+        productCode,
+        productName,
+        productScale,
+        buyPrice
+      FROM products
+      WHERE LEFT(productName, 3) = '195'
+      ORDER BY productName ASC;
+  - id: SE9
+    difficulty: easy
+    question: "Show offices and display the second address line as N/A when it is missing. Return the office code, city, country, and the displayed second address line, sorted by office code ascending."
+    groundtruth_sql: |
+      SELECT
+        officeCode,
+        city,
+        country,
+        COALESCE(NULLIF(addressLine2, ''), 'N/A') AS displayed_second_address_line
+      FROM offices
+      ORDER BY officeCode ASC;
+  - id: SE10
+    difficulty: easy
+    question: "Find order details where the quantity ordered is between 30 and 50, inclusive, and the price per item is below 100. Return the order number, product code, quantity ordered, and price per item, sorted by quantity ordered descending, then order number ascending."
+    groundtruth_sql: |
+      SELECT
+        orderNumber,
+        productCode,
+        quantityOrdered,
+        priceEach
+      FROM orderdetails
+      WHERE quantityOrdered BETWEEN 30 AND 50
+        AND priceEach < 100
+      ORDER BY quantityOrdered DESC, orderNumber ASC;
