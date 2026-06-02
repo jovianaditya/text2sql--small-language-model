@@ -424,6 +424,13 @@ heuristic_repairs:
       - order
       - having
       - limit
+    unit_price_phrases:
+      - price per unit
+      - price per item
+      - price each
+    listed_price_phrases:
+      - listed price
+      - listed selling price
   explicit_single_table_scope:
     scope_prepositions:
       - in
@@ -982,6 +989,7 @@ agent_semantics:
       - "\\bordered\\s+by\\b"
       - "\\bbased\\s+on\\b[^.]{0,80}\\border\\b"
       - "\\b(?:date|time|timestamp)[-\\s]+order\\b"
+      - "\\bsorted\\s+from\\s+(?:the\\s+)?(?:earliest|oldest|latest|newest)\\s+to\\s+(?:the\\s+)?(?:earliest|oldest|latest|newest)\\b"
   running_window_sequence:
     running_terms:
       - running
@@ -1386,6 +1394,10 @@ winner_row_intent:
     - average
     - avg
     - sum
+    - earliest
+    - latest
+    - newest
+    - oldest
     - highest
     - lowest
     - largest

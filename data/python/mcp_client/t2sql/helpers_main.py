@@ -50,10 +50,12 @@ from .config import (
     AGENT_PROMPT_V2_ENABLED,
     AGENT_PROMPT_ABSTAIN_ENABLED,
     AGENT_PROMPT_ABSTAIN_NOTES_PREFIX,
+    AGENT_PROMPT_TELEMETRY,
     AGENT_ROUTER_EXPLICIT_RANK_PATTERNS,
     AGENT_ROUTER_VALUE_RANK_TERMS,
     AGENT_ROUTER_TIME_RANK_TERMS,
     AGENT_ROUTER_QTYPE_SET_OPERATION,
+    ALIAS_MAX_LEN,
     REFINER_AST_TRACE_LOGS,
     REFINER_VERBOSE_LOGS,
     SQL_PARSE_DIALECT,
@@ -101,7 +103,7 @@ from .helpers_core import (
     _ast_normalize_cosmetic_aliases,
     _ast_normalize_from_aliases,
     # phase 3
-    _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _ensure_explicit_simple_projection_columns, _prune_non_primary_dimensions_for_primary_aggregate, _drop_unrequested_nonprimary_identifier_group_keys, _drop_redundant_raw_name_columns_when_concat_present,
+    _prefer_friendly_names, _ensure_entity_id_and_name_if_requested, _ensure_explicit_simple_projection_columns, _restore_missing_grouped_dimension_projection, _prune_non_primary_dimensions_for_primary_aggregate, _drop_unrequested_nonprimary_identifier_group_keys, _drop_redundant_raw_name_columns_when_concat_present,
     _align_requested_description_variant, _align_requested_joined_description_variant, _drop_unrequested_difference_operand_columns,
     _expand_group_by_aliases_regex, _is_potential_winner_row, _enforce_explicit_group_by,
     _remove_invalid_select_columns_with_group_by, _fix_order_by_group_by_consistency,
@@ -160,6 +162,7 @@ from .helpers_core import (
     _rewrite_scalar_window_subquery_to_correlated_aggregate,
     _repair_misnested_offset_window_function,
     _repair_unbalanced_select_item_parentheses,
+    _normalize_single_table_semantic_column_names,
     _repair_single_table_friendly_column_names,
     _rewrite_explicit_single_table_scope,
     _append_requested_secondary_order_key,
@@ -170,11 +173,13 @@ from .helpers_core import (
     _rewrite_metric_aggregate_column_mismatch,
     _rewrite_row_level_nonnull_to_group_existence,
     _rewrite_grouped_self_fk_exists_to_group_having,
+    _rewrite_grouped_self_fk_summary_metrics,
     _rewrite_role_label_count_semantics,
     _fix_misplaced_entity_count_threshold,
     _drop_unrequested_exists_filters,
     _drop_unrequested_missing_value_subset_filters,
     _drop_unrequested_group_key_filters,
+    _drop_unrequested_same_table_group_key_subquery_filters,
     _drop_unrequested_group_key_having_filters,
     _drop_unrequested_positive_row_filters,
     _drop_unrequested_joined_identifier_literal_filters,
@@ -186,6 +191,10 @@ from .helpers_core import (
     _project_requested_comparison_count_from_having,
     _repair_missing_fixed_year_filter_on_unique_temporal_alias,
     _drop_unrequested_length_filter_for_prefix_grouping,
+    _drop_unresolved_placeholder_length_group_filter,
+    _drop_unrequested_year_between_filter_for_year_rollup,
+    _drop_contradictory_case_bucket_prefilter,
+    _prefer_char_length_for_text_columns,
     _repair_unbalanced_not_exists_order_by,
     _rewrite_two_table_grouped_temporal_exclusion,
     _rewrite_missing_temporal_bridge_exclusion,
@@ -215,8 +224,13 @@ from .helpers_core import (
     _ast_guardrails,
     # phase 7
     _simplify_default_window_frame, _repair_running_window_missing_partition, _rewrite_same_group_avg_gap_window_to_partition_only, _rewrite_correlated_offset_subquery_to_window, _rewrite_same_table_group_count_self_join_to_window, _rewrite_running_self_join_aggregate_to_window, _rewrite_single_table_case_band_derived_subquery, _enforce_window_sequence_direction, _repair_offset_window_projection_shape, _preserve_requested_base_columns_in_running_self_join, _enforce_requested_order_direction, _remove_top_level_order_by_if_not_requested, _drop_unrequested_grouped_limit, _maybe_add_limit, _collapse_spaces_outside_quotes, _strip_empty_string_comparison_on_non_text, _drop_raw_column_covered_by_function,
+    _rewrite_single_table_grouped_aggregate_derived_subquery, _repair_inner_grouped_aggregate_where_to_having,
     _enforce_requested_base_projection_in_single_table_window,
-    _repair_explicit_iso_date_filter_from_question, _repair_enum_process_proxy_filter_from_question,
+    _preserve_requested_context_columns_in_derived_single_table_window,
+    _preserve_requested_context_columns_in_single_table_scalar_subquery,
+    _ensure_alias_for_top_level_derived_table,
+    _rewrite_single_table_joined_max_case_winner_row,
+    _repair_explicit_iso_date_filter_from_question, _repair_explicit_weekday_filter_from_question, _repair_enum_process_proxy_filter_from_question,
 )
 from .rulebook import (
     aggregate_threshold_intent_aggregate_terms,
@@ -5481,6 +5495,18 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     subject = str(intent_ir.get("subject_entity") or "").strip()
     qtype = str(intent_ir.get("qtype") or "").strip()
     q_text = str(state.get("question") or "").strip().lower()
+    explicit_row_pick_hint = bool(
+        re.search(
+            r"\b(?:row|record|entry|item)\b[^.;!?]{0,80}\b"
+            r"(?:earliest|oldest|first|latest|newest|most\s+recent|last|highest|largest|lowest|smallest)\b"
+            r"|\b(?:earliest|oldest|first|latest|newest|most\s+recent|last|highest|largest|lowest|smallest)\b"
+            r"[^.;!?]{0,80}\b(?:row|record|entry|item)\b",
+            q_text,
+            flags=re.I,
+        )
+    )
+    if explicit_row_pick_hint:
+        return ""
     regex_bucket_query = bool(
         re.search(r"\bby\s+whether\b.*\b(?:match|matches|pattern|exactly|followed\s+by)\b", q_text, flags=re.I)
         or re.search(r"\bpattern\s+label\b", q_text, flags=re.I)
@@ -5623,6 +5649,13 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if agg == "COUNT":
             if c == "*":
                 return _with_alias("COUNT(*)")
+            if not bool(metric.get("distinct")):
+                try:
+                    id_col = str(get_id_column(table_l) or "").strip().lower()
+                except Exception:
+                    id_col = ""
+                if id_col and col_l == id_col:
+                    return _with_alias("COUNT(*)")
             distinct_kw = "DISTINCT " if bool(metric.get("distinct")) else ""
             return _with_alias(f"{agg}({distinct_kw}{t}.{c})")
         if agg == "PCT_NON_NULL":
@@ -5649,6 +5682,46 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 return _with_alias(f"{agg}({t}.{c})")
             return ""
         return ""
+
+    def _is_self_fk_nonnull_conditional_metric_filter(filter_obj: dict) -> bool:
+        if not isinstance(filter_obj, dict):
+            return False
+        if str(qtype or "").strip().lower() != "aggregate":
+            return False
+        if not re.search(r"\b(?:how\s+many|count|number\s+of)\b", q_text, flags=re.I):
+            return False
+        if not re.search(
+            r"\b(?:for\s+each|per|by|group(?:ed)?|summari[sz]e|break\s+.*\s+down)\b",
+            q_text,
+            flags=re.I,
+        ):
+            return False
+
+        table_l = str(filter_obj.get("table") or "").strip().lower()
+        col_l = str(filter_obj.get("column") or "").strip().lower()
+        op_l = str(filter_obj.get("op") or "").strip().lower()
+        if not table_l or not col_l or op_l != "is_not_null_or_empty":
+            return False
+
+        try:
+            fk_map = get_fk_relationships() or {}
+        except Exception:
+            fk_map = {}
+        try:
+            id_col = str(get_id_column(table_l) or "").strip().lower()
+        except Exception:
+            id_col = ""
+        target_table = str((fk_map.get(table_l) or {}).get(col_l) or "").strip().lower()
+        if not id_col or target_table != table_l:
+            return False
+
+        return bool(
+            re.search(
+                r"\b(?:manager|supervisor|reports?\s+to|reporting\s+to|managed)\b",
+                q_text,
+                flags=re.I,
+            )
+        )
 
     def _supplemental_metric_hint_strs() -> List[str]:
         hints: List[str] = []
@@ -5955,6 +6028,14 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                         f"percentage of {table}.{column} relative to the total {phrase} across all rows"
                     )
 
+        for filter_obj in (intent_ir.get("filters") or []):
+            if not _is_self_fk_nonnull_conditional_metric_filter(filter_obj):
+                continue
+            table = str(filter_obj.get("table") or "").strip()
+            column = str(filter_obj.get("column") or "").strip()
+            if table and column:
+                add_case_when_hint("SUM", table, column)
+
         return hints
 
     def _safe_filter_hint_str(filter_obj: dict) -> str:
@@ -6093,6 +6174,17 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             syn_text = str(syn or "").strip().lower()
             if syn_text:
                 variants.add(syn_text.replace("_", " ").replace("-", " "))
+        description = re.sub(
+            r"\s+",
+            " ",
+            str(_column_schema_semantics(table.lower(), column).get("description") or "").strip().lower().replace("_", " ").replace("-", " "),
+        ).strip()
+        if description:
+            variants.add(description)
+            for piece in re.split(r"\s*(?:,|;|/)\s*|\s+\bor\b\s+", description, flags=re.I):
+                piece_norm = re.sub(r"\s+", " ", str(piece or "").strip(" \t\r\n'\"()[]{}"))
+                if piece_norm and len(re.findall(r"[a-z0-9]+", piece_norm)) <= 6:
+                    variants.add(piece_norm)
         return {re.sub(r"\s+", " ", v.strip().lower()) for v in variants if str(v or "").strip()}
 
     def _extract_projection_segments_local(question_text: str) -> List[str]:
@@ -6181,7 +6273,9 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         projection_candidates = _structural_column_candidates()
         for seg in projection_segments:
             seg_l = re.sub(r"\s+", " ", str(seg or "").strip().lower())
-            if not seg_l or _metric_like_projection_segment(seg_l):
+            if not seg_l:
+                continue
+            if _metric_like_projection_segment(seg_l):
                 continue
             explicit_pairs: List[Tuple[str, str]] = []
             for table, column in projection_candidates:
@@ -6263,8 +6357,82 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     break
         return dims
 
+    def _aggregate_group_phrase_backbone_dims() -> List[dict]:
+        if qtype.lower() != "aggregate":
+            return []
+        dims: List[dict] = []
+        seen_keys: Set[Tuple[str, str, str]] = set()
+        subject_tokens: Set[str] = set()
+        if subject:
+            subject_norm = re.sub(r"\s+", " ", str(subject or "").strip().lower())
+            for token in re.findall(r"[a-z0-9]+", subject_norm):
+                if not token:
+                    continue
+                subject_tokens.add(token)
+                if token.endswith("ies") and len(token) > 3:
+                    subject_tokens.add(token[:-3] + "y")
+                if token.endswith("es") and len(token) > 2:
+                    subject_tokens.add(token[:-2])
+                if token.endswith("s") and len(token) > 1:
+                    subject_tokens.add(token[:-1])
+        for match in re.finditer(
+            r"\b(?:for\s+each|in\s+each|per|by|group\s+by)\s+([a-z][a-z0-9_ ]{1,60}?)"
+            r"(?=\s*(?:,|;|\.|\breturn\b|\bshow\b|\bdisplay\b|\blist\b|\binclude\b|\bgive\b|\bkeep\b|\bonly\b|\bsort\b|\border\b|\band\b|$))",
+            q_text,
+            flags=re.I,
+        ):
+            phrase = re.sub(r"\s+", " ", str(match.group(1) or "").strip().lower())
+            if not phrase or phrase in {"month", "year", "date", "day", "quarter"}:
+                continue
+            phrase_tokens = {tok for tok in re.findall(r"[a-z0-9]+", phrase) if tok}
+            attribute_tokens = {
+                tok for tok in phrase_tokens
+                if tok not in subject_tokens and tok not in {"each", "every", "all"}
+            }
+            if not attribute_tokens:
+                continue
+            scored_candidates: List[Tuple[int, int, str, str]] = []
+            for table, column in _structural_column_candidates():
+                score = _column_match_score(phrase, table, column)
+                if score <= 0:
+                    continue
+                specific_score = _specific_phrase_token_score(phrase, table, column)
+                scored_candidates.append((score, specific_score, table, column))
+            if not scored_candidates:
+                continue
+            scored_candidates.sort(
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                    item[2].lower() == subject.lower() if subject else False,
+                    len(item[3]),
+                ),
+                reverse=True,
+            )
+            table, column = scored_candidates[0][2], scored_candidates[0][3]
+            dim_key = (table.lower(), column.lower(), "none")
+            if dim_key in seen_keys:
+                continue
+            seen_keys.add(dim_key)
+            dims.append(
+                {
+                    "table": table,
+                    "column": column,
+                    "alias": "",
+                    "transform": "none",
+                    "visible": True,
+                }
+            )
+        return dims
+
     def _hint_display_dimensions() -> List[dict]:
         raw_dims = [d for d in (intent_ir.get("dimensions") or []) if isinstance(d, dict)]
+        q_group_scope_local = re.split(
+            r"\b(?:sort(?:ed)?\s+by|order(?:ed)?\s+by|sort(?:ed)?\s+from|order(?:ed)?\s+from)\b",
+            q_text,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip() or q_text
         is_window_hint = any(
             str(reason or "").startswith("router_hard:window_aggregate")
             for reason in gate_reasons
@@ -6353,6 +6521,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
         projection_backbone_dims = _aggregate_projection_backbone_dims()
         intro_backbone_dims = _aggregate_intro_backbone_dims()
+        group_phrase_backbone_dims = _aggregate_group_phrase_backbone_dims()
 
         quarter_match = re.search(r"\b(?:calendar\s+)?quarter\b|\bquarter\s+number\b", q_text, flags=re.I)
         if quarter_match:
@@ -6415,7 +6584,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 variant_pat = re.escape(variant_norm).replace(r"\ ", r"\s+")
                 if re.search(
                     rf"\b(?:for\s+each|per|by|group\s+by|in\s+each)\s+{variant_pat}\b",
-                    q_text,
+                    q_group_scope_local,
                     flags=re.I,
                 ):
                     matched = True
@@ -6424,7 +6593,50 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 explicit_dims.append(d)
                 seen_keys.add(dim_key)
 
-        base_dims = explicit_dims or raw_dims
+        count_distinct_metric_keys = {
+            (
+                str(metric.get("table") or "").strip().lower(),
+                str(metric.get("column") or "").strip().lower(),
+            )
+            for metric in (intent_ir.get("metrics") or [])
+            if isinstance(metric, dict)
+            and bool(metric.get("distinct"))
+            and str(metric.get("agg") or "").strip().lower() == "count"
+            and str(metric.get("table") or "").strip()
+            and str(metric.get("column") or "").strip()
+            and str(metric.get("column") or "").strip() != "*"
+        }
+        raw_dim_keys = {
+            (
+                str(d.get("table") or "").strip().lower(),
+                str(d.get("column") or "").strip().lower(),
+            )
+            for d in raw_dims
+            if isinstance(d, dict)
+            and str(d.get("table") or "").strip()
+            and str(d.get("column") or "").strip()
+        }
+        group_phrase_dim_keys = {
+            (
+                str(d.get("table") or "").strip().lower(),
+                str(d.get("column") or "").strip().lower(),
+            )
+            for d in group_phrase_backbone_dims
+            if isinstance(d, dict)
+            and str(d.get("table") or "").strip()
+            and str(d.get("column") or "").strip()
+        }
+        prefer_group_phrase_dims = bool(
+            group_phrase_backbone_dims
+            and count_distinct_metric_keys
+            and raw_dim_keys
+            and raw_dim_keys.issubset(count_distinct_metric_keys)
+            and group_phrase_dim_keys != raw_dim_keys
+        )
+
+        base_dims = explicit_dims or (group_phrase_backbone_dims if prefer_group_phrase_dims else group_phrase_backbone_dims or raw_dims)
+        if not base_dims and intro_backbone_dims:
+            base_dims = intro_backbone_dims
         if projection_backbone_dims:
             return _merge_dim_dicts(base_dims, projection_backbone_dims)
         return base_dims
@@ -6440,6 +6652,27 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if re.search(rf"\b{variant_pat}\b", phrase_norm, flags=re.I):
                 score = max(score, len(variant_norm.split()) + 2)
             variant_tokens = {tok for tok in re.findall(r"[a-z0-9]+", variant_norm) if tok}
+            score = max(score, len(phrase_tokens.intersection(variant_tokens)))
+        return score
+
+    def _specific_phrase_token_score(phrase: str, table: str, column: str) -> int:
+        phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+        if not phrase_norm:
+            return 0
+        stop_tokens = {str(tok or "").strip().lower() for tok in AGENT_COLUMN_STOP_TOKENS if str(tok or "").strip()}
+        phrase_tokens = {
+            tok for tok in re.findall(r"[a-z0-9]+", phrase_norm)
+            if tok and tok not in stop_tokens
+        }
+        if not phrase_tokens:
+            return 0
+
+        score = 0
+        for variant_norm in _column_variant_texts(table, column):
+            variant_tokens = {
+                tok for tok in re.findall(r"[a-z0-9]+", variant_norm)
+                if tok and tok not in stop_tokens
+            }
             score = max(score, len(phrase_tokens.intersection(variant_tokens)))
         return score
 
@@ -6466,13 +6699,26 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
         if phrase_norm:
             scored = [
-                (_column_match_score(phrase_norm, table, column), table, column)
+                (
+                    _column_match_score(phrase_norm, table, column),
+                    _specific_phrase_token_score(phrase_norm, table, column),
+                    table,
+                    column,
+                )
                 for table, column in candidates
             ]
             scored = [item for item in scored if item[0] > 0]
             if scored:
-                scored.sort(key=lambda item: (item[0], item[1].lower() == subject.lower(), -len(item[2])), reverse=True)
-                return (scored[0][1], scored[0][2])
+                scored.sort(
+                    key=lambda item: (
+                        item[0],
+                        item[1],
+                        item[2].lower() == subject.lower(),
+                        len(item[3]),
+                    ),
+                    reverse=True,
+                )
+                return (scored[0][2], scored[0][3])
 
         if subject:
             subject_candidates = [(t, c) for t, c in candidates if t.lower() == subject.lower()]
@@ -6688,7 +6934,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
         year_group = bool(
             re.search(
-                r"\b(?:by|per|for\s+each)\s+(?:order\s+)?year\b|\b(?:order\s+)?year\b.*\bdistinct\b",
+                r"\b(?:by|per|for\s+each)\s+(?:(?:[a-z][a-z0-9_]*\s+){0,2})?year\b"
+                r"|\b(?:(?:[a-z][a-z0-9_]*\s+){0,2})?year\b.*\bdistinct\b",
                 q_text,
                 flags=re.I,
             )
@@ -6702,8 +6949,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 )
 
         m_prefix = re.search(
-            r"\bfirst\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
-            r"(?:characters?|chars?|letters?|digits?)\s+of\s+(?:their\s+|the\s+)?"
+            r"\bfirst\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+)?"
+            r"(?P<unit>character|characters|char|chars|letter|letters|digit|digits)\s+of\s+(?:their\s+|the\s+)?"
             r"([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
             q_text,
             flags=re.I,
@@ -6711,12 +6958,22 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if m_prefix:
             raw_n = str(m_prefix.group(1) or "").strip().lower()
             n = int(raw_n) if raw_n.isdigit() else number_words.get(raw_n)
+            if not n:
+                n = 1
+            unit_raw = str(m_prefix.group("unit") or "").strip().lower()
             phrase = re.sub(r"\s+", " ", str(m_prefix.group(2) or "").strip().lower())
             resolved = _resolve_derived_column(phrase)
             if n and n > 0 and resolved:
                 table, column = resolved
+                if unit_raw.startswith("letter"):
+                    unit_label = "letter" if n == 1 else "letters"
+                elif unit_raw.startswith("digit"):
+                    unit_label = "digit" if n == 1 else "digits"
+                else:
+                    unit_label = "character" if n == 1 else "characters"
+                count_label = f"first {n} {unit_label}" if n != 1 else f"first {unit_label}"
                 add_hint(
-                    f"Derived grouping: group by first {n} characters of {table}.{column} as the visible prefix/group key; do not add a row-level LENGTH filter for this grouping phrase"
+                    f"Derived grouping: group by {count_label} of {table}.{column} as the visible prefix/group key; do not add a row-level LENGTH filter for this grouping phrase"
                 )
 
         m_length = re.search(
@@ -6768,7 +7025,17 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         return hints
 
     router_decision = state.get("router_decision") or {}
+    router_qtype = str(router_decision.get("qtype") or "").strip().lower()
+    winner_row_hint_mode = bool(
+        explicit_row_pick_hint
+        or (
+            router_qtype == "rank"
+            and explicit_row_pick_hint
+        )
+    )
     display_qtype = qtype
+    if winner_row_hint_mode:
+        display_qtype = "rank"
     if any(str(reason or "").startswith("router_hard:window_aggregate") for reason in gate_reasons):
         display_qtype = "window_aggregate"
     elif bool(router_decision.get("is_set_operation_intent", False)) and bool(
@@ -6791,6 +7058,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         ]
 
         best_dim_score = 0
+        best_dim_specific = 0
         best_dim_anchor = ""
         if phrase_norm:
             for dim in raw_dim_candidates:
@@ -6799,8 +7067,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 if not (dim_table and dim_column):
                     continue
                 score = _column_match_score(phrase_norm, dim_table, dim_column)
-                if score > best_dim_score:
+                specific_score = _specific_phrase_token_score(phrase_norm, dim_table, dim_column)
+                if (score, specific_score) > (best_dim_score, best_dim_specific):
                     best_dim_score = score
+                    best_dim_specific = specific_score
                     best_dim_anchor = f"{dim_table}.{dim_column}"
             for dim in dims:
                 if not isinstance(dim, dict):
@@ -6810,8 +7080,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 if not (dim_table and dim_column):
                     continue
                 score = _column_match_score(phrase_norm, dim_table, dim_column)
-                if score > best_dim_score:
+                specific_score = _specific_phrase_token_score(phrase_norm, dim_table, dim_column)
+                if (score, specific_score) > (best_dim_score, best_dim_specific):
                     best_dim_score = score
+                    best_dim_specific = specific_score
                     best_dim_anchor = f"{dim_table}.{dim_column}"
 
             resolved = _resolve_derived_column(
@@ -6821,7 +7093,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             )
             if resolved:
                 resolved_score = _column_match_score(phrase_norm, resolved[0], resolved[1])
-                if resolved_score > best_dim_score:
+                resolved_specific = _specific_phrase_token_score(phrase_norm, resolved[0], resolved[1])
+                if (resolved_score, resolved_specific) > (best_dim_score, best_dim_specific):
                     return f"{resolved[0]}.{resolved[1]}"
 
             if best_dim_anchor:
@@ -6863,6 +7136,29 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
         if shape_qtype == "window_aggregate":
             return ""
+
+        if shape_qtype == "rank" and winner_row_hint_mode:
+            group_phrase = ""
+            m_group = re.search(
+                r"\bfor\s+each\s+([a-z][a-z0-9_ ]{1,60}?)(?=\s+\bin\b\s+[a-z]|\s*,|\s+\b(?:return|show|list|include|keep)\b|[.;]|$)",
+                q_text,
+                flags=re.I,
+            )
+            if m_group:
+                group_phrase = re.sub(r"\s+", " ", str(m_group.group(1) or "").strip().lower())
+            anchor = _output_shape_anchor(group_phrase) if group_phrase else _output_shape_anchor()
+            row_label = "selected row"
+            if re.search(r"\b(?:earliest|oldest|first)\b", q_text, flags=re.I):
+                row_label = "earliest matching row"
+            elif re.search(r"\b(?:latest|newest|most\s+recent|last)\b", q_text, flags=re.I):
+                row_label = "latest matching row"
+            elif re.search(r"\b(?:highest|largest|max(?:imum)?)\b", q_text, flags=re.I):
+                row_label = "highest matching row"
+            elif re.search(r"\b(?:lowest|smallest|min(?:imum)?)\b", q_text, flags=re.I):
+                row_label = "lowest matching row"
+            if anchor:
+                return f"one row per {anchor} keeping the {row_label}"
+            return f"one row per group keeping the {row_label}"
 
         if shape_qtype != "aggregate":
             return ""
@@ -6908,7 +7204,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
         year_group = bool(
             re.search(
-                r"\b(?:by|per|for\s+each)\s+(?:order\s+)?year\b|\b(?:order\s+)?year\b.*\bdistinct\b",
+                r"\b(?:by|per|for\s+each)\s+(?:(?:[a-z][a-z0-9_]*\s+){0,2})?year\b"
+                r"|\b(?:(?:[a-z][a-z0-9_]*\s+){0,2})?year\b.*\bdistinct\b",
                 q_text,
                 flags=re.I,
             )
@@ -6920,18 +7217,30 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             return "grouped summary with one row per year"
 
         m_prefix = re.search(
-            r"\bfirst\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
-            r"(?:characters?|chars?|letters?|digits?)\s+of\s+(?:their\s+|the\s+)?"
+            r"\bfirst\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+)?"
+            r"(?P<unit>character|characters|char|chars|letter|letters|digit|digits)\s+of\s+(?:their\s+|the\s+)?"
             r"([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
             q_text,
             flags=re.I,
         )
         if m_prefix:
+            raw_n = str(m_prefix.group(1) or "").strip().lower()
+            n = int(raw_n) if raw_n.isdigit() else number_words.get(raw_n)
+            if not n:
+                n = 1
+            unit_raw = str(m_prefix.group("unit") or "").strip().lower()
             phrase = re.sub(r"\s+", " ", str(m_prefix.group(2) or "").strip().lower())
             anchor = _output_shape_anchor(phrase)
+            if unit_raw.startswith("letter"):
+                unit_label = "letter" if n == 1 else "letters"
+            elif unit_raw.startswith("digit"):
+                unit_label = "digit" if n == 1 else "digits"
+            else:
+                unit_label = "character" if n == 1 else "characters"
+            shape_label = f"first {n} {unit_label}" if n != 1 else f"first {unit_label}"
             if anchor:
-                return f"grouped summary with one row per prefix derived from {anchor}"
-            return "grouped summary with one row per prefix"
+                return f"grouped summary with one row per {shape_label} derived from {anchor}"
+            return f"grouped summary with one row per {shape_label}"
 
         m_length = re.search(
             r"\b(?:by|per|for\s+each|group(?:ed)?\s+by)\s+([a-z][a-z0-9_ ]{1,60}?)\s+length\b|\blength\s+of\s+([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
@@ -6986,11 +7295,26 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
     # Dimensions
     has_structural = False
+    suppress_nonprojected_derived_dims = False
+    output_shape_anchor_key: Optional[Tuple[str, str]] = None
     if not reduced_multi_table_hint:
         output_shape_hint = _output_shape_hint().strip()
         if output_shape_hint:
             parts.append(f"Output shape: {output_shape_hint}")
             has_structural = True
+            suppress_nonprojected_derived_dims = bool(
+                re.search(r"\bderived\s+from\b", output_shape_hint, flags=re.I)
+            )
+            m_shape_anchor = re.search(
+                r"\bderived\s+from\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                output_shape_hint,
+                flags=re.I,
+            )
+            if m_shape_anchor:
+                output_shape_anchor_key = (
+                    str(m_shape_anchor.group(1) or "").strip().lower(),
+                    str(m_shape_anchor.group(2) or "").strip().lower(),
+                )
 
     metrics = [m for m in (intent_ir.get("metrics") or []) if isinstance(m, dict)]
     computed_projections = [
@@ -7025,6 +7349,59 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     if dims:
         dim_strs = []
         seen_dim_keys = set()
+        subject_dim_columns = {
+            str(d.get("column") or "").strip().lower()
+            for d in dims
+            if isinstance(d, dict)
+            and str(d.get("table") or "").strip().lower() == subject.lower()
+            and str(d.get("column") or "").strip()
+        } if subject else set()
+        count_metric_target_keys = {
+            (
+                str(metric.get("table") or "").strip().lower(),
+                str(metric.get("column") or "").strip().lower(),
+            )
+            for metric in metrics
+            if isinstance(metric, dict)
+            and str(metric.get("agg") or "").strip().lower() == "count"
+            and not bool(metric.get("distinct"))
+            and str(metric.get("table") or "").strip()
+            and str(metric.get("column") or "").strip()
+            and str(metric.get("column") or "").strip() != "*"
+        }
+        count_distinct_metric_target_keys = {
+            (
+                str(metric.get("table") or "").strip().lower(),
+                str(metric.get("column") or "").strip().lower(),
+            )
+            for metric in metrics
+            if isinstance(metric, dict)
+            and str(metric.get("agg") or "").strip().lower() == "count"
+            and bool(metric.get("distinct"))
+            and str(metric.get("table") or "").strip()
+            and str(metric.get("column") or "").strip()
+            and str(metric.get("column") or "").strip() != "*"
+        }
+        has_non_identifier_subject_group_dim = any(
+            isinstance(d, dict)
+            and str(d.get("table") or "").strip().lower() == subject.lower()
+            and str(d.get("column") or "").strip()
+            and not _column_is_identifier_like(
+                str(d.get("table") or "").strip().lower(),
+                str(d.get("column") or "").strip(),
+            )
+            for d in dims
+        ) if subject else False
+        has_non_distinct_group_anchor = any(
+            (
+                str(d.get("table") or "").strip().lower(),
+                str(d.get("column") or "").strip().lower(),
+            ) not in count_distinct_metric_target_keys
+            for d in dims
+            if isinstance(d, dict)
+            and str(d.get("table") or "").strip()
+            and str(d.get("column") or "").strip()
+        )
         for d in dims:
             if not isinstance(d, dict):
                 continue
@@ -7040,6 +7417,44 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     and dim_key not in explicit_projection_dim_keys
                 ):
                     continue
+                if (
+                    suppress_nonprojected_derived_dims
+                    and dim_key not in explicit_projection_dim_keys
+                    and dim_key != output_shape_anchor_key
+                ):
+                    continue
+                if (
+                    qtype.lower() == "aggregate"
+                    and len(dims) >= 2
+                    and dim_key in count_metric_target_keys
+                    and dim_key not in explicit_projection_dim_keys
+                    and _column_is_identifier_like(t.lower(), c)
+                ):
+                    continue
+                if (
+                    qtype.lower() == "aggregate"
+                    and subject
+                    and t.lower() == subject.lower()
+                    and _column_is_identifier_like(t.lower(), c)
+                    and has_non_identifier_subject_group_dim
+                    and dim_key not in explicit_projection_dim_keys
+                ):
+                    continue
+                if (
+                    qtype.lower() == "aggregate"
+                    and len(dims) >= 2
+                    and has_non_distinct_group_anchor
+                    and dim_key in count_distinct_metric_target_keys
+                ):
+                    continue
+                if (
+                    qtype.lower() == "aggregate"
+                    and subject
+                    and t.lower() != subject.lower()
+                    and c.lower() in subject_dim_columns
+                    and _column_is_identifier_like(subject.lower(), c)
+                ):
+                    continue
                 seen_dim_keys.add(dim_key)
                 dim_strs.append(f"{t}.{c}")
         if dim_strs:
@@ -7048,14 +7463,15 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
     # Metrics
     met_strs = []
-    for m in metrics:
-        metric_hint = _safe_metric_hint_str(m)
-        if metric_hint:
-            met_strs.append(metric_hint)
-    supplemental_metric_hints = _supplemental_metric_hint_strs()
-    for metric_hint in supplemental_metric_hints:
-        if metric_hint and metric_hint not in met_strs:
-            met_strs.append(metric_hint)
+    if not winner_row_hint_mode:
+        for m in metrics:
+            metric_hint = _safe_metric_hint_str(m)
+            if metric_hint:
+                met_strs.append(metric_hint)
+        supplemental_metric_hints = _supplemental_metric_hint_strs()
+        for metric_hint in supplemental_metric_hints:
+            if metric_hint and metric_hint not in met_strs:
+                met_strs.append(metric_hint)
     arithmetic_metric_hints = _reduced_multi_table_arithmetic_metric_hints()
     if arithmetic_metric_hints:
         count_language_requested = bool(
@@ -7095,6 +7511,114 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if hint_text not in met_strs:
                 met_strs.append(hint_text)
     if met_strs:
+        def _metric_hint_scalar_key(hint_text: str) -> Tuple[str, str, str]:
+            match = re.match(
+                r"(?is)^\s*(SUM|AVG|MIN|MAX)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+                str(hint_text or "").strip(),
+            )
+            if not match:
+                return ("", "", "")
+            return (
+                str(match.group(1) or "").strip().upper(),
+                str(match.group(2) or "").strip().lower(),
+                str(match.group(3) or "").strip().lower(),
+            )
+
+        deduped_met_strs: List[str] = []
+        scalar_metric_positions: Dict[Tuple[str, str, str], int] = {}
+        for hint_text in met_strs:
+            clean_hint = str(hint_text or "").strip()
+            if not clean_hint:
+                continue
+            scalar_key = _metric_hint_scalar_key(clean_hint)
+            if not all(scalar_key):
+                if clean_hint not in deduped_met_strs:
+                    deduped_met_strs.append(clean_hint)
+                continue
+            existing_idx = scalar_metric_positions.get(scalar_key)
+            if existing_idx is None:
+                scalar_metric_positions[scalar_key] = len(deduped_met_strs)
+                deduped_met_strs.append(clean_hint)
+                continue
+            existing_hint = deduped_met_strs[existing_idx]
+            existing_case_when = bool(re.search(r"\bwith\s+case\s+when\b", existing_hint, flags=re.I))
+            current_case_when = bool(re.search(r"\bwith\s+case\s+when\b", clean_hint, flags=re.I))
+            if current_case_when and not existing_case_when:
+                deduped_met_strs[existing_idx] = clean_hint
+        met_strs = deduped_met_strs
+
+        if qtype.lower() == "aggregate" and output_shape_anchor_key:
+            def _rendered_scalar_metric_key(hint_text: str) -> Tuple[str, str, str]:
+                match = re.match(
+                    r"(?is)^\s*(SUM|AVG|MIN|MAX)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+                    str(hint_text or "").strip(),
+                )
+                if not match:
+                    return ("", "", "")
+                return (
+                    str(match.group(1) or "").strip().upper(),
+                    str(match.group(2) or "").strip().lower(),
+                    str(match.group(3) or "").strip().lower(),
+                )
+
+            explicit_temporal_metric_request = bool(
+                re.search(
+                    r"\b(?:earliest|oldest|latest|newest|most\s+recent)\s+"
+                    r"(?:[a-z][a-z0-9_]*\s+){0,3}(?:date|time|timestamp|day|month|year)\b",
+                    q_text,
+                    flags=re.I,
+                )
+            )
+            has_non_temporal_metric = any(
+                isinstance(metric, dict)
+                and str(metric.get("agg") or "").strip().upper() in {"SUM", "AVG", "MIN", "MAX"}
+                and (
+                    (
+                        str(metric.get("table") or "").strip().lower(),
+                        str(metric.get("column") or "").strip().lower(),
+                    ) != output_shape_anchor_key
+                )
+                for metric in metrics
+            )
+            if not has_non_temporal_metric:
+                has_non_temporal_metric = any(
+                    agg in {"SUM", "AVG", "MIN", "MAX"}
+                    and (table, column) != output_shape_anchor_key
+                    for agg, table, column in (
+                        _rendered_scalar_metric_key(hint_text) for hint_text in met_strs
+                    )
+                    if agg and table and column
+                )
+            if not explicit_temporal_metric_request and has_non_temporal_metric:
+                blocked_metric_hints: Set[str] = set()
+                for metric in metrics:
+                    metric_hint = _safe_metric_hint_str(metric)
+                    if not metric_hint:
+                        continue
+                    agg = str(metric.get("agg") or "").strip().upper()
+                    metric_key = (
+                        str(metric.get("table") or "").strip().lower(),
+                        str(metric.get("column") or "").strip().lower(),
+                    )
+                    if (
+                        agg in {"MIN", "MAX"}
+                        and metric_key == output_shape_anchor_key
+                        and _column_is_date_like(metric_key[0], metric_key[1])
+                    ):
+                        blocked_metric_hints.add(metric_hint)
+                for hint_text in met_strs:
+                    agg, table, column = _rendered_scalar_metric_key(hint_text)
+                    if (
+                        agg in {"MIN", "MAX"}
+                        and (table, column) == output_shape_anchor_key
+                        and _column_is_date_like(table, column)
+                    ):
+                        blocked_metric_hints.add(str(hint_text or "").strip())
+                if blocked_metric_hints:
+                    met_strs = [
+                        hint_text for hint_text in met_strs
+                        if str(hint_text or "").strip() not in blocked_metric_hints
+                    ]
         parts.append(f"Metrics: {', '.join(met_strs)}")
         has_structural = True
 
@@ -7146,7 +7670,30 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     filters = intent_ir.get("filters") or []
     if not reduced_multi_table_hint and filters and not suppress_lookup_execution_shape:
         filt_strs = []
+        winner_row_metric_keys = {
+            (
+                str(metric.get("table") or "").strip().lower(),
+                str(metric.get("column") or "").strip().lower(),
+            )
+            for metric in metrics
+            if isinstance(metric, dict)
+            and str(metric.get("agg") or "").strip().upper() in {"MIN", "MAX"}
+            and str(metric.get("table") or "").strip()
+            and str(metric.get("column") or "").strip()
+            and str(metric.get("column") or "").strip() != "*"
+        }
         for f in filters:
+            if _is_self_fk_nonnull_conditional_metric_filter(f):
+                continue
+            if winner_row_hint_mode:
+                f_table = str((f or {}).get("table") or "").strip().lower()
+                f_col = str((f or {}).get("column") or "").strip().lower()
+                f_op = str((f or {}).get("op") or "").strip().lower()
+                if (
+                    f_op in {"is_not_null_or_empty", "is_null_or_empty"}
+                    and (f_table, f_col) in winner_row_metric_keys
+                ):
+                    continue
             filter_hint = _safe_filter_hint_str(f)
             if filter_hint:
                 filt_strs.append(filter_hint)
@@ -7433,9 +7980,14 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             "twelve": 12,
         }
         number_pat = r"-?\d[\d,]*(?:\.\d+)?|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+        threshold_op_alt = (
+            r"at\s+least|minimum\s+of|more\s+than|greater\s+than|above|over|"
+            r"at\s+most|maximum\s+of|less\s+than|below|under"
+        )
         threshold_re = re.compile(
-            rf"\b(?P<op>at\s+least|minimum\s+of|more\s+than|greater\s+than|above|over|at\s+most|maximum\s+of|less\s+than|below|under)\s+"
-            rf"(?P<num>{number_pat})\b(?P<tail>[^.;!?]{{0,80}})",
+            rf"\b(?P<op>{threshold_op_alt})\s+"
+            rf"(?P<num>{number_pat})\b"
+            rf"(?P<tail>(?:(?!\b(?:{threshold_op_alt})\s+{number_pat}\b)[^.;!?]){{0,80}})",
             flags=re.I,
         )
         op_map = {
@@ -7452,8 +8004,9 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             "under": "<",
         }
         saw_group_filter_candidate = False
-        semantic_group_filter_hint = ""
         concrete_hint_confidence = 0.90
+        concrete_group_filter_hints: List[str] = []
+        semantic_group_filter_hints: List[str] = []
 
         count_metric = None
         for metric in metrics:
@@ -7567,9 +8120,22 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 return "post-aggregation maximum threshold"
             return "post-aggregation threshold"
 
+        def _append_unique_hint(bucket: List[str], hint_text: str) -> None:
+            normalized = str(hint_text or "").strip()
+            if normalized and normalized not in bucket:
+                bucket.append(normalized)
+
         for match in threshold_re.finditer(q_text):
             tail = str(match.group("tail") or "")
             prefix = q_text[max(0, match.start() - 80):match.start()]
+            conditional_metric_threshold = bool(
+                re.search(
+                    r"\b(?:how\s+many|count|number\s+of)\b[^.;!?]{0,120}\bhave\s+"
+                    r"(?:a\s+|an\s+|their\s+)?[a-z][a-z0-9_ ]{1,60}?\s*(?:of\s*)?$",
+                    prefix,
+                    flags=re.I,
+                )
+            )
             threshold_targets_count = bool(
                 re.search(
                     r"\b(?:line|lines|row|rows|record|records|entry|entries|item|items|group|groups|time|times)\b",
@@ -7599,6 +8165,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     )
                 )
             )
+            if conditional_metric_threshold and not threshold_targets_count:
+                continue
             raw_num = str(match.group("num") or "").strip().lower()
             if raw_num in number_word_values:
                 threshold_value = str(number_word_values[raw_num])
@@ -7649,26 +8217,39 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
             if threshold_targets_count or aggregate_metric_expr:
                 saw_group_filter_candidate = True
-                if not semantic_group_filter_hint:
-                    semantic_group_filter_hint = _semantic_group_filter_family(
-                        threshold_targets_count=threshold_targets_count,
-                        aggregate_metric_family=aggregate_metric_family,
-                        count_metric_is_distinct_dim=count_metric_is_distinct_dim,
-                    )
+                semantic_hint = _semantic_group_filter_family(
+                    threshold_targets_count=threshold_targets_count,
+                    aggregate_metric_family=aggregate_metric_family,
+                    count_metric_is_distinct_dim=count_metric_is_distinct_dim,
+                )
+                _append_unique_hint(semantic_group_filter_hints, semantic_hint)
 
             if confidence >= concrete_hint_confidence:
                 if aggregate_metric_expr and not threshold_targets_count:
-                    return f"{aggregate_metric_expr} {op} {threshold_value}"
+                    _append_unique_hint(
+                        concrete_group_filter_hints,
+                        f"{aggregate_metric_expr} {op} {threshold_value}",
+                    )
+                    continue
                 if threshold_targets_count:
-                    return f"{count_expr} {op} {threshold_value}"
+                    _append_unique_hint(
+                        concrete_group_filter_hints,
+                        f"{count_expr} {op} {threshold_value}",
+                    )
+                    continue
 
-            if not threshold_targets_count:
-                continue
+            if threshold_targets_count or aggregate_metric_expr:
+                _append_unique_hint(
+                    semantic_group_filter_hints,
+                    semantic_hint if (threshold_targets_count or aggregate_metric_expr) else "post-aggregation threshold",
+                )
 
-            return semantic_group_filter_hint or "post-aggregation threshold"
-
+        if concrete_group_filter_hints:
+            return " AND ".join(concrete_group_filter_hints)
+        if semantic_group_filter_hints:
+            return " AND ".join(semantic_group_filter_hints)
         if saw_group_filter_candidate:
-            return semantic_group_filter_hint or "post-aggregation threshold"
+            return "post-aggregation threshold"
         return ""
 
     group_filter_qtype = qtype.lower()
@@ -7689,7 +8270,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     if reduced_multi_table_hint:
         if not has_structural:
             return ""
-        if qtype.lower() == "aggregate" and not met_strs:
+        if str(display_qtype or "").strip().lower() == "aggregate" and not met_strs:
             return ""
         hint = (
             f"\n[CANDIDATE INTENT SUMMARY] (confidence={confidence:.2f}):\n"
@@ -7714,13 +8295,6 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         intent_ir,
         suppress_lookup_execution_shape=suppress_lookup_execution_shape,
     )
-    if low_risk_single_table_lookup and not suppress_lookup_execution_shape:
-        parts.append(
-            "Execution shape: direct single-table SELECT from the subject table; "
-            "use simple WHERE filtering only if the question asks for it; "
-            "avoid subqueries, set operations, and self-joins unless the question explicitly requires them"
-        )
-        has_structural = True
     # Guard: require at least one structural field beyond subject+qtype
     if not has_structural:
         return ""
@@ -7729,7 +8303,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     # (e.g. window/cumulative query mislabeled as aggregate) - dims-only
     # hint biases LLM to treat columns as grouping-only, not SELECT targets.
     has_valid_metrics = any(f"Metrics:" in p for p in parts)
-    if qtype.lower() == "aggregate" and not has_valid_metrics:
+    if str(display_qtype or "").strip().lower() == "aggregate" and not has_valid_metrics:
         return ""
 
     hint = (
@@ -7808,16 +8382,20 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         )
         if symbolic_filter_hint_present:
             constraints.append(
-                "INTENT HINT FILTER SEMANTICS (CRITICAL): If the Intent IR Hint shows symbolic filter operators such as "
-                "`eq`, `in`, `not_in`, `like_prefix`, `like_suffix`, `like_contains`, `is_null_or_empty`, or `is_not_null_or_empty`, "
-                "preserve their exact row-filter meaning in SQL. Respect the shown AND/OR structure exactly. "
-                "Do NOT weaken a positive filter into a tautology by mixing it with its opposite condition."
+                "INTENT HINT FILTER SEMANTICS (CRITICAL): Treat symbolic IR operators as meaning hints, not literal SQL. "
+                "Preserve the shown AND/OR structure exactly. Translate `eq`, `in`, `not_in`, `like_prefix`, `like_suffix`, "
+                "`like_contains`, `is_null_or_empty`, and `is_not_null_or_empty` into normal SQL predicates. "
+                "Never output the symbolic operator names themselves in SQL."
             )
 
     # === [PRIORITY 1] TOP N GLOBAL RANKING RULE (FIRST - before all other rules) ===
     # Detect "Top N" or "N highest/lowest" pattern that should use ORDER BY + LIMIT
     # This is DIFFERENT from ordinal ranking ("second highest per group")
     q_lower = question.lower()
+    sort_requested = any_phrase_in_text(
+        question,
+        rule_list(("prompt_intent", "sort_direction", "sort_request_terms"), ["sort", "sorted", "order by"]),
+    )
     # Pattern: "10 highest", "top 10", "10 largest", "10 products with the highest"
     top_n_pattern = re.search(r'\b(top\s+\d+|\d+\s+(highest|lowest|largest|smallest|most|least|tertinggi|terendah|terbesar|terkecil))\b', q_lower)
     # Also check for generic noun-phrase variants like:
@@ -7828,17 +8406,21 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         q_lower,
         re.IGNORECASE,
     )
+    has_temporal_language = bool(
+        re.search(
+            r"\b(?:date|dates|day|days|month|months|year|years|weekday|weekdays|"
+            r"week|weeks|quarter|quarters|time|timestamp|chronological|"
+            r"chronologically|earliest|latest|newest|oldest)\b",
+            q_lower,
+        )
+    )
 
     is_top_n_global_ranking = bool(top_n_pattern or top_n_context) and not is_ordinal_ranking
 
     if is_top_n_global_ranking:
         constraints.append(
-            "TOP N QUERY (HIGHEST PRIORITY): This question asks for 'Top N' or 'N highest/lowest'. "
-            "YOU MUST USE: ORDER BY column DESC LIMIT N. "
-            "EXAMPLE SHAPE: SELECT <requested columns> FROM <main table> ORDER BY <requested metric> DESC LIMIT N. "
-            "FORBIDDEN: Do NOT use MAX() in WHERE clause. Do NOT use subquery with LIMIT. "
-            "FORBIDDEN: WHERE col = (SELECT MAX(col) ...). "
-            "CORRECT: Just ORDER BY and LIMIT directly on the main table."
+            "TOP N QUERY (HIGHEST PRIORITY): For 'Top N' / 'N highest-lowest', use ORDER BY + LIMIT directly on the main query. "
+            "Do NOT rewrite it as MAX()/MIN() in WHERE and do NOT use a LIMIT subquery."
         )
 
     # === [PRIORITY 2] GENERAL ANTI-HALLUCINATION RULE ===
@@ -7847,16 +8429,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         "Do NOT change the casing style or spelling of schema columns."
     )
     constraints.append(
-        "SCHEMA CONTEXT RULE (CRITICAL): In schema cards, only the real table/column names "
-        "shown by ALLOWED IDENTIFIERS or by `Table:` and `Column:` are SQL identifiers. "
-        "Descriptions, role tags, synonyms, stats, and sample values are evidence only; "
-        "NEVER turn them into SQL identifiers. If a user phrase matches a synonym or "
-        "description, translate it to the canonical column name from that same card."
+        "SCHEMA CONTEXT RULE (CRITICAL): Only ALLOWED IDENTIFIERS and explicit `Table:`/`Column:` names are SQL identifiers. "
+        "Descriptions, synonyms, stats, and sample values are evidence only; map them back to the canonical schema name."
     )
     constraints.append(
-        "CRITICAL RULE: Do NOT add SQL clauses (WHERE, HAVING, LIMIT, ORDER BY) "
-        "unless the user EXPLICITLY requests them in the question. "
-        "NEVER add filters based on STATS or sample values - only use what the user asks for."
+        "CRITICAL RULE: Add WHERE, HAVING, LIMIT, or ORDER BY only when the question asks for them. "
+        "Never invent filters from stats or sample values."
     )
     if _question_wants_count_distinct(question):
         constraints.append(
@@ -7949,15 +8527,9 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     for_each_triggers = ["for each", "each ", "per ", "every "]
     if any(t in question.lower() for t in for_each_triggers):
         constraints.append(
-            "FOR EACH RULE (CRITICAL): When the question says 'For each X' or 'Per X', you MUST return ALL values of X. "
-            "Do NOT add WHERE filters on the grouping column unless the user explicitly filters it. "
-            "Do NOT add subqueries to filter grouping columns. "
-            "TABLE SELECTION RULE: When counting 'number of Y' per each X, use FROM the Y table (the entity being counted), "
-            "NOT the dimension table for X. "
-            "Example: 'for each grouping label, count entities' -> FROM entity_table GROUP BY grouping_label (NOT FROM grouping_dimension_table). "
-            "The COUNT(*) counts rows in the FROM table, so use the table containing the entities to count. "
-            "CORRECT: SELECT groupingCol, COUNT(*) FROM entity_table GROUP BY groupingCol "
-            "WRONG: SELECT groupingCol, COUNT(*) FROM dimension_table GROUP BY groupingCol (this counts dimension rows, not entities)"
+            "FOR EACH RULE (CRITICAL): 'For each/per/every X' means return all X groups. "
+            "Do not filter the grouping column unless the user asks for it, do not use subqueries to prune groups, "
+            "and when counting Y per X, use the Y-side table as the FROM table."
         )
 
     # === [NEW] EXPLICIT RANK() FUNCTION RULE ===
@@ -7970,12 +8542,8 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 f"Do NOT partition by an unrelated descriptive column."
             )
         constraints.append(
-            "RANK FUNCTION RULE (CRITICAL): The question asks for a 'rank' of items. "
-            "You MUST use the RANK() or DENSE_RANK() window function. "
-            "CORRECT PATTERN: `SELECT col1, col2, RANK() OVER (PARTITION BY group_col ORDER BY order_col DESC) AS entity_rank FROM table_name` "
-            "WRONG: Using COUNT(*) - that gives a total count, NOT a rank. "
-            "WRONG: Using ROW_NUMBER() - use RANK() for tied values. "
-            "IMPORTANT: RANK() assigns the same rank to equal values and skips ranks for ties."
+            "RANK FUNCTION RULE (CRITICAL): For ranking questions, use RANK() or DENSE_RANK() as a window function. "
+            "Do not replace rank with COUNT(*), and prefer RANK() over ROW_NUMBER() when ties should share a rank."
             f"{partition_rank_hint}"
         )
 
@@ -7990,11 +8558,8 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 f"Do NOT partition by another selected attribute just because it also appears in the output."
             )
         constraints.append(
-            f"WINDOW AGGREGATE RULE (CRITICAL): The phrase 'within the same' or 'in the same' means you MUST use a WINDOW FUNCTION with PARTITION BY. "
-            f"CORRECT: `SELECT col1, col2, COUNT(*) OVER (PARTITION BY groupColumn) AS total FROM table` "
-            f"WRONG: `COUNT(*) OVER ()` without PARTITION BY. "
-            f"WRONG: Using GROUP BY with window functions.{partition_col_hint} "
-            f"IMPORTANT: Do NOT add GROUP BY clause when using window functions for this pattern."
+            f"WINDOW AGGREGATE RULE (CRITICAL): 'within the same' / 'in the same' requires a window function with PARTITION BY. "
+            f"Do not use an unpartitioned OVER() and do not add GROUP BY for this windowed pattern.{partition_col_hint}"
         )
 
     has_offset_window_intent = bool(
@@ -8003,6 +8568,12 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             re.search(r"\bordered\s+by\b", question.lower())
             or re.search(r"\bbased\s+on\b[^.]{0,80}\border\b", question.lower())
             or re.search(r"\b(?:date|time|timestamp)[-\s]+order\b", question.lower())
+            or re.search(
+                r"\bsorted\s+from\s+(?:the\s+)?"
+                r"(?:earliest|oldest|latest|newest)\s+to\s+(?:the\s+)?"
+                r"(?:earliest|oldest|latest|newest)\b",
+                question.lower(),
+            )
         )
     )
     if has_offset_window_intent:
@@ -8012,13 +8583,37 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "Use a window function with PARTITION BY the entity group (for example the same customer) and ORDER BY the sequence column named in the question. "
             "If the question says 'ordered by X' without saying descending, use ascending order for the window sequence."
         )
+    simple_single_table_lookup = bool(
+        complexity == "simple"
+        and qtype == "lookup"
+        and not has_multi_table_question
+        and not is_top_n_global_ranking
+        and not has_grouping
+        and not has_exclusion
+        and not is_ordinal_ranking
+        and not is_window_aggregate
+        and not is_explicit_rank_function
+        and not is_winner_row
+        and not is_set_operation_intent
+        and not has_offset_window_intent
+    )
+    simple_single_table_aggregate = bool(
+        complexity == "simple"
+        and qtype == "aggregate"
+        and not has_multi_table_question
+        and not has_exclusion
+        and not is_ordinal_ranking
+        and not is_window_aggregate
+        and not is_explicit_rank_function
+        and not is_winner_row
+        and not is_set_operation_intent
+        and not has_offset_window_intent
+    )
 
     # [A] STATS UTILIZATION (profiling statistics)
     constraints.append(
-        "DATA INTELLIGENCE: Use the provided 'STATS' in the Context responsibly:\n"
-        "   - SAMPLES: Use exact string values found in 'Sample=...'. (e.g. if Sample='USA', do not query 'United States').\n"
-        "   - RANGE/DISTRIBUTION: `Min`/`Max` values are provided ONLY as a reference to describe data distribution. "
-        "     NEVER hardcode these values into the query. Use SQL logic (e.g. `ORDER BY`, `MAX()`, comparison operators) instead."
+        "DATA INTELLIGENCE: Treat Sample values as exact lexical evidence when matching user-provided literals. "
+        "Treat Min/Max as descriptive context only; never hardcode them unless the user explicitly asks for those exact values."
     )
     # [B] SIMPLE QUERY RULES
     if complexity == "simple":
@@ -8035,57 +8630,55 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 "Use FK-consistent JOIN predicates only."
             )
         else:
-            constraints.append("SCOPE: This query requires ONE TABLE ONLY. DO NOT JOIN.")
-            constraints.append("FILTERING: Filter by ID/Code directly in the main table.")
+            if simple_single_table_lookup:
+                constraints.append(
+                    "SIMPLE LOOKUP SCOPE (CRITICAL): Use one table only, no JOIN, no aggregates, and direct WHERE filtering on the main table."
+                )
+            else:
+                constraints.append("SCOPE: This query requires ONE TABLE ONLY. DO NOT JOIN.")
+                constraints.append("FILTERING: Filter by ID/Code directly in the main table.")
 
         if qtype == "lookup" and not is_top_n_global_ranking:
-            constraints.append(
-                "SIMPLE LOOKUP RULE: Do NOT use aggregation functions like MAX(), MIN(), or SUM(). "
-                "Just SELECT the column directly. Use 'ORDER BY column DESC' for 'latest/newest/highest'."
-            )
+            if not simple_single_table_lookup:
+                constraints.append(
+                    "SIMPLE LOOKUP RULE: Do NOT use aggregation functions like MAX(), MIN(), or SUM(). "
+                    "Just SELECT the column directly. Use 'ORDER BY column DESC' for 'latest/newest/highest'."
+                )
         elif qtype == "aggregate":
             constraints.append(
-                "AGGREGATE RULE: When computing aggregates (COUNT, SUM, AVG, MIN, MAX) 'per each X', "
-                "you MUST use GROUP BY on the grouping column. Use HAVING for filters on aggregates, NOT WHERE."
+                "AGGREGATE RULE: For grouped aggregates, put grouping columns in GROUP BY and aggregate filters in HAVING, not WHERE."
             )
     if group_filters_hint_present:
         constraints.append(
-            "GROUP FILTERS RULE (CRITICAL): If the intent summary includes Group Filters, "
-            "apply those filters as HAVING conditions unless the question clearly contradicts them. "
-            "Keep ordinary row filters in WHERE. If the threshold is about how many rows or items "
-            "are in each group, use COUNT(*) or the requested count metric; do not invent a "
-            "separate row-level comparison on another numeric column."
+            "GROUP FILTERS RULE (CRITICAL): If the intent summary includes Group Filters, apply them in HAVING unless the question clearly contradicts them. "
+            "Keep ordinary row filters in WHERE, and if the threshold is about rows/items per group, use COUNT(*) or the requested count metric."
         )
         constraints.append(
-            "PROJECTION STABILITY: When grouped filtering is needed, preserve the requested output columns "
-            "and requested aggregate measures in SELECT."
+            "PROJECTION STABILITY: When grouped filtering is needed, preserve the requested output columns and aggregate measures in SELECT."
         )
     if intent_hint_preview:
-        constraints.append(
-            "INTENT SUMMARY CONTRACT (CRITICAL): When a CANDIDATE INTENT SUMMARY is provided, "
-            "use its schema-grounded expressions as the draft target. Visible Dimensions belong "
-            "in SELECT and GROUP BY; Metrics belong in SELECT as aggregate expressions; Group "
-            "Filters belong in HAVING. Do NOT paraphrase these expressions into natural-language "
-            "SQL identifiers."
-        )
-        constraints.append(
-            "AGGREGATE ORDERING RULE (CRITICAL): If the user asks to sort by a requested aggregate "
-            "such as total/sum/count/average/latest/earliest/min/max, ORDER BY that aggregate's "
-            "alias or exact aggregate expression. Do NOT substitute a different aggregate just "
-            "because it is also present in the query."
-        )
+        if simple_single_table_lookup:
+            constraints.append(
+                "INTENT SUMMARY CONTRACT (CRITICAL): Follow the hinted columns, filters, and ordering; do not invent joins, aggregates, or extra columns."
+            )
+        else:
+            constraints.append(
+                "INTENT SUMMARY CONTRACT (CRITICAL): When a CANDIDATE INTENT SUMMARY is provided, draft toward those schema-grounded expressions. "
+                "Dimensions belong in SELECT/GROUP BY, Metrics in SELECT, and Group Filters in HAVING."
+            )
+        if sort_requested or is_top_n_global_ranking or is_ordinal_ranking:
+            constraints.append(
+                "AGGREGATE ORDERING RULE (CRITICAL): If sorting is requested by a shown aggregate, ORDER BY that same aggregate alias or expression."
+            )
 
     if is_simple_scalar_subquery_single_table:
         constraints.append(
-            "SIMPLE SCALAR SUBQUERY RULE (CRITICAL): This question compares rows to a single-table scalar baseline such as "
-            "the overall average, MAX(date), or MIN(date). "
-            "You MUST keep the base table as the main FROM table and use a scalar subquery in WHERE. "
-            "Example: `WHERE date_col = (SELECT MAX(date_col) FROM base_table)` or "
-            "`WHERE metric_col > (SELECT AVG(metric_col) FROM base_table)`."
+            "SIMPLE SCALAR SUBQUERY RULE (CRITICAL): When comparing rows to a single-table scalar baseline (overall AVG, MAX date, MIN date), "
+            "keep the base table in FROM and use a scalar subquery in WHERE."
         )
         constraints.append(
-            "SIMPLE SCALAR SUBQUERY RULE (CRITICAL): Do NOT replace the scalar subquery with only ORDER BY/LIMIT on the outer query. "
-            "If the question asks for all rows on the latest or earliest date, filter to that date first, then apply any requested final ORDER BY."
+            "SIMPLE SCALAR SUBQUERY RULE (CRITICAL): Do not replace that scalar subquery with only ORDER BY/LIMIT. "
+            "If all rows on the latest/earliest date are needed, filter to that date first, then apply any requested final ORDER BY."
         )
 
     # [C] RANKING RULES
@@ -8118,59 +8711,36 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                     break
             
             constraints.append(
-                f"ORDINAL RANKING RULE (CRITICAL): The question asks for the {rank_n}th highest/lowest item. "
-                f"Use SIMPLE pattern: `WHERE rn = {rank_n}` in the outer query. "
-                f"This AUTOMATICALLY excludes entities with fewer than {rank_n} records - NO NEED for HAVING or extra COUNT checks."
+                f"ORDINAL RANKING RULE (CRITICAL): For the {rank_n}th highest/lowest item, use ROW_NUMBER() in a subquery and filter with `WHERE rn = {rank_n}` in the outer query. "
+                f"That already excludes groups with fewer than {rank_n} rows; do not add HAVING or extra COUNT checks."
             )
             constraints.append(
-                f"STRICT SYNTAX (FOLLOW EXACTLY): "
-                f"`SELECT t.col1, t.col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY valueCol DESC) AS rn FROM table) t WHERE t.rn = {rank_n}` "
-                f"Do NOT use GROUP BY, HAVING, or MAX(CASE WHEN...) - just WHERE rn = {rank_n} is enough!"
+                "ORDINAL RANKING RULE (CRITICAL): Use standard ANSI ROW_NUMBER() only. "
+                "Do not use session variables, GROUP BY, HAVING, or MAX(CASE WHEN ...) after filtering on rn; once `WHERE rn = N` is applied, select the requested columns directly."
             )
             constraints.append(
-                "ORDINAL RANKING RULE (CRITICAL): Do NOT use MySQL session variables such as `@rn`, `@cn`, or manual running counters. "
-                "Use the standard ANSI window function `ROW_NUMBER()` only."
-            )
-            constraints.append(
-                f"REDUNDANT PATTERN WARNING: When you use `WHERE rn = {rank_n}`, each group already has exactly ONE row. "
-                f"THEREFORE: (1) NO GROUP BY needed - it's redundant! (2) NO MAX(CASE WHEN rn = {rank_n}...) needed - just select the column directly! "
-                f"WRONG: `SELECT t.entity_col, MAX(CASE WHEN rn = {rank_n} THEN metric_col END) FROM (...) t WHERE t.rn = {rank_n} GROUP BY t.entity_col` "
-                f"CORRECT: `SELECT t.entity_col, t.metric_col FROM (...) t WHERE t.rn = {rank_n}`"
-            )
-            constraints.append(
-                f"ALIAS CONSISTENCY (CRITICAL): Use the SAME alias everywhere! "
-                f"WRONG: `SELECT p.col FROM (...) t WHERE t.rn = {rank_n}` - 'p' is undefined! "
-                f"CORRECT: `SELECT t.col FROM (...) t WHERE t.rn = {rank_n}` - same alias 't' everywhere!"
+                "ALIAS CONSISTENCY (CRITICAL): Keep the same subquery alias in SELECT and WHERE when filtering on rn."
             )
         else:
             constraints.append(
-                "WINNER-ROW RULE (CRITICAL): You MUST use ROW_NUMBER() subquery pattern ONLY. "
-                "CORRECT: `SELECT t.col1, t.col2 FROM (SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY valueCol DESC) AS rn FROM table) t WHERE t.rn = 1` "
-                "WRONG: Using MAX() with GROUP BY - this does NOT give you the correct row with all its columns! "
+                "WINNER-ROW RULE (CRITICAL): Use the ROW_NUMBER() subquery pattern and filter the outer query with `WHERE rn = 1`. "
+                "Do not replace it with MAX()/MIN() + GROUP BY when the full winning row is required."
             )
 
             # Add tiebreaker constraint if detected
             if has_tiebreaker:
                 constraints.append(
-                    "TIEBREAKER RULE (CRITICAL): The question says 'if multiple, choose the one with latest/earliest'. "
-                    "You MUST add a SECOND column to ORDER BY for tiebreaking: "
-                    "`ROW_NUMBER() OVER (PARTITION BY groupCol ORDER BY primaryCol [direction], tiebreakCol [direction]) AS rn` "
-                    "Use DESC for 'latest/highest/largest', ASC for 'earliest/lowest/smallest'. "
-                    "DO NOT use MAX(), GROUP BY, LEFT JOIN, or correlated subquery - just the simple subquery pattern!"
+                    "TIEBREAKER RULE (CRITICAL): If the question says to choose latest/earliest among ties, add a second ORDER BY key inside ROW_NUMBER(). "
+                    "Use DESC for latest/highest/largest and ASC for earliest/lowest/smallest."
                 )
 
             # ANTI-PATTERN PROHIBITION: Prevent mixing MAX() GROUP BY with ROW_NUMBER()
             constraints.append(
-                "STRICT PROHIBITION (SYNTAX ERROR): DO NOT mix MAX()/MIN()/GROUP BY with ROW_NUMBER(). "
-                "These are MUTUALLY EXCLUSIVE patterns. Choose ONE:\n"
-                "• If you need ROW_NUMBER(): Do NOT use MAX(), MIN(), SUM(), COUNT(), GROUP BY, or HAVING\n"
-                "• If you need GROUP BY aggregation: Do NOT use ROW_NUMBER(), RANK(), or window functions\n"
-                "For this query, use ONLY the ROW_NUMBER() pattern - no GROUP BY, no MAX(), no aggregate functions."
+                "STRICT PROHIBITION (CRITICAL): Do not mix ROW_NUMBER() with MAX()/MIN()/SUM()/COUNT(), GROUP BY, or HAVING in the same winner-row solution."
             )
         
         constraints.append(
-            "CRITICAL PROHIBITION: Do NOT put `ROW_NUMBER()` inside a `GROUP BY` clause. "
-            "Do NOT use `HAVING` for ranking. Use the subquery pattern above."
+            "CRITICAL PROHIBITION: Do not put ROW_NUMBER() in GROUP BY and do not use HAVING for ranking."
         )
 
     # [D] PRIMARY TABLE GUIDANCE (CRITICAL FOR ALL MULTI-TABLE QUERIES)
@@ -8600,40 +9170,40 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     percentage_triggers = ["percentage", "percent", "ratio", "proportion"]
     if any(t in question.lower() for t in percentage_triggers):
         constraints.append(
-            "PERCENTAGE CALCULATION RULE: When asked for percentage, you MUST compute it as a formula. "
-            "Do NOT just return counts; return the actual percentage value."
+            "PERCENTAGE CALCULATION RULE: When asked for a percentage/ratio/proportion, return the computed percentage rather than only raw counts."
         )
 
     # [F] DATE RULES
-    constraints.append(
-        "DATE LABEL STRICT RULE: If asking for Month Name, GROUP BY both MONTH(date) and DATE_FORMAT(date, '%M')."
-        "DATE FILTERING RULES:\n"
-        "   - For year filtering: Use `YEAR(date_column) = YYYY` (NOT SUBSTR).\n"
-        "   - For month filtering: Use `MONTH(date_column) = M`.\n"
-        "   - For range filtering: Use `date_column BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'`."
-    )
+    if "month" in q_lower and ("group" in q_lower or has_grouping):
+        constraints.append(
+            "DATE LABEL STRICT RULE: If asking for Month Name, GROUP BY both MONTH(date) and DATE_FORMAT(date, '%M')."
+        )
+    if has_temporal_language:
+        constraints.append(
+            "DATE FILTERING RULES: Use YEAR(date_column)=YYYY for year filters, MONTH(date_column)=M for month filters, "
+            "and direct date comparisons for ranges instead of substring slicing."
+        )
     if any(re.search(pat, question, flags=re.I) for pat in AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS if pat):
         constraints.append(
             "RANGE BOUNDARY RULE (CRITICAL): If the question says a range is 'between X and less than Y' "
             "or otherwise makes the upper bound exclusive, do NOT use BETWEEN X AND Y because SQL BETWEEN is inclusive. "
             "Use `column >= X AND column < Y` for that bucket/filter."
         )
-    constraints.append(
-        "JOIN ALIAS RULE (CRITICAL): In each JOIN ... ON clause, only reference aliases that are already introduced "
-        "(current table alias + previously joined aliases). NEVER reference a future alias."
-    )
-    constraints.append(
-        "DATE COLUMN VALIDATION RULE (CRITICAL): Apply YEAR()/DATE filters only on columns that exist in the schema cards. "
-        "Do NOT invent date columns on non-date tables."
-    )
+    if has_multi_table_question or is_simple_multi_table_candidate:
+        constraints.append(
+            "JOIN ALIAS RULE (CRITICAL): In each JOIN ... ON clause, only reference aliases that are already introduced "
+            "(current table alias + previously joined aliases). NEVER reference a future alias."
+        )
+    if has_temporal_language:
+        constraints.append(
+            "DATE COLUMN VALIDATION RULE (CRITICAL): Apply YEAR()/DATE filters only to schema columns that are actually date-like."
+        )
 
     # [F.1] LATEST-YEAR + SAME-YEAR SUM RULE
     if _question_wants_latest_year_scope_with_aggregate(question):
         constraints.append(
-            "LATEST-YEAR AGGREGATION RULE (CRITICAL): If the question asks for latest/most-recent year and "
-            "sum in that same year, do NOT use `MAX(date)` + `SUM(amount)` on all rows in one GROUP BY. "
-            "Use 2-step pattern: (1) subquery to get latest year per entity, "
-            "(2) join/filter rows to that year, then compute `MAX(date)` and `SUM(amount)`."
+            "LATEST-YEAR AGGREGATION RULE (CRITICAL): If the question asks for the latest year and an aggregate within that same year, "
+            "first isolate the latest year per entity, then aggregate only rows from that year."
         )
 
     # [G] COLUMN INTEGRITY RULES (BENCHMARK MODE)
@@ -8695,32 +9265,24 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "Do NOT add extra identifiers, codes, labels, or auxiliary columns unless explicitly mentioned."
         )
     constraints.append(
-        "IMPLICIT SELECTION RULE: If the user says 'For each [Entity]' or 'List [Entity]', "
-        "you MUST include that entity's identifier or display label in the SELECT list, even if not explicitly listed in 'Include ...'. "
-        "Example: 'For each grouping entity, show the aggregated metric' -> "
-        "You MUST select the grouping entity identifier or display label AND the aggregated metric."
+        "IMPLICIT SELECTION RULE: If the user says 'for each/list X', include X's identifier or display label in SELECT even if not restated in an `Include ...` clause. "
+        "Other than that required entity column, do not add extra identifiers, codes, or labels unless asked."
     )
     constraints.append(
-        "NO EXTRA COLUMNS: Apart from the required grouping entity identifier or display label, "
-        "do NOT add extra identifiers, codes, or labels unless asked."
+        "ALIAS CONSISTENCY: If you use a table alias, qualify all selected columns with that alias."
     )
-    constraints.append(
-        "ALIAS CONSISTENCY: If you use a table alias (e.g. `t`, `p`, `cust`), "
-        "you MUST prefix ALL columns in the SELECT clause with that alias. "
-        "Bad: `SELECT p.id, name FROM ...` | Good: `SELECT p.id, p.name FROM ...`"
-    )
-    constraints.append(
-        "ALIAS STYLE: Let aliases be concise and readable. Prefer short snake_case names (roughly <= 30-36 chars)."
-    )
+    if not simple_single_table_lookup:
+        constraints.append(
+            "ALIAS STYLE: Let aliases be concise and readable. Prefer short snake_case names (roughly <= 30-36 chars)."
+        )
     # [G] ANTI-HALLUCINATION & LOGIC EFFICIENCY
     # 1. Month Sorting
     if "month" in question.lower() and ("order" in question.lower() or "sort" in question.lower()):
         constraints.append(
-            "CHRONOLOGICAL SORTING RULE: If grouping by Month Name, you MUST also ORDER BY the month number `MONTH(dateColumn)`."
+            "CHRONOLOGICAL SORTING RULE: If grouping by month name, also ORDER BY MONTH(dateColumn)."
         )
         constraints.append(
-            "GROUP BY CONSISTENCY: To avoid SQL Error 1055, if you ORDER BY `MONTH(dateColumn)`, "
-            "you MUST also include `MONTH(dateColumn)` in the GROUP BY clause."
+            "GROUP BY CONSISTENCY: If you ORDER BY MONTH(dateColumn), include MONTH(dateColumn) in GROUP BY too."
         )
 
     # 3. Categorization Strategy (ANSI SQL STANDARD FIX)
@@ -8735,9 +9297,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     # 4. Aggregation Safety (Anti Error 1055)
     if has_grouping or "group" in question.lower():
         constraints.append(
-            "STRICT GROUP BY RULE (Error 1055): If you GROUP BY a derived column (e.g. `CASE WHEN`), "
-            "you MUST NOT select the original raw source column unless it is wrapped in an aggregate function (COUNT, SUM). "
-            "ONLY select the derived expression and Aggregates."
+            "STRICT GROUP BY RULE (Error 1055): If you GROUP BY a derived expression such as CASE WHEN, do not also select the raw source column unless it is aggregated."
         )
     if re.search(
         r"\bfirst\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
@@ -8746,8 +9306,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         flags=re.I,
     ):
         constraints.append(
-            "PREFIX GROUPING RULE: When grouping by the first N characters of a column, use the derived prefix expression as the group key. "
-            "Do NOT invent a literal prefix row filter unless the question explicitly gives that prefix value."
+            "PREFIX GROUPING RULE: When grouping by the first N characters of a column, use that derived prefix expression as the group key and do not invent a literal prefix filter."
         )
     # 5. Pattern Matching Rule (Balanced & Robust)
     # Trigger dipersempit hanya untuk kata yang benar-benar butuh presisi
@@ -8779,28 +9338,20 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         ],
     )
 
-    # Default untuk "sorted" tanpa qualifier
-    sort_requested = any_phrase_in_text(
-        question,
-        rule_list(("prompt_intent", "sort_direction", "sort_request_terms"), ["sort", "sorted", "order by"]),
-    )
-
     question_lower = question.lower()
 
     if any_phrase_in_text(question_lower, desc_triggers):
         constraints.append(
-            "SORT DIRECTION: The user implies a descending order. You MUST append `DESC` to the ORDER BY clause."
+            "SORT DIRECTION: The user implies descending order, so append DESC to ORDER BY."
         )
     elif any_phrase_in_text(question_lower, asc_triggers):
         constraints.append(
-            "SORT DIRECTION: The user requests ascending order. You MUST append `ASC` to the ORDER BY clause."
+            "SORT DIRECTION: The user requests ascending order, so append ASC to ORDER BY."
         )
     elif sort_requested:
         # "sorted by X" without qualifier → default ascending (natural order)
         constraints.append(
-            "SORT DIRECTION: The user requests sorting without specifying direction. "
-            "Use ascending order (ASC) as default, which means A-Z for text, 0-9 for numbers, oldest-to-newest for dates. "
-            "You can omit ASC keyword (ascending is SQL default)."
+            "SORT DIRECTION: If sorting is requested without a direction, default to ascending order."
         )
     else:
         constraints.append(
@@ -8811,13 +9362,56 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     # Ini tidak melanggar standar SQL (karena SQL whitespace insensitive), 
     # tapi vital agar 3B tidak crash saat generate query panjang (CASE WHEN).
     constraints.append(
-        "JSON FORMATTING: The 'sql' field must be a SINGLE LINE string. Remove all newlines (\\n) from the SQL."
+        "JSON FORMATTING: The `sql` field must be a single-line string with no embedded newlines."
     )
 
     # --- 2. BUILD DYNAMIC JOIN CONTEXT (from retrieval) ---
     join_context = ""
-    if state:
+    needs_join_context = bool(
+        has_multi_table_question
+        or is_simple_multi_table_candidate
+        or len(routed_tables_for_prompt) > 1
+    )
+    if state and needs_join_context:
         join_context = _build_dynamic_join_context(state, router_decision)
+
+    if simple_single_table_lookup:
+        redundant_prefixes = (
+            "DATA INTELLIGENCE:",
+            "ALIAS STYLE:",
+        )
+        compact_constraints: List[str] = []
+        for item in constraints:
+            text = str(item or "").strip()
+            if text.startswith(redundant_prefixes):
+                continue
+            compact_constraints.append(text)
+        constraints = compact_constraints
+    elif simple_single_table_aggregate:
+        redundant_prefixes = (
+            "DATA INTELLIGENCE:",
+            "FILTERING:",
+            "ALIAS STYLE:",
+        )
+        compact_constraints = []
+        for item in constraints:
+            text = str(item or "").strip()
+            if text.startswith(redundant_prefixes):
+                continue
+            if text.startswith("AGGREGATE ORDERING RULE") and not sort_requested:
+                continue
+            compact_constraints.append(text)
+        constraints = compact_constraints
+
+    deduped_constraints: List[str] = []
+    seen_constraints: Set[str] = set()
+    for item in constraints:
+        text = re.sub(r"\s+", " ", str(item or "").strip())
+        if not text or text in seen_constraints:
+            continue
+        seen_constraints.add(text)
+        deduped_constraints.append(text)
+    constraints = deduped_constraints
 
     # --- 3. RAKIT CONSTRAINT BLOCK ---
     constraint_block = ""
@@ -8863,22 +9457,70 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
 
     def _build_generation_output_contract() -> str:
         base = (
-            'Return EXACTLY one JSON object:\n'
+            'Return exactly one JSON object:\n'
             '{"sql":"<final MySQL query>","notes":"<brief rationale, max 12 words>"}\n'
-            "No Markdown. End SQL with a semicolon.\n"
-            'If NO JOINs, notes MUST be exactly: "No joins used."'
+            "No markdown. End SQL with a semicolon.\n"
+            'If no joins are used, notes must be exactly: "No joins used."'
         )
         if AGENT_PROMPT_ABSTAIN_ENABLED:
             prefix = AGENT_PROMPT_ABSTAIN_NOTES_PREFIX or "CANNOT_ANSWER:"
             base += (
-                "\nABSTAIN CONTRACT (ONLY when schema evidence is truly insufficient):\n"
+                "\nAbstain only when schema evidence is truly insufficient:\n"
                 '{"sql":"","notes":"'
                 + prefix
                 + ' <short reason>","cannot_answer":true,"cannot_answer_reason":"<short reason>"}'
             )
         return base
 
+    def _approx_prompt_tokens(text: str) -> int:
+        if not text:
+            return 0
+        return len(re.findall(r"\S+", str(text)))
+
+    def _record_prompt_telemetry(prompt_text: str) -> None:
+        if not AGENT_PROMPT_TELEMETRY:
+            return
+        retrieval_snapshot = state.get("retrieval_snapshot") if state else {}
+        telemetry = {
+            "complexity": str(complexity or ""),
+            "qtype": str(qtype or ""),
+            "constraints_count": int(len(constraints)),
+            "context_chars": int(len(prompt_ctx or "")),
+            "context_tokens": int(_approx_prompt_tokens(prompt_ctx)),
+            "join_chars": int(len(join_context or "")),
+            "join_tokens": int(_approx_prompt_tokens(join_context)),
+            "question_chars": int(len(question or "")),
+            "question_tokens": int(_approx_prompt_tokens(question)),
+            "constraint_chars": int(len(constraint_block or "")),
+            "constraint_tokens": int(_approx_prompt_tokens(constraint_block)),
+            "intent_hint_chars": int(len(intent_hint or "")),
+            "intent_hint_tokens": int(_approx_prompt_tokens(intent_hint)),
+            "prompt_chars": int(len(prompt_text or "")),
+            "prompt_tokens": int(_approx_prompt_tokens(prompt_text)),
+            "allowed_tables": int((retrieval_snapshot or {}).get("allowed_tables_after_filter", 0) or 0),
+            "allowed_columns": int((retrieval_snapshot or {}).get("allowed_columns_after_filter", 0) or 0),
+        }
+        if state is not None:
+            state["prompt_telemetry"] = telemetry
+        print(
+            "[PROMPT TELEMETRY] "
+            f"complexity={telemetry['complexity'] or 'unknown'} "
+            f"qtype={telemetry['qtype'] or 'unknown'} "
+            f"constraints={telemetry['constraints_count']} "
+            f"context={telemetry['context_chars']}c/{telemetry['context_tokens']}t "
+            f"join={telemetry['join_chars']}c/{telemetry['join_tokens']}t "
+            f"question={telemetry['question_chars']}c/{telemetry['question_tokens']}t "
+            f"constraints_block={telemetry['constraint_chars']}c/{telemetry['constraint_tokens']}t "
+            f"ir_hint={telemetry['intent_hint_chars']}c/{telemetry['intent_hint_tokens']}t "
+            f"prompt={telemetry['prompt_chars']}c/{telemetry['prompt_tokens']}t "
+            f"allowed_tables={telemetry['allowed_tables']} "
+            f"allowed_cols={telemetry['allowed_columns']}"
+        )
+
     def _assemble_prompt_v2() -> str:
+        context_sections = [str(prompt_ctx or "").strip()]
+        if str(join_context or "").strip():
+            context_sections.append(str(join_context).strip())
         return (
             "You are a senior SQL assistant for MySQL 8.0.\n\n"
             "Use ONLY tables/columns listed under ALLOWED IDENTIFIERS in Context.\n"
@@ -8886,9 +9528,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
             "Output:\n"
             + _build_generation_output_contract()
             + "\n\nContext:\n"
-            + str(prompt_ctx or "")
-            + "\n"
-            + str(join_context or "")
+            + "\n\n".join(part for part in context_sections if part)
             + "\n\nQuestion:\n"
             + str(question or "")
             + "\n"
@@ -8899,8 +9539,13 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
 
     # --- 4. RETURN PROMPT LENGKAP ---
     if AGENT_PROMPT_V2_ENABLED:
-        return _assemble_prompt_v2()
-    return fr"""
+        prompt = _assemble_prompt_v2()
+        _record_prompt_telemetry(prompt)
+        return prompt
+    fallback_join_block = ""
+    if str(join_context or "").strip():
+        fallback_join_block = "\n\n" + str(join_context).strip()
+    prompt = fr"""
 You are a senior SQL assistant for MySQL 8.0.
 
 Use ONLY tables/columns listed under ALLOWED IDENTIFIERS in Context.
@@ -8910,14 +9555,15 @@ Output:
 {_build_generation_output_contract()}
 
 Context:
-{prompt_ctx}
-{join_context}
+{prompt_ctx}{fallback_join_block}
 
 Question:
 {question}
 {constraint_block}
 {intent_hint}
 """.strip()
+    _record_prompt_telemetry(prompt)
+    return prompt
 # ======================================================================
 # =========================== MAIN PIPELINE ============================
 # ================ Postprocess SQL & Normalize Pipeline ================
@@ -9158,6 +9804,127 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         )
         return pattern.sub(lambda m: f"{m.group('expr')} AS {m.group('alias')}", sql)
 
+    def _normalize_malformed_quoted_output_aliases(sql: str) -> str:
+        """
+        Repair overly natural-language quoted output aliases before AST parsing.
+
+        Small models sometimes emit aliases like:
+          AS 'and that employee's rank inside the office ...'
+
+        Even when the intent is clear, the embedded apostrophe makes the SQL
+        unparseable. This helper rewrites only obviously unsafe quoted aliases
+        into short SQL-safe identifiers.
+        """
+        if not sql or " as " not in sql.lower():
+            return sql
+
+        max_alias_len = ALIAS_MAX_LEN if ALIAS_MAX_LEN >= 8 else 8
+        keyword_set = {str(k or "").strip().lower() for k in (_SQL_KEYWORDS or set()) if str(k or "").strip()}
+        clause_lookahead = (
+            r"(?=\s*(?:,|;|$|\bFROM\b|\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|"
+            r"\bHAVING\b|\bLIMIT\b|\bUNION\b|\bINTERSECT\b|\bEXCEPT\b|"
+            r"\bJOIN\b|\bLEFT\b|\bRIGHT\b|\bINNER\b|\bFULL\b|\bCROSS\b))"
+        )
+        filler_tokens = {
+            "a", "an", "and", "are", "as", "at", "be", "been", "being", "by",
+            "final", "for", "from", "in", "inside", "into", "is", "it", "its",
+            "of", "on", "or", "ordered", "output", "return", "show", "should",
+            "sorted", "than", "that", "the", "their", "then", "this", "those",
+            "to", "was", "were", "when", "where", "which", "with", "within",
+        }
+        pattern = re.compile(
+            rf"(?is)\bAS\s+(?P<quote>['\"])(?P<alias>.+?)(?P=quote){clause_lookahead}"
+        )
+
+        def _safe_alias(alias_text: str) -> str:
+            raw = re.sub(r"\s+", " ", str(alias_text or "")).strip()
+            normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)
+            normalized = normalized.replace("&", " and ")
+            raw_tokens = [
+                tok.lower()
+                for tok in re.findall(r"[A-Za-z0-9]+", normalized)
+                if tok
+            ]
+            cleaned_tokens: List[str] = []
+            seen_tokens: Set[str] = set()
+            for tok in raw_tokens:
+                if tok in filler_tokens:
+                    continue
+                tok_norm = tok
+                if tok_norm.endswith("ies") and len(tok_norm) > 4:
+                    tok_norm = tok_norm[:-3] + "y"
+                elif tok_norm.endswith("s") and len(tok_norm) > 4 and not tok_norm.endswith(("ss", "us")):
+                    tok_norm = tok_norm[:-1]
+                if tok_norm in filler_tokens or not tok_norm:
+                    continue
+                if tok_norm in seen_tokens:
+                    continue
+                seen_tokens.add(tok_norm)
+                cleaned_tokens.append(tok_norm)
+            if cleaned_tokens:
+                normalized = "_".join(cleaned_tokens[:4])
+            else:
+                normalized = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_").lower()
+            normalized = re.sub(r"_+", "_", normalized)
+            if not normalized:
+                normalized = "alias"
+            if normalized[0].isdigit():
+                normalized = f"col_{normalized}"
+            if normalized in keyword_set:
+                normalized = f"{normalized}_value"
+            alias_cap = min(max_alias_len, 24)
+            if len(normalized) > alias_cap:
+                normalized = normalized[:alias_cap].rstrip("_")
+            return normalized or "alias"
+
+        alias_rewrites: List[Tuple[str, str]] = []
+
+        def replace_alias(match: re.Match) -> str:
+            alias = str(match.group("alias") or "").strip()
+            if not alias:
+                return match.group(0)
+            safe_identifier = bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", alias))
+            needs_rewrite = (
+                not safe_identifier
+                or len(alias) > max_alias_len
+                or "'" in alias
+                or " " in alias
+            )
+            if not needs_rewrite:
+                return match.group(0)
+            safe_alias = _safe_alias(alias)
+            alias_rewrites.append((alias, safe_alias))
+            return f"AS {safe_alias}"
+
+        out = pattern.sub(replace_alias, sql)
+        if not alias_rewrites:
+            return out
+
+        for old_alias, new_alias in alias_rewrites:
+            if not old_alias or not new_alias:
+                continue
+            out = re.sub(
+                rf"`{re.escape(old_alias)}`",
+                new_alias,
+                out,
+                flags=re.I,
+            )
+            out = re.sub(
+                rf'"{re.escape(old_alias)}"',
+                new_alias,
+                out,
+                flags=re.I,
+            )
+            # Single-quoted references are not valid identifier syntax in MySQL,
+            # but small-model drafts sometimes reuse them elsewhere.
+            out = re.sub(
+                rf"'{re.escape(old_alias)}'",
+                new_alias,
+                out,
+                flags=re.I,
+            )
+        return out
+
     def _rewrite_pipes_concat_mysql(text: str) -> str:
         """
         Convert common string-concat style `a || b` into MySQL-safe CONCAT(a, b).
@@ -9190,6 +9957,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s = _norm_kw(s)
     s = _fix_date_format_quarter(s)
     s = _normalize_misaliased_double_colon_expr(s)
+    s = _normalize_malformed_quoted_output_aliases(s)
     s = _normalize_timestampdiff_day_to_datediff(s)
     s = _rewrite_pipes_concat_mysql(s)
     s = _fix_missing_space_before_clauses(s)
@@ -9470,6 +10238,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s = _prefer_friendly_names(s, question)
     s = _ensure_entity_id_and_name_if_requested(s, question)
     s = _ensure_explicit_simple_projection_columns(s, question, ctx)
+    if not ast_parseable:
+        s = _restore_missing_grouped_dimension_projection(s, question, ctx)
     s = _rewrite_missing_ordered_lookup_join(s, question, ctx)
     s = _rewrite_ordered_quantity_stock_aggregate(s, question, ctx)
     s = _drop_unrequested_secondary_self_join_identifier_columns(s, question, ctx)
@@ -9481,6 +10251,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s = _drop_redundant_raw_name_columns_when_concat_present(s, question)
     s = _ensure_unique_output_column_labels(s)
     s = _expand_group_by_aliases_regex(s)
+    s = _prefer_char_length_for_text_columns(s, question, ctx)
     s = _canonicalize_single_computed_group_by_expression(s)
     s = _drop_unrequested_metric_operand_group_keys(s, question, ctx)
     s = _simplify_same_expression_group_threshold_subquery(s)
@@ -9493,7 +10264,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         )
     )
     skip_phase3_groupby_cleanup = latest_year_sum_intent and has_correlated_max_subquery
-    if not _is_potential_winner_row(s, question, force=True):
+    if not _is_potential_winner_row(s, question):
         # REMOVE invalid columns FIRST, then enforce GROUP BY consistency
         # This prevents columns from being added to GROUP BY unnecessarily
         if not skip_phase3_groupby_cleanup:
@@ -9505,7 +10276,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                 "warnings": ["parse_gate_not_ast"] if not ast_parseable else [],
             }
             if ast_parseable:
-                ast_group_projection_sql, ast_group_projection_meta = _ast_repair_group_by_projection_validity(s)
+                ast_group_projection_sql, ast_group_projection_meta = _ast_repair_group_by_projection_validity(s, question)
                 if AST_TRACE:
                     print(
                         "[REFINER - AST GROUPED PROJECTION] "
@@ -9515,6 +10286,11 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
                 if ast_group_projection_meta.get("parse_ok", False) and ast_group_projection_meta.get("handled_scope", False):
                     s = ast_group_projection_sql
                     phase3_groupby_projection_handled = True
+                    s_backstop = _restore_missing_grouped_dimension_projection(s, question, ctx)
+                    if s_backstop != s:
+                        s = s_backstop
+                        if AST_TRACE:
+                            print("[REFINER - AST GROUPED PROJECTION] fallback_backstop=applied reason=ast_output_missing_visible_group_key")
                     if AST_TRACE and ast_group_projection_meta.get("fixes"):
                         print(f"[REFINER - AST GROUPED PROJECTION] sql={s}")
             if not phase3_groupby_projection_handled:
@@ -9899,7 +10675,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _rewrite_explicit_single_table_scope(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after explicit single-table scope fix:", s)
 
-        s = _repair_single_table_friendly_column_names(s, question, ctx)
+        s = _normalize_single_table_semantic_column_names(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after friendly column-name fix:", s)
 
         s = _rewrite_winner_row_aggregate_misuse(s, question, ctx)
@@ -9907,6 +10683,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
 
         s = _rewrite_single_table_tuple_in_winner_row(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after tuple-IN winner-row fix:", s)
+
+        s = _rewrite_single_table_joined_max_case_winner_row(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after joined max-case winner-row fix:", s)
 
         s = _drop_tuple_in_filter_from_single_table_ranked_winner(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after ranked winner tuple-IN drop fix:", s)
@@ -10017,6 +10796,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _drop_unrequested_fixed_year_filter_for_yearly_rollup(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after unrequested fixed-year drop:", s)
 
+        s = _drop_unrequested_year_between_filter_for_year_rollup(s, question)
+        if DEBUG_WR: print("[REFINER - PH4] after unrequested year-between drop:", s)
+
         s = _project_requested_comparison_count_from_having(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after comparison-count HAVING projection fix:", s)
 
@@ -10024,6 +10806,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         if DEBUG_WR: print("[REFINER - PH4] after late metric-operand group-key drop:", s)
 
         s = _drop_unrequested_length_filter_for_prefix_grouping(s, question)
+        s = _drop_unresolved_placeholder_length_group_filter(s, question)
         if DEBUG_WR: print("[REFINER - PH4] after unrequested prefix-length filter drop:", s)
         
         s, aggregate_filter_legacy_needed = _run_ast_aggregate_filter_owner(s)
@@ -10054,6 +10837,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         s = _rewrite_grouped_self_fk_exists_to_group_having(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after grouped self-FK existence fix: {s}")
 
+        s = _rewrite_grouped_self_fk_summary_metrics(s, question, ctx)
+        if DEBUG_WR: print(f"[REFINER - PH4] after grouped self-FK summary metric fix: {s}")
+
         s = _rewrite_role_label_count_semantics(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after role-label count fix: {s}")
 
@@ -10074,6 +10860,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
 
         s = _rewrite_conditional_avg_to_count_with_overall_avg(s, question)
         if DEBUG_WR: print(f"[REFINER - PH4] after conditional-avg->count+avg fix: {s}")
+
+        s = _drop_contradictory_case_bucket_prefilter(s, question)
+        if DEBUG_WR: print(f"[REFINER - PH4] after contradictory CASE-bucket prefilter drop: {s}")
 
         s = _rewrite_grouped_total_count_to_metric_sum(s, question, ctx)
         if DEBUG_WR: print(f"[REFINER - PH4] after grouped total-count->sum fix: {s}")
@@ -10175,6 +10964,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
         if DEBUG_WR: print("[REFINER - PH4] after post-repair ornamental-join cleanup:", s)
         s = _drop_unrequested_group_key_filters(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after post-repair group-key filter drop:", s)
+        s = _drop_unrequested_same_table_group_key_subquery_filters(s, question, ctx)
+        if DEBUG_WR: print("[REFINER - PH4] after same-table group-key subquery drop:", s)
         s = _drop_unrequested_positive_row_filters(s, question, ctx)
         if DEBUG_WR: print("[REFINER - PH4] after unrequested positive row-filter drop:", s)
         s = _drop_unrequested_literal_row_filters(s, question, ctx)
@@ -10283,7 +11074,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
 
             s = _rewrite_explicit_single_table_scope(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after explicit single-table scope fix: {s}")
-            s = _repair_single_table_friendly_column_names(s, question, ctx)
+            s = _normalize_single_table_semantic_column_names(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after friendly column-name fix: {s}")
             s = _add_missing_count_for_group_by(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after add-count fix: {s}")
@@ -10294,6 +11085,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
             if DEBUG_WR: print(f"[PH4-FORCE] after agg-misuse fix: {s}")
             s = _rewrite_single_table_tuple_in_winner_row(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after tuple-IN winner-row fix: {s}")
+            s = _rewrite_single_table_joined_max_case_winner_row(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after joined max-case winner-row fix: {s}")
             s = _drop_tuple_in_filter_from_single_table_ranked_winner(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after ranked winner tuple-IN drop fix: {s}")
             s = _fix_winner_row_window_order_priority(s, question)
@@ -10324,6 +11117,9 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
 
             s = _rewrite_conditional_avg_to_count_with_overall_avg(s, question)
             if DEBUG_WR: print(f"[PH4-FORCE] after conditional-avg->count+avg fix: {s}")
+
+            s = _drop_contradictory_case_bucket_prefilter(s, question)
+            if DEBUG_WR: print(f"[PH4-FORCE] after contradictory CASE-bucket prefilter drop: {s}")
 
             s = _add_missing_grouped_metric_threshold_having(s, question, ctx)
             if DEBUG_WR: print(f"[PH4-FORCE] after grouped metric-threshold HAVING fix: {s}")
@@ -10384,6 +11180,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     if DEBUG_WR: print(f"[REFINER - PH6] after missing-value subset filter drop fix: {s}")
     s = _drop_unrequested_group_key_filters(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested group-key filter drop fix: {s}")
+    s = _drop_unrequested_same_table_group_key_subquery_filters(s, question, ctx)
+    if DEBUG_WR: print(f"[REFINER - PH6] after same-table group-key subquery drop fix: {s}")
     s = _drop_unrequested_group_key_having_filters(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested group-key HAVING drop fix: {s}")
     s = _drop_unrequested_positive_row_filters(s, question, ctx)
@@ -10393,7 +11191,12 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s = _drop_unrequested_joined_identifier_literal_filters(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after joined identifier row-filter drop fix: {s}")
     s = _drop_unrequested_length_filter_for_prefix_grouping(s, question)
+    s = _drop_unresolved_placeholder_length_group_filter(s, question)
     if DEBUG_WR: print(f"[REFINER - PH6] after unrequested prefix-length filter drop fix: {s}")
+    s = _drop_unrequested_year_between_filter_for_year_rollup(s, question)
+    if DEBUG_WR: print(f"[REFINER - PH6] after unrequested year-between drop fix: {s}")
+    s = _drop_contradictory_case_bucket_prefilter(s, question)
+    if DEBUG_WR: print(f"[REFINER - PH6] after contradictory CASE-bucket prefilter drop: {s}")
     s = _add_missing_grouped_extrema_date_metric(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after missing grouped extrema-date metric fix: {s}")
     s = _drop_tautological_positive_count_having(s, question, ctx)
@@ -10527,7 +11330,10 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     elif DEBUG_WR:
         print("[REFINER - PH7] skip legacy window-validation overlap: ast window validation handled scope")
     s = _rewrite_same_group_avg_gap_window_to_partition_only(s, question)
+    s = _rewrite_single_table_grouped_aggregate_derived_subquery(s, question)
+    s = _repair_inner_grouped_aggregate_where_to_having(s, question)
     s = _rewrite_single_table_case_band_derived_subquery(s, question)
+    s = _ensure_alias_for_top_level_derived_table(s)
     s = _rewrite_correlated_offset_subquery_to_window(s, question)
     s = _rewrite_same_table_group_count_self_join_to_window(s, question)
     s = _rewrite_running_self_join_aggregate_to_window(s, question)
@@ -10535,6 +11341,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s = _repair_offset_window_projection_shape(s, question)
     s = _preserve_requested_base_columns_in_running_self_join(s, question)
     s = _enforce_requested_base_projection_in_single_table_window(s, question)
+    s = _preserve_requested_context_columns_in_derived_single_table_window(s, question)
+    s = _preserve_requested_context_columns_in_single_table_scalar_subquery(s, question)
     s = _enforce_requested_order_direction(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
     s = _restore_requested_temporal_group_order(s, question)
@@ -10965,6 +11773,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
 
     def _apply_final_question_repairs(sql_in: str) -> str:
         sql_in = _repair_explicit_iso_date_filter_from_question(sql_in, question)
+        sql_in = _repair_explicit_weekday_filter_from_question(sql_in, question)
         sql_in = _repair_enum_process_proxy_filter_from_question(sql_in, question)
         return sql_in
 

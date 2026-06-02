@@ -61,9 +61,9 @@ docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluatio
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --testset t2sql/devset/qa_classicmodels_devset_mix.yml --output results_easy_mix.xlsx --easy --warmup-models small" 2>&1 | tee run_easy_mix.log
 
 # PRIMARY EVALUATION SCENARIO P1
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/development/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p1.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p1.log
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/development/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p1.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p1.log
-docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/development/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p1.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p1.log
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/development/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p1.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p1.log
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/development/qa_classicmodels_evaluation_medium.yml --output results_evaluation_medium_p1.xlsx --medium --warmup-models small" 2>&1 | tee evaluation_medium_p1.log
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/development/qa_classicmodels_evaluation_hard.yml --output results_evaluation_hard_p1.xlsx --hard --warmup-models small" 2>&1 | tee evaluation_hard_p1.log
 
 # PRIMARY EVALUATION SCENARIO P2
 docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/development/qa_classicmodels_evaluation_easy.yml --output results_evaluation_easy_p2.xlsx --easy --warmup-models small" 2>&1 | tee evaluation_easy_p2.log
@@ -91,3 +91,7 @@ INTENT IR & TABLE ORDER GUIDANCE CHECKER:
 cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --easy --log /home/home/thesis/evaluation_easy_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_easy.log
 cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --medium --log /home/home/thesis/evaluation_medium_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_medium.log
 cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --hard --log /home/home/thesis/evaluation_hard_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_hard.log
+
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/evaluation/qa_classicmodels_shadow_easy.yml --output results_shadow_easy_p1.xlsx --easy --warmup-models small --base-database classicmodels --ts-databases classicmodels_2,classicmodels_3" 2>&1 | tee evaluation_shadow_easy_p1.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/evaluation/qa_classicmodels_shadow_medium.yml --output results_shadow_medium_p1.xlsx --medium --warmup-models small --base-database classicmodels --ts-databases classicmodels_2,classicmodels_3" 2>&1 | tee evaluation_shadow_medium_p1.log
+docker exec -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/evaluation/qa_classicmodels_shadow_hard.yml --output results_shadow_hard_p1.xlsx --hard --warmup-models small --base-database classicmodels --ts-databases classicmodels_2,classicmodels_3" 2>&1 | tee evaluation_shadow_hard_p1.log

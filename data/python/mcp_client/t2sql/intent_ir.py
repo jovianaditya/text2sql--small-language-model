@@ -439,6 +439,17 @@ def _semantic_token_variants(token: str) -> List[str]:
 
     _add(tok)
 
+    if tok.endswith("ied") and len(tok) > 4:
+        _add(tok[:-3] + "y")
+    elif tok.endswith("ed") and len(tok) > 4:
+        stem = tok[:-2]
+        if len(stem) >= 3:
+            _add(stem)
+            if len(stem) >= 2 and stem[-1] == stem[-2]:
+                _add(stem[:-1])
+        if len(tok[:-1]) >= 3:
+            _add(tok[:-1])
+
     if tok.endswith("ies") and len(tok) > 3:
         _add(tok[:-3] + "y")
     elif tok.endswith("uses") and len(tok) > 4:
@@ -526,7 +537,7 @@ def _table_variants(table: str) -> Set[str]:
     return {x for x in out if x}
 
 
-def _column_variants(table: str, column: str) -> Set[str]:
+def _column_reference_variants(table: str, column: str) -> Set[str]:
     t = (table or "").strip().lower()
     c = str(column or "").strip()
     if not c:
@@ -554,7 +565,13 @@ def _column_variants(table: str, column: str) -> Set[str]:
         out.add(s)
         out.add(s.replace("_", " "))
         out.add(s.replace("-", " "))
-
+    for alias in _safe_get_column_alias_tags(t, c):
+        a = str(alias).strip().lower()
+        if not a:
+            continue
+        out.add(a)
+        out.add(a.replace("_", " "))
+        out.add(a.replace("-", " "))
     expanded: Set[str] = set()
     for v in out:
         for vv in _phrase_spacing_variants(v):
@@ -573,6 +590,33 @@ def _column_variants(table: str, column: str) -> Set[str]:
         if stem:
             expanded.add(f"{stem} codes".replace("_", " "))
 
+    return {x for x in expanded if x}
+
+
+def _column_variants(table: str, column: str) -> Set[str]:
+    t = (table or "").strip().lower()
+    c = str(column or "").strip()
+    if not c:
+        return set()
+
+    out = set(_column_reference_variants(table, column))
+    description = re.sub(
+        r"\s+",
+        " ",
+        _safe_get_column_description(t, c).strip().lower().replace("_", " ").replace("-", " "),
+    ).strip()
+    if description:
+        out.add(description)
+        for piece in re.split(r"\s*(?:,|;|/)\s*|\s+\bor\b\s+", description, flags=re.I):
+            piece_norm = re.sub(r"\s+", " ", str(piece or "").strip(" \t\r\n'\"()[]{}"))
+            if piece_norm and len(re.findall(r"[a-z0-9]+", piece_norm)) <= 6:
+                out.add(piece_norm)
+
+    expanded: Set[str] = set()
+    for v in out:
+        for vv in _phrase_spacing_variants(v):
+            if vv:
+                expanded.add(vv)
     return {x for x in expanded if x}
 
 
@@ -712,6 +756,12 @@ def _is_numeric_column(col: str, table: str = "") -> bool:
     # ID-like columns (*Number, *Id, *Code) are identifiers, not numeric measures
     if (table and _is_identifier_like_column(table, col)) or cl.endswith("number") or cl.endswith("id") or cl.endswith("code"):
         return False
+    if table:
+        if _column_has_name_semantics(table, col):
+            return False
+        dtype = str(_column_schema_semantics(table, col).get("datatype") or "").upper()
+        if any(tok in dtype for tok in _TEXTUAL_DTYPE_HINTS):
+            return False
     words = _camel_to_words(col or "")
     tokens = {t for t in re.findall(r"[a-z0-9]+", words) if t}
     return any(k in tokens for k in _numeric_hint_terms())
@@ -957,6 +1007,30 @@ def _normalize_match_token(token: str) -> str:
     return t
 
 
+def _semantic_query_token_variants(tokens: Sequence[str]) -> Set[str]:
+    variants: Set[str] = set()
+    for token in tokens or []:
+        tok = str(token or "").strip().lower()
+        if not tok:
+            continue
+        variants.add(tok)
+        if tok.endswith("ied") and len(tok) > 4:
+            variants.add(tok[:-3] + "y")
+        elif tok.endswith("ing") and len(tok) > 5:
+            stem = tok[:-3]
+            if len(stem) >= 2 and stem[-1] == stem[-2]:
+                stem = stem[:-1]
+            if stem:
+                variants.add(stem)
+        elif tok.endswith("ed") and len(tok) > 4:
+            stem = tok[:-2]
+            if len(stem) >= 2 and stem[-1] == stem[-2]:
+                stem = stem[:-1]
+            if stem:
+                variants.add(stem)
+    return {variant for variant in variants if variant}
+
+
 def _tokenize_for_match(text: str, stop_tokens: Optional[Set[str]] = None) -> List[str]:
     stop = {str(tok).lower() for tok in (stop_tokens or set()) if str(tok)}
     out: List[str] = []
@@ -1155,6 +1229,17 @@ def _column_semantic_tokens(table: str, column: str) -> Set[str]:
             continue
         phrases.add(s.replace("_", " "))
         phrases.add(s.replace("-", " "))
+    description = re.sub(
+        r"\s+",
+        " ",
+        str(_column_schema_semantics(table, c)["description"] or "").strip().lower().replace("_", " ").replace("-", " "),
+    ).strip()
+    if description:
+        phrases.add(description)
+        for piece in re.split(r"\s*(?:,|;|/)\s*|\s+\bor\b\s+", description, flags=re.I):
+            piece_norm = re.sub(r"\s+", " ", str(piece or "").strip(" \t\r\n'\"()[]{}"))
+            if piece_norm and len(re.findall(r"[a-z0-9]+", piece_norm)) <= 6:
+                phrases.add(piece_norm)
 
     structural_stop_tokens = _FUNCTION_WORD_TOKENS.union({"in", "on", "at", "by"})
     tokens: Set[str] = set()
@@ -1273,7 +1358,7 @@ def _best_semantic_column_match(
     query_tokens = _tokenize_for_match(text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS)
     if not query_tokens:
         return None
-    query_token_set = set(query_tokens)
+    query_token_set = _semantic_query_token_variants(query_tokens)
 
     best_col = None
     best_score = 0.0
@@ -1324,7 +1409,7 @@ def _best_descriptor_column_match(
     query_tokens = _tokenize_for_match(text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS)
     if not query_tokens:
         return None
-    query_token_set = set(query_tokens)
+    query_token_set = _semantic_query_token_variants(query_tokens)
 
     best_col = None
     best_score = 0.0
@@ -1404,7 +1489,7 @@ def _extract_projection_segments(question: str) -> List[str]:
 
     matches = list(
         re.finditer(
-            r"\b(?:show|display|return|list|include)\b\s+([^.;!?]+)",
+            r"\b(?:show|display|return|list|include)\b\s+(.+?)(?=\b(?:show|display|return|list|include)\b|[.;!?]|$)",
             q_raw,
             flags=re.I,
         )
@@ -1416,7 +1501,7 @@ def _extract_projection_segments(question: str) -> List[str]:
     if not tail:
         return []
     tail = re.split(
-        r"\b(?:sort|sorted|order|ordered)\s+by\b",
+        r"\b(?:sort(?:ed)?|order(?:ed)?)\s+(?:by|from|alphabetically|chronologically)\b",
         tail,
         maxsplit=1,
         flags=re.I,
@@ -1528,13 +1613,27 @@ def _detect_column_mentions(question: str, allowed: Dict[str, Set[str]]) -> List
     q = (question or "").lower()
     out: List[Tuple[str, str, int]] = []
     for table, cols in allowed.items():
+        table_variants = {
+            re.sub(r"\s+", " ", str(v or "").strip().lower())
+            for v in (_table_variants(table) or {table})
+            if str(v or "").strip()
+        }
         for col in cols:
             best = -1
+            best_variant = ""
             for v in _column_variants(table, col):
                 pos = _phrase_pos(q, v)
                 if pos >= 0 and (best < 0 or pos < best):
                     best = pos
+                    best_variant = re.sub(r"\s+", " ", str(v or "").strip().lower())
             if best >= 0:
+                if (
+                    table
+                    and _column_has_name_semantics(table, col)
+                    and best_variant
+                    and best_variant in table_variants
+                ):
+                    continue
                 out.append((table, col, best))
     out.sort(key=lambda x: x[2])
     return out
@@ -1625,6 +1724,37 @@ def _best_name_column(table: str, allowed: Dict[str, Set[str]]) -> Optional[str]
         )
         return name_like[0]
     return None
+
+
+def _best_name_component_column_match(
+    text: str,
+    table: str,
+    allowed: Dict[str, Set[str]],
+) -> Optional[str]:
+    t = str(table or "").strip().lower()
+    text_l = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not t or not text_l:
+        return None
+
+    best_col: Optional[str] = None
+    best_pos = -1
+    best_len = -1
+    for col in sorted(allowed.get(t, set()), key=lambda c: (len(str(c or "")), str(c or "").lower())):
+        if not _column_has_name_semantics(t, col):
+            continue
+        for variant in sorted(_column_reference_variants(t, col), key=len, reverse=True):
+            variant_l = str(variant or "").strip().lower()
+            if not variant_l:
+                continue
+            pos = _phrase_pos(text_l, variant_l)
+            if pos < 0:
+                continue
+            if pos > best_pos or (pos == best_pos and len(variant_l) > best_len):
+                best_col = col
+                best_pos = pos
+                best_len = len(variant_l)
+                break
+    return best_col
 
 
 def _find_best_numeric_column(table: str, allowed: Dict[str, Set[str]]) -> Optional[str]:
@@ -1957,7 +2087,12 @@ def _detect_metrics(
             _, _, best_t, best_c = explicit_variant_hits[0]
             return best_t, best_c
 
-        phrase_tokens = set(_tokenize_for_match(p, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+        metric_phrase_stop_tokens = set(_LEXICAL_MATCH_STOP_TOKENS)
+        metric_phrase_stop_tokens.discard("list")
+        phrase_tokens = {
+            tok for tok in _semantic_phrase_tokens(p)
+            if tok and tok not in metric_phrase_stop_tokens
+        }
         best: Optional[Tuple[str, str]] = None
         best_score = 0.0
         best_pos = 10**9
@@ -2493,6 +2628,12 @@ def _detect_dimensions(
     q = (question or "").lower()
     dims: List[IRDimension] = []
     seen: Set[Tuple[str, str, str, str]] = set()
+    q_group_scope = re.split(
+        r"\b(?:sort(?:ed)?\s+by|order(?:ed)?\s+by|sort(?:ed)?\s+from|order(?:ed)?\s+from)\b",
+        q,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip() or q
     dedupe_row_request = bool(
         re.search(r"\bone\s+(?:row|record|result)\s+(?:per|for\s+each)\b", q)
     )
@@ -2502,9 +2643,10 @@ def _detect_dimensions(
             q,
         )
         or (re.search(r"\bfor\s+each\b", q) and not dedupe_row_request)
+        or (re.search(r"\bin\s+each\b", q) and not dedupe_row_request)
         or (re.search(r"\bper\b", q) and not dedupe_row_request)
     )
-    date_day_group_requested = bool(re.search(r"\b(for\s+each|per|by)\s+(?:date|day)\b", q))
+    date_day_group_requested = bool(re.search(r"\b(for\s+each|in\s+each|per|by)\s+(?:date|day)\b", q))
     nonnull_percentage_grouping = any(
         str(getattr(m, "agg", "") or "").lower() == "pct_non_null"
         for m in (metrics or [])
@@ -2532,12 +2674,12 @@ def _detect_dimensions(
             table_patterns.append(re.escape(cur).replace(r"\ ", r"\s+"))
         for v in _column_variants(table, col):
             pat = re.escape(v).replace(r"\ ", r"\s+")
-            if re.search(rf"\b(?:for\s+each|per|by|group\s+by)\s+{pat}\b", q, flags=re.I):
+            if re.search(rf"\b(?:for\s+each|in\s+each|per|by|group\s+by)\s+{pat}\b", q_group_scope, flags=re.I):
                 return True
             for table_pat in table_patterns:
                 if re.search(
-                    rf"\b(?:for\s+each|per|by|group\s+by)\s+(?:{table_pat})\s+{pat}\b",
-                    q,
+                    rf"\b(?:for\s+each|in\s+each|per|by|group\s+by)\s+(?:{table_pat})\s+{pat}\b",
+                    q_group_scope,
                     flags=re.I,
                 ):
                     return True
@@ -2591,7 +2733,7 @@ def _detect_dimensions(
 
     # Time bucket dimensions.
     if re.search(
-        r"\b(for\s+each|per|by)\s+month\b|\beach\s+month(?:\s+name)?\b|\bmonth\s+names?\b",
+        r"\b(for\s+each|in\s+each|per|by)\s+month\b|\beach\s+month(?:\s+name)?\b|\bmonth\s+names?\b",
         q,
         flags=re.I,
     ):
@@ -2600,7 +2742,7 @@ def _detect_dimensions(
             add_dim(IRDimension(table=subject, column=date_col, alias="month_name", transform="month_name", visible=True))
             add_dim(IRDimension(table=subject, column=date_col, alias="__month_num", transform="month_num", visible=False))
 
-    if re.search(r"\b(for\s+each|per|by)\s+year\b", q):
+    if re.search(r"\b(for\s+each|in\s+each|per|by)\s+year\b", q):
         date_col = _find_best_date_column(subject, allowed)
         if date_col:
             add_dim(IRDimension(table=subject, column=date_col, alias="year", transform="year", visible=True))
@@ -2692,7 +2834,7 @@ def _detect_dimensions(
 
     if aggregate_like and subject:
         for m in re.finditer(
-            r"\b(?:for\s+each|per|by|group\s+by)\s+([a-z][a-z0-9_ ]{1,48}?)"
+            r"\b(?:for\s+each|in\s+each|per|by|group\s+by)\s+([a-z][a-z0-9_ ]{1,48}?)"
             r"(?=\s*(?:,|;|\.|\breturn\b|\bshow\b|\bdisplay\b|\blist\b|\binclude\b|\bgive\b|\bkeep\b|\bonly\b|\bsort\b|\border\b|\band\b|$))",
             q,
             flags=re.I,
@@ -2738,11 +2880,18 @@ def _detect_dimensions(
     # use schema-grounded matching on explicit "show/display/return/list" tails.
     if (qtype or "").lower() == "lookup" and subject:
         projection_cols: Set[str] = set()
+        best_subject_name_col = str(_best_name_column(subject, allowed) or "").strip()
         for seg in _extract_projection_segments(question):
+            seg_l = re.sub(r"\s+", " ", str(seg or "").strip().lower())
+            seg_tokens = set(_tokenize_for_match(seg, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+            if best_subject_name_col and re.fullmatch(r"(?:their\s+|the\s+)?names?", seg_l):
+                projection_cols.add(best_subject_name_col.lower())
+                add_dim(IRDimension(table=subject, column=best_subject_name_col))
+                continue
             explicit_projection_cols: List[str] = []
             explicit_variants: Dict[str, str] = {}
             for col in allowed.get(subject, set()):
-                for variant in _column_variants(subject, col):
+                for variant in _column_reference_variants(subject, col):
                     pat = re.escape(variant).replace(r"\ ", r"\s+")
                     if pat and re.search(rf"\b{pat}\b", seg, flags=re.I):
                         explicit_projection_cols.append(str(col).strip())
@@ -2751,7 +2900,6 @@ def _detect_dimensions(
             explicit_projection_cols = list(dict.fromkeys(explicit_projection_cols))
             if len(explicit_projection_cols) == 1:
                 resolved_col = explicit_projection_cols[0]
-                seg_tokens = set(_tokenize_for_match(seg, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
                 variant_tokens = set(
                     _tokenize_for_match(
                         explicit_variants.get(resolved_col, ""),
@@ -3176,6 +3324,9 @@ def _detect_filters(
             window_end = min(len(q), anchor_pos + 24)
             anchor_window = q[window_start:window_end]
             before_anchor = q[window_start:anchor_pos]
+            explicit_name_component = _best_name_component_column_match(before_anchor, subject, allowed)
+            if explicit_name_component:
+                return (subject, explicit_name_component)
             best_exact: Optional[Tuple[str, str]] = None
             best_exact_score: Tuple[bool, bool, int, int, int] = (False, False, -1, -1, -1)
             for t, cols in allowed.items():
@@ -3185,7 +3336,7 @@ def _detect_filters(
                 for c in cols:
                     if _is_date_column(c, table_l):
                         continue
-                    for variant in sorted(_column_variants(table_l, c), key=len, reverse=True):
+                    for variant in sorted(_column_reference_variants(table_l, c), key=len, reverse=True):
                         variant_l = str(variant or "").strip().lower()
                         if not variant_l:
                             continue
@@ -3291,7 +3442,7 @@ def _detect_filters(
             for column in allowed.get(subject, set()):
                 if not _supports_categorical_text_filter(subject, column):
                     continue
-                for variant in sorted(_column_variants(subject, column), key=len, reverse=True):
+                for variant in sorted(_column_reference_variants(subject, column), key=len, reverse=True):
                     variant_l = str(variant or "").strip().lower()
                     if not variant_l:
                         continue
@@ -3326,13 +3477,17 @@ def _detect_filters(
         if not prefix_l:
             return None
 
+        explicit_name_component = _best_name_component_column_match(prefix_l, subject, allowed)
+        if explicit_name_component:
+            return (subject, explicit_name_component)
+
         best_exact: Optional[Tuple[str, str]] = None
         best_exact_len = -1
         best_exact_pos = -1
         for column in sorted(allowed.get(subject, set()), key=lambda c: (len(str(c or "")), str(c or "").lower())):
             if not _supports_categorical_text_filter(subject, column):
                 continue
-            for variant in sorted(_column_variants(subject, column), key=len, reverse=True):
+            for variant in sorted(_column_reference_variants(subject, column), key=len, reverse=True):
                 variant_l = str(variant or "").strip().lower()
                 if not variant_l:
                     continue
@@ -3461,6 +3616,8 @@ def _detect_filters(
             flags=re.I,
         ) and re.search(r"\b\d+\b", clean):
             return True
+        if re.fullmatch(r"(?:from\s+)?(?:high|low)\s+to\s+(?:high|low)", clean):
+            return True
         if _looks_like_alphabetical_sort_phrase(clean):
             return True
         return False
@@ -3503,15 +3660,22 @@ def _detect_filters(
             seen_eq_candidates.add(key)
             eq_candidates.append(key)
 
+        known_variant_phrases: Set[str] = set()
         for table, column in eq_candidates:
-            for variant in sorted(_column_variants(table, column), key=len, reverse=True):
+            for variant in _column_reference_variants(table, column):
+                variant_norm = re.sub(r"\s+", " ", str(variant or "").strip().lower())
+                if variant_norm:
+                    known_variant_phrases.add(variant_norm)
+
+        for table, column in eq_candidates:
+            for variant in sorted(_column_reference_variants(table, column), key=len, reverse=True):
                 variant_text = str(variant or "").strip()
                 if not variant_text:
                     continue
                 c_pat = re.escape(variant_text).replace(r"\ ", r"\s+")
                 match = re.search(
-                    rf"\b{c_pat}\b(?:\s+(?:of|is|=|equals?|equal\s+to))?\s+"
-                    rf"""["'“”]?([A-Za-z0-9][A-Za-z0-9/&:._'/-]*(?:\s+[A-Za-z0-9/&:._'/-]+){{0,5}}?)["'“”]?(?={clause_stop})""",
+                    rf"\b{c_pat}\b(?:\s+(?P<link>of|is|=|equals?|equal\s+to))?\s+"
+                    rf"""["'“”]?(?P<value>[A-Za-z0-9][A-Za-z0-9/&:._'/-]*(?:\s+[A-Za-z0-9/&:._'/-]+){{0,5}}?)["'“”]?(?={clause_stop})""",
                     q_raw,
                     flags=re.I,
                 )
@@ -3521,8 +3685,21 @@ def _detect_filters(
                 if re.search(r"\b(?:not\s+in|excluding|except(?:\s+for)?|outside)\s+$", prefix_local, flags=re.I):
                     continue
 
-                raw_value = str(match.group(1) or "").strip(" \t\r\n'\".,;:!?")
+                raw_value = str(match.group("value") or "").strip(" \t\r\n'\".,;:!?")
                 if not raw_value:
+                    continue
+                has_explicit_link = bool(str(match.groupdict().get("link") or "").strip())
+                if not has_explicit_link and raw_value.lower() in {"is", "are", "was", "were"}:
+                    continue
+                variant_norm = re.sub(r"\s+", " ", variant_text.strip().lower())
+                raw_value_norm = re.sub(r"\s+", " ", raw_value.strip().lower())
+                combined_phrase = f"{variant_norm} {raw_value_norm}".strip()
+                if (
+                    not has_explicit_link
+                    and raw_value_norm
+                    and combined_phrase != variant_norm
+                    and combined_phrase in known_variant_phrases
+                ):
                     continue
                 if (
                     projection_null_fill_requested
@@ -3881,7 +4058,7 @@ def _detect_filters(
             for column in allowed.get(subject, set()):
                 if not _supports_categorical_text_filter(subject, column):
                     continue
-                for variant in sorted(_column_variants(subject, column), key=len, reverse=True):
+                for variant in sorted(_column_reference_variants(subject, column), key=len, reverse=True):
                     variant_l = str(variant or "").strip().lower()
                     if not variant_l:
                         continue
@@ -4004,7 +4181,7 @@ def _detect_filters(
         subject_mentions = [(t, c, p) for (t, c, p) in column_mentions if t == subject]
         other_mentions = [(t, c, p) for (t, c, p) in column_mentions if t != subject]
         for t, c, _ in subject_mentions + other_mentions:
-            for variant in _column_variants(t, c):
+            for variant in _column_reference_variants(t, c):
                 c_pat = re.escape(variant).replace(r"\ ", r"\s+")
                 if re.search(
                     rf"\b{c_pat}\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
@@ -4039,7 +4216,7 @@ def _detect_filters(
                 ):
                     return (t, c)
         for c in allowed.get(subject, set()):
-            for variant in _column_variants(subject, c):
+            for variant in _column_reference_variants(subject, c):
                 c_pat = re.escape(variant).replace(r"\ ", r"\s+")
                 if re.search(
                     rf"\b{c_pat}\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+"
@@ -4089,7 +4266,7 @@ def _detect_filters(
             candidate_pairs.append(key)
         clause_stop = r"(?:[.,;:!?]|\s+(?:and|or|but|return|show|list|display|include|give|sort|order|ordered|sorted|where|having)\b|$)"
         for t, c in candidate_pairs:
-            for variant in _column_variants(t, c):
+            for variant in _column_reference_variants(t, c):
                 c_pat = re.escape(variant).replace(r"\ ", r"\s+")
                 if re.search(
                     rf"\b(?:have|has)\b(?:[\s,;:()'\"-]+\w+){{0,4}}[\s,;:()'\"-]+{c_pat}\b(?={clause_stop})",
@@ -4230,7 +4407,7 @@ def _detect_filters(
         best_exact = None
         best_exact_len = -1
         for column in candidate_cols:
-            for variant in sorted(_column_variants(subject, column), key=len, reverse=True):
+            for variant in sorted(_column_reference_variants(subject, column), key=len, reverse=True):
                 variant_l = str(variant or "").strip().lower()
                 if variant_l and _phrase_pos(phrase_text, variant_l) >= 0 and len(variant_l) > best_exact_len:
                     best_exact = column
@@ -4248,7 +4425,9 @@ def _detect_filters(
         if semantic_match and semantic_match in candidate_cols:
             return semantic_match
 
-        phrase_tokens = set(_tokenize_for_match(phrase_text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+        phrase_tokens = _semantic_query_token_variants(
+            _tokenize_for_match(phrase_text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS)
+        )
         if not phrase_tokens:
             return None
         best_col = None
@@ -4284,6 +4463,7 @@ def _detect_filters(
 
         window_start = max(0, int(anchor_pos) - 64)
         anchor_window = q[window_start:int(anchor_pos)]
+        anchor_focus = re.split(r"\b(?:and|but|or|while)\b", anchor_window, flags=re.I)[-1].strip()
         anchor_tokens = set(
             _tokenize_for_match(
                 anchor_window,
@@ -4308,6 +4488,31 @@ def _detect_filters(
             local_candidate_tables = list(numeric_candidate_tables)
         elif subject not in local_candidate_tables:
             local_candidate_tables.append(subject)
+
+        if anchor_focus and anchor_focus != anchor_window.strip():
+            best_focus_target: Optional[Tuple[str, str]] = None
+            best_focus_score = 0.0
+            for table in local_candidate_tables:
+                matched = _best_semantic_column_match(
+                    text=anchor_focus,
+                    table=table,
+                    allowed=allowed,
+                    numeric_only=True,
+                    min_score=1.0,
+                )
+                if not matched:
+                    continue
+                overlap = _semantic_query_token_variants(
+                    _tokenize_for_match(anchor_focus, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS)
+                ).intersection(_column_semantic_tokens(table, matched))
+                score = float(len(overlap))
+                if table == subject:
+                    score += 0.25
+                if score > best_focus_score:
+                    best_focus_score = score
+                    best_focus_target = (table, matched)
+            if best_focus_target is not None and best_focus_score >= 1.0:
+                return best_focus_target
 
         best_semantic_target: Optional[Tuple[str, str]] = None
         best_semantic_score = 0.0
@@ -4340,7 +4545,7 @@ def _detect_filters(
             distance = abs(pos - int(anchor_pos))
             score = float(len(overlap) * 3)
             best_variant_len = 0
-            for variant in sorted(_column_variants(t, c), key=len, reverse=True):
+            for variant in sorted(_column_reference_variants(t, c), key=len, reverse=True):
                 variant_l = str(variant or "").strip().lower()
                 if variant_l and _phrase_pos(anchor_window, variant_l) >= 0:
                     best_variant_len = len(variant_l)
@@ -5375,6 +5580,23 @@ def _detect_ordering_and_limit(
                 return True
         return False
 
+    def _segment_column_match_score(seg: str, table: str, column: str) -> Tuple[int, int]:
+        seg_text = re.sub(r"\s+", " ", str(seg or "").strip().lower())
+        t = str(table or "").strip().lower()
+        c = str(column or "").strip()
+        if not seg_text or not t or not c:
+            return (0, 0)
+        best = (0, 0)
+        for variant in _column_variants(t, c):
+            variant_text = re.sub(r"\s+", " ", str(variant or "").strip().lower())
+            if not variant_text or _phrase_pos(seg_text, variant_text) < 0:
+                continue
+            token_count = len(re.findall(r"[a-z0-9]+", variant_text))
+            score = (token_count, len(variant_text))
+            if score > best:
+                best = score
+        return best
+
     def _preferred_lookup_order_dimension() -> Optional[IRDimension]:
         visible_dims = [d for d in dimensions if bool(getattr(d, "visible", True))]
         if not visible_dims:
@@ -5641,19 +5863,46 @@ def _detect_ordering_and_limit(
                     add_order(IROrder(kind="alias", by=d.alias, direction=seg_dir))
                     matched = True
                     break
-                if lookup_order_enrichment and _segment_mentions_column(seg, d.table, d.column):
-                    add_order(IROrder(kind="column", by=d.column, table=d.table, direction=seg_dir))
+            if not matched and lookup_order_enrichment:
+                best_dim: Optional[Tuple[Tuple[int, int], IRDimension]] = None
+                for d in dimensions:
+                    score = _segment_column_match_score(seg, d.table, d.column)
+                    if score <= (0, 0):
+                        continue
+                    if best_dim is None or score > best_dim[0]:
+                        best_dim = (score, d)
+                if best_dim is not None:
+                    add_order(
+                        IROrder(
+                            kind="column",
+                            by=best_dim[1].column,
+                            table=best_dim[1].table,
+                            direction=seg_dir,
+                        )
+                    )
                     matched = True
-                    break
             if matched:
                 continue
 
             # Column mentions fallback.
-            for t, c, _ in column_mentions:
-                if lookup_order_enrichment and _segment_mentions_column(seg, t, c):
-                    add_order(IROrder(kind="column", by=c, table=t, direction=seg_dir))
+            if lookup_order_enrichment:
+                best_col: Optional[Tuple[Tuple[int, int], str, str]] = None
+                for t, c, _ in column_mentions:
+                    score = _segment_column_match_score(seg, t, c)
+                    if score <= (0, 0):
+                        continue
+                    if best_col is None or score > best_col[0]:
+                        best_col = (score, t, c)
+                if best_col is not None:
+                    add_order(
+                        IROrder(
+                            kind="column",
+                            by=best_col[2],
+                            table=best_col[1],
+                            direction=seg_dir,
+                        )
+                    )
                     matched = True
-                    break
             if matched:
                 continue
 
@@ -6131,7 +6380,8 @@ def _should_reclassify_pseudo_aggregate_lookup(
     filters: List[IRFilter],
     existence: List[IRExistence],
 ) -> bool:
-    if str(qtype or "").strip().lower() != "aggregate":
+    qtype_l = str(qtype or "").strip().lower()
+    if qtype_l not in {"aggregate", "rank"}:
         return False
     if metrics or existence or not filters:
         return False
@@ -6174,6 +6424,17 @@ def _should_reclassify_pseudo_aggregate_lookup(
         )
     )
     if has_aggregate_lexemes:
+        return False
+
+    has_rank_lexemes = bool(
+        re.search(
+            r"\b(?:rank|ranking|row\s+number|dense\s+rank|position|top|bottom|highest|lowest|largest|smallest|"
+            r"earliest|latest|newest|oldest|most\s+recent)\b",
+            q,
+            flags=re.I,
+        )
+    )
+    if qtype_l == "rank" and has_rank_lexemes:
         return False
 
     has_projection_shape = bool(dimensions) or bool(_extract_projection_segments(question))

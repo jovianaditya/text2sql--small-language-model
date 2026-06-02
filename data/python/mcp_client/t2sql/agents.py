@@ -471,6 +471,7 @@ from .helpers_main import (validate_identifiers, _regex_requirement_ok,
 from .helpers_core import (
     has_join,
     _ast_guardrails,
+    _fix_winner_row_window_order_priority,
     _fix_winner_row_metric_order_priority,
     _question_wants_latest_year_scope_with_aggregate,
     _rewrite_missing_temporal_exclusion_from_null_filter,
@@ -552,6 +553,7 @@ from .rulebook import (
     semantic_contract_sum_terms,
     semantic_contract_sum_total_count_phrases,
     semantic_contract_sum_total_prefix_terms,
+    identifier_id_like_terms,
     temporal_year_column_terms,
 )
 
@@ -637,6 +639,13 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         and not wants_projection_null_fill
     )
     wants_offset_window = _question_has_offset_window_sequence_intent(question)
+    explicit_rank_window_contract = bool(
+        re.search(
+            r"\b(?:rank|ranking|ranked|row\s+number|row_number|dense\s*rank|dense_rank)\b",
+            q_lower,
+            flags=re.I,
+        )
+    )
     wants_same_group_avg_difference = (
         any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_AVERAGE_INTENT_PATTERNS)
         and any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_SAME_GROUP_INTENT_PATTERNS)
@@ -678,7 +687,12 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
     )
     if same_group_avg_comparison_filter:
         repair_same_group_avg_partition_col = _resolve_required_window_partition_column(question, ctx)
-    if not wants_winner_row and not all_other_same_group_avg and not same_group_avg_comparison_filter:
+    if (
+        not wants_winner_row
+        and not all_other_same_group_avg
+        and not same_group_avg_comparison_filter
+        and not explicit_rank_window_contract
+    ):
         required_window_partition_col = _resolve_required_window_partition_column(question, ctx)
     return {
         "requires_projection_distinct": wants_projection_distinct,
@@ -889,6 +903,7 @@ def _extract_same_group_phrase(question: str) -> str:
         r"which|who|whose|including|excluding|counting|except"
     )
     patterns = [
+        rf"\b(?:inside|within)\s+each\s+([a-z][a-z0-9_ ]{{1,40}}?)(?=\s+\bin\b\s+[a-z]|\s+\b(?:{boundary_terms})\b|[.,;]|$)",
         rf"\b(?:within|in)\s+the\s+same\s+([a-z][a-z0-9_ ]{{1,40}}?)(?=\s+\b(?:{boundary_terms})\b|[.,;]|$)",
         rf"\b(?:that|the)\s+same\s+([a-z][a-z0-9_ ]{{1,40}}?)(?=\s+\b(?:{boundary_terms})\b|[.,;]|$)",
         rf"\bsame\s+([a-z][a-z0-9_ ]{{1,40}}?)(?=\s+\b(?:{boundary_terms})\b|[.,;]|$)",
@@ -986,6 +1001,8 @@ def _resolve_required_window_partition_column(question: str, ctx: str = "", sql:
     best_col = ""
     best_score = 0
     q_lower = (question or "").lower()
+    hint_parts = [part for part in hint_norm.split() if part]
+    trailing_hint = hint_parts[-1] if hint_parts else ""
 
     for _, cols in candidate_tables:
         for col in cols:
@@ -1007,6 +1024,14 @@ def _resolve_required_window_partition_column(question: str, ctx: str = "", sql:
                 matched_hint = True
             if hint_tokens.intersection(col_tokens):
                 score += 10 * len(hint_tokens.intersection(col_tokens))
+                matched_hint = True
+            if (
+                len(hint_tokens) >= 2
+                and trailing_hint
+                and trailing_hint not in {"id", "number", "code", "key"}
+                and col_spaced == trailing_hint
+            ):
+                score += 80
                 matched_hint = True
             if len(hint_tokens) == 1:
                 only_hint = next(iter(hint_tokens))
@@ -1224,17 +1249,37 @@ def _rewrite_grouped_aggregate_to_window_partition(sql: str, partition_col: str,
                         if idx != aggregate_idx and item.strip()
                     ]
 
+                    distinct_arg_match = re.match(
+                        r"(?is)^DISTINCT\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)$",
+                        aggregate_arg,
+                    )
+                    distinct_arg_col = (
+                        str(distinct_arg_match.group(1) or "").strip()
+                        if distinct_arg_match
+                        else ""
+                    )
+                    count_distinct_partition_count = bool(
+                        aggregate_func == "COUNT"
+                        and distinct_arg_col
+                        and not _question_wants_count_distinct(question)
+                        and distinct_arg_col.lower() == str(partition_col or "").strip().lower()
+                    )
                     simple_arg_match = re.match(
                         r"(?is)^(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)$",
                         aggregate_arg,
                     )
                     arg_col = (simple_arg_match.group(1) if simple_arg_match else "").strip()
-                    if arg_col and _question_mentions_column((question or "").lower(), arg_col):
+                    if (
+                        arg_col
+                        and not count_distinct_partition_count
+                        and _question_mentions_column((question or "").lower(), arg_col)
+                    ):
                         projection_tokens = " ".join(projection_items).lower()
                         if arg_col.lower() not in projection_tokens:
                             projection_items.append(arg_col)
 
-                    window_expr = f"{aggregate_func}({aggregate_arg}) OVER (PARTITION BY {partition_col})"
+                    window_aggregate_arg = "*" if count_distinct_partition_count else aggregate_arg
+                    window_expr = f"{aggregate_func}({window_aggregate_arg}) OVER (PARTITION BY {partition_col})"
                     if aggregate_alias:
                         window_expr += f" AS {aggregate_alias}"
                     elif aggregate_expr:
@@ -1491,6 +1536,8 @@ def _find_top_level_kw(sql: str, keyword: str, start: int = 0) -> int:
     s = str(sql)
     low = s.lower()
     kw = keyword.lower()
+    def _is_ident_char(ch: str) -> bool:
+        return bool(ch) and (ch.isalnum() or ch == "_")
     depth = 0
     in_sq = False
     in_dq = False
@@ -1511,8 +1558,8 @@ def _find_top_level_kw(sql: str, keyword: str, start: int = 0) -> int:
             elif ch == ")":
                 depth = max(0, depth - 1)
             if depth == 0 and low.startswith(kw, i):
-                before_ok = i == 0 or not low[i - 1].isalnum()
-                after_ok = i + len(kw) >= len(low) or not low[i + len(kw)].isalnum()
+                before_ok = i == 0 or not _is_ident_char(low[i - 1])
+                after_ok = i + len(kw) >= len(low) or not _is_ident_char(low[i + len(kw)])
                 if before_ok and after_ok:
                     return i
         i += 1
@@ -2006,7 +2053,7 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
     m = re.search(
         r"\b(?:group(?:ed|ing)?(?:\s+\w+){0,4}\s+by|by)\s+"
         r"(?:the\s+)?(?:first|leading|leftmost)\s+"
-        r"(?P<count>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+        r"(?:(?P<count>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+)?"
         r"(?:characters?|chars?|letters?|digits?)\s+of\s+"
         r"(?P<target>[a-z][a-z0-9_ ]{1,48}?)"
         r"(?=(?:[.,;]|\b(?:return|show|list|display|give|keep|only|order|sort|having|where|with)\b|$))",
@@ -2018,7 +2065,7 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
 
     count_token = str(m.group("count") or "").strip().lower()
     target_phrase = str(m.group("target") or "").strip()
-    if not count_token or not target_phrase:
+    if not target_phrase:
         return sql
 
     word_to_int = {
@@ -2026,7 +2073,10 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
         "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
     }
     try:
-        n_chars = int(count_token) if count_token.isdigit() else word_to_int.get(count_token)
+        if count_token:
+            n_chars = int(count_token) if count_token.isdigit() else word_to_int.get(count_token)
+        else:
+            n_chars = 1
     except Exception:
         n_chars = None
     if n_chars is None or n_chars <= 0:
@@ -2465,43 +2515,88 @@ def _build_requested_final_order_mapping(
     if not select_items:
         return None
 
-    candidates: List[Dict[str, Any]] = []
-    for item in select_items:
-        item_clean = re.sub(r"(?is)^(?:DISTINCT|ALL)\s+", "", item.strip()).strip()
-        if not item_clean:
-            continue
+    def _collect_order_candidates(select_text: str) -> List[Dict[str, Any]]:
+        collected: List[Dict[str, Any]] = []
+        for item in _split_top_level_csv(select_text):
+            item_clean = re.sub(r"(?is)^(?:DISTINCT|ALL)\s+", "", item.strip()).strip()
+            if not item_clean:
+                continue
 
-        alias_match = re.search(
-            r"""\bAS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
-            item_clean,
-            flags=re.I,
-        )
-        alias_sql = alias_match.group(1).strip() if alias_match else ""
-        alias = alias_sql.strip("`")
-        expr = item_clean[:alias_match.start()].strip() if alias_match else item_clean
-        simple_col_match = re.search(r"(?:^|\.)(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", expr)
-        expr_name = simple_col_match.group(1).strip("`") if simple_col_match else expr
-        preferred_expr = _quote_order_identifier_if_reserved(alias_sql or expr_name)
-        token_text = " ".join(x for x in [alias, expr_name, expr] if x)
-        tokens = _normalize_order_term_tokens(token_text)
-        if not preferred_expr or not tokens:
-            continue
+            alias_match = re.search(
+                r"""\bAS\s+(`[^`]+`|'[^']+'|"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$""",
+                item_clean,
+                flags=re.I,
+            )
+            alias_sql = alias_match.group(1).strip() if alias_match else ""
+            alias = alias_sql.strip("`")
+            expr = item_clean[:alias_match.start()].strip() if alias_match else item_clean
+            simple_col_match = re.search(r"(?:^|\.)(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", expr)
+            expr_name = simple_col_match.group(1).strip("`") if simple_col_match else expr
+            preferred_expr = _quote_order_identifier_if_reserved(alias_sql or expr_name)
+            token_text = " ".join(x for x in [alias, expr_name, expr] if x)
+            tokens = _normalize_order_term_tokens(token_text)
+            if not preferred_expr or not tokens:
+                continue
 
-        acceptable_refs: Set[str] = set()
-        for ref in {preferred_expr, alias_sql, alias, expr_name, expr}:
-            norm = _normalize_order_reference(ref)
-            if norm:
-                acceptable_refs.add(norm)
-                if "." in norm:
-                    acceptable_refs.add(norm.split(".")[-1])
+            acceptable_refs: Set[str] = set()
+            for ref in {preferred_expr, alias_sql, alias, expr_name, expr}:
+                norm = _normalize_order_reference(ref)
+                if norm:
+                    acceptable_refs.add(norm)
+                    if "." in norm:
+                        acceptable_refs.add(norm.split(".")[-1])
 
-        candidates.append(
-            {
-                "preferred_expr": preferred_expr,
-                "tokens": tokens,
-                "acceptable_refs": acceptable_refs,
-            }
-        )
+            collected.append(
+                {
+                    "preferred_expr": preferred_expr,
+                    "tokens": tokens,
+                    "acceptable_refs": acceptable_refs,
+                }
+            )
+        return collected
+
+    candidates: List[Dict[str, Any]] = _collect_order_candidates(select_segment)
+    seen_preferred_exprs: Set[str] = {
+        str(cand.get("preferred_expr") or "").strip()
+        for cand in candidates
+        if str(cand.get("preferred_expr") or "").strip()
+    }
+
+    from_segment = s[from_pos + len("from"):].strip()
+    if from_segment.startswith("("):
+        depth = 0
+        in_sq = False
+        in_dq = False
+        close_idx = -1
+        for idx, ch in enumerate(from_segment):
+            if ch == "'" and not in_dq:
+                if in_sq and idx + 1 < len(from_segment) and from_segment[idx + 1] == "'":
+                    continue
+                in_sq = not in_sq
+            elif ch == '"' and not in_sq:
+                in_dq = not in_dq
+            elif not in_sq and not in_dq:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = idx
+                        break
+        if close_idx > 1:
+            inner_sql = from_segment[1:close_idx].strip()
+            if re.match(r"(?is)^SELECT\b", inner_sql):
+                inner_from_pos = _find_top_level_kw(inner_sql, "from")
+                if inner_from_pos > 0:
+                    inner_select_segment = re.sub(
+                        r"^\s*select\s+", "", inner_sql[:inner_from_pos], flags=re.I | re.S
+                    ).strip()
+                    for candidate in _collect_order_candidates(inner_select_segment):
+                        preferred_expr = str(candidate.get("preferred_expr") or "").strip()
+                        if not preferred_expr or preferred_expr in seen_preferred_exprs:
+                            continue
+                        candidates.append(candidate)
+                        seen_preferred_exprs.add(preferred_expr)
 
     if not candidates:
         return None
@@ -2811,7 +2906,577 @@ def _strip_unrequested_offset_window_default(sql: str, question: str) -> str:
     return "".join(out) if changed else sql
 
 
-def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col: str) -> str:
+def _repair_single_table_offset_window_contract_shape(
+    sql: str,
+    question: str,
+    partition_col: str,
+) -> Optional[str]:
+    """
+    Post-contract repair for simple single-table LAG/LEAD queries.
+
+    This runs after semantic-contract partition enforcement so we can safely:
+    - restore the required partition key to the output projection
+    - mirror stable trailing ORDER BY keys into the window ORDER BY
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip()
+    part_col = str(partition_col or "").strip()
+    if not s or not q or not part_col:
+        return None
+    if not _question_has_offset_window_sequence_intent(q):
+        return None
+    if not re.search(r"\b(?:LAG|LEAD)\s*\(", s, flags=re.I):
+        return None
+    if re.search(r"\bJOIN\b", s, flags=re.I):
+        return None
+
+    def _text_fallback() -> Optional[str]:
+        s0 = s.rstrip().rstrip(";")
+        order_pos = _find_top_level_kw(s0, "order by")
+        if order_pos < 0:
+            return None
+        limit_pos = _find_top_level_kw(s0, "limit", order_pos + len("order by"))
+        order_end = limit_pos if limit_pos >= 0 else len(s0)
+        top_order_clause = s0[order_pos + len("order by"):order_end].strip()
+        top_order_items = [str(item or "").strip() for item in _split_top_level_csv(top_order_clause) if str(item or "").strip()]
+        if not top_order_items:
+            return None
+
+        part_norm = _normalize_order_reference(part_col)
+        part_suffix = part_norm.split(".")[-1] if part_norm else ""
+
+        def _order_item_keys(item: str) -> Set[str]:
+            raw = re.sub(r"\s+\b(?:ASC|DESC)\b\s*$", "", str(item or "").strip(), flags=re.I).strip()
+            norm = _normalize_order_reference(raw)
+            keys = {norm} if norm else set()
+            if norm and "." in norm:
+                keys.add(norm.split(".")[-1])
+            return {k for k in keys if k}
+
+        desired_items: List[str] = []
+        seen_desired_keys: Set[str] = set()
+        for item in top_order_items:
+            keys = _order_item_keys(item)
+            if not keys or part_norm in keys or part_suffix in keys:
+                continue
+            if keys & seen_desired_keys:
+                continue
+            seen_desired_keys.update(keys)
+            desired_items.append(item)
+        if not desired_items:
+            return None
+
+        window_pat = re.compile(
+            r"""(?is)(?P<prefix>\b(?:LAG|LEAD)\s*\([^)]*\)\s+OVER\s*\()(?P<body>[^)]*?)(?P<suffix>\))"""
+        )
+        m_win = window_pat.search(s0)
+        if not m_win:
+            return None
+        body = str(m_win.group("body") or "")
+        m_order = re.search(r"\bORDER\s+BY\b", body, flags=re.I)
+        if not m_order:
+            return None
+        before_order = body[:m_order.end()]
+        window_order_clause = body[m_order.end():].strip()
+        window_order_items = [str(item or "").strip() for item in _split_top_level_csv(window_order_clause) if str(item or "").strip()]
+        if not window_order_items:
+            return None
+
+        existing_window_keys: Set[str] = set()
+        new_window_items: List[str] = []
+        deduped_existing = False
+        for item in window_order_items:
+            keys = _order_item_keys(item)
+            if keys and keys & existing_window_keys:
+                deduped_existing = True
+                continue
+            new_window_items.append(item)
+            existing_window_keys.update(keys)
+
+        appended = False
+        for item in desired_items:
+            keys = _order_item_keys(item)
+            if not keys or keys & existing_window_keys:
+                continue
+            rendered = str(item or "").strip()
+            if not re.search(r"\b(?:ASC|DESC)\b\s*$", rendered, flags=re.I):
+                rendered = f"{rendered} ASC"
+            new_window_items.append(rendered)
+            existing_window_keys.update(keys)
+            appended = True
+
+        if not appended and not deduped_existing:
+            return None
+
+        new_body = before_order + " " + ", ".join(new_window_items)
+        rebuilt = s0[:m_win.start()] + f"{m_win.group('prefix')}{new_body}{m_win.group('suffix')}" + s0[m_win.end():]
+        rebuilt = rebuilt.strip()
+        if str(sql or "").rstrip().endswith(";"):
+            rebuilt += ";"
+        return rebuilt
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return _text_fallback()
+
+    try:
+        ast = sqlglot.parse_one(s, read="mysql")
+    except Exception:
+        return _text_fallback()
+
+    sel = ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return None
+    if sel.args.get("joins"):
+        return None
+
+    from_expr = sel.args.get("from") or sel.args.get("from_")
+    base_src = getattr(from_expr, "this", None) if from_expr is not None else None
+    if not isinstance(base_src, exp.Table):
+        return None
+
+    table_alias = str(getattr(base_src, "alias_or_name", "") or "").strip()
+    if not table_alias:
+        table_name = getattr(base_src, "name", None)
+        if isinstance(table_name, str) and table_name.strip():
+            table_alias = table_name.strip()
+
+    window_expr = None
+    for item in sel.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        found = base if isinstance(base, exp.Window) else base.find(exp.Window)
+        if isinstance(found, exp.Window) and isinstance(getattr(found, "this", None), (exp.Lag, exp.Lead)):
+            window_expr = found
+            break
+    if not isinstance(window_expr, exp.Window):
+        return None
+
+    def _expr_norm(e: "exp.Expression") -> str:
+        try:
+            return re.sub(r"[\s`]+", "", e.sql(dialect="mysql").lower())
+        except Exception:
+            return ""
+
+    partition_expr = exp.column(part_col, table=table_alias or None)
+    partition_norm = _expr_norm(partition_expr)
+
+    changed = False
+    existing_norms: Set[str] = set()
+    for item in sel.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        norm = _expr_norm(base)
+        if norm:
+            existing_norms.add(norm)
+    if partition_norm and partition_norm not in existing_norms:
+        sel.set("expressions", [partition_expr.copy()] + [item.copy() for item in (sel.expressions or [])])
+        changed = True
+
+    def _semantic_clause_arg(name: str) -> Any:
+        root_arg = getattr(ast, "args", {}).get(name)
+        if root_arg is not None:
+            return root_arg
+        return getattr(sel, "args", {}).get(name)
+
+    top_order = _semantic_clause_arg("order")
+    desired_order_items: List["exp.Ordered"] = []
+    seen_top_order_norms: Set[str] = set()
+
+    def _append_desired_order_item(ordered: "exp.Ordered") -> None:
+        if not isinstance(ordered, exp.Ordered):
+            return
+        base = getattr(ordered, "this", None)
+        if not isinstance(base, exp.Expression):
+            return
+        base_norm = _expr_norm(base)
+        if not base_norm or base_norm == partition_norm or base_norm in seen_top_order_norms:
+            return
+        desired_order_items.append(ordered.copy())
+        seen_top_order_norms.add(base_norm)
+
+    if isinstance(top_order, exp.Order):
+        for ordered in top_order.expressions or []:
+            _append_desired_order_item(ordered)
+
+    if not desired_order_items:
+        order_pos = _find_top_level_kw(s, "order by")
+        if order_pos >= 0:
+            limit_pos = _find_top_level_kw(s, "limit", order_pos + len("order by"))
+            order_end_candidates = [p for p in (limit_pos,) if p >= 0]
+            order_end = min(order_end_candidates) if order_end_candidates else len(s.rstrip().rstrip(";"))
+            order_clause = s[order_pos + len("order by"):order_end].strip().rstrip(";")
+            for raw_item in _split_top_level_csv(order_clause):
+                raw_item_s = str(raw_item or "").strip()
+                if not raw_item_s:
+                    continue
+                try:
+                    parsed_order_sql = sqlglot.parse_one(
+                        f"SELECT 1 ORDER BY {raw_item_s}",
+                        read="mysql",
+                    )
+                except Exception:
+                    continue
+                parsed_order = getattr(parsed_order_sql, "args", {}).get("order")
+                if not isinstance(parsed_order, exp.Order):
+                    continue
+                for ordered in parsed_order.expressions or []:
+                    _append_desired_order_item(ordered)
+
+    if desired_order_items:
+        existing_window_order = window_expr.args.get("order")
+        existing_window_items: List["exp.Ordered"] = []
+        existing_window_norms: Set[str] = set()
+        if isinstance(existing_window_order, exp.Order):
+            for ordered in existing_window_order.expressions or []:
+                if not isinstance(ordered, exp.Ordered):
+                    continue
+                existing_window_items.append(ordered.copy())
+                base = getattr(ordered, "this", None)
+                if isinstance(base, exp.Expression):
+                    base_norm = _expr_norm(base)
+                    if base_norm:
+                        existing_window_norms.add(base_norm)
+
+        appended = False
+        for ordered in desired_order_items:
+            base = getattr(ordered, "this", None)
+            base_norm = _expr_norm(base) if isinstance(base, exp.Expression) else ""
+            if not base_norm or base_norm in existing_window_norms:
+                continue
+            existing_window_items.append(ordered.copy())
+            existing_window_norms.add(base_norm)
+            appended = True
+
+        if appended:
+            window_expr.set("order", exp.Order(expressions=existing_window_items))
+            changed = True
+
+    if not changed:
+        return _text_fallback()
+    try:
+        return ast.sql(dialect="mysql")
+    except Exception:
+        return _text_fallback()
+
+
+def _repair_offset_window_final_output_order(
+    sql: str,
+    question: str,
+    partition_col: str,
+) -> Optional[str]:
+    """
+    Re-apply final ORDER BY completion after offset-window projection repair.
+
+    For offset-window questions, the requested first sort key can be the
+    partition column implied by the question (for example `status`) even when
+    the draft omitted it from SELECT. Once the projection repair restores that
+    column, the regular final-order mapper becomes reliable again.
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip()
+    part_col = str(partition_col or "").strip()
+    if not s or not q or not part_col:
+        return None
+    if not _question_has_offset_window_sequence_intent(q):
+        return None
+    if not _question_requests_ordering(q):
+        return None
+    if not re.search(r"\b(?:LAG|LEAD)\s*\(", s, flags=re.I):
+        return None
+    if not re.search(
+        rf"(?is)\bSELECT\b[^;]*\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?{re.escape(part_col)}`?\b",
+        s,
+        flags=re.I | re.S,
+    ):
+        return None
+
+    fixed = _complete_requested_final_order(s, q)
+    fixed = _enforce_requested_order_direction(fixed, q)
+    if fixed and fixed != s:
+        return fixed
+    return None
+
+
+def _append_offset_window_tiebreak_from_final_order(
+    sql: str,
+    question: str,
+    partition_col: str,
+) -> Optional[str]:
+    """
+    Mirror stable top-level ORDER BY keys into a single-table offset window.
+
+    Example:
+    - final ORDER BY status, orderDate, orderNumber
+    - window ORDER BY orderDate
+    becomes:
+    - window ORDER BY orderDate, orderNumber
+    """
+    def _set_debug(mode: str, applied: bool, reason: str = "", detail: str = "") -> None:
+        setattr(
+            _append_offset_window_tiebreak_from_final_order,
+            "last_debug",
+            {
+                "mode": str(mode or "").strip() or "unknown",
+                "applied": bool(applied),
+                "reason": str(reason or "").strip(),
+                "detail": str(detail or "").strip(),
+            },
+        )
+
+    def _action_reason(appended: bool, deduped: bool) -> str:
+        if appended and deduped:
+            return "appended_missing_tiebreak+deduped_existing_window_order"
+        if appended:
+            return "appended_missing_tiebreak"
+        if deduped:
+            return "deduped_existing_window_order"
+        return "no_change"
+
+    s = str(sql or "").strip()
+    q = str(question or "").strip()
+    part_col = str(partition_col or "").strip()
+    _set_debug("not_applicable", False, "guard_unset")
+    if not s or not q or not part_col:
+        _set_debug("not_applicable", False, "missing_sql_or_question_or_partition")
+        return None
+    if not _question_has_offset_window_sequence_intent(q):
+        _set_debug("not_applicable", False, "question_not_offset_window")
+        return None
+    if not re.search(r"\b(?:LAG|LEAD)\s*\(", s, flags=re.I):
+        _set_debug("not_applicable", False, "no_lag_lead_window")
+        return None
+    if re.search(r"\bJOIN\b", s, flags=re.I):
+        _set_debug("not_applicable", False, "join_present")
+        return None
+
+    def _text_fallback() -> Tuple[Optional[str], str]:
+        s0 = s.rstrip().rstrip(";")
+        order_pos = _find_top_level_kw(s0, "order by")
+        if order_pos < 0:
+            return None, "no_change"
+        limit_pos = _find_top_level_kw(s0, "limit", order_pos + len("order by"))
+        order_end = limit_pos if limit_pos >= 0 else len(s0)
+        top_order_clause = s0[order_pos + len("order by"):order_end].strip()
+        top_order_items = [
+            str(item or "").strip()
+            for item in _split_top_level_csv(top_order_clause)
+            if str(item or "").strip()
+        ]
+        if not top_order_items:
+            return None, "no_change"
+
+        part_norm = _normalize_order_reference(part_col)
+        part_suffix = part_norm.split(".")[-1] if part_norm else ""
+
+        def _order_item_keys(item: str) -> Set[str]:
+            raw = re.sub(r"\s+\b(?:ASC|DESC)\b\s*$", "", str(item or "").strip(), flags=re.I).strip()
+            norm = _normalize_order_reference(raw)
+            keys = {norm} if norm else set()
+            if norm and "." in norm:
+                keys.add(norm.split(".")[-1])
+            return {k for k in keys if k}
+
+        desired_items: List[str] = []
+        seen_desired_keys: Set[str] = set()
+        for item in top_order_items:
+            keys = _order_item_keys(item)
+            if not keys or part_norm in keys or part_suffix in keys:
+                continue
+            if keys & seen_desired_keys:
+                continue
+            seen_desired_keys.update(keys)
+            desired_items.append(item)
+        if not desired_items:
+            return None, "no_change"
+
+        window_pat = re.compile(
+            r"""(?is)(?P<prefix>\b(?:LAG|LEAD)\s*\([^)]*\)\s+OVER\s*\()(?P<body>[^)]*?)(?P<suffix>\))"""
+        )
+        m_win = window_pat.search(s0)
+        if not m_win:
+            return None, "no_change"
+        body = str(m_win.group("body") or "")
+        m_order = re.search(r"\bORDER\s+BY\b", body, flags=re.I)
+        if not m_order:
+            return None, "no_change"
+        before_order = body[:m_order.end()]
+        window_order_clause = body[m_order.end():].strip()
+        window_order_items = [
+            str(item or "").strip()
+            for item in _split_top_level_csv(window_order_clause)
+            if str(item or "").strip()
+        ]
+        if not window_order_items:
+            return None, "no_change"
+
+        existing_window_keys: Set[str] = set()
+        for item in window_order_items:
+            existing_window_keys.update(_order_item_keys(item))
+
+        appended = False
+        new_window_items = list(window_order_items)
+        for item in desired_items:
+            keys = _order_item_keys(item)
+            if not keys or keys & existing_window_keys:
+                continue
+            rendered = str(item or "").strip()
+            if not re.search(r"\b(?:ASC|DESC)\b\s*$", rendered, flags=re.I):
+                rendered = f"{rendered} ASC"
+            new_window_items.append(rendered)
+            existing_window_keys.update(keys)
+            appended = True
+
+        if not appended:
+            return None, "no_change"
+
+        new_body = before_order + " " + ", ".join(new_window_items)
+        rebuilt = s0[:m_win.start()] + f"{m_win.group('prefix')}{new_body}{m_win.group('suffix')}" + s0[m_win.end():]
+        rebuilt = rebuilt.strip()
+        if str(sql or "").rstrip().endswith(";"):
+            rebuilt += ";"
+        return rebuilt, _action_reason(appended=True, deduped=False)
+
+    def _return_text_fallback(reason: str) -> Optional[str]:
+        rebuilt, action_reason = _text_fallback()
+        _set_debug(
+            "text_fallback",
+            bool(rebuilt and rebuilt != s),
+            action_reason,
+            reason,
+        )
+        return rebuilt
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return _return_text_fallback("sqlglot_unavailable")
+
+    try:
+        ast = sqlglot.parse_one(s, read="mysql")
+    except Exception:
+        return _return_text_fallback("ast_parse_failed")
+
+    sel = ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return _return_text_fallback("ast_no_select")
+    if sel.args.get("joins"):
+        return _return_text_fallback("ast_join_present")
+
+    from_expr = sel.args.get("from") or sel.args.get("from_")
+    base_src = getattr(from_expr, "this", None) if from_expr is not None else None
+    if not isinstance(base_src, exp.Table):
+        return _return_text_fallback("ast_non_table_source")
+
+    table_alias = str(getattr(base_src, "alias_or_name", "") or "").strip()
+    if not table_alias:
+        table_name = getattr(base_src, "name", None)
+        if isinstance(table_name, str) and table_name.strip():
+            table_alias = table_name.strip()
+
+    window_expr = None
+    for item in sel.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        found = base if isinstance(base, exp.Window) else base.find(exp.Window)
+        if isinstance(found, exp.Window) and isinstance(getattr(found, "this", None), (exp.Lag, exp.Lead)):
+            window_expr = found
+            break
+    if not isinstance(window_expr, exp.Window):
+        return _return_text_fallback("ast_no_offset_window")
+
+    def _expr_norm(expr_in: "exp.Expression") -> str:
+        try:
+            return re.sub(r"[\s`]+", "", expr_in.sql(dialect="mysql").lower())
+        except Exception:
+            return ""
+
+    part_norm = _normalize_order_reference(part_col)
+    part_suffix = part_norm.split(".")[-1] if part_norm else ""
+    partition_norms: Set[str] = {part_norm, part_suffix}
+    if part_suffix and table_alias:
+        partition_norms.add(f"{table_alias.lower()}.{part_suffix}")
+    partition_norms = {norm for norm in partition_norms if norm}
+
+    def _is_partition_expr(expr_in: Optional["exp.Expression"]) -> bool:
+        if not isinstance(expr_in, exp.Expression):
+            return False
+        expr_norm = _expr_norm(expr_in)
+        if not expr_norm:
+            return False
+        if expr_norm in partition_norms:
+            return True
+        return bool(part_suffix and expr_norm.split(".")[-1] == part_suffix)
+
+    top_order = ast.args.get("order") or sel.args.get("order")
+    if not isinstance(top_order, exp.Order):
+        return _return_text_fallback("ast_no_top_order")
+
+    desired_order_items: List["exp.Ordered"] = []
+    seen_desired_norms: Set[str] = set()
+    for ordered in top_order.expressions or []:
+        if not isinstance(ordered, exp.Ordered):
+            continue
+        base = getattr(ordered, "this", None)
+        if not isinstance(base, exp.Expression) or _is_partition_expr(base):
+            continue
+        base_norm = _expr_norm(base)
+        if not base_norm or base_norm in seen_desired_norms:
+            continue
+        desired_order_items.append(ordered.copy())
+        seen_desired_norms.add(base_norm)
+    if not desired_order_items:
+        return _return_text_fallback("ast_no_desired_tiebreaks")
+
+    existing_window_order = window_expr.args.get("order")
+    if not isinstance(existing_window_order, exp.Order):
+        return _return_text_fallback("ast_no_window_order")
+
+    existing_window_items: List["exp.Ordered"] = []
+    existing_window_norms: Set[str] = set()
+    deduped_existing = False
+    for ordered in existing_window_order.expressions or []:
+        if not isinstance(ordered, exp.Ordered):
+            continue
+        base = getattr(ordered, "this", None)
+        base_norm = _expr_norm(base) if isinstance(base, exp.Expression) else ""
+        if base_norm and base_norm in existing_window_norms:
+            deduped_existing = True
+            continue
+        existing_window_items.append(ordered.copy())
+        if isinstance(base, exp.Expression):
+            if base_norm:
+                existing_window_norms.add(base_norm)
+
+    appended = False
+    for ordered in desired_order_items:
+        base = getattr(ordered, "this", None)
+        base_norm = _expr_norm(base) if isinstance(base, exp.Expression) else ""
+        if not base_norm or base_norm in existing_window_norms:
+            continue
+        existing_window_items.append(ordered.copy())
+        existing_window_norms.add(base_norm)
+        appended = True
+
+    if not appended and not deduped_existing:
+        return _return_text_fallback("ast_no_change")
+
+    window_expr.set("order", exp.Order(expressions=existing_window_items))
+    try:
+        rebuilt = ast.sql(dialect="mysql")
+    except Exception:
+        return _return_text_fallback("ast_serialize_failed")
+    if str(sql or "").rstrip().endswith(";"):
+        rebuilt = rebuilt.rstrip(";") + ";"
+    _set_debug(
+        "ast",
+        bool(rebuilt and rebuilt != s),
+        _action_reason(appended=appended, deduped=deduped_existing),
+    )
+    return rebuilt
+
+
+def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col: str, question: str = "") -> str:
     """
     Rewrite a same-table aggregate comparison into a derived window form.
 
@@ -2927,9 +3592,33 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
     if not metric_col or not partition_col:
         return sql
 
+    def _extract_requested_output_segment(text: str) -> str:
+        q = str(text or "").strip().lower()
+        if not q:
+            return ""
+        m = re.search(
+            r"(?is)\b(?:return|show|display|get|list|include|including|provide)\s+(?P<seg>.+?)(?=\b(?:order\s+by|sort\s+by|sorted\s+by)\b|$)",
+            q,
+        )
+        if not m:
+            return ""
+        return str(m.group("seg") or "").strip(" .;")
+
+    requested_segment = _extract_requested_output_segment(question)
+
     # Keep this helper for flat projections only.
     output_items: List[str] = []
     needed_cols: List[str] = []
+    needed_cols_seen: Set[str] = set()
+    existing_output_cols: Dict[str, str] = {}
+
+    def _append_needed_col(col_name: str) -> None:
+        col_norm = str(col_name or "").strip().lower()
+        if not col_norm or col_norm in needed_cols_seen:
+            return
+        needed_cols_seen.add(col_norm)
+        needed_cols.append(str(col_name or "").strip())
+
     for item in select_items:
         raw = item.strip()
         if re.search(r"\b(?:COUNT|SUM|AVG|MIN|MAX|OVER|CASE)\s*\(", raw, flags=re.I):
@@ -2940,9 +3629,8 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
         if not col_match:
             return sql
         col = col_match.group(1)
-        output_items.append(raw if "." not in raw else re.sub(r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.)", "", raw))
-        if col not in needed_cols:
-            needed_cols.append(col)
+        existing_output_cols[col.lower()] = raw if "." not in raw else re.sub(r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.)", "", raw)
+        _append_needed_col(col)
 
     order_pos = _find_top_level_kw(tail, "order by")
     if order_pos >= 0:
@@ -2954,9 +3642,103 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
                 if col not in needed_cols:
                     needed_cols.append(col)
 
+    try:
+        analyzer = get_schema_analyzer()
+        table_cols = [str(c).strip("`") for c in analyzer.get_table_columns(str(from_match.group("table") or "").strip()) if str(c).strip()]
+    except Exception:
+        table_cols = []
+        analyzer = None
+
+    requested_cols: List[str] = []
+    if requested_segment and table_cols:
+        requested_segment_l = requested_segment.lower()
+        requested_token_positions: List[Tuple[int, str]] = [
+            (m.start(), m.group(0).lower())
+            for m in re.finditer(r"[a-z0-9]+", requested_segment_l)
+        ]
+
+        def _identifier_parts(text: str) -> List[str]:
+            raw = str(text or "").strip()
+            if not raw:
+                return []
+            raw = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)
+            raw = raw.replace("_", " ").replace("-", " ")
+            return [tok for tok in re.findall(r"[a-z0-9]+", raw.lower()) if tok]
+
+        def _identifier_variants(parts: List[str]) -> Set[str]:
+            if not parts:
+                return set()
+            variants: Set[str] = {" ".join(parts)}
+            suffix_terms = {str(x or "").strip().lower() for x in identifier_id_like_terms() if str(x or "").strip()}
+            if len(parts) >= 2 and parts[-1] in suffix_terms:
+                prefix = parts[:-1]
+                for suffix in sorted(suffix_terms):
+                    variants.add(" ".join(prefix + [suffix]))
+            return {v.strip() for v in variants if v.strip()}
+
+        for col in table_cols:
+            col_l = str(col or "").strip().lower()
+            if not col_l:
+                continue
+            candidate_texts = [col]
+            if analyzer is not None:
+                try:
+                    candidate_texts.extend(analyzer.get_column_synonyms(str(from_match.group("table") or "").strip(), col_l) or [])
+                except Exception:
+                    pass
+                try:
+                    sem = get_column_semantics(str(from_match.group("table") or "").strip(), col_l) or {}
+                    candidate_texts.extend(
+                        str(tag).strip()
+                        for tag in (sem.get("alias_tags") or [])
+                        if str(tag).strip()
+                    )
+                except Exception:
+                    pass
+            best_pos: Optional[int] = None
+            for text in candidate_texts:
+                for phrase in _identifier_variants(_identifier_parts(text)):
+                    phrase_regex = re.escape(phrase).replace(r"\ ", r"\s+")
+                    m_phrase = re.search(rf"\b{phrase_regex}\b", requested_segment_l, flags=re.I)
+                    if m_phrase:
+                        pos = m_phrase.start()
+                        if best_pos is None or pos < best_pos:
+                            best_pos = pos
+                if best_pos is None:
+                    compact = re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+                    compact_hits = [
+                        (pos, tok) for pos, tok in requested_token_positions
+                        if len(tok) >= 3 and tok in compact
+                    ]
+                    distinct_hit_roots = {tok[:-1] if tok.endswith("s") and len(tok) > 1 else tok for _pos, tok in compact_hits if tok}
+                    if len(distinct_hit_roots) >= 2 and compact_hits:
+                        pos = min(pos for pos, _tok in compact_hits)
+                        if best_pos is None or pos < best_pos:
+                            best_pos = pos
+            if best_pos is not None:
+                requested_cols.append(col_l)
+
+    final_output_cols: List[str] = []
+    seen_final_cols: Set[str] = set()
+    for col_l in requested_cols:
+        display = existing_output_cols.get(col_l)
+        if display is None and col_l in table_cols:
+            display = col_l
+        if display and col_l not in seen_final_cols:
+            final_output_cols.append(display)
+            seen_final_cols.add(col_l)
+    for col_l, display in existing_output_cols.items():
+        if col_l not in seen_final_cols:
+            final_output_cols.append(display)
+            seen_final_cols.add(col_l)
+
+    if final_output_cols:
+        output_items = final_output_cols
+        for col_name in [_strip_qual(x) for x in final_output_cols]:
+            _append_needed_col(col_name)
+
     for col in (metric_col, partition_col):
-        if col not in needed_cols:
-            needed_cols.append(col)
+        _append_needed_col(col)
 
     agg = str(agg_match.group("agg") or "AVG").upper()
     avg_alias = re.sub(r"[^A-Za-z0-9_]+", "_", f"{agg.lower()}_{metric_col}_by_{partition_col}").strip("_")
@@ -3143,6 +3925,7 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         fixed = _rewrite_same_table_correlated_aggregate_comparison(
             out_sql,
             repair_same_group_avg_partition_col,
+            question,
         )
         if fixed != out_sql:
             out_sql = fixed
@@ -3247,6 +4030,7 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         fixed = _rewrite_same_table_correlated_aggregate_comparison(
             out_sql,
             required_window_partition_col,
+            question,
         )
         if fixed != out_sql:
             out_sql = fixed
@@ -10421,6 +11205,19 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # 1. HEURISTIC PIPELINE (Versi Bersih/Safe Mode)
     final_sql = normalize_sql_pipeline(draft_sql, question, ctx)
     corrections = ["Applied Heuristic Pipeline"]
+
+    def _log_offset_window_tiebreak_debug(stage: str, before_sql: str, after_sql: Optional[str]) -> None:
+        info = getattr(_append_offset_window_tiebreak_from_final_order, "last_debug", {}) or {}
+        mode = str(info.get("mode") or "unknown")
+        reason = str(info.get("reason") or "none")
+        detail = str(info.get("detail") or "")
+        applied = bool(after_sql and str(after_sql).strip() != str(before_sql or "").strip())
+        detail_suffix = f" detail={detail}" if detail else ""
+        _dbg_print_two(
+            "[REFINER - OFFSET TIEBREAK]",
+            f"stage={stage} mode={mode} applied={applied} reason={reason}{detail_suffix}",
+        )
+
     repaired_distinct_sql = _repair_misplaced_select_distinct(final_sql)
     if repaired_distinct_sql and repaired_distinct_sql != final_sql:
         final_sql = str(repaired_distinct_sql).strip()
@@ -10468,9 +11265,66 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         elif AGENT_AST_GUARDS_DEBUG and ast_meta.get("error"):
             _dbg_print_two("[REFINER - AST] parse skipped", f"{ast_meta.get('error')}")
 
+    semantic_contract = _derive_semantic_contract(question, ctx)
     final_sql, contract_corrections, contract_violations = _apply_semantic_contract(final_sql, question, ctx)
     if contract_corrections:
         corrections.extend(contract_corrections)
+    repaired_winner_window_order_sql = _fix_winner_row_window_order_priority(final_sql, question)
+    if repaired_winner_window_order_sql and repaired_winner_window_order_sql != final_sql:
+        final_sql = str(repaired_winner_window_order_sql).strip()
+        corrections.append("Repaired single-table winner-row window order after semantic contract")
+    required_offset_partition_col = str(semantic_contract.get("required_window_partition_col") or "").strip()
+    if not required_offset_partition_col:
+        required_offset_partition_col = _resolve_required_window_partition_column(question, ctx, final_sql)
+    if (
+        required_offset_partition_col
+        and _question_has_offset_window_sequence_intent(question)
+        and not _has_required_window_partition(final_sql, required_offset_partition_col)
+    ):
+        repaired_required_partition_sql = _rewrite_required_window_partition(
+            final_sql,
+            required_offset_partition_col,
+        )
+        if repaired_required_partition_sql and repaired_required_partition_sql != final_sql:
+            final_sql = str(repaired_required_partition_sql).strip()
+            corrections.append(
+                f"Reapplied required window partition '{required_offset_partition_col}' after semantic contract"
+            )
+    repaired_offset_shape_sql = _repair_single_table_offset_window_contract_shape(
+        final_sql,
+        question,
+        required_offset_partition_col,
+    )
+    if repaired_offset_shape_sql and repaired_offset_shape_sql != final_sql:
+        final_sql = str(repaired_offset_shape_sql).strip()
+        corrections.append(
+            f"Repaired single-table offset-window output shape for partition '{required_offset_partition_col}'"
+        )
+    repaired_offset_output_order_sql = _repair_offset_window_final_output_order(
+        final_sql,
+        question,
+        required_offset_partition_col,
+    )
+    if repaired_offset_output_order_sql and repaired_offset_output_order_sql != final_sql:
+        final_sql = str(repaired_offset_output_order_sql).strip()
+        corrections.append(
+            f"Completed final ORDER BY after offset-window projection repair for partition '{required_offset_partition_col}'"
+        )
+    repaired_offset_window_tiebreak_sql = _append_offset_window_tiebreak_from_final_order(
+        final_sql,
+        question,
+        required_offset_partition_col,
+    )
+    _log_offset_window_tiebreak_debug(
+        "post_contract",
+        final_sql,
+        repaired_offset_window_tiebreak_sql,
+    )
+    if repaired_offset_window_tiebreak_sql and repaired_offset_window_tiebreak_sql != final_sql:
+        final_sql = str(repaired_offset_window_tiebreak_sql).strip()
+        corrections.append(
+            f"Appended stable offset-window tie-break keys from final ORDER BY for partition '{required_offset_partition_col}'"
+        )
     dropped_filter_only_sql = _drop_unrequested_missing_filter_columns(final_sql, question, ctx)
     if dropped_filter_only_sql and dropped_filter_only_sql != final_sql:
         final_sql = str(dropped_filter_only_sql).strip()
@@ -10898,7 +11752,102 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         part_match = re.search(AGENT_REFINE_PARTITION_BY_PATTERN, final_sql, re.IGNORECASE)
         if part_match:
             part_col = part_match.group(1)
-            select_clause_match = re.search(AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN, final_sql, re.IGNORECASE | re.DOTALL)
+
+            def _winner_partition_key_explicitly_requested(partition_col: str, question_text: str) -> bool:
+                q_low = str(question_text or "").strip().lower()
+                if not q_low or not partition_col:
+                    return False
+
+                def _extract_requested_output_segment_local(text: str) -> str:
+                    head_patterns = [
+                        r"\b(?:return|show|display|get|list|find|identify|retrieve|extract)\s+(?:the\s+)?(?P<seg>.+?)\s+\bfor\b",
+                        r"\b(?:return|show|display|get|list|find|identify|retrieve|extract)\s+(?:the\s+)?(?P<seg>.+?)\s+\bwhere\b",
+                    ]
+                    for pat in head_patterns:
+                        m = re.search(pat, text, flags=re.I)
+                        if not m:
+                            continue
+                        seg = str(m.group("seg") or "").strip(" .;")
+                        if seg:
+                            return seg
+
+                    tail_patterns = [
+                        r"\bincluding\b\s+(?P<seg>.+)$",
+                        r"\binclude\b\s+(?P<seg>.+)$",
+                        r"\breturn\b\s+(?P<seg>.+)$",
+                        r"\bshow\b\s+(?P<seg>.+)$",
+                        r"\bdisplay\b\s+(?P<seg>.+)$",
+                        r"\bget\b\s+(?P<seg>.+)$",
+                        r"\bshowing\b\s+(?P<seg>.+)$",
+                        r"\bwith\b\s+(?P<seg>.+)$",
+                    ]
+                    for pat in tail_patterns:
+                        m = re.search(pat, text, flags=re.I)
+                        if not m:
+                            continue
+                        seg = str(m.group("seg") or "").strip(" .;")
+                        if not seg:
+                            continue
+                        stop_pat = re.compile(
+                            r"(?is)(?:,\s*|\.\s*|\s+)(?:sorted|ordered|starting|beginning|ranked|grouped|within|among|across|inside|only\s+include|include\s+only|keep\s+only|only\s+keep|retain\s+only)\b"
+                        )
+                        stop_m = stop_pat.search(seg)
+                        if stop_m:
+                            seg = seg[:stop_m.start()].strip(" ,.;")
+                        return seg
+                    return ""
+
+                clean = re.sub(AGENT_COLUMN_CAMEL_SPLIT_LOWER_PATTERN, r"\1 \2", str(partition_col or ""))
+                clean = clean.replace("_", " ").strip().lower()
+                if not clean:
+                    return False
+                parts = [p for p in clean.split() if p]
+                if not parts:
+                    return False
+
+                phrase_patterns = {clean, r"\s+".join(re.escape(p) for p in parts)}
+                last_word = parts[-1]
+                if last_word in AGENT_MISSING_COL_SUFFIX_SYNONYMS and len(parts) >= 2:
+                    prefix = r"\s+".join(re.escape(p) for p in parts[:-1])
+                    phrase_patterns.add(rf"{prefix}\s*{AGENT_MISSING_COL_SUFFIX_SYNONYMS[last_word]}")
+
+                output_seg = _extract_requested_output_segment_local(q_low)
+                if output_seg and any(
+                    re.search(rf"\b(?:the\s+)?{pat}\b", output_seg, flags=re.I)
+                    for pat in phrase_patterns
+                ):
+                    return True
+
+                group_scope_patterns = [
+                    rf"\bfor\s+each\s+(?:the\s+)?(?P<seg>[a-z][a-z0-9_ ]{{1,60}}?)(?=\s+\bin\b\s+[a-z]|\s*,|\s+\b(?:return|show|display|get|list|find|identify|retrieve|extract|keep|include)\b|[.;]|$)",
+                    rf"\bper\s+(?:the\s+)?(?P<seg>[a-z][a-z0-9_ ]{{1,60}}?)(?=\s+\bin\b\s+[a-z]|\s*,|\s+\b(?:return|show|display|get|list|find|identify|retrieve|extract|keep|include)\b|[.;]|$)",
+                ]
+                for pat in group_scope_patterns:
+                    m = re.search(pat, q_low, flags=re.I)
+                    if not m:
+                        continue
+                    seg = re.sub(r"\s+", " ", str(m.group("seg") or "").strip())
+                    if seg and any(
+                        re.search(rf"\b(?:the\s+)?{pat2}\b", seg, flags=re.I)
+                        for pat2 in phrase_patterns
+                    ):
+                        return True
+
+                same_group_phrase = _extract_same_group_phrase(q_low)
+                if same_group_phrase:
+                    group_tokens = set(_semantic_phrase_tokens(same_group_phrase))
+                    part_tokens = set(_semantic_phrase_tokens(clean))
+                    if part_tokens and group_tokens and part_tokens.issubset(group_tokens):
+                        if re.search(r"\b(?:for|within|inside)\s+each\b|\bper\b", q_low, flags=re.I):
+                            return True
+
+                return False
+
+            select_clause_match = re.search(
+                AGENT_REFINE_SELECT_FROM_CLAUSE_PATTERN,
+                final_sql,
+                re.IGNORECASE | re.DOTALL,
+            )
             if select_clause_match:
                 select_clause = select_clause_match.group(1)
                 select_clause_up = select_clause.upper()
@@ -10906,17 +11855,12 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 def _partition_key_present_semantically(part_col_up: str, outer_select_up: str, full_sql: str) -> bool:
                     part_col_norm = (part_col_up or "").strip().lower()
                     outer_select_norm = (outer_select_up or "").strip().lower()
-                    # Direct presence in outer SELECT.
                     if part_col_norm and part_col_norm in outer_select_norm:
                         return True
 
                     outer_select_tokens = set(
                         re.findall(AGENT_REFINE_SQL_TOKEN_PATTERN, outer_select_up.lower())
                     )
-
-                    # Support alias projection from inner query:
-                    # PARTITION BY customerNumber, inner SELECT customerNumber AS customer_id,
-                    # outer SELECT customer_id ...
                     alias_matches = re.findall(
                         rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\.)?{re.escape(part_col_up)}\b\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
                         full_sql,
@@ -10926,7 +11870,6 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                         if alias_name.lower() in outer_select_tokens:
                             return True
 
-                    # Semantic equivalence: customerNumber ~ customer_id / customerCode.
                     part_low = part_col_up.lower()
                     part_stem = re.sub(r"(?:_)?(?:number|id|code|key)$", "", part_low).strip("_")
                     if part_stem:
@@ -10937,7 +11880,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
                     return False
 
-                if not _partition_key_present_semantically(part_col, select_clause_up, final_sql):
+                if (
+                    _winner_partition_key_explicitly_requested(part_col, question)
+                    and not _partition_key_present_semantically(part_col, select_clause_up, final_sql)
+                ):
                     def _inject_partition_key_into_outer_select(full_sql: str, partition_col: str) -> Optional[str]:
                         s = (full_sql or "").strip()
                         if not s:
@@ -11026,22 +11972,46 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                             return None
                         outer_alias = alias_match.group(1)
 
+                        inner_select_match = re.match(r"(?is)^\s*SELECT\s+(?P<inner_sel>.+?)\s+FROM\b", inner_sql)
+                        if not inner_select_match:
+                            return None
+                        inner_select_clause = str(inner_select_match.group("inner_sel") or "").strip()
+                        inner_items = _split_top_level_csv_local(inner_select_clause)
+
+                        def _item_projects_partition(item: str) -> bool:
+                            raw = str(item or "").strip()
+                            if not raw:
+                                return False
+                            if re.search(
+                                rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\.)?{re.escape(partition_col)}\b\s+AS\s+[A-Za-z_][A-Za-z0-9_]*\s*$",
+                                raw,
+                                flags=re.IGNORECASE,
+                            ):
+                                return True
+                            return bool(
+                                re.fullmatch(
+                                    rf"(?is)(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?{re.escape(partition_col)}`?",
+                                    raw,
+                                )
+                            )
+
                         projected_name = partition_col
                         alias_from_inner = re.search(
                             rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\.)?{re.escape(partition_col)}\b\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
-                            inner_sql,
+                            inner_select_clause,
                             flags=re.IGNORECASE,
                         )
                         if alias_from_inner:
                             projected_name = alias_from_inner.group(1)
                         else:
-                            has_inner_projection = re.search(
-                                rf"(?:\b[A-Za-z_][A-Za-z0-9_]*\.)?{re.escape(partition_col)}\b",
-                                inner_sql,
-                                flags=re.IGNORECASE,
-                            )
+                            has_inner_projection = any(_item_projects_partition(item) for item in inner_items)
                             if not has_inner_projection:
-                                return None
+                                rebuilt_inner_select = ", ".join([partition_col] + inner_items)
+                                inner_sql = (
+                                    inner_sql[:inner_select_match.start("inner_sel")]
+                                    + rebuilt_inner_select
+                                    + inner_sql[inner_select_match.end("inner_sel"):]
+                                )
 
                         outer_select = (select_match.group("outer") or "").strip()
                         qualified_outer_items: List[str] = []
@@ -11053,7 +12023,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                                 qualified_outer_items.append(item)
                         outer_select_qualified = ", ".join(qualified_outer_items)
                         candidate_expr = f"{outer_alias}.{projected_name}"
-                        fixed = "SELECT " + candidate_expr + ", " + outer_select_qualified + s[select_match.end("outer"):]
+                        fixed = f"SELECT {candidate_expr}, {outer_select_qualified} FROM ({inner_sql}) {outer_tail}"
                         fixed = re.sub(r"\s{2,}", " ", fixed).strip()
                         if full_sql.rstrip().endswith(";") and not fixed.endswith(";"):
                             fixed += ";"
@@ -11079,7 +12049,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                                 f"Target format: SELECT {part_col}, [other columns] FROM ..."
                             )
                             needs_regeneration = True
-                            regeneration_model = LARGE_MODEL  # Force 7B
+                            regeneration_model = LARGE_MODEL
                     else:
                         _dbg_agent3_retry("Missing Partition Key", f"'{part_col}' missing from SELECT")
                         extra_instruction = (
@@ -11088,7 +12058,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                             f"Target format: SELECT {part_col}, [other columns] FROM ..."
                         )
                         needs_regeneration = True
-                        regeneration_model = LARGE_MODEL  # Force 7B
+                        regeneration_model = LARGE_MODEL
 
     # --- KASUS E: INNER JOIN TRAP (HARD ERROR) ---
     # Apply this guard ONLY when question intent expects inclusive parent rows
@@ -11311,13 +12281,13 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     return seg
 
             tail_patterns = [
+                r"\bincluding\b\s+(?P<seg>.+)$",
+                r"\binclude\b\s+(?P<seg>.+)$",
                 r"\breturn\b\s+(?P<seg>.+)$",
                 r"\bshow\b\s+(?P<seg>.+)$",
                 r"\bdisplay\b\s+(?P<seg>.+)$",
                 r"\bget\b\s+(?P<seg>.+)$",
                 r"\bshowing\b\s+(?P<seg>.+)$",
-                r"\bincluding\b\s+(?P<seg>.+)$",
-                r"\binclude\b\s+(?P<seg>.+)$",
                 r"\bwith\b\s+(?P<seg>.+)$",
             ]
             for pat in tail_patterns:
@@ -11927,6 +12897,51 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 return None
 
             candidate_sql = normalize_sql_pipeline(str(new_sql_local).strip(), question, ctx)
+            semantic_contract_local = _derive_semantic_contract(question, ctx)
+            candidate_sql, _, _ = _apply_semantic_contract(candidate_sql, question, ctx)
+            repaired_candidate_winner_order = _fix_winner_row_window_order_priority(candidate_sql, question)
+            if repaired_candidate_winner_order and repaired_candidate_winner_order != candidate_sql:
+                candidate_sql = str(repaired_candidate_winner_order).strip()
+            required_partition_col_local = str(
+                semantic_contract_local.get("required_window_partition_col") or ""
+            ).strip()
+            if (
+                required_partition_col_local
+                and _question_has_offset_window_sequence_intent(question)
+                and not _has_required_window_partition(candidate_sql, required_partition_col_local)
+            ):
+                repaired_candidate_partition_sql = _rewrite_required_window_partition(
+                    candidate_sql,
+                    required_partition_col_local,
+                )
+                if repaired_candidate_partition_sql and repaired_candidate_partition_sql != candidate_sql:
+                    candidate_sql = str(repaired_candidate_partition_sql).strip()
+            repaired_candidate_offset_shape = _repair_single_table_offset_window_contract_shape(
+                candidate_sql,
+                question,
+                required_partition_col_local,
+            )
+            if repaired_candidate_offset_shape and repaired_candidate_offset_shape != candidate_sql:
+                candidate_sql = str(repaired_candidate_offset_shape).strip()
+            repaired_candidate_output_order = _repair_offset_window_final_output_order(
+                candidate_sql,
+                question,
+                required_partition_col_local,
+            )
+            if repaired_candidate_output_order and repaired_candidate_output_order != candidate_sql:
+                candidate_sql = str(repaired_candidate_output_order).strip()
+            repaired_candidate_window_tiebreak = _append_offset_window_tiebreak_from_final_order(
+                candidate_sql,
+                question,
+                required_partition_col_local,
+            )
+            _log_offset_window_tiebreak_debug(
+                f"regen:{tag}:pre_gate",
+                candidate_sql,
+                repaired_candidate_window_tiebreak,
+            )
+            if repaired_candidate_window_tiebreak and repaired_candidate_window_tiebreak != candidate_sql:
+                candidate_sql = str(repaired_candidate_window_tiebreak).strip()
             gate_local = _deterministic_sql_acceptance_gate(
                 candidate_sql,
                 ctx=ctx,
@@ -11934,6 +12949,39 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
             )
             candidate_sql = str(gate_local.get("sql") or candidate_sql).strip()
+            repaired_gated_output_order = _repair_offset_window_final_output_order(
+                candidate_sql,
+                question,
+                required_partition_col_local,
+            )
+            if repaired_gated_output_order and repaired_gated_output_order != candidate_sql:
+                candidate_sql = str(repaired_gated_output_order).strip()
+                gate_local = _deterministic_sql_acceptance_gate(
+                    candidate_sql,
+                    ctx=ctx,
+                    question=question,
+                    strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+                )
+                candidate_sql = str(gate_local.get("sql") or candidate_sql).strip()
+            repaired_gated_window_tiebreak = _append_offset_window_tiebreak_from_final_order(
+                candidate_sql,
+                question,
+                required_partition_col_local,
+            )
+            _log_offset_window_tiebreak_debug(
+                f"regen:{tag}:post_gate",
+                candidate_sql,
+                repaired_gated_window_tiebreak,
+            )
+            if repaired_gated_window_tiebreak and repaired_gated_window_tiebreak != candidate_sql:
+                candidate_sql = str(repaired_gated_window_tiebreak).strip()
+                gate_local = _deterministic_sql_acceptance_gate(
+                    candidate_sql,
+                    ctx=ctx,
+                    question=question,
+                    strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+                )
+                candidate_sql = str(gate_local.get("sql") or candidate_sql).strip()
             if not candidate_sql.endswith(";"):
                 candidate_sql += ";"
 
@@ -12094,6 +13142,35 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 corrections.append(f"Semantic contract warnings: {best.get('semantic_failures')}")
         else:
             corrections.append("Regeneration failed: no candidate SQL returned")
+
+    final_required_offset_partition_col = str(
+        _derive_semantic_contract(question, ctx).get("required_window_partition_col") or ""
+    ).strip()
+    repaired_final_offset_output_order = _repair_offset_window_final_output_order(
+        final_sql,
+        question,
+        final_required_offset_partition_col,
+    )
+    if repaired_final_offset_output_order and repaired_final_offset_output_order != final_sql:
+        final_sql = str(repaired_final_offset_output_order).strip()
+        corrections.append(
+            f"Completed final ORDER BY before acceptance gate for offset-window partition '{final_required_offset_partition_col}'"
+        )
+    repaired_final_window_tiebreak = _append_offset_window_tiebreak_from_final_order(
+        final_sql,
+        question,
+        final_required_offset_partition_col,
+    )
+    _log_offset_window_tiebreak_debug(
+        "final_pre_gate",
+        final_sql,
+        repaired_final_window_tiebreak,
+    )
+    if repaired_final_window_tiebreak and repaired_final_window_tiebreak != final_sql:
+        final_sql = str(repaired_final_window_tiebreak).strip()
+        corrections.append(
+            f"Appended final stable offset-window tie-break keys for partition '{final_required_offset_partition_col}'"
+        )
 
     final_gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
     final_sql = str(final_gate.get("sql") or final_sql).strip()

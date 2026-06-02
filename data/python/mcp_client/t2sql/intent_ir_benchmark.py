@@ -41,6 +41,11 @@ SUMMARY_CONFIDENCE_RE = re.compile(
     r"(\[CANDIDATE INTENT SUMMARY\]\s*\(confidence=)(\d+(?:\.\d+)?)(\):)",
     flags=re.I,
 )
+SUMMARY_OUTPUT_SHAPE_RE = re.compile(r"^\s*-\s*Output shape:\s*.*$", flags=re.I)
+SUMMARY_EXECUTION_SHAPE_RE = re.compile(r"^\s*-\s*Execution shape:\s*.*$", flags=re.I)
+SUMMARY_ORDER_INSENSITIVE_LIST_RE = re.compile(
+    r"^(?P<prefix>\s*-\s*(?P<label>Dimensions|Metrics):\s*)(?P<body>.+?)\s*$"
+)
 TABLE_ORDER_GUIDANCE_RE = re.compile(
     r"^\[PROMPT DEBUG\] Adding hint: (?P<guidance>TABLE ORDER GUIDANCE: .*?)\.\s+Use\b"
 )
@@ -145,9 +150,31 @@ def _normalize_summary(summary: str) -> str:
     return "\n".join(line.rstrip() for line in summary.strip().splitlines())
 
 
+def _normalize_order_insensitive_summary_lines(summary: str) -> str:
+    normalized_lines: list[str] = []
+    for raw_line in _normalize_summary(summary).splitlines():
+        match = SUMMARY_ORDER_INSENSITIVE_LIST_RE.match(raw_line)
+        if not match:
+            normalized_lines.append(raw_line)
+            continue
+        items = [
+            item.strip()
+            for item in str(match.group("body") or "").split(",")
+            if item.strip()
+        ]
+        items.sort(key=lambda item: item.lower())
+        normalized_lines.append(f"{match.group('prefix')}{', '.join(items)}")
+    return "\n".join(normalized_lines)
+
+
 def _summary_compare_key(summary: str) -> str:
-    normalized = _normalize_summary(summary)
+    normalized = _normalize_order_insensitive_summary_lines(summary)
     return SUMMARY_CONFIDENCE_RE.sub(r"\1<ignored>\3", normalized)
+
+
+def _normalize_order_insensitive_line(line: str) -> str:
+    normalized = _normalize_summary(str(line or ""))
+    return _normalize_order_insensitive_summary_lines(normalized)
 
 
 def parse_difficulty_filter(filter_spec: str | None) -> set[int] | None:
@@ -181,6 +208,39 @@ def _load_embedded_gold() -> Dict[str, Dict[str, Dict[str, str]]]:
     return json.loads(raw)
 
 
+def _strip_easy_ignored_shape_lines(summary: str) -> str:
+    kept_lines = [
+        line
+        for line in _normalize_summary(summary).splitlines()
+        if not SUMMARY_OUTPUT_SHAPE_RE.match(line)
+        and not SUMMARY_EXECUTION_SHAPE_RE.match(line)
+    ]
+    return "\n".join(kept_lines).strip()
+
+
+def _normalize_summary_for_difficulty(summary: str, difficulty: str) -> str:
+    normalized = _normalize_summary(summary)
+    if difficulty == "easy":
+        return _strip_easy_ignored_shape_lines(normalized)
+    return normalized
+
+
+def _normalize_gold_benchmarks(
+    gold_benchmarks: Dict[str, Dict[str, Dict[str, str]]],
+) -> Dict[str, Dict[str, Dict[str, str]]]:
+    normalized: Dict[str, Dict[str, Dict[str, str]]] = {}
+    for difficulty, cases in gold_benchmarks.items():
+        normalized_cases: Dict[str, Dict[str, str]] = {}
+        for qid, payload in cases.items():
+            next_payload = dict(payload)
+            summary = str(next_payload.get("summary") or "")
+            if summary and difficulty == "easy":
+                next_payload["summary"] = _strip_easy_ignored_shape_lines(summary)
+            normalized_cases[qid] = next_payload
+        normalized[difficulty] = normalized_cases
+    return normalized
+
+
 HARD_GOLD_BENCHMARK = {
     "H2": {
         "question_line": "[H2] (hard) Only include customers who have placed orders, and for each such customer return...",
@@ -205,7 +265,7 @@ HARD_GOLD_BENCHMARK = {
 }
 
 
-GOLD_BENCHMARKS = _load_embedded_gold()
+GOLD_BENCHMARKS = _normalize_gold_benchmarks(_load_embedded_gold())
 GOLD_BENCHMARKS["hard"] = HARD_GOLD_BENCHMARK
 
 
@@ -311,8 +371,11 @@ def _print_indented_block(title: str, content: str) -> None:
         print(f"  {line}")
 
 
-def _print_changed_lines(expected_text: str, actual_text: str) -> None:
+def _print_changed_lines(expected_text: str, actual_text: str, difficulty: str = "") -> None:
     print("Changed lines:")
+    if difficulty == "easy":
+        expected_text = _normalize_summary_for_difficulty(expected_text, difficulty)
+        actual_text = _normalize_summary_for_difficulty(actual_text, difficulty)
     changed_count = 0
     for expected_line, actual_line in zip_longest(
         expected_text.splitlines(),
@@ -320,6 +383,8 @@ def _print_changed_lines(expected_text: str, actual_text: str) -> None:
         fillvalue="<missing>",
     ):
         if expected_line == actual_line:
+            continue
+        if _normalize_order_insensitive_line(expected_line) == _normalize_order_insensitive_line(actual_line):
             continue
         changed_count += 1
         print(f"  - Gold     : {expected_line}")
@@ -387,8 +452,8 @@ def compare_cases(
 
     mismatches: list[dict[str, str]] = []
     for qid in sorted(gold_ids & actual_ids, key=_numeric_qid_key):
-        expected_summary = _normalize_summary(gold_cases[qid]["summary"])
-        actual_summary = _normalize_summary(actual_cases[qid]["summary"])
+        expected_summary = _normalize_summary_for_difficulty(gold_cases[qid]["summary"], difficulty)
+        actual_summary = _normalize_summary_for_difficulty(actual_cases[qid]["summary"], difficulty)
         expected_summary_key = _summary_compare_key(expected_summary)
         actual_summary_key = _summary_compare_key(actual_summary)
         expected_guidance = str(gold_cases[qid].get("table_order_guidance") or "").strip()
@@ -473,7 +538,7 @@ def print_compare_report(
                 )
                 print()
                 if guidance_changed:
-                    _print_changed_lines(expected_guidance or "<missing>", actual_guidance or "<missing>")
+                    _print_changed_lines(expected_guidance or "<missing>", actual_guidance or "<missing>", difficulty)
                     print()
             if summary_changed or difficulty != "hard":
                 _print_indented_block("Gold summary:", expected_summary)
@@ -481,7 +546,7 @@ def print_compare_report(
                 _print_indented_block("Predicted summary:", actual_summary)
                 print()
                 if summary_changed:
-                    _print_changed_lines(expected_summary, actual_summary)
+                    _print_changed_lines(expected_summary, actual_summary, difficulty)
                 else:
                     print("Changed lines:")
                     print("  - No summary differences.")

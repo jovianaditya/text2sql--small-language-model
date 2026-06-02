@@ -620,6 +620,18 @@ def _format_stats_for_llm(stats_raw: Any) -> str:
 
     parts = []
 
+    def _temporal_sample_format_hint(value: Any) -> str:
+        sample = str(value or "").strip()
+        if not sample:
+            return ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", sample):
+            return "YYYY-MM-DD"
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}[ t]\d{2}:\d{2}(?::\d{2})?", sample, flags=re.I):
+            return "YYYY-MM-DD HH:MM[:SS]"
+        if re.fullmatch(r"\d{2}:\d{2}(?::\d{2})?", sample):
+            return "HH:MM[:SS]"
+        return ""
+
     # A. SAMPLE VALUES
     # Di data Anda, key-nya adalah "sample_value" (tunggal)
     # Kita juga cek "all_sample_values" (list) jaga-jaga kalau sparse script update lagi
@@ -627,13 +639,23 @@ def _format_stats_for_llm(stats_raw: Any) -> str:
     val_single = stats.get("sample_value")
 
     if val_list and isinstance(val_list, list):
-        # Ambil max 5 sample agar hemat token
-        clean_vals = [str(v) for v in val_list[:RETRIEVAL_STATS_MAX_SAMPLES] if v is not None]
-        if clean_vals:
-            parts.append(f"Samples={str(clean_vals)}")
+        temporal_formats = {
+            fmt for fmt in (_temporal_sample_format_hint(v) for v in val_list[:RETRIEVAL_STATS_MAX_SAMPLES]) if fmt
+        }
+        if temporal_formats:
+            parts.append(f"Format={sorted(temporal_formats)[0]}")
+        else:
+            # Ambil max 5 sample agar hemat token
+            clean_vals = [str(v) for v in val_list[:RETRIEVAL_STATS_MAX_SAMPLES] if v is not None]
+            if clean_vals:
+                parts.append(f"Samples={str(clean_vals)}")
     elif val_single:
-        # Format singular
-        parts.append(f"Sample='{val_single}'")
+        temporal_format = _temporal_sample_format_hint(val_single)
+        if temporal_format:
+            parts.append(f"Format={temporal_format}")
+        else:
+            # Format singular
+            parts.append(f"Sample='{val_single}'")
 
     # B. NUMERIC STATS
     if RETRIEVAL_STATS_KEY_MIN in stats and RETRIEVAL_STATS_KEY_MAX in stats:

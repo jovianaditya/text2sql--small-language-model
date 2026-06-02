@@ -12,7 +12,9 @@ services:
     container_name: ollama
     environment:
       - OLLAMA_KEEP_ALIVE=180s
-      - OLLAMA_NUM_THREAD=6
+      - OLLAMA_NUM_THREAD=8
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_LLM_LIBRARY=cpu_avx2
     ports: 
       - "11434:11434" 
     volumes: 
