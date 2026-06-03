@@ -5615,6 +5615,26 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         ]
         return len(values) >= 2
 
+    def _normalized_count_metric_expr(metric_obj: dict) -> str:
+        if not isinstance(metric_obj, dict):
+            return ""
+        table = str(metric_obj.get("table") or "").strip()
+        column = str(metric_obj.get("column") or "*").strip()
+        distinct = bool(metric_obj.get("distinct"))
+        if not table:
+            return "COUNT(*)" if column == "*" else ""
+        if column == "*" or not column:
+            return "COUNT(*)"
+        if not distinct:
+            try:
+                id_col = str(get_id_column(table.lower()) or "").strip().lower()
+            except Exception:
+                id_col = ""
+            if id_col and column.lower() == id_col:
+                return "COUNT(*)"
+        qualified = f"{table}.{column}"
+        return f"COUNT(DISTINCT {qualified})" if distinct else f"COUNT({qualified})"
+
     def _safe_metric_hint_str(metric: dict) -> str:
         if not isinstance(metric, dict):
             return ""
@@ -5648,17 +5668,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         }
 
         if agg == "COUNT":
-            if c == "*":
-                return _with_alias("COUNT(*)")
-            if not bool(metric.get("distinct")):
-                try:
-                    id_col = str(get_id_column(table_l) or "").strip().lower()
-                except Exception:
-                    id_col = ""
-                if id_col and col_l == id_col:
-                    return _with_alias("COUNT(*)")
-            distinct_kw = "DISTINCT " if bool(metric.get("distinct")) else ""
-            return _with_alias(f"{agg}({distinct_kw}{t}.{c})")
+            return _with_alias(_normalized_count_metric_expr(metric))
         if agg == "PCT_NON_NULL":
             if c != "*" and (
                 col_l in date_cols
@@ -6615,7 +6625,11 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
         derived_grouping_hints = _derived_grouping_hints()
         expression_only_grouping = any(
-            re.search(r"\bgroup by first \d+ characters\b|\bgroup by CHAR_LENGTH\(", str(hint or ""), flags=re.I)
+            re.search(
+                r"\bgroup by (?:first|last)(?: \d+)? (?:characters?|letters?|digits?)\b|\bgroup by CHAR_LENGTH\(",
+                str(hint or ""),
+                flags=re.I,
+            )
             for hint in derived_grouping_hints
         )
         if expression_only_grouping:
@@ -7035,6 +7049,34 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     f"Derived grouping: group by {count_label} of {table}.{column} as the visible prefix/group key; do not add a row-level LENGTH filter for this grouping phrase"
                 )
 
+        m_suffix = re.search(
+            r"\blast\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+)?"
+            r"(?P<unit>character|characters|char|chars|letter|letters|digit|digits)\s+of\s+(?:their\s+|the\s+)?"
+            r"([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
+            q_text,
+            flags=re.I,
+        )
+        if m_suffix:
+            raw_n = str(m_suffix.group(1) or "").strip().lower()
+            n = int(raw_n) if raw_n.isdigit() else number_words.get(raw_n)
+            if not n:
+                n = 1
+            unit_raw = str(m_suffix.group("unit") or "").strip().lower()
+            phrase = re.sub(r"\s+", " ", str(m_suffix.group(2) or "").strip().lower())
+            resolved = _resolve_derived_column(phrase)
+            if n and n > 0 and resolved:
+                table, column = resolved
+                if unit_raw.startswith("letter"):
+                    unit_label = "letter" if n == 1 else "letters"
+                elif unit_raw.startswith("digit"):
+                    unit_label = "digit" if n == 1 else "digits"
+                else:
+                    unit_label = "character" if n == 1 else "characters"
+                count_label = f"last {n} {unit_label}" if n != 1 else f"last {unit_label}"
+                add_hint(
+                    f"Derived grouping: group by {count_label} of {table}.{column} as the visible suffix/group key; use RIGHT({table}.{column}, {n}) as the derived group key and do not invent a literal suffix filter for this grouping phrase"
+                )
+
         m_length = re.search(
             r"\b(?:by|per|for\s+each|group(?:ed)?\s+by)\s+([a-z][a-z0-9_ ]{1,60}?)\s+length\b|\blength\s+of\s+([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
             q_text,
@@ -7297,6 +7339,32 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             else:
                 unit_label = "character" if n == 1 else "characters"
             shape_label = f"first {n} {unit_label}" if n != 1 else f"first {unit_label}"
+            if anchor:
+                return f"grouped summary with one row per {shape_label} derived from {anchor}"
+            return f"grouped summary with one row per {shape_label}"
+
+        m_suffix = re.search(
+            r"\blast\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+)?"
+            r"(?P<unit>character|characters|char|chars|letter|letters|digit|digits)\s+of\s+(?:their\s+|the\s+)?"
+            r"([a-z][a-z0-9_ ]{1,60}?)(?=[.,;!?]|$|\s+(?:return|only|sort|order|keep|and)\b)",
+            q_text,
+            flags=re.I,
+        )
+        if m_suffix:
+            raw_n = str(m_suffix.group(1) or "").strip().lower()
+            n = int(raw_n) if raw_n.isdigit() else number_words.get(raw_n)
+            if not n:
+                n = 1
+            unit_raw = str(m_suffix.group("unit") or "").strip().lower()
+            phrase = re.sub(r"\s+", " ", str(m_suffix.group(2) or "").strip().lower())
+            anchor = _output_shape_anchor(phrase)
+            if unit_raw.startswith("letter"):
+                unit_label = "letter" if n == 1 else "letters"
+            elif unit_raw.startswith("digit"):
+                unit_label = "digit" if n == 1 else "digits"
+            else:
+                unit_label = "character" if n == 1 else "characters"
+            shape_label = f"last {n} {unit_label}" if n != 1 else f"last {unit_label}"
             if anchor:
                 return f"grouped summary with one row per {shape_label} derived from {anchor}"
             return f"grouped summary with one row per {shape_label}"
@@ -8320,12 +8388,9 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
             count_expr = "COUNT(*)"
             if count_metric:
-                table = str(count_metric.get("table") or "").strip()
-                column = str(count_metric.get("column") or "").strip()
-                distinct = bool(count_metric.get("distinct"))
-                if column and column != "*":
-                    qualified = f"{table}.{column}" if table else column
-                    count_expr = f"COUNT(DISTINCT {qualified})" if distinct else f"COUNT({qualified})"
+                normalized_count_expr = _normalized_count_metric_expr(count_metric)
+                if normalized_count_expr:
+                    count_expr = normalized_count_expr
 
             threshold_target_is_row_entity = bool(
                 any(
@@ -9443,14 +9508,21 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         constraints.append(
             "STRICT GROUP BY RULE (Error 1055): If you GROUP BY a derived expression such as CASE WHEN, do not also select the raw source column unless it is aggregated."
         )
-    if re.search(
-        r"\bfirst\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
+    first_char_grouping = bool(re.search(
+        r"\bfirst\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+)?"
         r"(?:characters?|chars?|letters?|digits?)\s+of\s+",
         question,
         flags=re.I,
-    ):
+    ))
+    last_char_grouping = bool(re.search(
+        r"\blast\s+(?:(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+)?"
+        r"(?:characters?|chars?|letters?|digits?)\s+of\s+",
+        question,
+        flags=re.I,
+    ))
+    if first_char_grouping or last_char_grouping:
         constraints.append(
-            "PREFIX GROUPING RULE: When grouping by the first N characters of a column, use that derived prefix expression as the group key and do not invent a literal prefix filter."
+            "CHARACTER-SLICE GROUPING RULE: When grouping by the first/last N characters of a column, use LEFT(column, N) for first and RIGHT(column, N) for last as the derived group key in SELECT/GROUP BY/ORDER BY, and do not invent a literal prefix/suffix filter."
         )
     # 5. Pattern Matching Rule (Balanced & Robust)
     # Trigger dipersempit hanya untuk kata yang benar-benar butuh presisi

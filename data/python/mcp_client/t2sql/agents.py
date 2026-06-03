@@ -2032,13 +2032,13 @@ def _repair_near_miss_output_alias_references(sql: str, ctx: str = "") -> str:
     return "".join(rebuilt)
 
 
-def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") -> str:
+def _rewrite_character_slice_grouping(sql: str, question: str, ctx: str = "") -> str:
     """
-    Repair explicit "group by first N characters of <column>" questions.
+    Repair explicit "group by first/last N characters of <column>" questions.
 
     This is a schema-driven semantic rewrite for single-table grouped summaries:
     - resolve the referenced text/code column from runtime schema metadata
-    - normalize the grouping expression to LEFT(column, N)
+    - normalize the grouping expression to LEFT(column, N) or RIGHT(column, N)
     - drop redundant/invalid LENGTH(alias)=N filters introduced by drafts
     """
     s = (sql or "").strip()
@@ -2048,7 +2048,7 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
 
     m = re.search(
         r"\b(?:group(?:ed|ing)?(?:\s+\w+){0,4}\s+by|by)\s+"
-        r"(?:the\s+)?(?:first|leading|leftmost)\s+"
+        r"(?:the\s+)?(?P<edge>first|leading|leftmost|last|trailing|rightmost|final)\s+"
         r"(?:(?P<count>\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+)?"
         r"(?:characters?|chars?|letters?|digits?)\s+of\s+"
         r"(?P<target>[a-z][a-z0-9_ ]{1,48}?)"
@@ -2060,6 +2060,7 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
         return sql
 
     count_token = str(m.group("count") or "").strip().lower()
+    edge_token = str(m.group("edge") or "").strip().lower()
     target_phrase = str(m.group("target") or "").strip()
     if not target_phrase:
         return sql
@@ -2077,6 +2078,8 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
         n_chars = None
     if n_chars is None or n_chars <= 0:
         return sql
+
+    use_right = edge_token in {"last", "trailing", "rightmost", "final"}
 
     try:
         import sqlglot
@@ -2213,8 +2216,9 @@ def _rewrite_leading_character_grouping(sql: str, question: str, ctx: str = "") 
     idx, old_dim_expr, old_alias = grouped_items[0]
     qualified_col = f"{relation_alias}.{best_col}" if relation_alias else best_col
     try:
+        func_name = "RIGHT" if use_right else "LEFT"
         replacement_expr = sqlglot.parse_one(
-            f"SELECT LEFT({qualified_col}, {int(n_chars)})",
+            f"SELECT {func_name}({qualified_col}, {int(n_chars)})",
             read="mysql",
         ).expressions[0]
     except Exception:
@@ -3934,10 +3938,10 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         out_sql = fixed
         corrections.append("Semantic contract: repaired near-miss output alias reference")
 
-    fixed = _rewrite_leading_character_grouping(out_sql, question, ctx)
+    fixed = _rewrite_character_slice_grouping(out_sql, question, ctx)
     if fixed != out_sql:
         out_sql = fixed
-        corrections.append("Semantic contract: normalized leading-character grouping expression")
+        corrections.append("Semantic contract: normalized character-slice grouping expression")
 
     has_set_operation = bool(
         re.search(r"\b(?:UNION(?:\s+ALL)?|INTERSECT|EXCEPT)\b", out_sql, flags=re.I)
@@ -6929,7 +6933,8 @@ def _llm_output_is_cannot_answer(obj: Dict[str, Any]) -> bool:
 def _extract_explicit_row_limit_value(question: str) -> Optional[int]:
     """
     Extract a row-limit value only from phrases that constrain result rows.
-    Transformation phrases like "first 2 characters" are not row limits.
+    Transformation phrases like "first 2 characters" or "last 3 letters" are
+    not row limits.
     """
     q = str(question or "").strip().lower()
     if not q:

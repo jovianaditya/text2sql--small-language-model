@@ -5183,7 +5183,7 @@ def _detect_filters(
         m_letter_then_digits = re.search(
             r"\b(?:exactly\s+)?"
             r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+"
-            r"(?:(uppercase|lowercase)\s+)?letters?\s+followed\s+by\s+exactly\s+"
+            r"(?:(uppercase|lowercase)\s+)?letters?\s+followed\s+by\s+(?:exactly\s+)?"
             r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+digits?\b",
             q,
             flags=re.I,

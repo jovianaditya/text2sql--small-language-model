@@ -13105,6 +13105,14 @@ def _question_wants_winner_row(question: str) -> bool:
             flags=re.I | re.S,
         )
     )
+    generic_identifier_extrema_sig = bool(
+        re.search(
+            r"\b(?:highest|lowest|largest|smallest|maximum|minimum|max|min)\b"
+            r"[^.;]{0,48}\b(?:id|ids|code|codes|name|names|number|numbers)\b",
+            q_rank_scope,
+            flags=re.I | re.S,
+        )
+    )
 
     reporting_verb_alt = _regex_alt_from_terms(
         {str(term).strip().lower() for term in winner_row_reporting_verbs() if str(term).strip()},
@@ -13270,6 +13278,18 @@ def _question_wants_winner_row(question: str) -> bool:
             and not explicit_row_container_sig
             and not row_object_after_rank_sig
             and not row_object_before_rank_sig
+        ):
+            return False
+        # "highest customer number" / "lowest employee id" inside a grouped
+        # multi-metric report is usually MIN/MAX on the identifier column,
+        # not a request to pick one winning row from the group.
+        if (
+            _metric_count >= 2
+            and generic_identifier_extrema_sig
+            and row_object_after_rank_sig
+            and not same_row_sig
+            and not context_sig
+            and not explicit_row_container_sig
         ):
             return False
 
