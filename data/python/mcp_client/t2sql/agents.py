@@ -823,13 +823,9 @@ def _has_top_level_order_by(sql: str) -> bool:
     s = (sql or "").strip()
     if not s:
         return False
-    try:
-        import sqlglot
-        parsed = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT)
-        order = parsed.args.get("order") if parsed is not None else None
-        return order is not None
-    except Exception:
-        return bool(re.search(r"\bORDER\s+BY\b", s, flags=re.I))
+    if _find_top_level_kw(s, "order by") >= 0:
+        return True
+    return False
 
 
 def _question_requires_scalar_extrema_date_filter(question: str) -> bool:
@@ -2530,6 +2526,11 @@ def _build_requested_final_order_mapping(
             alias_sql = alias_match.group(1).strip() if alias_match else ""
             alias = alias_sql.strip("`")
             expr = item_clean[:alias_match.start()].strip() if alias_match else item_clean
+            if re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", expr, flags=re.I):
+                # Internal ranking helper aliases such as rn are implementation
+                # detail for derived ranked subqueries and must not be reused
+                # as user-facing final ORDER BY keys.
+                continue
             simple_col_match = re.search(r"(?:^|\.)(`?[A-Za-z_][A-Za-z0-9_]*`?)\s*$", expr)
             expr_name = simple_col_match.group(1).strip("`") if simple_col_match else expr
             preferred_expr = _quote_order_identifier_if_reserved(alias_sql or expr_name)
@@ -2762,16 +2763,11 @@ def _complete_requested_final_order(sql: str, question: str) -> str:
     mapped_specs = _build_requested_final_order_mapping(s, question)
     if not mapped_specs:
         return sql
+    explicit_requested_order_terms = _extract_requested_final_order_terms(question)
     # Ranking window ORDER BY is often part of row-number semantics.  Still
     # allow a top-level final ORDER BY repair when the question explicitly names
     # the final output order; the scanner below only edits the top-level tail.
-    if re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", s, flags=re.I) and not re.search(
-        r"\b(?:final\s+)?(?:result|results|output|rows?)\s+(?:should\s+be\s+)?(?:sorted|ordered|arranged)\s+by\b"
-        r"|\b(?:sort|sorted|order|ordered|arrange|arranged)\s+by\b"
-        r"|\b(?:sort|order|arrange)\s+(?:the\s+)?final\s+(?:result|results|output|rows?)\s+by\b",
-        str(question or ""),
-        flags=re.I,
-    ):
+    if re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", s, flags=re.I) and not explicit_requested_order_terms:
         return sql
 
     trailing_semicolon = ";" if s.endswith(";") else ""

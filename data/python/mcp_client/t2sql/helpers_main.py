@@ -238,6 +238,7 @@ from .rulebook import (
     aggregate_threshold_intent_comparison_terms,
     any_phrase_in_text,
     guidance_fact_support_phrases,
+    identifier_id_like_terms,
     question_has_hierarchy_role_intent,
     name_request_terms,
     ordering_temporal_asc_terms,
@@ -6169,6 +6170,30 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
     def _column_variant_texts(table: str, column: str) -> Set[str]:
         variants = {column.lower(), _camel_words(column)}
+        parts = [tok for tok in re.findall(r"[a-z0-9]+", _camel_words(column).lower()) if tok]
+        id_like_terms = {
+            str(term or "").strip().lower()
+            for term in retrieval_probe_id_like_terms()
+            if str(term or "").strip()
+        }
+        id_like_terms.update(
+            str(term or "").strip().lower()
+            for term in identifier_id_like_terms()
+            if str(term or "").strip()
+        )
+        if len(parts) >= 2 and parts[-1] in id_like_terms:
+            prefix = parts[:-1]
+            for suffix in sorted(id_like_terms):
+                variants.add(" ".join(prefix + [suffix]))
+        table_root_tokens = set(re.findall(r"[a-z0-9]+", _camel_words(table).lower()))
+        try:
+            singular_table = get_singular_form(table.lower().strip())
+            table_root_tokens.update(re.findall(r"[a-z0-9]+", _camel_words(singular_table).lower()))
+        except Exception:
+            pass
+        stripped_parts = [tok for tok in parts if tok not in table_root_tokens]
+        if stripped_parts and stripped_parts != parts:
+            variants.add(" ".join(stripped_parts))
         variants.update(_column_semantic_alias_terms(table.lower(), column))
         for syn in get_column_synonyms(table.lower(), column) or []:
             syn_text = str(syn or "").strip().lower()
@@ -6246,6 +6271,25 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             )
         )
 
+    def _mixed_projection_dimension_allowed(table: str, column: str) -> bool:
+        table_l = str(table or "").strip().lower()
+        column_s = str(column or "").strip()
+        column_l = column_s.lower()
+        if not (table_l and column_s):
+            return False
+        if _column_is_identifier_like(table_l, column_s):
+            return True
+        try:
+            name_col = str(get_name_column(table_l) or "").strip("`").lower()
+        except Exception:
+            name_col = ""
+        if name_col and column_l == name_col:
+            return True
+        semantic_terms = _guidance_column_semantic_terms(table_l, column_s)
+        if {"name", "title", "label"} & semantic_terms and not _column_is_metric_like(table_l, column_s):
+            return True
+        return False
+
     def _merge_dim_dicts(primary: List[dict], extras: List[dict]) -> List[dict]:
         merged: List[dict] = []
         seen_keys: Set[Tuple[str, str, str]] = set()
@@ -6275,7 +6319,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             seg_l = re.sub(r"\s+", " ", str(seg or "").strip().lower())
             if not seg_l:
                 continue
-            if _metric_like_projection_segment(seg_l):
+            metric_like_seg = _metric_like_projection_segment(seg_l)
+            if metric_like_seg:
                 continue
             explicit_pairs: List[Tuple[str, str]] = []
             for table, column in projection_candidates:
@@ -6425,7 +6470,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             )
         return dims
 
+    derived_label_intro_anchor_keys: Set[Tuple[str, str]] = set()
+
     def _hint_display_dimensions() -> List[dict]:
+        nonlocal derived_label_intro_anchor_keys
         raw_dims = [d for d in (intent_ir.get("dimensions") or []) if isinstance(d, dict)]
         q_group_scope_local = re.split(
             r"\b(?:sort(?:ed)?\s+by|order(?:ed)?\s+by|sort(?:ed)?\s+from|order(?:ed)?\s+from)\b",
@@ -6551,6 +6599,17 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
 
         if regex_bucket_query or bucket_or_classification_query:
             if intro_backbone_dims:
+                if not derived_label_intro_anchor_keys:
+                    derived_label_intro_anchor_keys = {
+                        (
+                            str(d.get("table") or "").strip().lower(),
+                            str(d.get("column") or "").strip().lower(),
+                        )
+                        for d in intro_backbone_dims
+                        if isinstance(d, dict)
+                        and str(d.get("table") or "").strip()
+                        and str(d.get("column") or "").strip()
+                    }
                 return intro_backbone_dims
             return raw_dims
 
@@ -7303,7 +7362,11 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             parts.append(f"Output shape: {output_shape_hint}")
             has_structural = True
             suppress_nonprojected_derived_dims = bool(
-                re.search(r"\bderived\s+from\b", output_shape_hint, flags=re.I)
+                re.search(
+                    r"\bderived\s+from\b|\bone\s+row\s+per\s+derived\s+label\b",
+                    output_shape_hint,
+                    flags=re.I,
+                )
             )
             m_shape_anchor = re.search(
                 r"\bderived\s+from\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
@@ -7333,17 +7396,44 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         and str(m.get("column") or "").strip() != "*"
     }
     explicit_projection_dim_keys: Set[Tuple[str, str]] = set()
+    metric_like_projection_dim_keys: Set[Tuple[str, str]] = set()
+    nonmetric_projection_dim_keys: Set[Tuple[str, str]] = set()
+    generic_identifier_variants = {
+        "id", "ids", "identifier", "identifiers", "number", "numbers",
+        "code", "codes", "key", "keys",
+    }
     projection_segments = _extract_projection_segments_local(str(state.get("question") or ""))
     projection_candidates = _structural_column_candidates()
     for seg in projection_segments:
         seg_l = re.sub(r"\s+", " ", str(seg or "").strip().lower())
-        if not seg_l or _metric_like_projection_segment(seg_l):
+        if not seg_l:
+            continue
+        metric_like_seg = _metric_like_projection_segment(seg_l)
+        if metric_like_seg:
             continue
         for table, column in projection_candidates:
             for variant_norm in _column_variant_texts(table, column):
+                if (
+                    _column_is_identifier_like(str(table or "").strip().lower(), str(column or "").strip())
+                    and variant_norm in generic_identifier_variants
+                ):
+                    continue
+                if (
+                    qtype.lower() == "aggregate"
+                    and subject
+                    and str(table or "").strip().lower() != subject.lower()
+                    and _column_is_identifier_like(str(table or "").strip().lower(), str(column or "").strip())
+                    and variant_norm in generic_identifier_variants
+                ):
+                    continue
                 variant_pat = re.escape(variant_norm).replace(r"\ ", r"\s+")
                 if re.search(rf"\b{variant_pat}\b", seg_l, flags=re.I):
-                    explicit_projection_dim_keys.add((table.lower(), str(column).strip().lower()))
+                    dim_key = (table.lower(), str(column).strip().lower())
+                    explicit_projection_dim_keys.add(dim_key)
+                    if metric_like_seg:
+                        metric_like_projection_dim_keys.add(dim_key)
+                    else:
+                        nonmetric_projection_dim_keys.add(dim_key)
                     break
 
     if dims:
@@ -7356,6 +7446,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             and str(d.get("table") or "").strip().lower() == subject.lower()
             and str(d.get("column") or "").strip()
         } if subject else set()
+        try:
+            subject_name_col = str(get_name_column(subject) or "").strip("`").lower() if subject else ""
+        except Exception:
+            subject_name_col = ""
         count_metric_target_keys = {
             (
                 str(metric.get("table") or "").strip().lower(),
@@ -7392,6 +7486,13 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             )
             for d in dims
         ) if subject else False
+        has_other_subject_group_dim = any(
+            isinstance(d, dict)
+            and str(d.get("table") or "").strip().lower() == subject.lower()
+            and str(d.get("column") or "").strip()
+            and str(d.get("column") or "").strip().lower() != subject_name_col
+            for d in dims
+        ) if subject and subject_name_col else False
         has_non_distinct_group_anchor = any(
             (
                 str(d.get("table") or "").strip().lower(),
@@ -7414,6 +7515,16 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 if (
                     qtype.lower() == "aggregate"
                     and dim_key in aggregate_metric_target_keys
+                    and (
+                        dim_key not in explicit_projection_dim_keys
+                        or dim_key in metric_like_projection_dim_keys
+                    )
+                ):
+                    continue
+                if (
+                    reduced_multi_table_hint
+                    and qtype.lower() == "aggregate"
+                    and explicit_projection_dim_keys
                     and dim_key not in explicit_projection_dim_keys
                 ):
                     continue
@@ -7421,6 +7532,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     suppress_nonprojected_derived_dims
                     and dim_key not in explicit_projection_dim_keys
                     and dim_key != output_shape_anchor_key
+                    and dim_key not in derived_label_intro_anchor_keys
                 ):
                     continue
                 if (
@@ -7429,6 +7541,16 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     and dim_key in count_metric_target_keys
                     and dim_key not in explicit_projection_dim_keys
                     and _column_is_identifier_like(t.lower(), c)
+                ):
+                    continue
+                if (
+                    qtype.lower() == "aggregate"
+                    and subject
+                    and t.lower() == subject.lower()
+                    and subject_name_col
+                    and c.lower() == subject_name_col
+                    and has_other_subject_group_dim
+                    and dim_key not in nonmetric_projection_dim_keys
                 ):
                     continue
                 if (
@@ -7451,12 +7573,34 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     qtype.lower() == "aggregate"
                     and subject
                     and t.lower() != subject.lower()
+                    and _column_is_identifier_like(t.lower(), c)
+                    and dim_key not in explicit_projection_dim_keys
+                ):
+                    continue
+                if (
+                    qtype.lower() == "aggregate"
+                    and subject
+                    and t.lower() != subject.lower()
                     and c.lower() in subject_dim_columns
                     and _column_is_identifier_like(subject.lower(), c)
                 ):
                     continue
                 seen_dim_keys.add(dim_key)
                 dim_strs.append(f"{t}.{c}")
+        if qtype.lower() == "aggregate" and subject:
+            try:
+                subject_id_col = str(get_id_column(subject) or "").strip()
+            except Exception:
+                subject_id_col = ""
+            subject_id_key = (subject.lower(), subject_id_col.lower()) if subject_id_col else None
+            if (
+                subject_id_key
+                and subject_id_key in nonmetric_projection_dim_keys
+                and subject_id_key not in seen_dim_keys
+                and subject_id_key not in aggregate_metric_target_keys
+            ):
+                dim_strs.insert(0, f"{subject}.{subject_id_col}")
+                seen_dim_keys.add(subject_id_key)
         if dim_strs:
             parts.append(f"Dimensions: {', '.join(dim_strs)}")
             has_structural = True
@@ -9374,6 +9518,134 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     )
     if state and needs_join_context:
         join_context = _build_dynamic_join_context(state, router_decision)
+
+    hard_multi_table_prompt_compaction = bool(
+        (has_multi_table_question or is_simple_multi_table_candidate or len(routed_tables_for_prompt) > 1)
+        and (
+            qtype in {"aggregate", "rank"}
+            or has_grouping
+            or has_exclusion
+            or is_winner_row
+            or is_ordinal_ranking
+            or is_explicit_rank_function
+            or is_window_aggregate
+        )
+    )
+
+    def _compact_hard_multi_table_constraint(text: str) -> str:
+        compact = str(text or "").strip()
+        compact = compact.replace(
+            ". Use this as base schema-path guidance only (it may be a partial path); if selected metrics require additional supporting tables, extend the chain through FK-consistent edges from JOIN KEY HINTS.",
+            ". Use this as path guidance; add only FK-connected support tables from JOIN KEY HINTS.",
+        )
+        if compact.startswith(
+            "ENTITY GRAIN GUIDANCE: The requested output grain is the explicitly named parent entity "
+        ):
+            compact = compact.replace(" and the question asks to preserve all of those rows. ", ". ")
+            compact = compact.replace(
+                " as the base domain in FROM. If a child table also contains a similarly named FK/category column, treat that child-side column only as a join attribute; do NOT replace the parent-entity anchor by grouping only from the child table.",
+                " as the base FROM grain. Treat similarly named child FK/category columns only as join attributes, not the reporting grain.",
+            )
+        elif compact.startswith("ENTITY MEMBERSHIP JOIN GUIDANCE: "):
+            compact = compact.replace(
+                " define which child rows belong to each ",
+                " define membership for each ",
+            )
+            compact = compact.replace(
+                " group, so keep that hop as INNER JOIN.",
+                " group; keep that hop as INNER JOIN.",
+            )
+            compact = compact.replace(
+                " Use LEFT JOIN only for downstream optional support table(s) ",
+                " Use LEFT JOIN only for optional downstream table(s) ",
+            )
+            compact = compact.replace(
+                " when the question asks to preserve parent/member rows even when related support rows are missing.",
+                " only when missing support rows must be preserved.",
+            )
+        elif compact.startswith(
+            "ENTITY GRAIN GUIDANCE: The requested output grain is one row per explicitly named base entity "
+        ):
+            compact = compact.replace(
+                " as the visible reporting grain, and do NOT project or GROUP BY child/support transaction identifiers unless the question explicitly asks for them.",
+                " as the reporting grain; do not project or GROUP BY child/support transaction identifiers unless asked.",
+            )
+        elif compact.startswith("JOIN TYPE GUIDANCE: Include-zero intent detected"):
+            compact = (
+                "JOIN TYPE GUIDANCE: Include-zero intent means keep optional tables on LEFT JOIN "
+                "and do not force INNER JOIN on exclusion targets."
+            )
+        elif compact.startswith(
+            "JOIN TYPE GUIDANCE: This query appears to need a required INNER JOIN chain for the metric path."
+        ):
+            compact = (
+                "JOIN TYPE GUIDANCE: Required metric-path tables stay INNER JOIN; use LEFT JOIN only "
+                "if the question explicitly preserves unmatched primary rows."
+            )
+        elif compact.startswith("JOIN TYPE GUIDANCE: Same table has mixed intent"):
+            compact = (
+                "JOIN TYPE GUIDANCE: For mixed positive/exclusion intent on the same table, use INNER JOIN "
+                "for the positive slice and NOT EXISTS/anti-join for exclusion."
+            )
+        elif compact.startswith("JOIN TYPE GUIDANCE: Mixed intent detected."):
+            compact = (
+                "JOIN TYPE GUIDANCE: Use INNER JOIN for required-existence tables and "
+                "LEFT JOIN + IS NULL/NOT EXISTS for exclusion tables."
+            )
+        elif compact.startswith("ANTI-JOIN (CRITICAL):"):
+            compact = (
+                "ANTI-JOIN (CRITICAL): For exclusion intent, prefer NOT EXISTS over NOT IN and correlate by key."
+            )
+        elif compact.startswith(
+            "JOIN TYPE GUIDANCE: Use INNER JOIN only for tables explicitly required by existence intent "
+        ):
+            compact = (
+                "JOIN TYPE GUIDANCE: Use INNER JOIN only for explicit existence-target tables; keep "
+                "non-target related tables on LEFT JOIN to avoid dropping primary rows."
+            )
+        elif compact.startswith("JOIN TYPE GUIDANCE: This query has explicit filtering intent"):
+            compact = (
+                "JOIN TYPE GUIDANCE: Explicit filtering intent uses INNER JOIN to remove unmatched entities, "
+                "even if the question says 'for each'."
+            )
+        elif compact.startswith("JOIN TYPE GUIDANCE: Exclusion + aggregate intent detected."):
+            compact = (
+                "JOIN TYPE GUIDANCE: In exclusion + aggregate queries, keep positive-slice support tables "
+                "on INNER JOIN and exclusion on NOT EXISTS/anti-join."
+            )
+        elif compact.startswith("JOIN TYPE GUIDANCE: Prefer **LEFT JOIN**"):
+            compact = "JOIN TYPE GUIDANCE: When the question preserves all primary entities, prefer LEFT JOIN."
+        elif compact.startswith("FILTER RULE (CRITICAL): If using LEFT JOIN"):
+            compact = "FILTER RULE (CRITICAL): With LEFT JOIN, put joined-table filters in ON, not WHERE."
+        elif compact.startswith(
+            "JOIN KEY HINTS (CRITICAL): Use only FK-consistent JOIN predicates from this list: "
+        ):
+            compact = compact.replace(
+                "JOIN KEY HINTS (CRITICAL): Use only FK-consistent JOIN predicates from this list: ",
+                "JOIN KEY HINTS: Use only these FK join edges: ",
+            )
+        elif compact.startswith("JOIN PATH RULE (CRITICAL):"):
+            compact = (
+                "JOIN PATH RULE (CRITICAL): Use the listed FK edges as one connected path; "
+                "do not invent direct joins not listed."
+            )
+        elif compact.startswith("PATH COMPLETENESS RULE (CRITICAL):"):
+            compact = (
+                "PATH COMPLETENESS RULE (CRITICAL): Treat table-order guidance as a starting path; "
+                "add only missing FK-connected support tables needed for the metric grain."
+            )
+        elif compact.startswith("JOIN ALIAS RULE (CRITICAL):"):
+            compact = (
+                "JOIN ALIAS RULE (CRITICAL): In each JOIN ... ON, reference only aliases already introduced; "
+                "never a future alias."
+            )
+        return compact
+
+    if hard_multi_table_prompt_compaction:
+        constraints = [
+            _compact_hard_multi_table_constraint(item)
+            for item in constraints
+        ]
 
     if simple_single_table_lookup:
         redundant_prefixes = (
