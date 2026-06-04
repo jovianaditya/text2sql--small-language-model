@@ -617,6 +617,8 @@ def _column_variants(table: str, column: str) -> Set[str]:
         for vv in _phrase_spacing_variants(v):
             if vv:
                 expanded.add(vv)
+    if any("price each" in str(v or "").lower() or "unit price" in str(v or "").lower() for v in expanded):
+        expanded.add("price per item")
     return {x for x in expanded if x}
 
 
@@ -1265,6 +1267,135 @@ def _column_descriptor_tokens(table: str, column: str) -> Set[str]:
     return set(_tokenize_for_match(desc_norm, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
 
 
+_DESCRIPTOR_FAMILY_ROOT_TOKENS = {"description", "detail", "content"}
+
+
+def _descriptor_family_root_token(token: str) -> str:
+    tok = str(token or "").strip().lower()
+    if not tok:
+        return ""
+    for variant in _semantic_token_variants(tok):
+        if variant in _DESCRIPTOR_FAMILY_ROOT_TOKENS:
+            return variant
+    return tok
+
+
+def _descriptor_family_qualifier_tokens(tokens: Set[str]) -> Set[str]:
+    return {
+        str(tok or "").strip().lower()
+        for tok in (tokens or set())
+        if str(tok or "").strip()
+        and _descriptor_family_root_token(str(tok or "").strip()) not in _DESCRIPTOR_FAMILY_ROOT_TOKENS
+    }
+
+
+def _descriptor_context_qualifier_tokens(text: str) -> Set[str]:
+    text_l = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not text_l:
+        return set()
+    contexts: List[str] = []
+    for match in re.finditer(r"\b(?:descriptions?|details?|contents?)\b", text_l, flags=re.I):
+        start = max(0, match.start() - 48)
+        end = min(len(text_l), match.end() + 16)
+        if start > 0:
+            while start > 0 and not text_l[start - 1].isspace():
+                start -= 1
+        if end < len(text_l):
+            while end < len(text_l) and not text_l[end].isspace():
+                end += 1
+        context = text_l[start:end].strip()
+        if context:
+            contexts.append(context)
+    if not contexts:
+        return set()
+
+    qualifier_tokens: Set[str] = set()
+    for context in contexts:
+        context_tokens = set(_tokenize_for_match(context, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+        qualifier_tokens.update(_descriptor_family_qualifier_tokens(context_tokens))
+    return qualifier_tokens
+
+
+def _is_description_like_column(table: str, column: str) -> bool:
+    semantic_tokens = _column_semantic_tokens(table, column)
+    descriptor_tokens = _column_descriptor_tokens(table, column)
+    merged = semantic_tokens.union(descriptor_tokens)
+    return bool(
+        {
+            _descriptor_family_root_token(tok)
+            for tok in merged
+            if _descriptor_family_root_token(tok)
+        }.intersection(_DESCRIPTOR_FAMILY_ROOT_TOKENS)
+    )
+
+
+def _pick_qualified_description_column(
+    text: str,
+    table: str,
+    allowed: Dict[str, Set[str]],
+) -> Optional[str]:
+    table_l = str(table or "").strip().lower()
+    if not table_l:
+        return None
+    text_l = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not text_l or not re.search(r"\b(?:descriptions?|details?|contents?)\b", text_l, flags=re.I):
+        return None
+    candidates = [
+        str(col or "").strip()
+        for col in allowed.get(table_l, set())
+        if str(col or "").strip() and _is_description_like_column(table_l, str(col))
+    ]
+    if len(candidates) < 2:
+        return None
+
+    variant_matches: Dict[str, Tuple[int, int, int]] = {}
+    for col in candidates:
+        best_col_score: Optional[Tuple[int, int, int]] = None
+        for variant in sorted(_column_variants(table_l, col), key=len, reverse=True):
+            variant_l = re.sub(r"\s+", " ", str(variant or "").strip().lower())
+            if not variant_l:
+                continue
+            pos = _phrase_pos(text_l, variant_l)
+            if pos < 0:
+                continue
+            variant_tokens = set(_tokenize_for_match(variant_l, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS))
+            qualifier_tokens = _descriptor_family_qualifier_tokens(variant_tokens)
+            if not qualifier_tokens:
+                continue
+            score = (len(qualifier_tokens), len(variant_l), -pos)
+            if best_col_score is None or score > best_col_score:
+                best_col_score = score
+        if best_col_score is not None:
+            variant_matches[col] = best_col_score
+    if len(variant_matches) == 1:
+        return next(iter(variant_matches.keys()))
+    if len(variant_matches) > 1:
+        return None
+
+    query_qualifier_tokens = _descriptor_context_qualifier_tokens(text_l)
+    if not query_qualifier_tokens:
+        return None
+
+    best_semantic_col: Optional[str] = None
+    best_semantic_score: Tuple[int, int] = (-1, -1)
+    semantic_tie = False
+    for col in candidates:
+        column_tokens = _descriptor_family_qualifier_tokens(
+            _column_semantic_tokens(table_l, col).union(_column_descriptor_tokens(table_l, col))
+        )
+        overlap = query_qualifier_tokens.intersection(column_tokens)
+        score = (len(overlap), len(column_tokens))
+        if score > best_semantic_score:
+            best_semantic_col = col
+            best_semantic_score = score
+            semantic_tie = False
+        elif score == best_semantic_score and best_semantic_col and str(best_semantic_col).lower() != str(col).lower():
+            semantic_tie = True
+    if best_semantic_col and not semantic_tie and best_semantic_score[0] > 0:
+        return best_semantic_col
+    return None
+
+
 def _is_identifier_like_column(table: str, column: str) -> bool:
     cl = str(column or "").strip().lower()
     if not cl:
@@ -1613,12 +1744,19 @@ def _detect_column_mentions(question: str, allowed: Dict[str, Set[str]]) -> List
     q = (question or "").lower()
     out: List[Tuple[str, str, int]] = []
     for table, cols in allowed.items():
+        preferred_description_col = _pick_qualified_description_column(question, table, allowed)
         table_variants = {
             re.sub(r"\s+", " ", str(v or "").strip().lower())
             for v in (_table_variants(table) or {table})
             if str(v or "").strip()
         }
         for col in cols:
+            if (
+                preferred_description_col
+                and _is_description_like_column(table, col)
+                and str(col or "").strip().lower() != str(preferred_description_col or "").strip().lower()
+            ):
+                continue
             best = -1
             best_variant = ""
             for v in _column_variants(table, col):
@@ -3324,6 +3462,9 @@ def _detect_filters(
             window_end = min(len(q), anchor_pos + 24)
             anchor_window = q[window_start:window_end]
             before_anchor = q[window_start:anchor_pos]
+            preferred_description_col = _pick_qualified_description_column(anchor_window, subject, allowed)
+            if preferred_description_col:
+                return (subject, preferred_description_col)
             explicit_name_component = _best_name_component_column_match(before_anchor, subject, allowed)
             if explicit_name_component:
                 return (subject, explicit_name_component)
@@ -3477,6 +3618,10 @@ def _detect_filters(
         if not prefix_l:
             return None
 
+        preferred_description_col = _pick_qualified_description_column(prefix, subject, allowed)
+        if preferred_description_col and _supports_categorical_text_filter(subject, preferred_description_col):
+            return (subject, preferred_description_col)
+
         explicit_name_component = _best_name_component_column_match(prefix_l, subject, allowed)
         if explicit_name_component:
             return (subject, explicit_name_component)
@@ -3522,18 +3667,58 @@ def _detect_filters(
     def _pick_exact_numeric_target_column(anchor_pos: int) -> Optional[Tuple[str, str]]:
         window_start = max(0, anchor_pos - 96)
         anchor_window = q[window_start:anchor_pos]
+        identifier_intent = bool(
+            re.search(r"\b(?:id|ids|code|codes|number|numbers|key|keys)\b", anchor_window, flags=re.I)
+        )
+        explicit_self_fk_parent_target = _best_subject_self_fk_parent_column()
+        if (
+            explicit_self_fk_parent_target
+            and _anchor_has_explicit_self_fk_parent_identifier_intent(anchor_window)
+        ):
+            return explicit_self_fk_parent_target
+        best_exact: Optional[Tuple[str, str]] = None
+        best_exact_len = -1
+        best_exact_pos = -1
+        for t, c, _ in column_mentions:
+            if t != subject:
+                continue
+            is_numeric_like = _is_numeric_column(c, t) or (
+                identifier_intent and _is_identifier_like_column(t, c)
+            )
+            if not is_numeric_like:
+                continue
+            for variant in sorted(_column_reference_variants(t, c), key=len, reverse=True):
+                variant_l = str(variant or "").strip().lower()
+                if not variant_l:
+                    continue
+                pos = _phrase_pos(anchor_window, variant_l)
+                if pos < 0:
+                    continue
+                if pos > best_exact_pos or (pos == best_exact_pos and len(variant_l) > best_exact_len):
+                    best_exact = (t, c)
+                    best_exact_len = len(variant_l)
+                    best_exact_pos = pos
+                    break
+        if best_exact is not None:
+            return best_exact
+
         semantic_match = _best_semantic_column_match(
             text=anchor_window,
             table=subject,
             allowed=allowed,
+            numeric_only=not identifier_intent,
             min_score=1.0,
         )
-        descriptor_match = _best_descriptor_column_match(
-            text=anchor_window,
-            table=subject,
-            allowed=allowed,
-            id_like_only=True,
-            min_score=1.0,
+        descriptor_match = (
+            _best_descriptor_column_match(
+                text=anchor_window,
+                table=subject,
+                allowed=allowed,
+                id_like_only=True,
+                min_score=1.0,
+            )
+            if identifier_intent
+            else None
         )
         matched = _prefer_specific_identifier_match(
             semantic_col=semantic_match,
@@ -3550,7 +3735,10 @@ def _detect_filters(
         for t, c, pos in column_mentions:
             if t != subject:
                 continue
-            if not (_is_numeric_column(c, t) or _is_identifier_like_column(t, c)):
+            is_numeric_like = _is_numeric_column(c, t) or (
+                identifier_intent and _is_identifier_like_column(t, c)
+            )
+            if not is_numeric_like:
                 continue
             distance = abs(pos - anchor_pos)
             score = max(0.0, 2.0 - (distance / 48.0))
@@ -3580,6 +3768,24 @@ def _detect_filters(
                 flags=re.I,
             )
         )
+
+    def _question_span_is_column_reference(start_pos: int, end_pos: int) -> bool:
+        span_start = int(start_pos)
+        span_end = int(end_pos)
+        span_phrase = re.sub(r"\s+", " ", q[max(0, span_start):span_end].strip().lower())
+        for table, cols in allowed.items():
+            for column in cols:
+                for variant in _column_reference_variants(table, column):
+                    variant_l = str(variant or "").strip().lower()
+                    if not variant_l:
+                        continue
+                    if span_phrase and span_phrase in variant_l:
+                        return True
+                    pat = re.escape(variant_l).replace(r"\ ", r"\s+")
+                    for m_variant in re.finditer(rf"\b{pat}\b", q, flags=re.I):
+                        if m_variant.start() <= span_start < m_variant.end():
+                            return True
+        return False
 
     def _looks_like_nonliteral_category_phrase(text: str) -> bool:
         clean = re.sub(r"\s+", " ", str(text or "").strip().lower())
@@ -3666,6 +3872,21 @@ def _detect_filters(
                 variant_norm = re.sub(r"\s+", " ", str(variant or "").strip().lower())
                 if variant_norm:
                     known_variant_phrases.add(variant_norm)
+
+        name_col = _best_name_column(subject, allowed)
+        if name_col:
+            named_match = re.search(
+                rf"\b(?:named|called)\s+"
+                rf"""["'“”]?(?P<value>[A-Za-z0-9][A-Za-z0-9/&:._'/-]*(?:\s+[A-Za-z0-9/&:._'/-]+){{0,5}}?)["'“”]?(?={clause_stop})""",
+                q_raw,
+                flags=re.I,
+            )
+            if named_match:
+                raw_value = str(named_match.group("value") or "").strip(" \t\r\n'\".,;:!?")
+                if raw_value and not _looks_like_nonliteral_category_phrase(raw_value):
+                    norm_value = _normalize_categorical_literal_value(raw_value, column=name_col)
+                    if norm_value and not _looks_like_nonliteral_category_phrase(norm_value):
+                        return IRFilter(table=subject, column=name_col, op="eq", value=norm_value)
 
         for table, column in eq_candidates:
             for variant in sorted(_column_reference_variants(table, column), key=len, reverse=True):
@@ -3837,13 +4058,30 @@ def _detect_filters(
                 if not raw_tail or not re.search(r"\b(?:or|and)\b|,", raw_tail, flags=re.I):
                     continue
 
-                quoted_values = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", raw_tail)
-                if len(quoted_values) < 2:
+                candidate_values = re.findall(r"""["'“”]([^"'“”]+)["'“”]""", raw_tail)
+                if len(candidate_values) < 2:
+                    enum_values = _extract_enum_values_from_description(table, column)
+                    matched_enum_values: List[str] = []
+                    seen_enum_values: Set[str] = set()
+                    for enum_value in enum_values:
+                        clean_enum = str(enum_value or "").strip()
+                        if not clean_enum:
+                            continue
+                        pat = r"\b" + r"\s+".join(re.escape(part) for part in clean_enum.split()) + r"\b"
+                        if not re.search(pat, raw_tail, flags=re.I):
+                            continue
+                        enum_key = clean_enum.lower()
+                        if enum_key in seen_enum_values:
+                            continue
+                        seen_enum_values.add(enum_key)
+                        matched_enum_values.append(clean_enum)
+                    candidate_values = matched_enum_values
+                if len(candidate_values) < 2:
                     continue
 
                 normalized_values: List[str] = []
                 seen_values: Set[str] = set()
-                for raw_value in quoted_values:
+                for raw_value in candidate_values:
                     clean = str(raw_value or "").strip()
                     if not clean or _looks_like_nonliteral_category_phrase(clean):
                         continue
@@ -4315,21 +4553,9 @@ def _detect_filters(
                     return (t, c)
         return None
 
-    def _find_required_self_fk_parent_column() -> Optional[Tuple[str, str]]:
+    def _best_subject_self_fk_parent_column() -> Optional[Tuple[str, str]]:
         q_l = str(q or "").strip().lower()
         if not q_l or not subject:
-            return None
-
-        parent_role_terms = {
-            "manager", "supervisor", "parent", "leader", "boss", "mentor", "owner",
-        }
-        if not (
-            re.search(r"\breport(?:s|ing)?\s+to\b", q_l, flags=re.I)
-            or (
-                re.search(r"\b(?:with|has|have|having|under|managed\s+by)\b", q_l, flags=re.I)
-                and any(re.search(rf"\b{re.escape(term)}\b", q_l, flags=re.I) for term in parent_role_terms)
-            )
-        ):
             return None
 
         try:
@@ -4373,6 +4599,72 @@ def _detect_filters(
         if len(candidate_cols) == 1:
             return (subject, candidate_cols[0])
         return None
+
+    def _anchor_has_explicit_self_fk_parent_identifier_intent(text: str) -> bool:
+        text_l = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not text_l:
+            return False
+        parent_role_pat = r"(?:manager|supervisor|parent|leader|boss|mentor|owner)"
+        if re.search(r"\breport(?:s|ing)?\s+to\b", text_l, flags=re.I):
+            return True
+        if re.search(
+            rf"\b{parent_role_pat}\b(?:[\s,;:()'\"-]+\w+){{0,3}}[\s,;:()'\"-]+\b(?:number|id|code)\b",
+            text_l,
+            flags=re.I,
+        ):
+            return True
+        if re.search(
+            rf"\b{parent_role_pat}\s+employee\s+(?:number|id|code)\b",
+            text_l,
+            flags=re.I,
+        ):
+            return True
+        return False
+
+    def _find_required_self_fk_parent_column() -> Optional[Tuple[str, str]]:
+        q_l = str(q or "").strip().lower()
+        if not q_l or not subject:
+            return None
+
+        parent_role_terms = {
+            "manager", "supervisor", "parent", "leader", "boss", "mentor", "owner",
+        }
+        negative_parent_intent = bool(
+            re.search(
+                r"\b(?:do(?:es)?\s+not|doesn['’]?t|did(?:\s+not)?|didn['’]?t|not)\s+report(?:s|ing)?\s+to\b"
+                r"|\breport(?:s|ing)?\s+to\s+anyone\b"
+                r"|\b(?:without|no)\s+(?:a\s+)?(?:manager|supervisor|parent|leader|boss|mentor|owner)\b"
+                r"|\b(?:do(?:es)?\s+not|doesn['’]?t|not)\s+have\b[^.]{0,32}\b(?:manager|supervisor|parent|leader|boss|mentor|owner)\b",
+                q_l,
+                flags=re.I,
+            )
+        )
+        if negative_parent_intent:
+            return None
+        if not (
+            re.search(r"\breport(?:s|ing)?\s+to\b", q_l, flags=re.I)
+            or (
+                re.search(r"\b(?:with|has|have|having|under|managed\s+by)\b", q_l, flags=re.I)
+                and any(re.search(rf"\b{re.escape(term)}\b", q_l, flags=re.I) for term in parent_role_terms)
+            )
+        ):
+            return None
+        return _best_subject_self_fk_parent_column()
+
+    def _find_missing_self_fk_parent_column() -> Optional[Tuple[str, str]]:
+        q_l = str(q or "").strip().lower()
+        if not q_l or not subject:
+            return None
+        if not re.search(
+            r"\b(?:do(?:es)?\s+not|doesn['’]?t|did(?:\s+not)?|didn['’]?t|not)\s+report(?:s|ing)?\s+to\b"
+            r"|\breport(?:s|ing)?\s+to\s+anyone\b"
+            r"|\b(?:without|no)\s+(?:a\s+)?(?:manager|supervisor|parent|leader|boss|mentor|owner)\b"
+            r"|\b(?:do(?:es)?\s+not|doesn['’]?t|not)\s+have\b[^.]{0,32}\b(?:manager|supervisor|parent|leader|boss|mentor|owner)\b",
+            q_l,
+            flags=re.I,
+        ):
+            return None
+        return _best_subject_self_fk_parent_column()
 
     def _subject_projection_comparable_columns() -> List[str]:
         projected_cols: List[str] = []
@@ -4637,7 +4929,9 @@ def _detect_filters(
         q,
     )
     range_match = m_between or m_range
-    range_target = _pick_comparison_numeric_target(range_match.start()) if range_match else None
+    range_target = _pick_exact_numeric_target_column(range_match.start()) if range_match else None
+    if range_match and not range_target:
+        range_target = _pick_comparison_numeric_target(range_match.start())
     if range_match and (range_target or numeric_col):
         v1 = _to_float_token(range_match.group(1))
         v2 = _to_float_token(range_match.group(2))
@@ -4859,7 +5153,13 @@ def _detect_filters(
                 )[0].strip()
                 left_col = _resolve_subject_comparison_column(left_phrase)
                 right_col = _resolve_subject_comparison_column(right_phrase)
-                if left_col and right_col and left_col.lower() != right_col.lower():
+                comparable_pair = bool(
+                    left_col and right_col and left_col.lower() != right_col.lower() and (
+                        (_is_date_column(left_col, subject) and _is_date_column(right_col, subject))
+                        or (_is_numeric_column(left_col, subject) and _is_numeric_column(right_col, subject))
+                    )
+                )
+                if comparable_pair:
                     add_filter(
                         IRFilter(
                             table=subject,
@@ -4963,7 +5263,7 @@ def _detect_filters(
         q_raw,
         flags=re.I,
     )
-    if location_list_match:
+    if location_list_match and not _question_span_is_column_reference(location_list_match.start(), location_list_match.end()):
         raw_list = str(location_list_match.group("value") or "").strip().strip(".,;:!?")
         raw_list = re.split(
             r"\b(?:show|return|list|display|include|give)\b",
@@ -4996,7 +5296,7 @@ def _detect_filters(
                 ) else "in"
                 add_filter(IRFilter(table=subject, column=target_col, op=op, value=values))
                 location_match = None
-    if location_match:
+    if location_match and not _question_span_is_column_reference(location_match.start(), location_match.end()):
         loc = str(location_match.group("value") or "").strip().strip(".,;:!?")
         loc_low = loc.lower()
         stop_loc = {
@@ -5128,15 +5428,32 @@ def _detect_filters(
         if null_like_target:
             add_filter(IRFilter(table=null_like_target[0], column=null_like_target[1], op="is_null_or_empty"))
 
-        self_fk_parent_target = _find_required_self_fk_parent_column()
-        if self_fk_parent_target:
+        missing_self_fk_parent_target = _find_missing_self_fk_parent_column()
+        if missing_self_fk_parent_target:
             add_filter(
                 IRFilter(
-                    table=self_fk_parent_target[0],
-                    column=self_fk_parent_target[1],
-                    op="is_not_null_or_empty",
+                    table=missing_self_fk_parent_target[0],
+                    column=missing_self_fk_parent_target[1],
+                    op="is_null_or_empty",
                 )
             )
+
+        self_fk_parent_target = None if missing_self_fk_parent_target else _find_required_self_fk_parent_column()
+        if self_fk_parent_target:
+            has_specific_parent_filter = any(
+                str(getattr(flt, "table", "") or "").strip().lower() == str(self_fk_parent_target[0] or "").strip().lower()
+                and str(getattr(flt, "column", "") or "").strip().lower() == str(self_fk_parent_target[1] or "").strip().lower()
+                and str(getattr(flt, "op", "") or "").strip().lower() not in {"is_null_or_empty", "is_not_null_or_empty"}
+                for flt in (filters or [])
+            )
+            if not has_specific_parent_filter:
+                add_filter(
+                    IRFilter(
+                        table=self_fk_parent_target[0],
+                        column=self_fk_parent_target[1],
+                        op="is_not_null_or_empty",
+                    )
+                )
 
         non_null_like_target = _find_non_null_like_target_column()
         if non_null_like_target:
@@ -5227,12 +5544,12 @@ def _detect_filters(
 
     if not strict_regex_applied:
         m_prefix = re.search(
-            r"""\b(?:start(?:s)?\s+with|begins?\s+with)\b(?:\s+the\s+letter)?\s*["'“”]?([A-Za-z0-9]+)""",
-            q,
+            r"""\b(?:start(?:s)?\s+with|begins?\s+with)\b(?:\s+the\s+letter)?\s*["'“”]?([+A-Za-z0-9][A-Za-z0-9+:/.-]*)""",
+            q_raw,
             flags=re.I,
         )
         if m_prefix:
-            token = m_prefix.group(1)
+            token = str(m_prefix.group(1) or "").strip(" \t\r\n'\".,;:!?")
             token_low = str(token or "").strip().lower()
             # Guard against quantifier capture on structural regex phrases like
             # "starts with exactly two uppercase letters ...", where the
@@ -5291,7 +5608,7 @@ def _detect_filters(
             if target:
                 add_filter(IRFilter(table=target[0], column=target[1], op="word_count_eq", value=n_words))
 
-    length_unit_pat = r"(?:characters?|chars?)"
+    length_unit_pat = r"(?:characters?|chars?|letters?)"
     length_comparison_patterns = [
         (
             rf"\b(?:longer|greater|more)\s+than\s+"
@@ -5323,6 +5640,16 @@ def _detect_filters(
         m_length_cmp = re.search(pattern, q, flags=re.I)
         if not m_length_cmp:
             continue
+        matched_length_phrase = str(m_length_cmp.group(0) or "")
+        if "letter" in matched_length_phrase.lower():
+            structural_prefix = q[max(0, m_length_cmp.start() - 24):m_length_cmp.end()]
+            structural_suffix = q[m_length_cmp.end():m_length_cmp.end() + 40]
+            if re.search(r"\b(?:uppercase|lowercase)\b", structural_prefix, flags=re.I) or re.search(
+                r"\bfollowed\s+by\b",
+                structural_suffix,
+                flags=re.I,
+            ):
+                continue
         n_chars = _to_int_count_token(m_length_cmp.group(1))
         if n_chars is None or n_chars < 0:
             continue
@@ -5338,7 +5665,7 @@ def _detect_filters(
         r"\b([a-z][a-z_]{2,})\s+(?:with\s+)?(?:id|ids|code|codes|number|numbers)\b(?P<tail>[^.]{0,80})",
         q,
     )
-    if m_entity_code_list:
+    if m_entity_code_list and not range_match:
         ent_raw = (m_entity_code_list.group(1) or "").lower()
         tail = m_entity_code_list.group("tail") or ""
         enumerated_entity_id_list = re.search(
@@ -5388,7 +5715,7 @@ def _detect_filters(
         r"\b([a-z][a-z_]{2,})\s+(?P<tail>\d+(?:\s*,\s*\d+)*(?:\s*,?\s*(?:or|and)\s+\d+)+)\b",
         q,
     )
-    if m_entity_bare_list and not in_applied:
+    if m_entity_bare_list and not in_applied and not range_match:
         ent_raw = (m_entity_bare_list.group(1) or "").lower()
         tail = m_entity_bare_list.group("tail") or ""
         nums = re.findall(r"\b\d+\b", tail)
@@ -5406,8 +5733,10 @@ def _detect_filters(
                 in_applied = True
 
     id_context = re.search(r"\b(?:id|ids|code|codes|number|numbers)\b(?P<tail>[^.]{0,80})", q)
-    if id_context and not in_applied:
+    if id_context and not in_applied and not range_match:
         tail = id_context.group("tail") or ""
+        if re.search(r"\bbetween\b", q[max(0, id_context.start() - 24):id_context.end() + 48], flags=re.I):
+            tail = ""
         comma_list_match = re.search(r"\b\d+(?:\s*,\s*\d+)+\b", tail)
         comma_list_text = str(comma_list_match.group(0) or "").strip() if comma_list_match else ""
         comma_list_is_thousands_literal = bool(
@@ -5448,6 +5777,23 @@ def _detect_filters(
                     target = (subject, id_col)
             if target:
                 add_filter(IRFilter(table=target[0], column=target[1], op="in", value=nums))
+
+    m_entity_single_id = re.search(r"\b([a-z][a-z_]{2,})\s+(\d+)\b", q)
+    if m_entity_single_id and not in_applied:
+        ent_raw = str(m_entity_single_id.group(1) or "").strip().lower()
+        num = str(m_entity_single_id.group(2) or "").strip()
+        prefix_local = q[max(0, m_entity_single_id.start() - 24):m_entity_single_id.start()]
+        if num and not re.search(r"\b(?:between|from|through|thru|to)\s*$", prefix_local, flags=re.I):
+            ent = _safe_get_singular_form(ent_raw).replace("_", "").lower()
+            subj_cols = list(allowed.get(subject, set()))
+            id_like = [
+                c for c in subj_cols
+                if c.lower().endswith("id") or c.lower().endswith("code") or c.lower().endswith("number")
+            ]
+            ent_hits = [c for c in id_like if ent and ent in c.lower().replace("_", "")]
+            if ent_hits:
+                ent_hits.sort(key=len)
+                add_filter(IRFilter(table=subject, column=ent_hits[0], op="eq", value=num))
 
     filter_logic = _derive_filter_logic(question, filters)
     return _prune_redundant_filters(filters, filter_logic)
@@ -5595,6 +5941,16 @@ def _detect_ordering_and_limit(
             score = (token_count, len(variant_text))
             if score > best:
                 best = score
+        if best > (0, 0):
+            return best
+        semantic_tokens = _semantic_query_token_variants(
+            _tokenize_for_match(seg_text, stop_tokens=_LEXICAL_MATCH_STOP_TOKENS)
+        )
+        overlap = semantic_tokens.intersection(
+            _column_semantic_tokens(t, c).union(_column_descriptor_tokens(t, c))
+        )
+        if len(overlap) >= 2:
+            return (1, len(overlap))
         return best
 
     def _preferred_lookup_order_dimension() -> Optional[IRDimension]:

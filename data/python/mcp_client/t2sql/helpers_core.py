@@ -8558,7 +8558,16 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str, ctx: str
         phrases: Set[str] = set(_identifier_variants(parts))
         if table_roots and parts:
             stripped_parts = [tok for tok in parts if tok not in table_roots]
-            if stripped_parts and stripped_parts != parts:
+            generic_identifier_terms = {
+                str(x or "").strip().lower()
+                for x in identifier_id_like_terms()
+                if str(x or "").strip()
+            }
+            if (
+                stripped_parts
+                and stripped_parts != parts
+                and any(tok not in generic_identifier_terms for tok in stripped_parts)
+            ):
                 phrases.update(_identifier_variants(stripped_parts))
         semantic_view: Dict[str, Any] = {}
         alias_phrase_parts: List[List[str]] = []
@@ -8805,7 +8814,23 @@ def _ensure_explicit_simple_projection_columns(sql: str, question: str, ctx: str
 
     display_name_col = _display_name_column_for_table(base_table) or get_name_column(base_table)
     display_name_l = str(display_name_col or "").strip().lower()
-    generic_name_requested = bool(re.search(r"\bname(?:s)?\b", requested_segment, flags=re.I))
+
+    specific_name_component_spans: List[Tuple[int, int]] = [
+        (m.start(), m.end())
+        for m in re.finditer(
+            r"\b(?:first|last|middle|given|family|surname|contact\s+first|contact\s+last)\s+name(?:s)?\b",
+            requested_segment,
+            flags=re.I,
+        )
+    ]
+
+    def _is_inside_specific_name_component(pos: int) -> bool:
+        return any(lo <= pos <= hi for lo, hi in specific_name_component_spans)
+
+    generic_name_requested = any(
+        not _is_inside_specific_name_component(m.start())
+        for m in re.finditer(r"\bname(?:s)?\b", requested_segment, flags=re.I)
+    )
     if (
         display_name_l
         and generic_name_requested
@@ -45493,7 +45518,74 @@ def _guardrail_fix_like_regex_anchors(sql: str, question: str) -> str:
     )
     pure_starts = starts and not ends and not contains
     pure_ends = ends and not starts and not contains
+    pure_contains = contains and not starts and not ends
     col_pat = r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+)"
+
+    def _extract_literal_like_target(question_text: str, mode: str) -> str:
+        phrase_map = {
+            "starts": r"(?:start(?:s)?|begin(?:s)?)\s+with",
+            "ends": r"end(?:s)?\s+with",
+            "contains": r"contain(?:s)?",
+        }
+        phrase = phrase_map.get(mode)
+        if not phrase:
+            return ""
+        clause_stop = (
+            r"(?:[.,;:!?]|"
+            r"\s+(?:but|except|excluding|return|show|list|display|include|give|sort|order|ordered|sorted|where|having)\b|$)"
+        )
+        match = re.search(
+            rf"\b{phrase}\b"
+            rf"(?:\s+(?:the\s+)?(?:word|words|letter|letters|digit|digits|text|string|phrase|value|character|characters))?\s*"
+            rf"""["'“”]?([A-Za-z0-9][A-Za-z0-9/&:' -]{{0,20}}?)["'“”]?(?={clause_stop})""",
+            str(question_text or ""),
+            flags=re.I,
+        )
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip(" \t\r\n'\".,;:!?")
+
+    def _canonical_like_pattern(mode: str, literal_target: str) -> str:
+        if mode == "starts":
+            return f"{literal_target}%"
+        if mode == "ends":
+            return f"%{literal_target}"
+        if mode == "contains":
+            return f"%{literal_target}%"
+        return literal_target
+
+    def _rewrite_like_to_question_target(sql_text: str, mode: str, literal_target: str) -> str:
+        if not sql_text or not literal_target:
+            return sql_text
+        canonical = _canonical_like_pattern(mode, literal_target)
+        target_lower = literal_target.lower()
+
+        def _rewrite(m: re.Match) -> str:
+            body = str(m.group("body") or "")
+            body_lower = body.lower()
+            if body_lower == canonical.lower():
+                return m.group(0)
+            collapsed = re.sub(r"[%_]+", "", body_lower).strip()
+            if not collapsed or target_lower not in collapsed:
+                return m.group(0)
+            if mode == "contains" or collapsed == target_lower:
+                return f"{m.group('prefix')}'{canonical}'"
+            if mode == "starts" and (
+                collapsed.startswith(target_lower) or collapsed.endswith(target_lower)
+            ):
+                return f"{m.group('prefix')}'{canonical}'"
+            if mode == "ends" and (
+                collapsed.endswith(target_lower) or collapsed.startswith(target_lower)
+            ):
+                return f"{m.group('prefix')}'{canonical}'"
+            return m.group(0)
+
+        return re.sub(
+            r"(?P<prefix>\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+(?:NOT\s+)?LIKE\s+)'(?P<body>[^']*)'",
+            _rewrite,
+            sql_text,
+            flags=re.IGNORECASE,
+        )
 
     # Rewrite LIKE '^X' -> LIKE 'X%'
     def repl_starts(m: re.Match) -> str:
@@ -45595,7 +45687,8 @@ def _guardrail_fix_like_regex_anchors(sql: str, question: str) -> str:
 
     # Rewrite reversed simple wildcard direction when the question semantics are
     # unambiguous. This keeps the fix bounded to pure starts-with / ends-with
-    # questions and avoids changing contains-style predicates.
+    # questions before the shared literal-target normalizer handles the pure
+    # starts/ends/contains cases.
     if pure_ends:
         sql = re.sub(
             r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+(?:NOT\s+)?LIKE\s+)'([^'%_]+)%'",
@@ -45609,12 +45702,36 @@ def _guardrail_fix_like_regex_anchors(sql: str, question: str) -> str:
             sql,
             flags=re.IGNORECASE,
         )
+        sql = re.sub(
+            r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+(?:NOT\s+)?LIKE\s+)'_+([^'%_]+)'",
+            lambda m: f"{m.group(1)}'%{m.group(2)}'",
+            sql,
+            flags=re.IGNORECASE,
+        )
     if pure_starts:
         sql = re.sub(
             r"(\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s+(?:NOT\s+)?LIKE\s+)'%([^'%_]+)'",
             lambda m: f"{m.group(1)}'{m.group(2)}%'",
             sql,
             flags=re.IGNORECASE,
+        )
+    if pure_starts:
+        sql = _rewrite_like_to_question_target(
+            sql,
+            mode="starts",
+            literal_target=_extract_literal_like_target(question, mode="starts"),
+        )
+    if pure_ends:
+        sql = _rewrite_like_to_question_target(
+            sql,
+            mode="ends",
+            literal_target=_extract_literal_like_target(question, mode="ends"),
+        )
+    if pure_contains:
+        sql = _rewrite_like_to_question_target(
+            sql,
+            mode="contains",
+            literal_target=_extract_literal_like_target(question, mode="contains"),
         )
 
     return sql
@@ -55345,6 +55462,71 @@ def _normalize_symbolic_presence_operators(sql: str) -> str:
     return s
 
 
+def _normalize_symbolic_like_operators(sql: str) -> str:
+    """
+    Translate symbolic LIKE operators leaked by the LLM into normal SQL.
+
+    Supported forms:
+    - col LIKE_PREFIX 'abc'      -> col LIKE 'abc%'
+    - col LIKE_SUFFIX 'abc'      -> col LIKE '%abc'
+    - col LIKE_CONTAINS 'abc'    -> col LIKE '%abc%'
+    - col NOT_LIKE_PREFIX 'abc'  -> col NOT LIKE 'abc%'
+    - col NOT_LIKE_SUFFIX 'abc'  -> col NOT LIKE '%abc'
+    - col NOT_LIKE_CONTAINS 'abc'-> col NOT LIKE '%abc%'
+    - LIKE_PREFIX(col, 'abc')      -> col LIKE 'abc%'
+    - LIKE_SUFFIX(col, 'abc')      -> col LIKE '%abc'
+    - LIKE_CONTAINS(col, 'abc')    -> col LIKE '%abc%'
+    - NOT_LIKE_PREFIX(col, 'abc')  -> col NOT LIKE 'abc%'
+    - NOT_LIKE_SUFFIX(col, 'abc')  -> col NOT LIKE '%abc'
+    - NOT_LIKE_CONTAINS(col, 'abc')-> col NOT LIKE '%abc%'
+
+    If the literal already carries wildcard intent, preserve it rather than
+    re-wrapping aggressively.
+    """
+    s = str(sql or "").strip()
+    if not s or not re.search(r"\b(?:NOT_)?LIKE_(?:PREFIX|SUFFIX|CONTAINS)\b", s, flags=re.I):
+        return sql
+
+    col_ref_pat = (
+        r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:\s*\.\s*(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))?"
+    )
+
+    def _apply_like_shape(mode: str, literal: str) -> str:
+        body = str(literal or "")
+        mode_l = str(mode or "").strip().lower()
+        if mode_l == "prefix":
+            return body if "%" in body or "_" in body else f"{body}%"
+        if mode_l == "suffix":
+            return body if "%" in body or "_" in body else f"%{body}"
+        if mode_l == "contains":
+            if "%" in body or "_" in body:
+                return body
+            return f"%{body}%"
+        return body
+
+    def _rewrite(match: re.Match[str]) -> str:
+        expr = re.sub(r"\s*\.\s*", ".", str(match.group("expr") or "").strip())
+        mode = str(match.group("mode") or "").strip()
+        literal = str(match.group("literal") or "")
+        sql_op = "NOT LIKE" if str(match.group("neg") or "").strip() else "LIKE"
+        return f"{expr} {sql_op} '{_apply_like_shape(mode, literal)}'"
+
+    s = re.sub(
+        rf"(?P<expr>{col_ref_pat})\s+(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s+'(?P<literal>(?:''|[^'])*)'",
+        _rewrite,
+        s,
+        flags=re.I,
+    )
+    s = re.sub(
+        rf"(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s*\(\s*(?P<expr>{col_ref_pat})\s*,\s*'(?P<literal>(?:''|[^'])*)'\s*\)",
+        _rewrite,
+        s,
+        flags=re.I,
+    )
+    return s
+
+
 def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
     """
     Apply only syntax-shape cleanup that is safe before AST routing.
@@ -55364,6 +55546,7 @@ def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
     s = re.sub(r";+\s*$", "", s).strip()
     s = _fix_bad_backticks(s)
     s = _normalize_symbolic_presence_operators(s)
+    s = _normalize_symbolic_like_operators(s)
     s = _repair_misnested_offset_window_function(s)
     s = _drop_redundant_inner_window_where_in_derived_subquery(s)
     s = re.sub(

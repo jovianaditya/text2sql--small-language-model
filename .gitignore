@@ -15,6 +15,7 @@ __pycache__/
 **/results*.xlsx
 **/run_*.log
 **/evaluation_*.log
+**/test_*.log
 **/intent_ir_compare_*.log
 **/.codex
 **/hitl_review_log_*.json

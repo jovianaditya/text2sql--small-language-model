@@ -6346,6 +6346,130 @@ def router_agent(state: RAGState) -> RAGState:
                     f"[ROUTER] Explicit-rank single-table compaction: keeping only {primary_table}"
                 )
 
+    def _extract_requested_output_segment_router(text: str) -> str:
+        q_text = str(text or "").strip().lower()
+        if not q_text:
+            return ""
+        m = re.search(
+            r"(?is)\b(?:return|show|display|get|list|include|including|provide)\s+(?P<seg>.+?)(?=\b(?:order\s+by|sort\s+by|sorted\s+by)\b|$)",
+            q_text,
+        )
+        if not m:
+            return ""
+        return str(m.group("seg") or "").strip(" .;")
+
+    def _router_is_key_or_fk_like_column(table_name: str, column_name: str) -> bool:
+        tbl_l = str(table_name or "").strip().lower()
+        col_l = str(column_name or "").strip().lower()
+        if not tbl_l or not col_l:
+            return False
+        table_id_col = (get_id_column(tbl_l) or "").strip().lower()
+        if table_id_col and col_l == table_id_col:
+            return True
+        if _is_conventional_fk_name(get_singular_form(tbl_l), col_l):
+            return True
+        if col_l in fk_columns_by_table.get(tbl_l, {}):
+            return True
+        return False
+
+    def _router_mentioned_non_key_cols(text: str, table_name: str) -> Set[str]:
+        text_l = str(text or "").strip().lower()
+        tbl_l = str(table_name or "").strip().lower()
+        if not text_l or not tbl_l:
+            return set()
+        out: Set[str] = set()
+        for col in _get_table_cols(tbl_l):
+            col_l = str(col or "").strip().lower()
+            if not col_l or _router_is_key_or_fk_like_column(tbl_l, col_l):
+                continue
+            if _question_mentions_column(text_l, str(col), tbl_l):
+                out.add(col_l)
+        return out
+
+    # Simple lookup questions can accumulate FK-neighbor noise from generic
+    # column mentions (e.g. `phone`, `code`) even when the primary table already
+    # has clear subject/output anchors. Compact that scope conservatively so IR
+    # hinting can stay available for true single-table lookups.
+    lookup_primary_anchor_compaction = bool(
+        primary_table
+        and len(relevant_tables) > 1
+        and not has_math
+        and not has_grouping
+        and not is_ranking
+        and not is_window_aggregate
+        and not is_explicit_rank_function
+        and not is_ordinal_ranking
+        and not has_exclusion
+        and not is_subquery_intent
+    )
+    if lookup_primary_anchor_compaction:
+        requested_output_segment = _extract_requested_output_segment_router(question_raw)
+        primary_requested_cols = _router_mentioned_non_key_cols(
+            requested_output_segment,
+            primary_table,
+        )
+        primary_question_cols = _router_mentioned_non_key_cols(
+            question_lower,
+            primary_table,
+        )
+        has_strong_primary_anchor = bool(
+            len(primary_requested_cols) >= 2
+            or (len(primary_requested_cols) >= 1 and len(primary_question_cols) >= 2)
+        )
+
+        if has_strong_primary_anchor:
+            retained_tables: List[str] = [primary_table]
+            for tbl in relevant_tables:
+                if tbl == primary_table:
+                    continue
+
+                tbl_lower = str(tbl or "").strip().lower()
+                evidence_list = evidence_details.get(tbl_lower, [])
+                if _question_mentions_table_entity(question_lower, tbl):
+                    retained_tables.append(tbl)
+                    continue
+
+                if any(
+                    ev in {
+                        AGENT_ROUTER_EVIDENCE_TAG_FOR_EACH,
+                        AGENT_ROUTER_EVIDENCE_TAG_TABLE_ATTRIBUTE,
+                        AGENT_ROUTER_EVIDENCE_TAG_AGGREGATE_CONTEXT,
+                    }
+                    or str(ev or "").startswith(AGENT_ROUTER_FK_EVIDENCE_PREFIX)
+                    for ev in evidence_list
+                ):
+                    retained_tables.append(tbl)
+                    continue
+
+                requested_non_key_cols = _router_mentioned_non_key_cols(
+                    requested_output_segment,
+                    tbl_lower,
+                )
+                if requested_non_key_cols:
+                    retained_tables.append(tbl)
+                    continue
+
+                mentioned_non_key_cols = _router_mentioned_non_key_cols(
+                    question_lower,
+                    tbl_lower,
+                )
+                if len(mentioned_non_key_cols) >= 2:
+                    retained_tables.append(tbl)
+                    continue
+
+                if RETRIEVE_DEBUG:
+                    print(
+                        f"[ROUTER] Lookup compaction: dropping {tbl} as generic non-primary noise "
+                        f"(requested_non_key_cols={sorted(requested_non_key_cols)}, "
+                        f"mentioned_non_key_cols={sorted(mentioned_non_key_cols)})"
+                    )
+
+            relevant_tables = list(dict.fromkeys(retained_tables))
+            if RETRIEVE_DEBUG and relevant_tables == [primary_table]:
+                print(
+                    f"[ROUTER] Lookup compaction: keeping only primary table {primary_table}"
+                )
+
     # ═══════════════════════════════════════════════════════════════════
     # STEP 5: LOGIKA ESKALASI (Smarter Multi-Table Handling)
     # ═══════════════════════════════════════════════════════════════════

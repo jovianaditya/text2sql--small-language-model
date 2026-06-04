@@ -116,6 +116,8 @@ from .helpers_core import (
     _simplify_group_key_count_threshold_subquery,
     _drop_unrequested_schema_named_count_outputs,
     _normalize_timestampdiff_day_to_datediff,
+    _normalize_symbolic_like_operators,
+    _normalize_symbolic_presence_operators,
     _drop_unrequested_current_date_filters,
     _drop_unrequested_literal_row_filters,
     _rewrite_null_conditional_count_to_date_comparison,
@@ -5173,8 +5175,6 @@ def _context_scope_allows_intent_ir_hint(
         for table in ((state or {}).get("router_tables") or [])
         if str(table or "").strip()
     }
-    if len(router_tables) != 1:
-        return False
 
     hard_router_reasons = {
         str(reason or "").strip()
@@ -5185,16 +5185,38 @@ def _context_scope_allows_intent_ir_hint(
         return False
 
     primary_table = str((state or {}).get("primary_table") or "").strip().lower()
-    if primary_table and primary_table not in router_tables:
+    if primary_table and router_tables and primary_table not in router_tables:
         return False
 
-    router_table = next(iter(router_tables))
-    payload_tables = _intent_ir_payload_tables(
-        intent_ir or {},
-        router_table=router_table,
-        context_allowed=context_allowed,
-    )
-    return bool(payload_tables) and payload_tables.issubset(router_tables)
+    if len(router_tables) == 1:
+        router_table = next(iter(router_tables))
+        payload_tables = _intent_ir_payload_tables(
+            intent_ir or {},
+            router_table=router_table,
+            context_allowed=context_allowed,
+        )
+        return bool(payload_tables) and payload_tables.issubset(router_tables)
+
+    # Retrieval can still surface lightweight FK-neighbor noise for simple
+    # single-table lookups. If the IR itself stays fully anchored to the
+    # primary table, allow the hint even when router_tables is slightly wider.
+    if primary_table and _intent_ir_is_low_risk_single_table_lookup(intent_ir or {}):
+        payload_tables = _intent_ir_payload_tables(
+            intent_ir or {},
+            router_table=primary_table,
+            context_allowed=context_allowed,
+        )
+        if (
+            payload_tables
+            and payload_tables == {primary_table}
+            and _intent_ir_confirms_primary_table_scope(
+                intent_ir or {},
+                primary_table,
+                context_allowed=context_allowed,
+            )
+        ):
+            return True
+    return False
 
 
 def _context_scope_allows_reduced_multi_table_intent_ir_hint(
@@ -8592,8 +8614,10 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
         if symbolic_filter_hint_present:
             constraints.append(
                 "INTENT HINT FILTER SEMANTICS (CRITICAL): Treat symbolic IR operators as meaning hints, not literal SQL. "
-                "Preserve the shown AND/OR structure exactly. Translate `eq`, `in`, `not_in`, `like_prefix`, `like_suffix`, "
-                "`like_contains`, `is_null_or_empty`, and `is_not_null_or_empty` into normal SQL predicates. "
+                "Preserve the shown AND/OR structure exactly. Translate `eq`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, "
+                "`col_eq`, `col_gt`, `col_gte`, `col_lt`, `col_lte`, `like_prefix`, `like_suffix`, `like_contains`, "
+                "`not_like_prefix`, `not_like_suffix`, `not_like_contains`, `is_null_or_empty`, and "
+                "`is_not_null_or_empty` into normal SQL predicates. "
                 "Never output the symbolic operator names themselves in SQL."
             )
 
@@ -11800,6 +11824,8 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     # ---------------------------------------------------------------------------
     # Final Polish
     # ---------------------------------------------------------------------------
+    s = _normalize_symbolic_presence_operators(s)
+    s = _normalize_symbolic_like_operators(s)
     s = _collapse_spaces_outside_quotes(s)
     return s
 
