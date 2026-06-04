@@ -1,20 +1,12 @@
 cases:
     - id: E1
       difficulty: easy
-      question: "Show the customer named Royale Belge. Return the customer name and postal code, sorted by customer name ascending and country descending."
-      groundtruth_sql: 
-        SELECT customerName, postalCode 
-        FROM customers 
-        WHERE customerName = 'Royale Belge' 
-        ORDER BY customerName ASC, country DESC;
-    - id: E2
-      difficulty: easy
       question: "Show customers whose contact last name starts with G. Return the customer name, contact first name, and contact last name."
       groundtruth_sql: |
         SELECT customerName, contactFirstName, contactLastName
         FROM customers
         WHERE contactLastName LIKE 'G%';
-    - id: E3
+    - id: E2
       difficulty: easy
       question: "Find customers with a credit limit above 100000. Return the customer number, customer name, phone, and credit limit, sorted by credit limit descending."
       groundtruth_sql: |
@@ -22,13 +14,22 @@ cases:
         FROM customers
         WHERE creditLimit > 100000
         ORDER BY creditLimit DESC;
-    - id: E4
+    - id: E3
       difficulty: easy
       question: "Show customers in Norway or Sweden. Return the customer name, city, country, postal code, and phone."
       groundtruth_sql: |
         SELECT customerName, city, country, postalCode, phone
         FROM customers
         WHERE country IN ('Norway', 'Sweden');
+    - id: E4
+      difficulty: easy
+      question: "Show customers that have an assigned sales rep and are not located in the USA, France, or Japan. Return the customer number, customer name, country, and sales rep employee number, sorted by country ascending, then customer number ascending."
+      groundtruth_sql: |
+        SELECT customerNumber, customerName, country, salesRepEmployeeNumber
+        FROM customers
+        WHERE salesRepEmployeeNumber IS NOT NULL
+          AND country NOT IN ('USA', 'France', 'Japan')
+        ORDER BY country ASC, customerNumber ASC;
     - id: E5
       difficulty: easy
       question: "Find products where the quantity in stock is greater than 5000. Return the product code, product name, quantity in stock, and product vendor, sorted by quantity in stock descending."
@@ -219,11 +220,11 @@ cases:
         ORDER BY productLine ASC;
     - id: E29
       difficulty: easy
-      question: "Find product lines whose names are longer than 10 characters. Return the product line, sorted by product line ascending."
+      question: "Find product lines where the text description contains the word certificate. Return the product line and text description, sorted by product line ascending."
       groundtruth_sql: |
-        SELECT productLine
+        SELECT productLine, textDescription
         FROM productlines
-        WHERE LENGTH(productLine) > 10
+        WHERE textDescription LIKE '%certificate%'
         ORDER BY productLine ASC;
     - id: E30
       difficulty: easy
