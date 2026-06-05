@@ -232,7 +232,7 @@ from .helpers_core import (
     _preserve_requested_context_columns_in_single_table_scalar_subquery,
     _ensure_alias_for_top_level_derived_table,
     _rewrite_single_table_joined_max_case_winner_row,
-    _repair_explicit_iso_date_filter_from_question, _repair_explicit_weekday_filter_from_question, _repair_enum_process_proxy_filter_from_question,
+    _repair_explicit_iso_date_filter_from_question, _repair_explicit_weekday_filter_from_question, _repair_explicit_weekday_number_grouping_from_question, _repair_enum_process_proxy_filter_from_question,
 )
 from .rulebook import (
     aggregate_threshold_intent_aggregate_terms,
@@ -5869,22 +5869,86 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 )
             )
 
-        m_date_gap = re.search(
-            r"\b(?:avg|average|mean)\s+(?:number\s+of\s+)?days?\s+between\s+"
-            r"([a-z][a-z0-9_ ]{1,40}?)\s+and\s+([a-z][a-z0-9_ ]{1,40}?)"
-            r"(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bsort\b|\border\b|$))",
-            q_text,
-            flags=re.I,
-        )
-        if m_date_gap:
-            left_phrase = re.sub(r"\s+", " ", str(m_date_gap.group(1) or "").strip())
-            right_phrase = re.sub(r"\s+", " ", str(m_date_gap.group(2) or "").strip())
-            left_col = _resolve_derived_column(left_phrase, date_like=True)
-            right_col = _resolve_derived_column(right_phrase, date_like=True)
-            if left_col and right_col and left_col != right_col:
-                add_hint(
-                    f"AVG(DATEDIFF({right_col[0]}.{right_col[1]}, {left_col[0]}.{left_col[1]}))"
-                )
+        date_gap_metric_expr = _resolved_date_gap_metric_expr()
+        if date_gap_metric_expr:
+            add_hint(date_gap_metric_expr)
+
+        def _row_count_requested() -> bool:
+            if qtype.lower() != "aggregate" or not subject:
+                return False
+            entity_terms: Set[str] = set()
+            subject_norm = str(subject or "").strip().lower()
+            if subject_norm:
+                entity_terms.add(subject_norm)
+            try:
+                singular = str(get_singular_form(subject_norm) or "").strip().lower()
+                if singular:
+                    entity_terms.add(singular)
+            except Exception:
+                pass
+            if not entity_terms:
+                return False
+            entity_alt = "|".join(
+                re.escape(term).replace(r"\ ", r"\s+")
+                for term in sorted(entity_terms)
+                if term
+            )
+            if not entity_alt:
+                return False
+            return bool(
+                re.search(rf"\b(?:{entity_alt})\s+count\b", q_text, flags=re.I)
+                or re.search(rf"\btotal\s+(?:{entity_alt})\b", q_text, flags=re.I)
+                or re.search(rf"\bhow\s+many\s+(?:{entity_alt})\b", q_text, flags=re.I)
+                or re.search(rf"\bnumber\s+of\s+(?:{entity_alt})\b", q_text, flags=re.I)
+            )
+
+        def _distinct_count_metric_hints() -> List[str]:
+            out: List[str] = []
+            for match in re.finditer(
+                r"\b(?:how\s+many|count|number\s+of|total)\s+distinct\s+"
+                r"([a-z][a-z0-9_ ]{1,50}?)(?=\s+(?:appear|appears|serve|serves|serving|are|is|exist|exists|occur|occurs|within|in|for|that|who|per|by|and|sort|order|keep|only)\b|[.,;!?]|$)",
+                q_text,
+                flags=re.I,
+            ):
+                phrase = re.sub(r"\s+", " ", str(match.group(1) or "").strip())
+                resolved = _resolve_derived_column(phrase)
+                if not resolved:
+                    continue
+                hint = f"COUNT(DISTINCT {resolved[0]}.{resolved[1]})"
+                if hint not in out:
+                    out.append(hint)
+            return out
+
+        def _normalize_date_metric_phrase(phrase: str) -> str:
+            phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+            if not phrase_norm:
+                return ""
+
+            tokens = [tok for tok in re.findall(r"[a-z0-9]+", phrase_norm) if tok]
+            if not tokens:
+                return ""
+
+            removable = {
+                "the", "a", "an", "were", "was", "are", "is",
+                "been", "being", "have", "has", "had",
+            }
+            subject_norm = str(subject or "").strip().lower()
+            if subject_norm:
+                removable.add(subject_norm)
+                try:
+                    singular = str(get_singular_form(subject_norm) or "").strip().lower()
+                    if singular:
+                        removable.add(singular)
+                except Exception:
+                    pass
+
+            kept_tokens = [tok for tok in tokens if tok not in removable]
+            if not kept_tokens:
+                return ""
+
+            if not any(tok in {"date", "time", "day", "month", "year"} for tok in kept_tokens):
+                kept_tokens.append("date")
+            return " ".join(kept_tokens)
 
         m_conditional_numeric_count = re.search(
             r"\bhow\s+many\b(?:\s+[a-z][a-z0-9_-]*){0,6}?\s+have\s+"
@@ -5930,8 +5994,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             left_phrase = re.sub(r"\s+", " ", str(m_conditional_date_count.group(1) or "").strip())
             cmp_phrase = str(m_conditional_date_count.group(2) or "").strip().lower()
             right_phrase = re.sub(r"\s+", " ", str(m_conditional_date_count.group(3) or "").strip())
-            left_col = _resolve_derived_column(left_phrase, date_like=True)
-            right_col = _resolve_derived_column(right_phrase, date_like=True)
+            left_phrase_norm = _normalize_date_metric_phrase(left_phrase)
+            right_phrase_norm = _normalize_date_metric_phrase(right_phrase)
+            left_col = _resolve_derived_column(left_phrase_norm or left_phrase, date_like=True)
+            right_col = _resolve_derived_column(right_phrase_norm or right_phrase, date_like=True)
             op_map = {
                 "earlier than": "<",
                 "before": "<",
@@ -6069,6 +6135,11 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if table and column:
                 add_case_when_hint("SUM", table, column)
 
+        if _row_count_requested():
+            add_hint("COUNT(*)")
+        for distinct_hint in _distinct_count_metric_hints():
+            add_hint(distinct_hint)
+
         return hints
 
     def _safe_filter_hint_str(filter_obj: dict) -> str:
@@ -6096,6 +6167,12 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if op == "eq" and val_text in {"a to z", "z to a"}:
             return ""
         if op == "eq" and re.fullmatch(r"[a-z]\s+to\s+[a-z]", val_text):
+            return ""
+        if op == "eq" and val_text in {
+            "number", "total", "count", "average", "avg", "mean",
+            "sum", "minimum", "maximum", "min", "max",
+            "required-gap", "required gap", "account-manager",
+        }:
             return ""
         if op == "eq" and c.lower() in {"country", "city"}:
             if _question_has_valid_multi_value_location_list():
@@ -6271,9 +6348,26 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         if "," not in tail and not re.search(r"\band\b", tail, flags=re.I):
             return []
 
+        between_and_placeholder = "__between_and__"
+        def _protect_between_and(match: re.Match) -> str:
+            return re.sub(
+                r"\s+\band\b\s+",
+                f" {between_and_placeholder} ",
+                str(match.group(0) or ""),
+                count=1,
+                flags=re.I,
+            )
+
+        tail = re.sub(
+            r"\bbetween\s+[^,.;!?]+?\s+\band\b\s+[^,.;!?]+?(?=(?:\s*,|\s+\band\b|\s+\bor\b|$))",
+            _protect_between_and,
+            tail,
+            flags=re.I,
+        )
+
         segments: List[str] = []
         for raw_seg in re.split(r"\s*,\s*|\s+\band\b\s+|\s+\bor\b\s+", tail, flags=re.I):
-            seg = str(raw_seg or "").strip(" \t\r\n.,;:!?")
+            seg = str(raw_seg or "").replace(between_and_placeholder, "and").strip(" \t\r\n.,;:!?")
             if not seg:
                 continue
             seg = re.sub(
@@ -6302,6 +6396,99 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 flags=re.I,
             )
         )
+
+    def _resolved_date_gap_metric_expr() -> str:
+        m_date_gap = re.search(
+            r"\b(?:avg|average|mean)\s+(?:number\s+of\s+)?days?\s+between\s+"
+            r"([a-z][a-z0-9_ ]{1,40}?)\s+and\s+([a-z][a-z0-9_ ]{1,40}?)"
+            r"(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bsort\b|\border\b|$))",
+            q_text,
+            flags=re.I,
+        )
+        if not m_date_gap:
+            return ""
+        left_phrase = re.sub(r"\s+", " ", str(m_date_gap.group(1) or "").strip())
+        right_phrase = re.sub(r"\s+", " ", str(m_date_gap.group(2) or "").strip())
+        left_col = _resolve_derived_column(left_phrase, date_like=True)
+        right_col = _resolve_derived_column(right_phrase, date_like=True)
+        if not left_col or not right_col or left_col == right_col:
+            return ""
+        return f"AVG(DATEDIFF({right_col[0]}.{right_col[1]}, {left_col[0]}.{left_col[1]}))"
+
+    def _date_gap_operand_keys() -> Set[Tuple[str, str]]:
+        expr = _resolved_date_gap_metric_expr()
+        if not expr:
+            return set()
+        match = re.match(
+            r"(?is)^\s*AVG\s*\(\s*DATEDIFF\(\s*"
+            r"([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
+            r"([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*"
+            r"\)\s*\)\s*$",
+            expr,
+        )
+        if not match:
+            return set()
+        return {
+            (str(match.group(1) or "").strip().lower(), str(match.group(2) or "").strip().lower()),
+            (str(match.group(3) or "").strip().lower(), str(match.group(4) or "").strip().lower()),
+        }
+
+    def _explicit_temporal_extrema_metric_keys() -> Set[Tuple[str, str, str]]:
+        keys: Set[Tuple[str, str, str]] = set()
+        def _generic_metric_phrase_local(phrase: str) -> bool:
+            phrase_norm = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+            return bool(
+                re.fullmatch(
+                    r"(?:the\s+)?(?:percentage|percent|ratio|rate|count|counts|total|totals|average|avg|mean|sum|"
+                    r"minimum|min|max|maximum|number(?:\s+of)?|rows?)",
+                    phrase_norm,
+                )
+            )
+        temporal_patterns = [
+            (
+                r"\b(?:earliest|oldest)\s+([a-z][a-z0-9_ ]{1,48}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bkeep\b|\bonly\b|\breturn\b|\bshow\b|\bsort\b|\border\b|$))",
+                "MIN",
+            ),
+            (
+                r"\b(?:latest|newest|most\s+recent)\s+([a-z][a-z0-9_ ]{1,48}?)(?=\s*(?:,|;|\.|\band\b|\bthen\b|\bkeep\b|\bonly\b|\breturn\b|\bshow\b|\bsort\b|\border\b|$))",
+                "MAX",
+            ),
+        ]
+        for pattern, agg_name in temporal_patterns:
+            for match in re.finditer(pattern, q_text, flags=re.I):
+                phrase = re.sub(r"\s+", " ", str(match.group(1) or "").strip())
+                if not phrase or _generic_metric_phrase_local(phrase):
+                    continue
+                resolved = _resolve_derived_column(phrase, date_like=True) or _resolve_derived_column(phrase)
+                if not resolved:
+                    continue
+                table, column = resolved
+                if not _column_is_date_like(table, column):
+                    continue
+                keys.add((agg_name, table.lower(), column.lower()))
+        return keys
+
+    def _resolved_line_number_dimension() -> Optional[Tuple[str, str]]:
+        for table, column in projection_candidates:
+            if any(
+                re.search(r"\bline\s+number\b", variant_norm, flags=re.I)
+                for variant_norm in _column_variant_texts(table, column)
+            ):
+                return (table, str(column).strip())
+        if subject:
+            try:
+                analyzer = get_schema_analyzer()
+                for column in analyzer.get_table_columns(subject):
+                    column_text = str(column).strip()
+                    column_norm = _camel_words(column_text)
+                    if (
+                        (re.search(r"\bline\b", column_norm, flags=re.I) and re.search(r"\bnumber\b", column_norm, flags=re.I))
+                        or ("line" in column_text.lower() and "number" in column_text.lower())
+                    ):
+                        return (subject, column_text)
+            except Exception:
+                pass
+        return _resolve_derived_column("line number")
 
     def _mixed_projection_dimension_allowed(table: str, column: str) -> bool:
         table_l = str(table or "").strip().lower()
@@ -6592,6 +6779,44 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                             "visible": True,
                         }
                     )
+                if re.search(r"\bline\s+number\b", q_text, flags=re.I):
+                    resolved_line: Optional[Tuple[str, str]] = None
+                    for table, column in projection_candidates:
+                        if any(
+                            re.search(r"\bline\s+number\b", variant_norm, flags=re.I)
+                            for variant_norm in _column_variant_texts(table, column)
+                        ):
+                            resolved_line = (table, str(column).strip())
+                            break
+                    if not resolved_line and subject:
+                        try:
+                            analyzer = get_schema_analyzer()
+                            for column in analyzer.get_table_columns(subject):
+                                column_text = str(column).strip()
+                                column_norm = _camel_words(column_text)
+                                if (
+                                    (re.search(r"\bline\b", column_norm, flags=re.I) and re.search(r"\bnumber\b", column_norm, flags=re.I))
+                                    or ("line" in column_text.lower() and "number" in column_text.lower())
+                                ):
+                                    resolved_line = (subject, column_text)
+                                    break
+                        except Exception:
+                            pass
+                    if not resolved_line:
+                        resolved_line = _resolve_derived_column("line number")
+                    if resolved_line:
+                        dim_key = (resolved_line[0].lower(), resolved_line[1].lower(), "none")
+                        if dim_key not in seen_keys:
+                            seen_keys.add(dim_key)
+                            projection_dims.append(
+                                {
+                                    "table": resolved_line[0],
+                                    "column": resolved_line[1],
+                                    "alias": "",
+                                    "transform": "none",
+                                    "visible": True,
+                                }
+                            )
                 if projection_dims:
                     return projection_dims
             return raw_dims
@@ -6628,6 +6853,28 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         ]
         if transformed_temporal_dims:
             return transformed_temporal_dims
+
+        weekday_group = bool(
+            re.search(r"\b(?:weekday(?:\s+number)?|day\s+of\s+week)\b", q_text, flags=re.I)
+        )
+        if weekday_group:
+            weekday_match = re.search(r"\b(?:weekday(?:\s+number)?|day\s+of\s+week)\b", q_text, flags=re.I)
+            phrase_window = q_text[
+                max(0, (weekday_match.start() if weekday_match else 0) - 80):
+                min(len(q_text), (weekday_match.end() if weekday_match else 0) + 80)
+            ]
+            resolved = _resolve_derived_column(phrase_window, date_like=True) or _resolve_derived_column("weekday", date_like=True)
+            if resolved:
+                return [
+                    {
+                        "table": resolved[0],
+                        "column": resolved[1],
+                        "alias": "",
+                        "transform": "none",
+                        "visible": True,
+                    }
+                ]
+            return raw_dims
 
         if regex_bucket_query or bucket_or_classification_query:
             if intro_backbone_dims:
@@ -7056,7 +7303,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if not n:
                 n = 1
             unit_raw = str(m_prefix.group("unit") or "").strip().lower()
-            phrase = re.sub(r"\s+", " ", str(m_prefix.group(2) or "").strip().lower())
+            phrase = re.sub(r"\s+", " ", str(m_prefix.group(3) or "").strip().lower())
             resolved = _resolve_derived_column(phrase)
             if n and n > 0 and resolved:
                 table, column = resolved
@@ -7084,7 +7331,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if not n:
                 n = 1
             unit_raw = str(m_suffix.group("unit") or "").strip().lower()
-            phrase = re.sub(r"\s+", " ", str(m_suffix.group(2) or "").strip().lower())
+            phrase = re.sub(r"\s+", " ", str(m_suffix.group(3) or "").strip().lower())
             resolved = _resolve_derived_column(phrase)
             if n and n > 0 and resolved:
                 table, column = resolved
@@ -7352,7 +7599,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if not n:
                 n = 1
             unit_raw = str(m_prefix.group("unit") or "").strip().lower()
-            phrase = re.sub(r"\s+", " ", str(m_prefix.group(2) or "").strip().lower())
+            phrase = re.sub(r"\s+", " ", str(m_prefix.group(3) or "").strip().lower())
             anchor = _output_shape_anchor(phrase)
             if unit_raw.startswith("letter"):
                 unit_label = "letter" if n == 1 else "letters"
@@ -7378,7 +7625,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if not n:
                 n = 1
             unit_raw = str(m_suffix.group("unit") or "").strip().lower()
-            phrase = re.sub(r"\s+", " ", str(m_suffix.group(2) or "").strip().lower())
+            phrase = re.sub(r"\s+", " ", str(m_suffix.group(3) or "").strip().lower())
             anchor = _output_shape_anchor(phrase)
             if unit_raw.startswith("letter"):
                 unit_label = "letter" if n == 1 else "letters"
@@ -7453,7 +7700,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             has_structural = True
             suppress_nonprojected_derived_dims = bool(
                 re.search(
-                    r"\bderived\s+from\b|\bone\s+row\s+per\s+derived\s+label\b",
+                    r"\bone\s+row\s+per\s+derived\s+label\b"
+                    r"|\bone\s+row\s+per\s+label\s+derived\s+from\b",
                     output_shape_hint,
                     flags=re.I,
                 )
@@ -7494,6 +7742,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     }
     projection_segments = _extract_projection_segments_local(str(state.get("question") or ""))
     projection_candidates = _structural_column_candidates()
+    date_gap_operand_keys = _date_gap_operand_keys()
+    explicit_temporal_extrema_metric_keys = _explicit_temporal_extrema_metric_keys()
     for seg in projection_segments:
         seg_l = re.sub(r"\s+", " ", str(seg or "").strip().lower())
         if not seg_l:
@@ -7529,6 +7779,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
     if dims:
         dim_strs = []
         seen_dim_keys = set()
+        allowed_derived_dim_keys: Set[Tuple[str, str]] = set()
+        if output_shape_anchor_key:
+            allowed_derived_dim_keys.add(output_shape_anchor_key)
+        allowed_derived_dim_keys.update(derived_label_intro_anchor_keys)
         subject_dim_columns = {
             str(d.get("column") or "").strip().lower()
             for d in dims
@@ -7605,6 +7859,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 if (
                     qtype.lower() == "aggregate"
                     and dim_key in aggregate_metric_target_keys
+                    and dim_key != output_shape_anchor_key
                     and (
                         dim_key not in explicit_projection_dim_keys
                         or dim_key in metric_like_projection_dim_keys
@@ -7621,8 +7876,14 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 if (
                     suppress_nonprojected_derived_dims
                     and dim_key not in explicit_projection_dim_keys
-                    and dim_key != output_shape_anchor_key
-                    and dim_key not in derived_label_intro_anchor_keys
+                    and dim_key not in allowed_derived_dim_keys
+                ):
+                    continue
+                if (
+                    qtype.lower() == "aggregate"
+                    and date_gap_operand_keys
+                    and dim_key in date_gap_operand_keys
+                    and dim_key not in explicit_projection_dim_keys
                 ):
                     continue
                 if (
@@ -7677,6 +7938,37 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                     continue
                 seen_dim_keys.add(dim_key)
                 dim_strs.append(f"{t}.{c}")
+        if (
+            qtype.lower() == "aggregate"
+            and not dim_strs
+            and derived_label_intro_anchor_keys
+        ):
+            for d in intro_backbone_dims:
+                if not isinstance(d, dict):
+                    continue
+                t = str(d.get("table") or "").strip()
+                c = str(d.get("column") or "").strip()
+                if not (t and c):
+                    continue
+                dim_key = (t.lower(), c.lower())
+                if dim_key not in derived_label_intro_anchor_keys or dim_key in seen_dim_keys:
+                    continue
+                seen_dim_keys.add(dim_key)
+                dim_strs.append(f"{t}.{c}")
+        if re.search(r"\bline\s+number\b", q_text, flags=re.I):
+            resolved_line = _resolved_line_number_dimension()
+            if resolved_line:
+                line_key = (resolved_line[0].lower(), resolved_line[1].lower())
+                if line_key not in seen_dim_keys:
+                    dim_strs.append(f"{resolved_line[0]}.{resolved_line[1]}")
+                    seen_dim_keys.add(line_key)
+        if (
+            qtype.lower() == "aggregate"
+            and not dim_strs
+            and output_shape_anchor_key
+        ):
+            dim_strs.append(f"{output_shape_anchor_key[0]}.{output_shape_anchor_key[1]}")
+            seen_dim_keys.add(output_shape_anchor_key)
         if qtype.lower() == "aggregate" and subject:
             try:
                 subject_id_col = str(get_id_column(subject) or "").strip()
@@ -7688,6 +7980,7 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
                 and subject_id_key in nonmetric_projection_dim_keys
                 and subject_id_key not in seen_dim_keys
                 and subject_id_key not in aggregate_metric_target_keys
+                and not suppress_nonprojected_derived_dims
             ):
                 dim_strs.insert(0, f"{subject}.{subject_id_col}")
                 seen_dim_keys.add(subject_id_key)
@@ -7780,6 +8073,195 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             if current_case_when and not existing_case_when:
                 deduped_met_strs[existing_idx] = clean_hint
         met_strs = deduped_met_strs
+
+        if suppress_nonprojected_derived_dims:
+            met_strs = [
+                hint_text for hint_text in met_strs
+                if not re.search(r"\bwith\s+case\s+when\b", str(hint_text or "").strip(), flags=re.I)
+            ]
+
+        visible_dim_keys_for_counts = {
+            (
+                str(d.get("table") or "").strip().lower(),
+                str(d.get("column") or "").strip().lower(),
+            )
+            for d in dims
+            if isinstance(d, dict)
+            and bool(d.get("visible", True))
+            and str(d.get("table") or "").strip()
+            and str(d.get("column") or "").strip()
+        }
+        existing_distinct_count_metric_keys = {
+            (
+                str(metric.get("table") or "").strip().lower(),
+                str(metric.get("column") or "").strip().lower(),
+            )
+            for metric in metrics
+            if isinstance(metric, dict)
+            and str(metric.get("agg") or "").strip().lower() == "count"
+            and bool(metric.get("distinct"))
+            and str(metric.get("table") or "").strip()
+            and str(metric.get("column") or "").strip()
+            and str(metric.get("column") or "").strip() != "*"
+        }
+        existing_rendered_distinct_count_hints = {
+            str(_safe_metric_hint_str(metric) or "").strip()
+            for metric in metrics
+            if isinstance(metric, dict)
+            and str(metric.get("agg") or "").strip().lower() == "count"
+            and bool(metric.get("distinct"))
+        }
+        existing_rendered_distinct_count_hints = {
+            hint for hint in existing_rendered_distinct_count_hints if hint
+        }
+        existing_non_distinct_count_hints = {
+            str(_safe_metric_hint_str(metric) or "").strip()
+            for metric in metrics
+            if isinstance(metric, dict)
+            and str(metric.get("agg") or "").strip().lower() == "count"
+            and not bool(metric.get("distinct"))
+        }
+        existing_non_distinct_count_hints = {
+            hint for hint in existing_non_distinct_count_hints if hint
+        }
+        desired_distinct_count_hints: List[str] = []
+        for hint_text in supplemental_metric_hints:
+            clean_hint = str(hint_text or "").strip()
+            if re.match(r"(?is)^COUNT\s*\(\s*DISTINCT\b", clean_hint):
+                desired_distinct_count_hints.append(clean_hint)
+        if desired_distinct_count_hints and existing_distinct_count_metric_keys:
+            filtered_distinct_hints: List[str] = []
+            for hint_text in desired_distinct_count_hints:
+                match = re.match(
+                    r"(?is)^COUNT\s*\(\s*DISTINCT\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)$",
+                    str(hint_text or "").strip(),
+                )
+                if not match:
+                    continue
+                metric_key = (
+                    str(match.group(1) or "").strip().lower(),
+                    str(match.group(2) or "").strip().lower(),
+                )
+                if metric_key in existing_distinct_count_metric_keys:
+                    filtered_distinct_hints.append(hint_text)
+            if filtered_distinct_hints:
+                desired_distinct_count_hints = filtered_distinct_hints
+        if desired_distinct_count_hints and existing_distinct_count_metric_keys and visible_dim_keys_for_counts:
+            filtered_distinct_hints: List[str] = []
+            for hint_text in desired_distinct_count_hints:
+                match = re.match(
+                    r"(?is)^COUNT\s*\(\s*DISTINCT\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)$",
+                    str(hint_text or "").strip(),
+                )
+                if not match:
+                    filtered_distinct_hints.append(hint_text)
+                    continue
+                metric_key = (
+                    str(match.group(1) or "").strip().lower(),
+                    str(match.group(2) or "").strip().lower(),
+                )
+                if (
+                    metric_key in visible_dim_keys_for_counts
+                    and metric_key not in existing_distinct_count_metric_keys
+                ):
+                    continue
+                filtered_distinct_hints.append(hint_text)
+            desired_distinct_count_hints = filtered_distinct_hints
+        if desired_distinct_count_hints and existing_distinct_count_metric_keys:
+            existing_targets_look_groupish = any(
+                metric_key in visible_dim_keys_for_counts
+                for metric_key in existing_distinct_count_metric_keys
+            )
+            if not existing_targets_look_groupish:
+                desired_distinct_count_hints = []
+        allowed_distinct_count_hints = set(desired_distinct_count_hints) if desired_distinct_count_hints else set(existing_rendered_distinct_count_hints)
+        wants_explicit_row_count = "COUNT(*)" in supplemental_metric_hints
+        has_conditional_case_metric_hint = any(
+            re.search(r"\bwith\s+case\s+when\b", str(hint_text or "").strip(), flags=re.I)
+            for hint_text in supplemental_metric_hints
+        )
+        if desired_distinct_count_hints or wants_explicit_row_count:
+            filtered_count_hints: List[str] = []
+            for hint_text in met_strs:
+                clean_hint = str(hint_text or "").strip()
+                if not re.match(r"(?is)^COUNT\s*\(", clean_hint):
+                    filtered_count_hints.append(hint_text)
+                    continue
+                if re.match(r"(?is)^COUNT\s*\(\s*DISTINCT\b", clean_hint):
+                    if clean_hint in allowed_distinct_count_hints or not allowed_distinct_count_hints:
+                        filtered_count_hints.append(hint_text)
+                    continue
+                if wants_explicit_row_count and clean_hint == "COUNT(*)" and not existing_non_distinct_count_hints:
+                    filtered_count_hints.append(hint_text)
+                    continue
+                if wants_explicit_row_count and clean_hint in existing_non_distinct_count_hints:
+                    filtered_count_hints.append(hint_text)
+                    continue
+            met_strs = filtered_count_hints
+            if (
+                wants_explicit_row_count
+                and "COUNT(*)" not in met_strs
+                and not existing_non_distinct_count_hints
+            ):
+                met_strs.insert(0, "COUNT(*)")
+            for desired_hint in allowed_distinct_count_hints:
+                if desired_hint not in met_strs:
+                    met_strs.append(desired_hint)
+
+        count_only_metric_request = bool(
+            (desired_distinct_count_hints or wants_explicit_row_count)
+            and not has_conditional_case_metric_hint
+            and not re.search(
+                r"\b(?:average|avg|mean|latest|newest|earliest|oldest|highest|lowest|largest|smallest|max(?:imum)?|min(?:imum)?|sum)\b",
+                q_text,
+                flags=re.I,
+            )
+            and not re.search(
+                r"\btotal\s+(?:amount|price|quantity|stock|sales|cost|value|credit)\b",
+                q_text,
+                flags=re.I,
+            )
+        )
+        if count_only_metric_request:
+            met_strs = [
+                hint_text for hint_text in met_strs
+                if re.match(r"(?is)^COUNT\s*\(", str(hint_text or "").strip())
+            ]
+
+        if date_gap_operand_keys and explicit_temporal_extrema_metric_keys:
+            filtered_temporal_extrema_hints: List[str] = []
+            for hint_text in met_strs:
+                agg, table, column = _metric_hint_scalar_key(hint_text)
+                metric_key = (table, column)
+                scalar_key = (agg, table, column)
+                if (
+                    agg in {"MIN", "MAX"}
+                    and metric_key in date_gap_operand_keys
+                    and scalar_key not in explicit_temporal_extrema_metric_keys
+                    and _column_is_date_like(table, column)
+                ):
+                    continue
+                filtered_temporal_extrema_hints.append(hint_text)
+            met_strs = filtered_temporal_extrema_hints
+
+        if existing_distinct_count_metric_keys:
+            filtered_rendered_metrics: List[str] = []
+            for hint_text in met_strs:
+                clean_hint = str(hint_text or "").strip()
+                match = re.match(
+                    r"(?is)^COUNT\s*\(\s*DISTINCT\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)$",
+                    clean_hint,
+                )
+                if not match:
+                    filtered_rendered_metrics.append(hint_text)
+                    continue
+                metric_key = (
+                    str(match.group(1) or "").strip().lower(),
+                    str(match.group(2) or "").strip().lower(),
+                )
+                if metric_key in existing_distinct_count_metric_keys:
+                    filtered_rendered_metrics.append(hint_text)
+            met_strs = filtered_rendered_metrics
 
         if qtype.lower() == "aggregate" and output_shape_anchor_key:
             def _rendered_scalar_metric_key(hint_text: str) -> Tuple[str, str, str]:
@@ -8314,6 +8796,10 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             column = str(metric_obj.get("column") or "").strip()
             if not agg:
                 return ""
+            if agg == "AVG" and (column == "*" or not column):
+                date_gap_expr = _resolved_date_gap_metric_expr()
+                if date_gap_expr:
+                    return date_gap_expr
             if column == "*" or not column:
                 return f"{agg}(*)"
             qualified = f"{table}.{column}" if table else column
@@ -12144,6 +12630,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
     def _apply_final_question_repairs(sql_in: str) -> str:
         sql_in = _repair_explicit_iso_date_filter_from_question(sql_in, question)
         sql_in = _repair_explicit_weekday_filter_from_question(sql_in, question)
+        sql_in = _repair_explicit_weekday_number_grouping_from_question(sql_in, question)
         sql_in = _repair_enum_process_proxy_filter_from_question(sql_in, question)
         return sql_in
 

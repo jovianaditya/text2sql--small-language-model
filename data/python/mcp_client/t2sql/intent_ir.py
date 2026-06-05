@@ -3763,7 +3763,8 @@ def _detect_filters(
         prefix = q_raw[max(0, int(anchor_pos) - 28):int(anchor_pos)]
         return bool(
             re.search(
-                r"\b(?:not|excluding|except|outside)\s*$",
+                r"\b(?:not|excluding|except|outside)\s*$"
+                r"|\bnot\s+(?:located|based|found|present)\s*$",
                 prefix,
                 flags=re.I,
             )
@@ -4551,6 +4552,26 @@ def _detect_filters(
                     flags=re.I,
                 ):
                     return (t, c)
+        if not _question_requests_conditional_null_breakdown():
+            assigned_match = re.search(
+                r"\bassigned\b(?P<tail>(?:[\s,;:()'\"-]+\w+){0,4})",
+                q,
+                flags=re.I,
+            )
+            if assigned_match and not re.search(r"\bunassigned\b", q, flags=re.I):
+                assigned_phrase = re.sub(
+                    r"\s+",
+                    " ",
+                    str(assigned_match.group(0) or "").strip(),
+                )
+                matched = _best_semantic_column_match(
+                    assigned_phrase,
+                    subject,
+                    allowed,
+                    min_score=1.0,
+                )
+                if matched and _is_identifier_like_column(subject, matched):
+                    return (subject, matched)
         return None
 
     def _best_subject_self_fk_parent_column() -> Optional[Tuple[str, str]]:

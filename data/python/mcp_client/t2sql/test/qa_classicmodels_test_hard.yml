@@ -1,0 +1,350 @@
+cases:
+    - id: H1
+      difficulty: hard
+      question: "For each customer who has made at least one payment, return the customer number, customer name, total payment amount, and latest payment date. Sort by total payment amount descending, then customer number ascending."
+      groundtruth_sql: |
+        SELECT c.customerNumber,
+               c.customerName,
+               SUM(p.amount) AS total_payment_amount,
+               MAX(p.paymentDate) AS latest_payment_date
+        FROM customers c
+        LEFT JOIN payments p
+          ON p.customerNumber = c.customerNumber
+        GROUP BY c.customerNumber, c.customerName
+        HAVING COUNT(p.checkNumber) >= 1
+        ORDER BY total_payment_amount DESC, c.customerNumber ASC;
+    - id: H2
+      difficulty: hard
+      question: "For each customer who has both orders and payments, return the customer number, customer name, latest order date, and earliest payment date. Sort by latest order date descending, then customer number ascending."
+      groundtruth_sql: |
+        SELECT c.customerNumber,
+               c.customerName,
+               MAX(o.orderDate) AS latest_order_date,
+               MIN(p.paymentDate) AS earliest_payment_date
+        FROM customers c
+        JOIN orders o
+          ON o.customerNumber = c.customerNumber
+        JOIN payments p
+          ON p.customerNumber = c.customerNumber
+        GROUP BY c.customerNumber, c.customerName
+        ORDER BY latest_order_date DESC, c.customerNumber ASC;
+    - id: H3
+      difficulty: hard
+      question: "For each product line that has ordered products, return the product line, total quantity ordered, average actual selling price, and number of distinct vendors represented. Sort by total quantity ordered descending, then product line ascending."
+      groundtruth_sql: |
+        SELECT pl.productLine,
+               SUM(od.quantityOrdered) AS total_quantity_ordered,
+               AVG(od.priceEach) AS average_actual_price,
+               COUNT(DISTINCT p.productVendor) AS vendor_count
+        FROM productlines pl
+        JOIN products p
+          ON p.productLine = pl.productLine
+        JOIN orderdetails od
+          ON od.productCode = p.productCode
+        GROUP BY pl.productLine
+        ORDER BY total_quantity_ordered DESC, pl.productLine ASC;
+    - id: H4
+      difficulty: hard
+      question: "Show employees whose assigned customers come from at least 2 distinct countries and whose average assigned customer credit limit is above 80000. Return the employee number, first name, last name, distinct customer country count, and average credit limit, sorted by average credit limit descending, then employee number ascending."
+      groundtruth_sql: |
+        SELECT e.employeeNumber,
+               e.firstName,
+               e.lastName,
+               COUNT(DISTINCT c.country) AS distinct_customer_countries,
+               AVG(c.creditLimit) AS average_credit_limit
+        FROM employees e
+        LEFT JOIN customers c
+          ON c.salesRepEmployeeNumber = e.employeeNumber
+        GROUP BY e.employeeNumber, e.firstName, e.lastName
+        HAVING COUNT(DISTINCT c.country) >= 2
+           AND AVG(c.creditLimit) > 80000
+        ORDER BY average_credit_limit DESC, e.employeeNumber ASC;
+    - id: H5
+      difficulty: hard
+      question: "Group ordered products by the first letter of the product line name. Return that product line initial, total ordered revenue, average actual selling price, and the longest product line text description length in that initial group. Keep only initials whose total ordered revenue is above 500000. Sort by total ordered revenue descending, then product line initial ascending."
+      groundtruth_sql: |
+        SELECT LEFT(pl.productLine, 1) AS product_line_initial,
+               SUM(od.quantityOrdered * od.priceEach) AS total_ordered_revenue,
+               AVG(od.priceEach) AS average_actual_selling_price,
+               MAX(CHAR_LENGTH(pl.textDescription)) AS longest_description_length
+        FROM productlines pl
+        JOIN products p
+          ON p.productLine = pl.productLine
+        JOIN orderdetails od
+          ON od.productCode = p.productCode
+        GROUP BY LEFT(pl.productLine, 1)
+        HAVING SUM(od.quantityOrdered * od.priceEach) > 500000
+        ORDER BY total_ordered_revenue DESC, product_line_initial ASC;
+    - id: H6
+      difficulty: hard
+      question: "For each order status, return the status, total line item count, total quantity ordered, and the number of distinct product line names represented in those line items. Keep only statuses whose total quantity ordered is above 5000. Sort by total quantity ordered descending, then status ascending."
+      groundtruth_sql: |
+        SELECT o.status,
+               COUNT(*) AS line_item_count,
+               SUM(od.quantityOrdered) AS total_quantity_ordered,
+               COUNT(DISTINCT p.productLine) AS distinct_product_lines
+        FROM orders o
+        JOIN orderdetails od
+          ON od.orderNumber = o.orderNumber
+        JOIN products p
+          ON p.productCode = od.productCode
+        GROUP BY o.status
+        HAVING SUM(od.quantityOrdered) > 5000
+        ORDER BY total_quantity_ordered DESC, o.status ASC;
+    - id: H7
+      difficulty: hard
+      question: "Inside each office, rank all employees by assigned customer count from highest to lowest, including employees with zero assigned customers. If multiple employees tie, place the smaller employee number first. Return the office code, employee number, employee name, assigned customer count, and rank. Sort by office code ascending, then rank ascending, then employee number ascending."
+      groundtruth_sql: |
+        SELECT e.officeCode,
+               e.employeeNumber,
+               CONCAT(e.firstName, ' ', e.lastName) AS employee_name,
+               COUNT(DISTINCT c.customerNumber) AS assigned_customer_count,
+               ROW_NUMBER() OVER (
+                   PARTITION BY e.officeCode
+                   ORDER BY COUNT(DISTINCT c.customerNumber) DESC, e.employeeNumber ASC
+               ) AS employee_rank
+        FROM employees e
+        LEFT JOIN customers c
+               ON c.salesRepEmployeeNumber = e.employeeNumber
+        GROUP BY e.officeCode, e.employeeNumber, e.firstName, e.lastName
+        ORDER BY officeCode ASC, employee_rank ASC, employeeNumber ASC;
+    - id: H8
+      difficulty: hard
+      question: "For each product that appears in at least 10 order lines, return the product code, product name, line item count, total quantity ordered, and the dense rank by total quantity ordered from highest to lowest. Sort by rank ascending, then product code ascending."
+      groundtruth_sql: |
+        SELECT p.productCode,
+               p.productName,
+               COUNT(od.orderNumber) AS line_item_count,
+               SUM(od.quantityOrdered) AS total_quantity_ordered,
+               DENSE_RANK() OVER (
+                   ORDER BY SUM(od.quantityOrdered) DESC
+               ) AS quantity_rank
+        FROM products p
+        LEFT JOIN orderdetails od
+          ON od.productCode = p.productCode
+        GROUP BY p.productCode, p.productName
+        HAVING COUNT(od.orderNumber) >= 10
+        ORDER BY quantity_rank ASC, p.productCode ASC;
+    - id: H9
+      difficulty: hard
+      question: "Find orders that include products from more than one product line. Return the order number, customer number, total number of distinct product lines in the order, and total line items in the order. Sort by distinct product line count descending, then order number ascending."
+      groundtruth_sql: |
+        SELECT o.orderNumber,
+               o.customerNumber,
+               COUNT(DISTINCT p.productLine) AS distinct_product_lines,
+               COUNT(*) AS line_item_count
+        FROM orders o
+        JOIN orderdetails od
+          ON od.orderNumber = o.orderNumber
+        JOIN products p
+          ON p.productCode = od.productCode
+        GROUP BY o.orderNumber, o.customerNumber
+        HAVING COUNT(DISTINCT p.productLine) > 1
+        ORDER BY distinct_product_lines DESC, o.orderNumber ASC;
+    - id: H10
+      difficulty: hard
+      question: "Show employees whose assigned customers made payments in at least 2 distinct years. Return the employee number, first name, last name, number of distinct payment years, and total payment amount from those customers. Sort by total payment amount descending, then employee number ascending."
+      groundtruth_sql: |
+        SELECT e.employeeNumber,
+               e.firstName,
+               e.lastName,
+               COUNT(DISTINCT YEAR(p.paymentDate)) AS distinct_payment_years,
+               SUM(p.amount) AS total_payment_amount
+        FROM employees e
+        JOIN customers c
+          ON c.salesRepEmployeeNumber = e.employeeNumber
+        LEFT JOIN payments p
+          ON p.customerNumber = c.customerNumber
+        GROUP BY e.employeeNumber, e.firstName, e.lastName
+        HAVING COUNT(DISTINCT YEAR(p.paymentDate)) >= 2
+        ORDER BY total_payment_amount DESC, e.employeeNumber ASC;
+    - id: H11
+      difficulty: hard
+      question: "Within each country, number customer payment rows from the highest payment amount to the lowest. Break ties by smaller customer number first, then earlier payment date. Return the customer number, customer name, country, payment date, payment amount, and row number. Sort by country ascending, then row number ascending, then customer number ascending, then payment date ascending."
+      groundtruth_sql: |
+        SELECT c.customerNumber,
+               c.customerName,
+               c.country,
+               p.paymentDate,
+               p.amount AS payment_amount,
+               ROW_NUMBER() OVER (
+                   PARTITION BY c.country
+                   ORDER BY p.amount DESC, c.customerNumber ASC, p.paymentDate ASC
+               ) AS country_payment_row_number
+        FROM customers c
+        JOIN payments p
+          ON p.customerNumber = c.customerNumber
+        ORDER BY c.country ASC, country_payment_row_number ASC, c.customerNumber ASC, p.paymentDate ASC;
+    - id: H12
+      difficulty: hard
+      question: "Show offices that have at least one employee without any assigned customers. Return the office code, city, total employees, number of distinct assigned customers, and number of employees without assigned customers. Sort by employees without assigned customers descending, then office code ascending."
+      groundtruth_sql: |
+        SELECT o.officeCode,
+               o.city,
+               COUNT(DISTINCT e.employeeNumber) AS total_employees,
+               COUNT(DISTINCT c.customerNumber) AS assigned_customer_count,
+               COUNT(DISTINCT CASE WHEN c.customerNumber IS NULL THEN e.employeeNumber END) AS employees_without_customers
+        FROM offices o
+        JOIN employees e
+          ON e.officeCode = o.officeCode
+        LEFT JOIN customers c
+          ON c.salesRepEmployeeNumber = e.employeeNumber
+        GROUP BY o.officeCode, o.city
+        HAVING COUNT(DISTINCT CASE WHEN c.customerNumber IS NULL THEN e.employeeNumber END) >= 1
+        ORDER BY employees_without_customers DESC, o.officeCode ASC;
+    - id: H13
+      difficulty: hard
+      question: "Show employees who share an office with at least one other employee. Return the employee number, employee name, office code, and the number of other employees in the same office. Sort by coworker count descending, then employee number ascending."
+      groundtruth_sql: |
+        SELECT e.employeeNumber,
+               CONCAT(e.firstName, ' ', e.lastName) AS employee_name,
+               e.officeCode,
+               COUNT(DISTINCT coworker.employeeNumber) AS coworker_count
+        FROM employees e
+        JOIN employees coworker
+          ON coworker.officeCode = e.officeCode
+         AND coworker.employeeNumber <> e.employeeNumber
+        GROUP BY e.employeeNumber, e.firstName, e.lastName, e.officeCode
+        ORDER BY coworker_count DESC, e.employeeNumber ASC;
+    - id: H14
+      difficulty: hard
+      question: "Group ordered products by vendor and by an order-status bucket: use 'Shipped Orders' for shipped orders and 'Other Orders' for everything else. Return the vendor, status group, total quantity ordered, and total revenue. Sort by total revenue descending, then vendor ascending, then status group ascending."
+      groundtruth_sql: |
+        SELECT p.productVendor,
+               CASE
+                   WHEN o.status = 'Shipped' THEN 'Shipped Orders'
+                   ELSE 'Other Orders'
+               END AS status_group,
+               SUM(od.quantityOrdered) AS total_quantity_ordered,
+               SUM(od.quantityOrdered * od.priceEach) AS total_revenue
+        FROM products p
+        JOIN orderdetails od
+          ON od.productCode = p.productCode
+        JOIN orders o
+          ON o.orderNumber = od.orderNumber
+        GROUP BY p.productVendor,
+                 CASE
+                     WHEN o.status = 'Shipped' THEN 'Shipped Orders'
+                     ELSE 'Other Orders'
+                 END
+        ORDER BY total_revenue DESC, p.productVendor ASC, status_group ASC;
+    - id: H15
+      difficulty: hard
+      question: "Inside each customer country, rank customers by total payment amount from highest to lowest. Return the country, customer number, customer name, total payment amount, and dense rank. Sort by country ascending, then rank ascending, then customer number ascending."
+      groundtruth_sql: |
+        SELECT c.country,
+               c.customerNumber,
+               c.customerName,
+               SUM(p.amount) AS total_payment_amount,
+               DENSE_RANK() OVER (
+                   PARTITION BY c.country
+                   ORDER BY SUM(p.amount) DESC
+               ) AS payment_rank
+        FROM customers c
+        JOIN payments p
+          ON p.customerNumber = c.customerNumber
+        GROUP BY c.country, c.customerNumber, c.customerName
+        ORDER BY c.country ASC, payment_rank ASC, c.customerNumber ASC;
+    - id: H16
+      difficulty: hard
+      question: "Show managers who supervise at least one employee. Return the manager number, manager name, office city, total direct reports, and number of distinct job titles among those direct reports. Sort by total direct reports descending, then manager number ascending."
+      groundtruth_sql: |
+        SELECT m.employeeNumber AS manager_number,
+               CONCAT(m.firstName, ' ', m.lastName) AS manager_name,
+               o.city AS office_city,
+               COUNT(e.employeeNumber) AS total_direct_reports,
+               COUNT(DISTINCT e.jobTitle) AS distinct_report_job_titles
+        FROM employees m
+        JOIN employees e
+          ON e.reportsTo = m.employeeNumber
+        JOIN offices o
+          ON o.officeCode = m.officeCode
+        GROUP BY m.employeeNumber, m.firstName, m.lastName, o.city
+        ORDER BY total_direct_reports DESC, manager_number ASC;
+    - id: H17
+      difficulty: hard
+      question: "Show employees whose assigned customers have placed orders with comments filled in. Return the employee number, first name, last name, latest commented order date, and average comment length. Keep only employees whose average comment length is above 20. Sort by latest commented order date descending, then employee number ascending."
+      groundtruth_sql: |
+        SELECT e.employeeNumber,
+               e.firstName,
+               e.lastName,
+               MAX(o.orderDate) AS latest_commented_order_date,
+               AVG(CHAR_LENGTH(o.comments)) AS average_comment_length
+        FROM employees e
+        JOIN customers c
+          ON c.salesRepEmployeeNumber = e.employeeNumber
+        JOIN orders o
+          ON o.customerNumber = c.customerNumber
+        WHERE o.comments IS NOT NULL
+          AND o.comments <> ''
+        GROUP BY e.employeeNumber, e.firstName, e.lastName
+        HAVING AVG(CHAR_LENGTH(o.comments)) > 20
+        ORDER BY latest_commented_order_date DESC, e.employeeNumber ASC;
+    - id: H18
+      difficulty: hard
+      question: "For customers who have placed orders, return the customer number, customer name, the most recent order date, and the total ordered revenue from orders placed on that same date. Sort by most recent order date descending, then customer number ascending."
+      groundtruth_sql: |
+        SELECT c.customerNumber,
+               c.customerName,
+               lo.latest_order_date,
+               SUM(od.quantityOrdered * od.priceEach) AS latest_order_date_revenue
+        FROM customers c
+        JOIN (
+            SELECT o2.customerNumber,
+                   MAX(o2.orderDate) AS latest_order_date
+            FROM orders o2
+            JOIN orderdetails od2
+              ON od2.orderNumber = o2.orderNumber
+            GROUP BY o2.customerNumber
+        ) lo
+          ON lo.customerNumber = c.customerNumber
+        JOIN orders o
+          ON o.customerNumber = c.customerNumber
+         AND o.orderDate = lo.latest_order_date
+        JOIN orderdetails od
+          ON od.orderNumber = o.orderNumber
+        GROUP BY c.customerNumber, c.customerName, lo.latest_order_date
+        ORDER BY lo.latest_order_date DESC, c.customerNumber ASC;
+    - id: H19
+      difficulty: hard
+      question: "Show every employee, including employees who do not manage any customers and customers who have never placed any orders, along with the customer number, order date, and order number for the most recent order placed by any of their customers. If multiple orders share that same most recent date, pick the larger order number. Sort by order date descending, then employee number ascending."
+      groundtruth_sql: |
+        SELECT t.employeeNumber,
+               t.employee_name,
+               t.customerNumber,
+               t.orderDate,
+               t.orderNumber
+        FROM (
+            SELECT e.employeeNumber,
+                   CONCAT(e.firstName, ' ', e.lastName) AS employee_name,
+                   c.customerNumber,
+                   o.orderDate,
+                   o.orderNumber,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY e.employeeNumber
+                       ORDER BY o.orderDate DESC, o.orderNumber DESC, c.customerNumber ASC
+                   ) AS rn
+            FROM employees e
+            LEFT JOIN customers c
+              ON c.salesRepEmployeeNumber = e.employeeNumber
+            LEFT JOIN orders o
+              ON o.customerNumber = c.customerNumber
+        ) t
+        WHERE t.rn = 1
+        ORDER BY t.orderDate DESC, t.employeeNumber ASC;
+    - id: H20
+      difficulty: hard
+      question: "For each office, return the office code, city, number of assigned customers, and number of distinct customer countries represented. Keep only offices with assigned customers from at least 2 distinct countries. Sort by distinct customer country count descending, then office code ascending."
+      groundtruth_sql: |
+        SELECT o.officeCode,
+               o.city,
+               COUNT(DISTINCT c.customerNumber) AS assigned_customer_count,
+               COUNT(DISTINCT c.country) AS distinct_customer_countries
+        FROM offices o
+        JOIN employees e
+          ON e.officeCode = o.officeCode
+        LEFT JOIN customers c
+          ON c.salesRepEmployeeNumber = e.employeeNumber
+        GROUP BY o.officeCode, o.city
+        HAVING COUNT(DISTINCT c.country) >= 2
+        ORDER BY distinct_customer_countries DESC, o.officeCode ASC;

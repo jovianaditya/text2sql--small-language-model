@@ -17350,21 +17350,6 @@ def _winner_row_final_sanity(sql: str, question: str) -> str:
 
     out_sql = outer.sql(dialect="mysql")
 
-    # sqlglot's MySQL serializer expands ascending ORDER BY on plain columns into:
-    #   CASE WHEN alias.col IS NULL THEN 1 ELSE 0 END, alias.col ASC
-    # For this winner-row rewrite, those wrappers are only serializer noise on the
-    # synthetic ranked aliases we just created. Collapse them back to the direct
-    # column ORDER BY form so the final SQL stays readable.
-    ordered_aliases = list(dict.fromkeys([partition_alias] + rank_aliases))
-    for rel_alias in ("c", "t"):
-        for alias in ordered_aliases:
-            pat = re.compile(
-                rf"CASE\s+WHEN\s+{re.escape(rel_alias)}\.`?{re.escape(alias)}`?\s+IS\s+NULL\s+THEN\s+1\s+ELSE\s+0\s+END\s*,\s*"
-                rf"{re.escape(rel_alias)}\.`?{re.escape(alias)}`?\s+ASC",
-                flags=re.IGNORECASE,
-            )
-            out_sql = pat.sub(f"{rel_alias}.{alias} ASC", out_sql)
-
     return out_sql
 
 
@@ -51654,14 +51639,15 @@ def _question_requests_ordering(question: str) -> bool:
 
 def _enforce_window_sequence_direction(sql: str, question: str) -> str:
     """
-    Fix LAG/LEAD window ORDER BY direction for sequence-style questions.
+    Fix LAG/LEAD window semantics for sequence-style questions.
 
     For natural questions like:
       "previous payment amount ... ordered by payment date"
-    the sequence should be chronological ascending unless the question
-    explicitly says descending.
+    the sequence should use LAG for previous/prior and LEAD for
+    next/following, and should be chronological ascending unless the
+    question explicitly says descending.
 
-    Only rewrites ORDER BY inside LAG/LEAD OVER(...), never top-level ORDER BY.
+    Only rewrites LAG/LEAD OVER(...), never the top-level ORDER BY.
     """
     s = (sql or "").strip()
     q = (question or "").lower()
@@ -51669,6 +51655,13 @@ def _enforce_window_sequence_direction(sql: str, question: str) -> str:
         return sql
     if not re.search(r"\b(?:previous|prior|next|following)\b", q, flags=re.I):
         return sql
+    wants_previous = bool(re.search(r"\b(?:previous|prior)\b", q, flags=re.I))
+    wants_next = bool(re.search(r"\b(?:next|following)\b", q, flags=re.I))
+    desired_fn = ""
+    if wants_previous and not wants_next:
+        desired_fn = "LAG"
+    elif wants_next and not wants_previous:
+        desired_fn = "LEAD"
     sequence_cue = re.search(
         r"\bordered\s+by\b|\bbased\s+on\b[^.]{0,80}\border\b|\b(?:date|time|timestamp)[-\s]+order\b",
         q,
@@ -51701,7 +51694,7 @@ def _enforce_window_sequence_direction(sql: str, question: str) -> str:
 
     laglead_pat = re.compile(
         r"""
-        (?P<prefix>\b(?:LAG|LEAD)\s*\([^)]*\)\s+OVER\s*\()
+        (?P<prefix>\b(?P<fn>LAG|LEAD)\s*\([^)]*\)\s+OVER\s*\()
         (?P<body>[^)]*?)
         (?P<suffix>\))
         """,
@@ -51729,11 +51722,16 @@ def _enforce_window_sequence_direction(sql: str, question: str) -> str:
 
     def _repl(m: re.Match) -> str:
         nonlocal changed
+        prefix = m.group("prefix") or ""
+        current_fn = str(m.group("fn") or "").upper()
+        if desired_fn and current_fn != desired_fn:
+            prefix = re.sub(r"(?is)\b(?:LAG|LEAD)\b", desired_fn, prefix, count=1)
+            changed = True
         body = m.group("body") or ""
         new_body = _rewrite_body(body)
         if new_body != body:
             changed = True
-        return f"{m.group('prefix')}{new_body}{m.group('suffix')}"
+        return f"{prefix}{new_body}{m.group('suffix')}"
 
     out = laglead_pat.sub(_repl, s)
     return out if changed else sql
@@ -54964,6 +54962,79 @@ def _repair_explicit_weekday_filter_from_question(sql: str, question: str) -> st
     if suffix and not suffix[:1].isspace():
         suffix = " " + suffix
     return sql[:m_where.start("body")] + rebuilt_where + suffix
+
+
+def _repair_explicit_weekday_number_grouping_from_question(sql: str, question: str) -> str:
+    """
+    Conservative repair for grouped weekday-number questions.
+
+    If the question explicitly asks for weekday numbers (or lists weekday 1..7)
+    but the SQL groups by weekday names via DATE_FORMAT(..., '%W'), rewrite that
+    grouping to DAYOFWEEK(...) and add ascending weekday ordering when missing.
+    """
+    if not sql or not question:
+        return sql
+    if has_join(sql):
+        return sql
+
+    q = str(question or "").strip().lower()
+    asks_weekday_number = bool(
+        re.search(r"\b(?:weekday\s+number|day\s+of\s+week\s+number)\b", q, flags=re.I)
+        or re.search(r"\bweekday\s+1\s+(?:through|to)\s+weekday\s+7\b", q, flags=re.I)
+        or re.search(r"\bfrom\s+weekday\s+1\s+(?:through|to)\s+weekday\s+7\b", q, flags=re.I)
+    )
+    if not asks_weekday_number:
+        return sql
+
+    weekday_name_expr = re.compile(
+        r"DATE_FORMAT\s*\(\s*"
+        r"(?P<expr>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))?)"
+        r"\s*,\s*'(?P<fmt>%W|%a)'\s*\)",
+        flags=re.I,
+    )
+    first_match = weekday_name_expr.search(sql)
+    if not first_match:
+        return sql
+
+    weekday_expr = re.sub(r"\s*\.\s*", ".", str(first_match.group("expr") or "").strip())
+    if not weekday_expr:
+        return sql
+
+    def _weekday_grouping_rewrite(match: re.Match) -> str:
+        normalized_expr = re.sub(r"\s*\.\s*", ".", str(match.group("expr") or "").strip())
+        return f"DAYOFWEEK({normalized_expr})"
+
+    rebuilt_sql = weekday_name_expr.sub(_weekday_grouping_rewrite, sql)
+
+    order_match = re.search(
+        r"(?is)\bORDER\s+BY\b\s+(?P<body>.*?)(?=\bLIMIT\b|;|$)",
+        rebuilt_sql,
+    )
+    preferred_order_expr = f"DAYOFWEEK({weekday_expr})"
+
+    if order_match:
+        order_body = str(order_match.group("body") or "").strip()
+        if re.search(
+            rf"\b(?:weekday_number|weekday|dayofweek\s*\(\s*{re.escape(weekday_expr)}\s*\))\b",
+            order_body,
+            flags=re.I,
+        ):
+            new_order_body = re.sub(
+                rf"(?is)\b(DAYOFWEEK\s*\(\s*{re.escape(weekday_expr)}\s*\)|weekday_number|weekday)\b(?:\s+(?:ASC|DESC))?",
+                rf"{preferred_order_expr} ASC",
+                order_body,
+                count=1,
+            )
+            return rebuilt_sql[:order_match.start("body")] + new_order_body + rebuilt_sql[order_match.end("body"):]
+        return rebuilt_sql
+
+    alias_match = re.search(
+        r"(?is)\bSELECT\b\s*DAYOFWEEK\(\s*" + re.escape(weekday_expr) + r"\s*\)\s+AS\s+`?([A-Za-z_][A-Za-z0-9_]*)`?",
+        rebuilt_sql,
+    )
+    order_key = str(alias_match.group(1) or "").strip() if alias_match else preferred_order_expr
+    trimmed_sql = rebuilt_sql.rstrip().rstrip(";")
+    return f"{trimmed_sql} ORDER BY {order_key} ASC;"
 
 
 def _repair_enum_process_proxy_filter_from_question(sql: str, question: str) -> str:

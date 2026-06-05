@@ -6,7 +6,6 @@ Examples:
   python -m t2sql.intent_ir_benchmark extract --difficulty easy --log evaluation_easy_p1.log
   python -m t2sql.intent_ir_benchmark compare --difficulty medium --log evaluation_medium_p1.log
   python -m t2sql.intent_ir_benchmark gold --difficulty easy
-  python -m t2sql.intent_ir_benchmark compare --easytest --log /home/home/thesis/test_easy_p1.log
 """
 
 from __future__ import annotations
@@ -28,7 +27,6 @@ from .schema_analyzer import get_all_tables, get_id_column
 
 DEFAULT_LOG_BY_DIFFICULTY = {
     "easy": "evaluation_easy_p1.log",
-    "easytest": "test_easy_p1.log",
     "easyshadow": "evaluation_shadow_easy_p1.log",
     "medium": "evaluation_medium_p1.log",
     "mediumshadow": "evaluation_shadow_medium_p1.log",
@@ -37,13 +35,12 @@ DEFAULT_LOG_BY_DIFFICULTY = {
 
 QUESTION_PREFIX_BY_DIFFICULTY = {
     "easy": "E",
-    "easytest": "E",
     "easyshadow": "SE",
     "medium": "M",
     "mediumshadow": "SM",
     "hard": "H",
 }
-EASY_LIKE_DIFFICULTIES = {"easy", "easytest", "easyshadow"}
+EASY_LIKE_DIFFICULTIES = {"easy", "easyshadow"}
 NO_GUIDANCE_DIFFICULTIES = EASY_LIKE_DIFFICULTIES.union({"medium", "mediumshadow"})
 
 CASE_HEADER_RE = re.compile(r"^\[(?P<qid>[A-Z]+?\d+)\]\s.*$")
@@ -64,13 +61,16 @@ COUNT_METRIC_RE = re.compile(
 COUNT_EXPR_RE = re.compile(
     r"""(?is)COUNT\s*\(\s*(?P<inner>`?[A-Za-z_][A-Za-z0-9_]*`?(?:\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?)?)\s*\)"""
 )
+QUALIFIED_IDENTIFIER_RE = re.compile(
+    r"""(?P<table>`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\.\s*(?P<column>`?[A-Za-z_][A-Za-z0-9_]*`?)"""
+)
 TABLE_ORDER_GUIDANCE_RE = re.compile(
     r"^\[PROMPT DEBUG\] Adding hint: (?P<guidance>TABLE ORDER GUIDANCE: .*?)\.\s+Use\b"
 )
 RUN_END_RE = re.compile(r"^RUN END:\s*(?P<value>.+?)\s*$")
 NUMBER_RE = re.compile(r"\d+")
 COMPACT_DIFFICULTY_FLAG_RE = re.compile(
-    r"^(--(?P<difficulty>easyshadow|easytest|easy|mediumshadow|medium|hard))(?P<suffix>\d.*)$"
+    r"^(--(?P<difficulty>easyshadow|easy|mediumshadow|medium|hard))(?P<suffix>\d.*)$"
 )
 JAKARTA_TZ = timezone(timedelta(hours=7), name="UTC+07:00")
 
@@ -146,38 +146,6 @@ _EMBEDDED_GOLD_BLOB = (
     "bVnzsWkzGfilz9Gn4NpWMrom+DVSqMVm7WhBI2UNA4vo+HfYf+QfLFyINM6hhiKfYeOYssXHenqRPvzff/9/5kaalhCDAAA="
 )
 
-_EMBEDDED_EASYTEST_GOLD_BLOB = (
-    "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"
-)
-
 _EMBEDDED_EASYSHADOW_GOLD_BLOB = (
     "H4sIABM9IWoC/82X3W/bOAzA/xUiL12BnJe0Tb+Aewj6AQxYs93SPRy2IVBtttbVllxJXs4Y+r8fZdmJ5Y9de7gA60NqU6JE8ieS"
     "8o8RMl3omEVyPTr/MVpeTe2/pxy14VKsEi5wdD76QvJv8MbO3YdlLNcQ5trIFJWGdSw1QiiFYaGBe660AcFSBBQRjXITg4kREjQG"
@@ -211,7 +179,6 @@ _EMBEDDED_MEDIUMSHADOW_GOLD_BLOB = (
     "GeqdvDU6KCl4Jx2tqRDCmfQ9a7lc/gFWR2no5QkAAA=="
 )
 
-
 def _numeric_qid_key(qid: str) -> tuple[str, int]:
     match = NUMBER_RE.search(qid)
     prefix = re.match(r"^[A-Z]+", qid or "")
@@ -242,7 +209,22 @@ def _normalize_metric_item(item: str) -> str:
     text = str(item or "").strip()
     if not text:
         return text
-    return _normalize_count_pk_equivalence(text)
+    return _normalize_identifier_case(_normalize_count_pk_equivalence(text))
+
+
+def _normalize_identifier_case(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return raw
+
+    def repl(match: re.Match[str]) -> str:
+        table = str(match.group("table") or "").replace("`", "").strip().lower()
+        column = str(match.group("column") or "").replace("`", "").strip().lower()
+        if not table or not column:
+            return match.group(0)
+        return f"{table}.{column}"
+
+    return QUALIFIED_IDENTIFIER_RE.sub(repl, raw)
 
 
 def _normalize_count_pk_equivalence(text: str) -> str:
@@ -273,7 +255,7 @@ def _normalize_count_pk_equivalence(text: str) -> str:
 def _normalize_order_insensitive_summary_lines(summary: str) -> str:
     normalized_lines: list[str] = []
     for raw_line in _normalize_summary(summary).splitlines():
-        raw_line = _normalize_count_pk_equivalence(raw_line)
+        raw_line = _normalize_identifier_case(_normalize_count_pk_equivalence(raw_line))
         match = SUMMARY_ORDER_INSENSITIVE_LIST_RE.match(raw_line)
         if not match:
             normalized_lines.append(raw_line)
@@ -331,7 +313,6 @@ def _load_embedded_gold_blob(blob: str) -> Dict[str, Dict[str, Dict[str, str]]]:
 
 def _load_embedded_gold() -> Dict[str, Dict[str, Dict[str, str]]]:
     payload = _load_embedded_gold_blob(_EMBEDDED_GOLD_BLOB)
-    payload.update(_load_embedded_gold_blob(_EMBEDDED_EASYTEST_GOLD_BLOB))
     payload.update(_load_embedded_gold_blob(_EMBEDDED_EASYSHADOW_GOLD_BLOB))
     payload.update(_load_embedded_gold_blob(_EMBEDDED_MEDIUMSHADOW_GOLD_BLOB))
     return payload
@@ -731,12 +712,6 @@ def build_parser() -> argparse.ArgumentParser:
             help="Only use easy questions. Optionally specify ID/range: --easy 4, --easy 4-7, --easy 1,3,5",
         )
         subparser.add_argument(
-            "--easytest",
-            nargs="?",
-            const="",
-            help="Only use embedded test easy questions. Optionally specify ID/range: --easytest 4, --easytest 4-7, --easytest 1,3,5",
-        )
-        subparser.add_argument(
             "--easyshadow",
             nargs="?",
             const="",
@@ -777,7 +752,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def resolve_requested_difficulty(args: argparse.Namespace) -> tuple[str, set[int] | None]:
     selections = []
-    for difficulty_name in ("easy", "easytest", "easyshadow", "medium", "mediumshadow", "hard"):
+    for difficulty_name in ("easy", "easyshadow", "medium", "mediumshadow", "hard"):
         arg_value = getattr(args, difficulty_name)
         if arg_value is not None:
             selections.append((difficulty_name, parse_difficulty_filter(arg_value)))
@@ -787,7 +762,7 @@ def resolve_requested_difficulty(args: argparse.Namespace) -> tuple[str, set[int
 
     if not selections:
         raise ValueError(
-            "Choose one difficulty selector: --easy, --easytest, --easyshadow, --medium, --mediumshadow, --hard, or --difficulty."
+            "Choose one difficulty selector: --easy, --easyshadow, --medium, --mediumshadow, --hard, or --difficulty."
         )
 
     unique_difficulties = {difficulty for difficulty, _ in selections}

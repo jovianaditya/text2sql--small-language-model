@@ -1,7 +1,7 @@
 cases:
     - id: E1
       difficulty: easy
-      question: "Show customers whose contact last name starts with G. Return the customer name, contact first name, and contact last name."
+      question: "List customers whose contact last name starts with G. Return the customer name, contact first name, and contact last name."
       groundtruth_sql: |
         SELECT customerName, contactFirstName, contactLastName
         FROM customers
@@ -16,7 +16,7 @@ cases:
         ORDER BY creditLimit DESC;
     - id: E3
       difficulty: easy
-      question: "Show customers in Norway or Sweden. Return the customer name, city, country, postal code, and phone."
+      question: "List customers in Norway or Sweden. Return the customer name, city, country, postal code, and phone."
       groundtruth_sql: |
         SELECT customerName, city, country, postalCode, phone
         FROM customers
@@ -32,7 +32,7 @@ cases:
         ORDER BY country ASC, customerNumber ASC;
     - id: E5
       difficulty: easy
-      question: "Find products where the quantity in stock is greater than 5000. Return the product code, product name, quantity in stock, and product vendor, sorted by quantity in stock descending."
+      question: "Show products where the quantity in stock is greater than 5000. Return the product code, product name, quantity in stock, and product vendor, sorted by quantity in stock descending."
       groundtruth_sql: |
         SELECT productCode, productName, quantityInStock, productVendor
         FROM products
@@ -40,7 +40,7 @@ cases:
         ORDER BY quantityInStock DESC;
     - id: E6
       difficulty: easy
-      question: "Show products whose product scale is 1:18. Return the product code, product name, product scale, and product line, sorted by product name ascending."
+      question: "List products whose product scale is 1:18. Return the product code, product name, product scale, and product line, sorted by product name ascending."
       groundtruth_sql: |
         SELECT productCode, productName, productScale, productLine
         FROM products
@@ -48,14 +48,14 @@ cases:
         ORDER BY productName ASC;
     - id: E7
       difficulty: easy
-      question: "Show products with a listed price between 80 and 120, inclusive. Return the product code, product name, buy price, and listed price."
+      question: "Find products with a listed price between 80 and 120, inclusive. Return the product code, product name, buy price, and listed price."
       groundtruth_sql: |
         SELECT productCode, productName, buyPrice, MSRP
         FROM products
         WHERE MSRP BETWEEN 80 AND 120;
     - id: E8
       difficulty: easy
-      question: "Show employees who do not report to anyone. Return the employee number, last name, job title, and office code, sorted by employee number ascending."
+      question: "List employees who do not report to anyone. Return the employee number, last name, job title, and office code, sorted by employee number ascending."
       groundtruth_sql: |
         SELECT employeeNumber, lastName, jobTitle, officeCode
         FROM employees
@@ -63,7 +63,7 @@ cases:
         ORDER BY employeeNumber ASC;
     - id: E9
       difficulty: easy
-      question: "Find employees working in office 4 whose last name starts with M. Return the first name, last name, email, and office code, sorted by last name ascending."
+      question: "Look for employees working in office 4 whose last name starts with M. Return the first name, last name, email, and office code, sorted by last name ascending."
       groundtruth_sql: |
         SELECT firstName, lastName, email, officeCode
         FROM employees
@@ -79,7 +79,7 @@ cases:
         ORDER BY employeeNumber ASC;
     - id: E11
       difficulty: easy
-      question: "Find employees whose first name has exactly 4 letters and who report to a manager. Return the employee number, first name, last name, and manager employee number, sorted by employee number ascending."
+      question: "Show employees whose first name has exactly 4 letters and who report to a manager. Return the employee number, first name, last name, and manager employee number, sorted by employee number ascending."
       groundtruth_sql: |
         SELECT employeeNumber, firstName, lastName, reportsTo
         FROM employees
@@ -87,7 +87,7 @@ cases:
         ORDER BY employeeNumber ASC;
     - id: E12
       difficulty: easy
-      question: "Show distinct territories for offices in the USA or Japan. Return the territory, sorted by territory ascending."
+      question: "Return the distinct territories for offices in the USA or Japan, sorted by territory ascending."
       groundtruth_sql: |
         SELECT DISTINCT territory
         FROM offices
@@ -95,7 +95,7 @@ cases:
         ORDER BY territory ASC;
     - id: E13
       difficulty: easy
-      question: "Find offices that do not have a second address line listed. Return the office code, address line 1, address line 2, and state."
+      question: "List offices that do not have a second address line listed. Return the office code, address line 1, address line 2, and state."
       groundtruth_sql: |
         SELECT officeCode, addressLine1, addressLine2, state
         FROM offices
@@ -109,7 +109,7 @@ cases:
         WHERE phone LIKE '+1%';
     - id: E15
       difficulty: easy
-      question: "Find offices in the USA whose city contains the letter o. Return the office code, city, state, and first address line, sorted by city ascending."
+      question: "Look for offices in the USA whose city contains the letter o. Return the office code, city, state, and first address line, sorted by city ascending."
       groundtruth_sql: |
         SELECT officeCode, city, state, addressLine1
         FROM offices
@@ -117,7 +117,7 @@ cases:
         ORDER BY city ASC;
     - id: E16
       difficulty: easy
-      question: "Find order details whose order number is between 10200 and 10250. Return the order number, price per item, and order line number, sorted by order number ascending."
+      question: "Show order details whose order number is between 10200 and 10250. Return the order number, price per item, and order line number, sorted by order number ascending."
       groundtruth_sql: |
         SELECT orderNumber, priceEach, orderLineNumber
         FROM orderdetails
@@ -125,15 +125,15 @@ cases:
         ORDER BY orderNumber ASC;
     - id: E17
       difficulty: easy
-      question: "Show order details where the price per item is greater than the quantity ordered. Return the product code, quantity ordered, and price per item, sorted by order number ascending."
+      question: "Find order details where the price per item is greater than the quantity ordered. Return the order number, product code, quantity ordered, and price per item, sorted by order number descending."
       groundtruth_sql: |
-        SELECT productCode, quantityOrdered, priceEach
+        SELECT orderNumber, productCode, quantityOrdered, priceEach
         FROM orderdetails
         WHERE priceEach > quantityOrdered
-        ORDER BY orderNumber ASC;
+        ORDER BY orderNumber DESC;
     - id: E18
       difficulty: easy
-      question: "Show order details whose order line number is 1. Return the order number, quantity ordered, and order line number, sorted by order number ascending."
+      question: "List order details whose order line number is 1. Return the order number, quantity ordered, and order line number, sorted by order number ascending."
       groundtruth_sql: |
         SELECT orderNumber, quantityOrdered, orderLineNumber
         FROM orderdetails
@@ -149,7 +149,7 @@ cases:
         ORDER BY priceEach DESC;
     - id: E20
       difficulty: easy
-      question: "Find orders placed on or before 2004-06-01. Return the order number, order date, and status, sorted by order date descending."
+      question: "Show orders placed on or before 2004-06-01. Return the order number, order date, and status, sorted by order date descending."
       groundtruth_sql: |
         SELECT orderNumber, orderDate, status
         FROM orders
@@ -157,14 +157,14 @@ cases:
         ORDER BY orderDate DESC;
     - id: E21
       difficulty: easy
-      question: "Show orders whose comments contain the word Customer. Return the order number, order date, and comments."
+      question: "List orders whose comments contain the word Customer. Return the order number, order date, and comments."
       groundtruth_sql: |
         SELECT orderNumber, orderDate, comments
         FROM orders
         WHERE comments LIKE '%Customer%';
     - id: E22
       difficulty: easy
-      question: "Show orders whose status is either Cancelled or Disputed. Return the order number, status, comments, and customer number, sorted by status ascending and order number ascending."
+      question: "Find orders whose status is either Cancelled or Disputed. Return the order number, status, comments, and customer number, sorted by status ascending and order number ascending."
       groundtruth_sql: |
         SELECT orderNumber, status, comments, customerNumber
         FROM orders
@@ -172,7 +172,7 @@ cases:
         ORDER BY status ASC, orderNumber ASC;
     - id: E23
       difficulty: easy
-      question: "Find orders that do not have any comments listed. Return the order number, order date, and status, sorted by order date ascending."
+      question: "Look for orders that do not have any comments listed. Return the order number, order date, and status, sorted by order date ascending."
       groundtruth_sql: |
         SELECT orderNumber, orderDate, status
         FROM orders
@@ -180,15 +180,15 @@ cases:
         ORDER BY orderDate ASC;
     - id: E24
       difficulty: easy
-      question: "Show payments whose check number is exactly 2 uppercase letters followed by exactly 6 digits. Return the customer number, check number, and amount, sorted by check number ascending."
+      question: "Return payments whose check number starts with the letter H followed by exactly 7 digits. Include the check number, amount, and payment date, sorted by check number ascending and payment date descending."
       groundtruth_sql: |
-        SELECT customerNumber, checkNumber, amount
+        SELECT checkNumber, amount, paymentDate
         FROM payments
-        WHERE checkNumber REGEXP '^[A-Z]{2}[0-9]{6}$'
-        ORDER BY checkNumber ASC;
+        WHERE checkNumber REGEXP '^H[0-9]{7}$'
+        ORDER BY checkNumber ASC, paymentDate DESC;
     - id: E25
       difficulty: easy
-      question: "Find payments above 50000. Return the customer number, payment date, amount, and check number, sorted by amount descending."
+      question: "Show payments above 50000. Return the customer number, payment date, amount, and check number, sorted by amount descending."
       groundtruth_sql: |
         SELECT customerNumber, paymentDate, amount, checkNumber
         FROM payments
@@ -196,7 +196,7 @@ cases:
         ORDER BY amount DESC;
     - id: E26
       difficulty: easy
-      question: "Show payments made in 2003. Return the payment date and check number, sorted by payment date ascending."
+      question: "List payments made in 2003. Return the payment date and check number, sorted by payment date ascending."
       groundtruth_sql: |
         SELECT paymentDate, checkNumber
         FROM payments
@@ -220,17 +220,19 @@ cases:
         ORDER BY productLine ASC;
     - id: E29
       difficulty: easy
-      question: "Find product lines where the text description contains the word certificate. Return the product line and text description, sorted by product line ascending."
-      groundtruth_sql: |
-        SELECT productLine, textDescription
-        FROM productlines
-        WHERE textDescription LIKE '%certificate%'
-        ORDER BY productLine ASC;
-    - id: E30
-      difficulty: easy
-      question: "Find product lines where the HTML description contains the word office. Return the product line and HTML description, sorted by product line ascending."
+      question: "List product lines whose names start with Vintage. Return the product line and HTML description, sorted by product line ascending."
       groundtruth_sql: |
         SELECT productLine, htmlDescription
         FROM productlines
-        WHERE htmlDescription LIKE '%office%'
+        WHERE productLine LIKE 'Vintage%'
+        ORDER BY productLine ASC;
+    - id: E30
+      difficulty: easy
+      question: "Look for product lines where the HTML description is missing, the product line name is Classic Cars, and the text description contains the word scale. Return the product line, text description, and HTML description, sorted by product line ascending."
+      groundtruth_sql: |
+        SELECT productLine, textDescription, htmlDescription
+        FROM productlines
+        WHERE productLine = 'Classic Cars'
+          AND textDescription LIKE '%scale%'
+          AND (htmlDescription IS NULL OR htmlDescription = '')
         ORDER BY productLine ASC;
