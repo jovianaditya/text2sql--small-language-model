@@ -55446,6 +55446,7 @@ def _normalize_symbolic_presence_operators(sql: str) -> str:
 
     This stays intentionally narrow:
     - only literal IS_NULL_OR_EMPTY / IS_NOT_NULL_OR_EMPTY tokens
+    - optional function-call booleanization such as IS_NULL_OR_EMPTY(col) = 1
     - text-like columns preserve empty-string semantics
     - non-text columns collapse to plain IS NULL / IS NOT NULL
     """
@@ -55506,18 +55507,39 @@ def _normalize_symbolic_presence_operators(sql: str) -> str:
         r"(?:\s*\.\s*(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))?"
     )
 
-    def _rewrite_not_null(match: re.Match[str]) -> str:
-        expr = re.sub(r"\s*\.\s*", ".", str(match.group("expr") or "").strip())
+    def _build_not_null_expr(expr: str) -> str:
+        expr = re.sub(r"\s*\.\s*", ".", str(expr or "").strip())
         if _is_text_like(expr):
             return f"({expr} IS NOT NULL AND {expr} <> '')"
         return f"{expr} IS NOT NULL"
 
-    def _rewrite_null(match: re.Match[str]) -> str:
-        expr = re.sub(r"\s*\.\s*", ".", str(match.group("expr") or "").strip())
+    def _build_null_expr(expr: str) -> str:
+        expr = re.sub(r"\s*\.\s*", ".", str(expr or "").strip())
         if _is_text_like(expr):
             return f"({expr} IS NULL OR {expr} = '')"
         return f"{expr} IS NULL"
 
+    def _rewrite_not_null(match: re.Match[str]) -> str:
+        return _build_not_null_expr(match.group("expr"))
+
+    def _rewrite_null(match: re.Match[str]) -> str:
+        return _build_null_expr(match.group("expr"))
+
+    def _rewrite_function_call(match: re.Match[str]) -> str:
+        expr = re.sub(r"\s*\.\s*", ".", str(match.group("expr") or "").strip())
+        fn = str(match.group("fn") or "").strip().upper()
+        bool_text = str(match.group("bool") or "1").strip()
+        want_true = bool_text != "0"
+        if fn == "IS_NULL_OR_EMPTY":
+            return _build_null_expr(expr) if want_true else _build_not_null_expr(expr)
+        return _build_not_null_expr(expr) if want_true else _build_null_expr(expr)
+
+    s = re.sub(
+        rf"(?P<fn>IS_(?:NOT_)?NULL_OR_EMPTY)\s*\(\s*(?P<expr>{col_ref_pat})\s*\)\s*(?:=\s*(?P<bool>[01]))?\b",
+        _rewrite_function_call,
+        s,
+        flags=re.I,
+    )
     s = re.sub(
         rf"(?P<expr>{col_ref_pat})\s+IS_NOT_NULL_OR_EMPTY\b",
         _rewrite_not_null,
@@ -55550,6 +55572,8 @@ def _normalize_symbolic_like_operators(sql: str) -> str:
     - NOT_LIKE_PREFIX(col, 'abc')  -> col NOT LIKE 'abc%'
     - NOT_LIKE_SUFFIX(col, 'abc')  -> col NOT LIKE '%abc'
     - NOT_LIKE_CONTAINS(col, 'abc')-> col NOT LIKE '%abc%'
+    - LIKE_CONTAINS(col, 'abc') = 1 -> col LIKE '%abc%'
+    - LIKE_CONTAINS(col, 'abc') = 0 -> col NOT LIKE '%abc%'
 
     If the literal already carries wildcard intent, preserve it rather than
     re-wrapping aggressively.
@@ -55580,17 +55604,20 @@ def _normalize_symbolic_like_operators(sql: str) -> str:
         expr = re.sub(r"\s*\.\s*", ".", str(match.group("expr") or "").strip())
         mode = str(match.group("mode") or "").strip()
         literal = str(match.group("literal") or "")
-        sql_op = "NOT LIKE" if str(match.group("neg") or "").strip() else "LIKE"
+        negated = bool(str(match.group("neg") or "").strip())
+        bool_text = match.groupdict().get("bool")
+        want_true = str(bool_text or "1").strip() != "0"
+        sql_op = "NOT LIKE" if (negated ^ (not want_true)) else "LIKE"
         return f"{expr} {sql_op} '{_apply_like_shape(mode, literal)}'"
 
     s = re.sub(
-        rf"(?P<expr>{col_ref_pat})\s+(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s+'(?P<literal>(?:''|[^'])*)'",
+        rf"(?P<expr>{col_ref_pat})\s+(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s+'(?P<literal>(?:''|[^'])*)'\s*(?:=\s*(?P<bool>[01]))?\b",
         _rewrite,
         s,
         flags=re.I,
     )
     s = re.sub(
-        rf"(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s*\(\s*(?P<expr>{col_ref_pat})\s*,\s*'(?P<literal>(?:''|[^'])*)'\s*\)",
+        rf"(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s*\(\s*(?P<expr>{col_ref_pat})\s*,\s*'(?P<literal>(?:''|[^'])*)'\s*\)\s*(?:=\s*(?P<bool>[01]))?\b",
         _rewrite,
         s,
         flags=re.I,
