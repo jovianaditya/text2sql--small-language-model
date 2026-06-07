@@ -6995,6 +6995,58 @@ def _ast_normalize_cosmetic_aliases(sql: str) -> Tuple[str, Dict[str, Any]]:
     meta["handled_scope"] = True
     changed = False
 
+    relation_alias_node_types = tuple(
+        cls for cls in (
+            getattr(exp, "Table", None),
+            getattr(exp, "Subquery", None),
+        )
+        if cls is not None
+    )
+
+    alias_targets: Dict[str, str] = {}
+    for node in ast.walk():
+        if relation_alias_node_types and not isinstance(node, relation_alias_node_types):
+            continue
+        alias_expr = getattr(node, "args", {}).get("alias")
+        alias_name = str(getattr(alias_expr, "this", "") or "").strip("`")
+        if not alias_name:
+            continue
+        alias_lower = alias_name.lower()
+        if alias_lower in _RESERVED_ALIASES:
+            continue
+        alias_targets[alias_lower] = alias_lower
+
+    if alias_targets:
+        def _normalize_table_alias_case(node: "exp.Expression") -> "exp.Expression":
+            nonlocal changed
+            if relation_alias_node_types and isinstance(node, relation_alias_node_types):
+                alias_expr = getattr(node, "args", {}).get("alias")
+                alias_name = str(getattr(alias_expr, "this", "") or "").strip("`")
+                if alias_name:
+                    alias_lower = alias_name.lower()
+                    target_alias = alias_targets.get(alias_lower, "")
+                    if target_alias and alias_name != target_alias:
+                        new_node = node.copy()
+                        new_node.set("alias", exp.TableAlias(this=exp.to_identifier(target_alias)))
+                        changed = True
+                        return new_node
+
+            if isinstance(node, exp.Column):
+                table_name = str(node.table or "").strip("`")
+                if not table_name:
+                    return node
+                target_alias = alias_targets.get(table_name.lower(), "")
+                if target_alias and table_name != target_alias:
+                    new_node = node.copy()
+                    new_node.set("table", exp.to_identifier(target_alias))
+                    changed = True
+                    return new_node
+            return node
+
+        ast = ast.transform(_normalize_table_alias_case)
+        if changed and "normalize_table_alias_case_ast" not in meta["fixes"]:
+            meta["fixes"].append("normalize_table_alias_case_ast")
+
     def _drop_same_name_alias(node: "exp.Expression") -> "exp.Expression":
         nonlocal changed
         if isinstance(node, exp.Alias) and isinstance(node.this, exp.Column):

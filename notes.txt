@@ -62,10 +62,15 @@ cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchm
 cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --easyshadow --log /home/home/thesis/evaluation_shadow_easy_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_easyshadow.log
 cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --mediumshadow --log /home/home/thesis/evaluation_shadow_medium_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_mediumshadow.log
 
+# TESTING P1 (QWEN 2.5-INSTRUCT)
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/test/qa_classicmodels_test_easy.yml --output results_test_easy_p1.xlsx --easy --warmup-models small" 2>&1 | tee test_easy_p1.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/test/qa_classicmodels_test_medium.yml --output results_test_medium_p1.xlsx --medium --warmup-models small" 2>&1 | tee test_medium_p1.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/test/qa_classicmodels_test_hard.yml --output results_test_hard_p1.xlsx --hard --warmup-models small" 2>&1 | tee test_hard_p1.log
 
+# TESTING P2 (QWEN 2.5-CODER)
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/test/qa_classicmodels_test_easy.yml --output results_test_easy_p2.xlsx --easy --warmup-models small" 2>&1 | tee test_easy_p2.log
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/test/qa_classicmodels_test_medium.yml --output results_test_medium_p2.xlsx --medium --warmup-models small" 2>&1 | tee test_medium_p2.log
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/test/qa_classicmodels_test_hard.yml --output results_test_hard_p2.xlsx --hard --warmup-models small" 2>&1 | tee test_hard_p2.log
 
 # tmux
 # new session
