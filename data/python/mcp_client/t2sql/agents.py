@@ -245,6 +245,22 @@ def _log_confidence_result(confidence_result: dict) -> None:
         _dbg_print_two("[REFINER - CONFIDENCE]", detail)
 
 
+def _model_lane_label(model_name: str) -> str:
+    """Return a stable small/large lane label for the active runtime models."""
+    model_raw = str(model_name or "").strip()
+    if model_raw == str(LARGE_MODEL or "").strip():
+        return "large"
+    if model_raw == str(SMALL_MODEL or "").strip():
+        return "small"
+    return "other"
+
+
+def _model_log_label(model_name: str) -> str:
+    """Return a human-readable log label with lane and exact model name."""
+    model_raw = str(model_name or "").strip() or "unknown"
+    return f"{_model_lane_label(model_raw)} ({model_raw})"
+
+
 def _build_confidence_retry_instruction(confidence_result: dict) -> str:
     """Build LLM instruction with confidence feedback for retry."""
     warnings = confidence_result.get("warnings", [])
@@ -288,12 +304,15 @@ def _attempt_confidence_retry(
     decision: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """
-    Attempt one retry with 7B model when confidence is below threshold.
+    Attempt one retry with the large-model lane when confidence is below threshold.
     Returns dict with: used, sql, confidence, accepted
     """
     from .generation import regenerate_with_extra_constraint
     
-    _dbg_print_two("[REFINER - CONFIDENCE]", "Attempting retry with 7B...")
+    _dbg_print_two(
+        "[REFINER - CONFIDENCE]",
+        f"Attempting retry with {_model_log_label(LARGE_MODEL)}..."
+    )
     
     instruction = _build_confidence_retry_instruction(confidence_result)
     llm_7b = build_llm_repair(model=LARGE_MODEL)
@@ -8390,7 +8409,10 @@ def _attempt_last_chance_rescue_7b(
 
     result["used"] = True
     llm_rescue = build_llm_repair(model=LARGE_MODEL)
-    _dbg_print_two("[REFINER] Last-chance rescue", "Regenerating with 7B")
+    _dbg_print_two(
+        "[REFINER] Last-chance rescue",
+        f"Regenerating with {_model_log_label(LARGE_MODEL)}"
+    )
 
     rescue_instruction = _build_gate_retry_instruction(
         "LAST-CHANCE RESCUE: Rewrite SQL to satisfy deterministic acceptance gate. Return one valid MySQL SELECT only.",
@@ -13003,8 +13025,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
         def _regen_once(model_name: str, instruction: str, tag: str, strict_schema: bool = False) -> Optional[Dict[str, Any]]:
             llm_regen_local = build_llm_repair(model=model_name)
-            model_label_local = "7B" if model_name == LARGE_MODEL else "3B"
-            _dbg_print_two("[REFINER] Regenerating with", f"{model_label_local} ({tag})")
+            model_label_local = _model_log_label(model_name)
+            _dbg_print_two("[REFINER] Regenerating with", f"{model_label_local} [{tag}]")
 
             packed_instruction = _regen_constraint_pack(instruction, strict_schema=strict_schema)
             new_sql_local, _ = regenerate_with_extra_constraint(
@@ -13227,7 +13249,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
         if attempts:
             regeneration_attempts_summary = [
-                f"{'7B' if str(a.get('model') or '') == LARGE_MODEL else '3B'}:"
+                f"{_model_lane_label(str(a.get('model') or ''))}:"
                 f"{str(a.get('tag') or 'unknown')}:{'pass' if bool(a.get('gate_accepted', False)) else 'fail'}"
                 for a in attempts
             ]
@@ -13250,7 +13272,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
             final_sql = str(best.get("sql") or final_sql)
             final_model = str(best.get("model") or final_model)
-            best_label = "7B" if final_model == LARGE_MODEL else "3B"
+            best_label = _model_log_label(final_model)
             corrections.append(f"Regenerated ({best_label}) [{best.get('tag')}]")
 
             if best.get("gate_reasons"):
@@ -13332,7 +13354,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             final_gate = rescue.get("gate") or final_gate
             if rescue.get("accepted", False):
                 final_model = LARGE_MODEL
-                corrections.append("Last-chance rescue succeeded (7B)")
+                corrections.append(f"Last-chance rescue succeeded ({_model_log_label(LARGE_MODEL)})")
             else:
                 corrections.append(
                     f"Last-chance rescue failed: {rescue.get('error')} | reasons={final_gate.get('reasons')}"
@@ -13397,7 +13419,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             final_gate_pass = bool(retry_result.get("gate_pass", final_gate_pass))
             final_gate_reasons = list(retry_result.get("gate_reasons") or final_gate_reasons)
             final_gate_reason_tags = list(retry_result.get("gate_reason_tags") or _categorize_gate_reasons(final_gate_reasons))
-            corrections.append("Confidence retry succeeded (7B)")
+            corrections.append(f"Confidence retry succeeded ({_model_log_label(LARGE_MODEL)})")
             final_model = LARGE_MODEL
         else:
             retry_reason = str(retry_result.get("reason") or "not_accepted").strip()
