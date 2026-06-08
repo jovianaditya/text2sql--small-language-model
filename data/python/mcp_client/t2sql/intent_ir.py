@@ -397,6 +397,41 @@ def _load_allowed_or_schema(ctx: str) -> Dict[str, Set[str]]:
     return out
 
 
+def _ordered_allowed_tables(allowed: Dict[str, Set[str]]) -> List[Tuple[str, Set[str]]]:
+    return [
+        (table, allowed[table])
+        for table in sorted(
+            (
+                str(table or "").strip().lower()
+                for table in (allowed or {}).keys()
+                if str(table or "").strip()
+            ),
+            key=lambda table: table,
+        )
+    ]
+
+
+def _ordered_allowed_columns(table: str, allowed: Dict[str, Set[str]]) -> List[str]:
+    table_l = str(table or "").strip().lower()
+    return sorted(
+        (
+            str(col or "").strip()
+            for col in (allowed.get(table_l, set()) or set())
+            if str(col or "").strip()
+        ),
+        key=lambda col: (len(col), col.lower()),
+    )
+
+
+def _ordered_variants(values: Iterable[str]) -> Tuple[str, ...]:
+    cleaned = {
+        str(value or "").strip()
+        for value in (values or [])
+        if str(value or "").strip()
+    }
+    return tuple(sorted(cleaned, key=lambda value: (-len(value), value.lower(), value)))
+
+
 def _camel_to_words(s: str) -> str:
     x = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s or "")
     x = x.replace("_", " ")
@@ -499,10 +534,10 @@ def _singularize_last_token(phrase: str) -> str:
     return " ".join(tokens)
 
 
-def _table_variants(table: str) -> Set[str]:
+def _table_variants(table: str) -> Tuple[str, ...]:
     t = (table or "").strip().lower()
     if not t:
-        return set()
+        return tuple()
     out = {t, t.replace("_", " ")}
 
     singular = _safe_get_singular_form(t) or t
@@ -534,14 +569,14 @@ def _table_variants(table: str) -> Set[str]:
         if s:
             out.add(s)
             out.add(s.replace("_", " "))
-    return {x for x in out if x}
+    return _ordered_variants(x for x in out if x)
 
 
-def _column_reference_variants(table: str, column: str) -> Set[str]:
+def _column_reference_variants(table: str, column: str) -> Tuple[str, ...]:
     t = (table or "").strip().lower()
     c = str(column or "").strip()
     if not c:
-        return set()
+        return tuple()
 
     c_low = c.lower()
     original_c = c
@@ -590,14 +625,14 @@ def _column_reference_variants(table: str, column: str) -> Set[str]:
         if stem:
             expanded.add(f"{stem} codes".replace("_", " "))
 
-    return {x for x in expanded if x}
+    return _ordered_variants(x for x in expanded if x)
 
 
-def _column_variants(table: str, column: str) -> Set[str]:
+def _column_variants(table: str, column: str) -> Tuple[str, ...]:
     t = (table or "").strip().lower()
     c = str(column or "").strip()
     if not c:
-        return set()
+        return tuple()
 
     out = set(_column_reference_variants(table, column))
     description = re.sub(
@@ -619,7 +654,7 @@ def _column_variants(table: str, column: str) -> Set[str]:
                 expanded.add(vv)
     if any("price each" in str(v or "").lower() or "unit price" in str(v or "").lower() for v in expanded):
         expanded.add("price per item")
-    return {x for x in expanded if x}
+    return _ordered_variants(x for x in expanded if x)
 
 
 def _phrase_pos(text: str, phrase: str) -> int:
@@ -729,7 +764,10 @@ def _augment_subject_allowed_columns_from_schema(
         if str(c or "").strip()
     }
 
-    for col in schema_cols:
+    for col in sorted(
+        (str(col or "").strip() for col in schema_cols),
+        key=lambda col: (len(col), col.lower()),
+    ):
         col_s = str(col or "").strip()
         col_l = col_s.lower()
         if not col_s or col_l in current_lowers:
@@ -1342,7 +1380,7 @@ def _pick_qualified_description_column(
         return None
     candidates = [
         str(col or "").strip()
-        for col in allowed.get(table_l, set())
+        for col in _ordered_allowed_columns(table_l, allowed)
         if str(col or "").strip() and _is_description_like_column(table_l, str(col))
     ]
     if len(candidates) < 2:
@@ -1636,7 +1674,7 @@ def _extract_projection_segments(question: str) -> List[str]:
         tail,
         maxsplit=1,
         flags=re.I,
-    )[0].strip()
+    )[0].strip(" \t\r\n,.;:!?")
     if not tail:
         return []
     if "," not in tail and not re.search(r"\band\b", tail, flags=re.I):
@@ -1743,14 +1781,14 @@ def _detect_table_mentions(question: str, tables: Sequence[str]) -> List[Tuple[s
 def _detect_column_mentions(question: str, allowed: Dict[str, Set[str]]) -> List[Tuple[str, str, int]]:
     q = (question or "").lower()
     out: List[Tuple[str, str, int]] = []
-    for table, cols in allowed.items():
+    for table, _ in _ordered_allowed_tables(allowed):
         preferred_description_col = _pick_qualified_description_column(question, table, allowed)
         table_variants = {
             re.sub(r"\s+", " ", str(v or "").strip().lower())
             for v in (_table_variants(table) or {table})
             if str(v or "").strip()
         }
-        for col in cols:
+        for col in _ordered_allowed_columns(table, allowed):
             if (
                 preferred_description_col
                 and _is_description_like_column(table, col)
@@ -1861,6 +1899,36 @@ def _best_name_column(table: str, allowed: Dict[str, Set[str]]) -> Optional[str]
             reverse=True,
         )
         return name_like[0]
+
+    def _normalized_identifier(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+    subject_keys = {
+        _normalized_identifier(table),
+        _normalized_identifier(_safe_get_singular_form(table)),
+    }
+    subject_keys.update(
+        _normalized_identifier(variant)
+        for variant in _table_variants(table)
+        if _normalized_identifier(variant)
+    )
+    subject_keys.discard("")
+
+    subject_aligned = [
+        c for c in cols
+        if _normalized_identifier(c) in subject_keys
+        or _normalized_identifier(_camel_to_words(c)) in subject_keys
+    ]
+    if subject_aligned:
+        subject_aligned.sort(
+            key=lambda c: (
+                1 if not _is_numeric_column(c, table) and not _is_date_column(c, table) else 0,
+                0 if _column_has_identifier_semantics(table, c) else 1,
+                -len(str(c or "")),
+            ),
+            reverse=True,
+        )
+        return subject_aligned[0]
     return None
 
 
@@ -2120,8 +2188,8 @@ def _detect_metrics(
 
         candidates = list(column_mentions or [])
         seen_candidates = {(t, c) for t, c, _ in candidates}
-        for t, cols in allowed.items():
-            for c in cols:
+        for t, _ in _ordered_allowed_tables(allowed):
+            for c in _ordered_allowed_columns(t, allowed):
                 if (t, c) not in seen_candidates:
                     candidates.append((t, c, 10**9))
                     seen_candidates.add((t, c))
@@ -2198,7 +2266,7 @@ def _detect_metrics(
 
         explicit_variant_hits: List[Tuple[int, int, str, str]] = []
         for t in metric_target_tables:
-            for c in allowed.get((t or "").lower(), set()):
+            for c in _ordered_allowed_columns(t, allowed):
                 if not _is_numeric_measure_column(t, c):
                     continue
                 best_variant_score = 0
@@ -2235,7 +2303,7 @@ def _detect_metrics(
         best_score = 0.0
         best_pos = 10**9
         for t in metric_target_tables:
-            for c in allowed.get((t or "").lower(), set()):
+            for c in _ordered_allowed_columns(t, allowed):
                 if not _is_numeric_measure_column(t, c):
                     continue
                 col_tokens = _column_semantic_tokens(t, c)
@@ -2520,8 +2588,8 @@ def _detect_metrics(
 
         candidates = column_mentions or []
         if not candidates:
-            for t, cols in allowed.items():
-                for c in cols:
+            for t, _ in _ordered_allowed_tables(allowed):
+                for c in _ordered_allowed_columns(t, allowed):
                     candidates.append((t, c, 10**9))
 
         best: Optional[Tuple[str, str]] = None
@@ -2635,7 +2703,7 @@ def _detect_metrics(
         for t, c, _ in column_mentions:
             if t == subject and _is_date_column(c, t):
                 return (t, c)
-        for c in allowed.get(subject, set()):
+        for c in _ordered_allowed_columns(subject, allowed):
             if _is_date_column(c, subject):
                 return (subject, c)
         return None
@@ -3028,7 +3096,7 @@ def _detect_dimensions(
                 continue
             explicit_projection_cols: List[str] = []
             explicit_variants: Dict[str, str] = {}
-            for col in allowed.get(subject, set()):
+            for col in _ordered_allowed_columns(subject, allowed):
                 for variant in _column_reference_variants(subject, col):
                     pat = re.escape(variant).replace(r"\ ", r"\s+")
                     if pat and re.search(rf"\b{pat}\b", seg, flags=re.I):
@@ -3394,7 +3462,7 @@ def _detect_filters(
             return None
         best_col = None
         best_score = 0
-        for col in allowed.get(table, set()):
+        for col in _ordered_allowed_columns(table, allowed):
             desc = str(get_column_description(table, col) or "").strip()
             if not desc or not re.search(r"\bnull\s+if\s+not\s+yet\b", desc, flags=re.I):
                 continue
@@ -3409,7 +3477,7 @@ def _detect_filters(
     def _find_best_enum_descriptor_column(table: str) -> Optional[str]:
         best_col = None
         best_score = 0
-        for col in allowed.get(table, set()):
+        for col in _ordered_allowed_columns(table, allowed):
             desc = str(get_column_description(table, col) or "").strip()
             if not desc:
                 continue
@@ -3453,7 +3521,7 @@ def _detect_filters(
     def _pick_text_target_column(anchor_pos: Optional[int] = None) -> Optional[Tuple[str, str]]:
         # Prefer explicit "check number" mention when present.
         if re.search(r"\bcheck\s+number\b", q):
-            for c in allowed.get(subject, set()):
+            for c in _ordered_allowed_columns(subject, allowed):
                 cl = c.lower()
                 if "check" in cl and "number" in cl:
                     return (subject, c)
@@ -3470,11 +3538,11 @@ def _detect_filters(
                 return (subject, explicit_name_component)
             best_exact: Optional[Tuple[str, str]] = None
             best_exact_score: Tuple[bool, bool, int, int, int] = (False, False, -1, -1, -1)
-            for t, cols in allowed.items():
+            for t, _ in _ordered_allowed_tables(allowed):
                 table_l = str(t or "").strip().lower()
                 if not table_l:
                     continue
-                for c in cols:
+                for c in _ordered_allowed_columns(t, allowed):
                     if _is_date_column(c, table_l):
                         continue
                     for variant in sorted(_column_reference_variants(table_l, c), key=len, reverse=True):
@@ -3580,7 +3648,7 @@ def _detect_filters(
             matched = None
             seg_l = str(seg or "").strip().lower()
             best_variant_len = -1
-            for column in allowed.get(subject, set()):
+            for column in _ordered_allowed_columns(subject, allowed):
                 if not _supports_categorical_text_filter(subject, column):
                     continue
                 for variant in sorted(_column_reference_variants(subject, column), key=len, reverse=True):
@@ -3774,8 +3842,8 @@ def _detect_filters(
         span_start = int(start_pos)
         span_end = int(end_pos)
         span_phrase = re.sub(r"\s+", " ", q[max(0, span_start):span_end].strip().lower())
-        for table, cols in allowed.items():
-            for column in cols:
+        for table, _ in _ordered_allowed_tables(allowed):
+            for column in _ordered_allowed_columns(table, allowed):
                 for variant in _column_reference_variants(table, column):
                     variant_l = str(variant or "").strip().lower()
                     if not variant_l:
@@ -3858,7 +3926,7 @@ def _detect_filters(
                 continue
             seen_eq_candidates.add(key)
             eq_candidates.append(key)
-        for column in allowed.get(subject, set()):
+        for column in _ordered_allowed_columns(subject, allowed):
             if not _supports_categorical_text_filter(subject, column):
                 continue
             key = (subject, column)
@@ -3876,6 +3944,28 @@ def _detect_filters(
 
         name_col = _best_name_column(subject, allowed)
         if name_col:
+            subject_variants = [
+                str(variant or "").strip()
+                for variant in _table_variants(subject)
+                if str(variant or "").strip()
+            ]
+            for subject_variant in sorted(subject_variants, key=len, reverse=True):
+                subject_pat = re.escape(subject_variant).replace(r"\ ", r"\s+")
+                subject_name_match = re.search(
+                    rf"\b(?:the\s+)?{subject_pat}\s+name\b\s+"
+                    rf"(?:(?:of|is|=|equals?|equal\s+to)\s+)"
+                    rf"""["'“”]?(?P<value>[A-Za-z0-9][A-Za-z0-9/&:._'/-]*(?:\s+[A-Za-z0-9/&:._'/-]+){{0,5}}?)["'“”]?(?={clause_stop})""",
+                    q_raw,
+                    flags=re.I,
+                )
+                if not subject_name_match:
+                    continue
+                raw_value = str(subject_name_match.group("value") or "").strip(" \t\r\n'\".,;:!?")
+                if raw_value and not _looks_like_nonliteral_category_phrase(raw_value):
+                    norm_value = _normalize_categorical_literal_value(raw_value, column=name_col)
+                    if norm_value and not _looks_like_nonliteral_category_phrase(norm_value):
+                        return IRFilter(table=subject, column=name_col, op="eq", value=norm_value)
+
             named_match = re.search(
                 rf"\b(?:named|called)\s+"
                 rf"""["'“”]?(?P<value>[A-Za-z0-9][A-Za-z0-9/&:._'/-]*(?:\s+[A-Za-z0-9/&:._'/-]+){{0,5}}?)["'“”]?(?={clause_stop})""",
@@ -4294,7 +4384,7 @@ def _detect_filters(
             best_exact = None
             best_exact_len = -1
             best_exact_pos = -1
-            for column in allowed.get(subject, set()):
+            for column in _ordered_allowed_columns(subject, allowed):
                 if not _supports_categorical_text_filter(subject, column):
                     continue
                 for variant in sorted(_column_reference_variants(subject, column), key=len, reverse=True):
@@ -4454,7 +4544,7 @@ def _detect_filters(
                     flags=re.I,
                 ):
                     return (t, c)
-        for c in allowed.get(subject, set()):
+        for c in _ordered_allowed_columns(subject, allowed):
             for variant in _column_reference_variants(subject, c):
                 c_pat = re.escape(variant).replace(r"\ ", r"\s+")
                 if re.search(
@@ -4491,7 +4581,7 @@ def _detect_filters(
                 continue
             seen_pairs.add(key)
             candidate_pairs.append(key)
-        for c in allowed.get(subject, set()):
+        for c in _ordered_allowed_columns(subject, allowed):
             key = (subject, c)
             if key in seen_pairs:
                 continue
@@ -4593,7 +4683,10 @@ def _detect_filters(
             return None
 
         candidate_cols: List[str] = []
-        allowed_cols = {str(c or "").strip().lower(): str(c or "").strip() for c in allowed.get(subject, set())}
+        allowed_cols = {
+            str(c or "").strip().lower(): str(c or "").strip()
+            for c in _ordered_allowed_columns(subject, allowed)
+        }
         for fk_col, tgt_table in subject_fk_map.items():
             fk_col_l = str(fk_col or "").strip().lower()
             tgt_l = str(tgt_table or "").strip().lower()
@@ -4711,7 +4804,7 @@ def _detect_filters(
 
         projected_cols = _subject_projection_comparable_columns()
         candidate_cols = projected_cols or [
-            c for c in allowed.get(subject, set())
+            c for c in _ordered_allowed_columns(subject, allowed)
             if _is_numeric_column(c, subject) or _is_date_column(c, subject)
         ]
         if not candidate_cols:
@@ -5258,7 +5351,7 @@ def _detect_filters(
             if matched and not _is_date_column(matched, subject) and not _is_numeric_column(matched, subject):
                 return matched
         for preferred in ("country", "territory", "state", "city"):
-            for c in allowed.get(subject, set()):
+            for c in _ordered_allowed_columns(subject, allowed):
                 if c.lower() == preferred:
                     return c
         projected_candidates = _projected_subject_text_candidates()
@@ -5334,7 +5427,7 @@ def _detect_filters(
         # Schema-aware check: phrases composed only of schema terms
         # (e.g., "that territory", "this status") are references, not literal values.
         schema_terms: Set[str] = set()
-        for c in allowed.get(subject, set()):
+        for c in _ordered_allowed_columns(subject, allowed):
             c_words = [w for w in re.findall(r"[a-z0-9]+", _camel_to_words(c)) if w]
             schema_terms.update(c_words)
             for syn in _safe_get_column_synonyms(subject, c):
@@ -5395,7 +5488,7 @@ def _detect_filters(
     if quoted_values and re.search(r"\bstatus\b", q):
         status_col = None
         status_table = subject
-        for c in allowed.get(subject, set()):
+        for c in _ordered_allowed_columns(subject, allowed):
             if "status" in c.lower():
                 status_col = c
                 break
@@ -5432,7 +5525,7 @@ def _detect_filters(
                 target = (t, c)
                 break
         if not target:
-            for c in allowed.get(subject, set()):
+            for c in _ordered_allowed_columns(subject, allowed):
                 if "state" in c.lower():
                     target = (subject, c)
                     break
@@ -5712,7 +5805,7 @@ def _detect_filters(
         nums = re.findall(r"\b\d+\b", tail)
         if has_entity_id_list and len(nums) >= 2:
             ent = _safe_get_singular_form(ent_raw).replace("_", "").lower()
-            subj_cols = list(allowed.get(subject, set()))
+            subj_cols = _ordered_allowed_columns(subject, allowed)
             target_col = None
             id_like = [
                 c for c in subj_cols
@@ -5742,7 +5835,7 @@ def _detect_filters(
         nums = re.findall(r"\b\d+\b", tail)
         if len(nums) >= 2:
             ent = _safe_get_singular_form(ent_raw).replace("_", "").lower()
-            subj_cols = list(allowed.get(subject, set()))
+            subj_cols = _ordered_allowed_columns(subject, allowed)
             id_like = [
                 c for c in subj_cols
                 if c.lower().endswith("id") or c.lower().endswith("code") or c.lower().endswith("number")
@@ -5806,7 +5899,7 @@ def _detect_filters(
         prefix_local = q[max(0, m_entity_single_id.start() - 24):m_entity_single_id.start()]
         if num and not re.search(r"\b(?:between|from|through|thru|to)\s*$", prefix_local, flags=re.I):
             ent = _safe_get_singular_form(ent_raw).replace("_", "").lower()
-            subj_cols = list(allowed.get(subject, set()))
+            subj_cols = _ordered_allowed_columns(subject, allowed)
             id_like = [
                 c for c in subj_cols
                 if c.lower().endswith("id") or c.lower().endswith("code") or c.lower().endswith("number")
@@ -6598,7 +6691,7 @@ def _detect_row_level_computed_projections(
 
     numeric_subject_cols = [
         str(col or "").strip()
-        for col in allowed.get(subject_l, set())
+        for col in _ordered_allowed_columns(subject_l, allowed)
         if str(col or "").strip() and _is_numeric_measure_column(str(col or "").strip())
     ]
     if len(numeric_subject_cols) < 2:

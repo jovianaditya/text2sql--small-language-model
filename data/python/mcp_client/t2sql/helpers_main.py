@@ -232,7 +232,7 @@ from .helpers_core import (
     _preserve_requested_context_columns_in_single_table_scalar_subquery,
     _ensure_alias_for_top_level_derived_table,
     _rewrite_single_table_joined_max_case_winner_row,
-    _repair_explicit_iso_date_filter_from_question, _repair_explicit_weekday_filter_from_question, _repair_explicit_weekday_number_grouping_from_question, _repair_enum_process_proxy_filter_from_question,
+    _repair_explicit_iso_date_filter_from_question, _repair_explicit_weekday_filter_from_question, _repair_explicit_weekday_number_grouping_from_question, _repair_enum_process_proxy_filter_from_question, _canonicalize_enum_literals_from_schema,
 )
 from .rulebook import (
     aggregate_threshold_intent_aggregate_terms,
@@ -6163,6 +6163,51 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
             7: "Saturday",
         }
 
+        def _sql_literal_hint(value: Any) -> str:
+            if value is None:
+                return "NULL"
+            if isinstance(value, bool):
+                return "TRUE" if value else "FALSE"
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return str(value)
+            text = str(value).strip()
+            if not text:
+                return "''"
+            if text[0] in {"'", '"', "`"} and text[-1:] == text[0]:
+                return text
+            if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+                return text
+            return "'" + text.replace("'", "''") + "'"
+
+        def _sql_list_hint(values: Any) -> str:
+            if not isinstance(values, list) or not values:
+                return "()"
+            return "(" + ", ".join(_sql_literal_hint(item) for item in values) + ")"
+
+        def _sql_like_hint(value: Any, mode: str, *, negated: bool = False) -> str:
+            body = str(value if value is not None else "").strip()
+            if mode == "prefix":
+                pattern = body if "%" in body or "_" in body else f"{body}%"
+            elif mode == "suffix":
+                pattern = body if "%" in body or "_" in body else f"%{body}"
+            else:
+                pattern = body if "%" in body or "_" in body else f"%{body}%"
+            op_text = "NOT LIKE" if negated else "LIKE"
+            return f"{t}.{c} {op_text} {_sql_literal_hint(pattern)}"
+
+        def _sql_binary_hint(sql_op: str, value: Any) -> str:
+            return f"{t}.{c} {sql_op} {_sql_literal_hint(value)}"
+
+        def _sql_word_count_hint(value: Any) -> str:
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                count = 0
+            if count <= 0:
+                return f"REGEXP_LIKE({t}.{c}, <word-count-pattern>)"
+            pattern = "^" + " ".join(["[^ ]+"] * count) + "$"
+            return f"REGEXP_LIKE({t}.{c}, {_sql_literal_hint(pattern)})"
+
         val_text = str(val or "").strip().lower()
         if op == "eq" and val_text in {"a to z", "z to a"}:
             return ""
@@ -6186,46 +6231,74 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         ):
             return ""
         if op == "is_null_or_empty":
-            return f"{t}.{c} is_null_or_empty"
+            return f"{t}.{c} IS NULL"
         if op == "is_not_null_or_empty":
-            return f"{t}.{c} is_not_null_or_empty"
+            return f"{t}.{c} IS NOT NULL"
         if op == "not_in" and isinstance(val, list) and val:
-            return f"{t}.{c} not_in {val}"
+            return f"{t}.{c} NOT IN {_sql_list_hint(val)}"
         if op == "in" and isinstance(val, list) and val:
-            return f"{t}.{c} in {val}"
+            return f"{t}.{c} IN {_sql_list_hint(val)}"
         if op == "eq" and val is not None:
-            return f"{t}.{c} eq {val}"
+            return _sql_binary_hint("=", val)
+        if op == "gt" and val is not None:
+            return _sql_binary_hint(">", val)
+        if op == "gte" and val is not None:
+            return _sql_binary_hint(">=", val)
+        if op == "lt" and val is not None:
+            return _sql_binary_hint("<", val)
+        if op == "lte" and val is not None:
+            return _sql_binary_hint("<=", val)
         if op == "between" and val is not None and val2 is not None:
-            return f"{t}.{c} between {val} and {val2}"
+            return f"{t}.{c} BETWEEN {_sql_literal_hint(val)} AND {_sql_literal_hint(val2)}"
+        if op == "month_eq" and val is not None:
+            return f"MONTH({t}.{c}) = {_sql_literal_hint(val)}"
         if op == "month_between" and val is not None and val2 is not None:
-            return f"{t}.{c} month_between {val} and {val2}"
+            return f"MONTH({t}.{c}) BETWEEN {_sql_literal_hint(val)} AND {_sql_literal_hint(val2)}"
+        if op == "year_eq" and val is not None:
+            return f"YEAR({t}.{c}) = {_sql_literal_hint(val)}"
         if op == "weekday_eq" and val is not None:
             day_name = weekday_num_to_name.get(int(val), str(val)) if str(val).isdigit() else str(val)
-            return f"{t}.{c} weekday_eq {day_name}"
+            return f"DAYNAME({t}.{c}) = {_sql_literal_hint(day_name)}"
         if op in {"col_eq", "col_gt", "col_gte", "col_lt", "col_lte"}:
             value_column = str(filter_obj.get("value_column") or "").strip()
             if value_column:
-                return f"{t}.{c} {op} {value_column}"
+                op_map = {
+                    "col_eq": "=",
+                    "col_gt": ">",
+                    "col_gte": ">=",
+                    "col_lt": "<",
+                    "col_lte": "<=",
+                }
+                return f"{t}.{c} {op_map[op]} {value_column}"
             return ""
         if op == "word_count_eq" and val is not None:
-            return f"{t}.{c} with REGEXP"
+            return _sql_word_count_hint(val)
         if op in {"len_eq", "len_gt", "len_gte", "len_lt", "len_lte"} and val is not None:
-            return f"{t}.{c} {op} {val}"
+            op_map = {
+                "len_eq": "=",
+                "len_gt": ">",
+                "len_gte": ">=",
+                "len_lt": "<",
+                "len_lte": "<=",
+            }
+            return f"CHAR_LENGTH({t}.{c}) {op_map[op]} {_sql_literal_hint(val)}"
         if op == "like_prefix" and val is not None:
-            return f"{t}.{c} like_prefix {val}"
+            return _sql_like_hint(val, "prefix")
         if op == "like_suffix" and val is not None:
-            return f"{t}.{c} like_suffix {val}"
+            return _sql_like_hint(val, "suffix")
         if op == "like_contains" and val is not None:
-            return f"{t}.{c} like_contains {val}"
+            return _sql_like_hint(val, "contains")
         if op == "not_like_contains" and val is not None:
-            return f"{t}.{c} not_like_contains {val}"
+            return _sql_like_hint(val, "contains", negated=True)
         if op == "not_like_prefix" and val is not None:
-            return f"{t}.{c} not_like_prefix {val}"
+            return _sql_like_hint(val, "prefix", negated=True)
         if op == "not_like_suffix" and val is not None:
-            return f"{t}.{c} not_like_suffix {val}"
+            return _sql_like_hint(val, "suffix", negated=True)
         if op == "regexp":
-            return f"{t}.{c} with REGEXP"
-        return f"{t}.{c} {op} {val}"
+            if val is not None:
+                return f"{t}.{c} REGEXP {_sql_literal_hint(val)}"
+            return f"{t}.{c} REGEXP <pattern>"
+        return f"{t}.{c} {op} {_sql_literal_hint(val)}"
 
     number_words = {
         "one": 1,
@@ -12632,6 +12705,7 @@ def normalize_sql_pipeline(raw_sql: str, question: str, ctx: str, ranked_cols=No
         sql_in = _repair_explicit_weekday_filter_from_question(sql_in, question)
         sql_in = _repair_explicit_weekday_number_grouping_from_question(sql_in, question)
         sql_in = _repair_enum_process_proxy_filter_from_question(sql_in, question)
+        sql_in = _canonicalize_enum_literals_from_schema(sql_in)
         return sql_in
 
     s = _apply_postprocess(raw_sql)

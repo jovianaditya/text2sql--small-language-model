@@ -61,6 +61,7 @@ cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchm
 cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --hard --log /home/home/thesis/evaluation_hard_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_hard.log
 cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --easyshadow --log /home/home/thesis/evaluation_shadow_easy_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_easyshadow.log
 cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --mediumshadow --log /home/home/thesis/evaluation_shadow_medium_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_mediumshadow.log
+cd /home/home/thesis/data/python/mcp_client && python3 -m t2sql.intent_ir_benchmark compare --easytest --log /home/home/thesis/test_easy_p1.log 2>&1 | tee /home/home/thesis/intent_ir_compare_easytest.log
 
 # TESTING P1 (QWEN 2.5-INSTRUCT)
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --testset t2sql/test/qa_classicmodels_test_easy.yml --output results_test_easy_p1.xlsx --easy --warmup-models small" 2>&1 | tee test_easy_p1.log
@@ -72,12 +73,12 @@ docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && pytho
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/test/qa_classicmodels_test_medium.yml --output results_test_medium_p2.xlsx --medium --warmup-models small" 2>&1 | tee test_medium_p2.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P2 --testset t2sql/test/qa_classicmodels_test_hard.yml --output results_test_hard_p2.xlsx --hard --warmup-models small" 2>&1 | tee test_hard_p2.log
 
-# TESTING P3 (QWEN 3-INSTRUCT)
+# TESTING P3 (GRANITE CODE-INSTRUCT IBM)
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/test/qa_classicmodels_test_easy.yml --output results_test_easy_p3.xlsx --easy --warmup-models small" 2>&1 | tee test_easy_p3.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/test/qa_classicmodels_test_medium.yml --output results_test_medium_p3.xlsx --medium --warmup-models small" 2>&1 | tee test_medium_p3.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P3 --testset t2sql/test/qa_classicmodels_test_hard.yml --output results_test_hard_p3.xlsx --hard --warmup-models small" 2>&1 | tee test_hard_p3.log
 
-# TESTING P4 (LLAMA 3.X)
+# TESTING P4 (MIXTURE MODEL: STABLE-CODE 3B INSTRUCT AND DEEPSEEK 6.7B INSTRUCT)
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P4 --testset t2sql/test/qa_classicmodels_test_easy.yml --output results_test_easy_p4.xlsx --easy --warmup-models small" 2>&1 | tee test_easy_p4.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P4 --testset t2sql/test/qa_classicmodels_test_medium.yml --output results_test_medium_p4.xlsx --medium --warmup-models small" 2>&1 | tee test_medium_p4.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P4 --testset t2sql/test/qa_classicmodels_test_hard.yml --output results_test_hard_p4.xlsx --hard --warmup-models small" 2>&1 | tee test_hard_p4.log

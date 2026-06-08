@@ -244,15 +244,18 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "180s")  # keep_alive 90s, mo
 ROUTING_MODEL     = os.getenv("ROUTING_MODEL", "qwen2.5:1.5b-instruct").strip()
 SMALL_MODEL       = os.getenv("SMALL_MODEL", "qwen2.5:3b-instruct").strip()
 LARGE_MODEL       = os.getenv("LARGE_MODEL", "qwen2.5:7b-instruct").strip()
-ROUTING_MODEL_P2  = os.getenv("ROUTING_MODEL_P2", "qwen2.5-coder:1.5b").strip()
+# Scenario-specific router defaults intentionally fall back to the base
+# routing model so evaluation presets remain comparable unless explicitly
+# overridden per scenario.
+ROUTING_MODEL_P2  = os.getenv("ROUTING_MODEL_P2", ROUTING_MODEL).strip()
 SMALL_MODEL_P2    = os.getenv("SMALL_MODEL_P2", "qwen2.5-coder:3b").strip()
 LARGE_MODEL_P2    = os.getenv("LARGE_MODEL_P2", "qwen2.5-coder:7b").strip()
-ROUTING_MODEL_P3  = os.getenv("ROUTING_MODEL_P3", "qwen3:1.7b").strip()
-SMALL_MODEL_P3    = os.getenv("SMALL_MODEL_P3", "qwen3:4b").strip()
-LARGE_MODEL_P3    = os.getenv("LARGE_MODEL_P3", "qwen3:8b").strip()
-ROUTING_MODEL_P4  = os.getenv("ROUTING_MODEL_P4", "llama3.2:1b").strip()
-SMALL_MODEL_P4    = os.getenv("SMALL_MODEL_P4", "llama3.2:3b").strip()
-LARGE_MODEL_P4    = os.getenv("LARGE_MODEL_P4", "llama3.1:8b").strip()
+ROUTING_MODEL_P3  = os.getenv("ROUTING_MODEL_P3", ROUTING_MODEL).strip()
+SMALL_MODEL_P3    = os.getenv("SMALL_MODEL_P3", "granite-code:3b-instruct").strip()
+LARGE_MODEL_P3    = os.getenv("LARGE_MODEL_P3", "granite-code:8b-instruct").strip()
+ROUTING_MODEL_P4  = os.getenv("ROUTING_MODEL_P4", ROUTING_MODEL).strip()
+SMALL_MODEL_P4    = os.getenv("SMALL_MODEL_P4", "stable-code:3b-instruct").strip()
+LARGE_MODEL_P4    = os.getenv("LARGE_MODEL_P4", "deepseek-coder:6.7b-instruct").strip()
 # Optional post-failure Human-in-the-Loop review for REPL execution failures.
 HITL_ENABLED      = bool(int(os.getenv("HITL_ENABLED", "1")))
 HITL_LOG_FILENAME_PREFIX = os.getenv("HITL_LOG_FILENAME_PREFIX", "hitl_review_log").strip()

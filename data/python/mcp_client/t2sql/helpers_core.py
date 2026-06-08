@@ -32,6 +32,7 @@ from .schema_analyzer import (
     get_column_description,
     get_columns_by_role,
     get_filterable_date_columns,
+    get_enum_value_profile,
     get_schema_analyzer,
     get_table_synonyms,
     get_singular_form,
@@ -55279,6 +55280,145 @@ def _repair_enum_process_proxy_filter_from_question(sql: str, question: str) -> 
     return re.sub(col_pat, rf"\1 IN ({in_list})", sql, count=1, flags=re.I)
 
 
+def _canonicalize_enum_literals_from_schema(sql: str) -> str:
+    """
+    Canonicalize string literals in simple categorical predicates using
+    explicit enum-like values from schema metadata.
+
+    This is intentionally narrow:
+    - only string literals in = / != / IN / NOT IN predicates
+    - only when the referenced column has explicit enumerated values
+    - only when the folded literal maps unambiguously to exactly one enum value
+    """
+    s = str(sql or "").strip()
+    if not s or "'" not in s:
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception:
+        return sql
+
+    alias_to_table = _parse_from_join_aliases(s)
+    query_tables = []
+    for table_node in ast.find_all(exp.Table):
+        table_name = str(table_node.name or "").strip()
+        if not table_name:
+            continue
+        lowered = table_name.lower()
+        if lowered not in query_tables:
+            query_tables.append(lowered)
+
+    def _resolve_column_table(col: "exp.Column") -> str:
+        table_hint = str(col.table or "").strip()
+        if table_hint:
+            mapped = alias_to_table.get(table_hint) or alias_to_table.get(table_hint.lower())
+            if mapped:
+                return str(mapped or "").strip().lower()
+            return table_hint.replace("`", "").split(".")[-1].strip().lower()
+        if len(query_tables) == 1:
+            return query_tables[0]
+        return ""
+
+    def _fold_literal(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(text or "").strip().lower())
+
+    def _enum_lookup(table: str, column: str) -> Dict[str, str]:
+        profile = get_enum_value_profile(table, column)
+        if not profile or not profile.get("has_explicit_enum_values"):
+            return {}
+        values = [
+            re.sub(r"\s+", " ", str(v or "").strip())
+            for v in (profile.get("enumerated_values") or [])
+            if re.sub(r"\s+", " ", str(v or "").strip())
+        ]
+        if not values:
+            return {}
+        folded_to_value: Dict[str, Optional[str]] = {}
+        for value in values:
+            key = _fold_literal(value)
+            if not key:
+                continue
+            if key not in folded_to_value:
+                folded_to_value[key] = value
+                continue
+            existing = folded_to_value.get(key)
+            if existing and existing != value:
+                folded_to_value[key] = None
+        return {k: v for k, v in folded_to_value.items() if v}
+
+    enum_lookup_cache: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+    def _canonicalize_literal_for_column(
+        literal: "exp.Literal",
+        column_expr: "exp.Column",
+    ) -> Optional["exp.Literal"]:
+        if not isinstance(literal, exp.Literal) or not literal.is_string:
+            return None
+        table_name = _resolve_column_table(column_expr)
+        column_name = str(column_expr.name or "").strip()
+        if not table_name or not column_name:
+            return None
+
+        cache_key = (table_name, column_name.lower())
+        lookup = enum_lookup_cache.get(cache_key)
+        if lookup is None:
+            lookup = _enum_lookup(table_name, column_name)
+            enum_lookup_cache[cache_key] = lookup
+        if not lookup:
+            return None
+
+        raw_value = re.sub(r"\s+", " ", str(literal.this or "").strip())
+        canonical = lookup.get(_fold_literal(raw_value))
+        if not canonical or canonical == raw_value:
+            return None
+        return exp.Literal.string(canonical)
+
+    changed = False
+
+    def _rewrite_in_list(node: "exp.In") -> None:
+        nonlocal changed
+        lhs = node.this
+        if not isinstance(lhs, exp.Column):
+            return
+        expressions = list(node.expressions or [])
+        if not expressions:
+            return
+        rewritten: List["exp.Expression"] = []
+        local_changed = False
+        for item in expressions:
+            replacement = _canonicalize_literal_for_column(item, lhs)
+            if replacement is not None:
+                rewritten.append(replacement)
+                local_changed = True
+            else:
+                rewritten.append(item)
+        if local_changed:
+            node.set("expressions", rewritten)
+            changed = True
+
+    for predicate in ast.find_all(exp.In):
+        _rewrite_in_list(predicate)
+
+    for predicate in ast.find_all((exp.EQ, exp.NEQ)):
+        lhs = predicate.left
+        rhs = predicate.right
+        if not isinstance(lhs, exp.Column):
+            continue
+        replacement = _canonicalize_literal_for_column(rhs, lhs)
+        if replacement is not None:
+            predicate.set("expression", replacement)
+            changed = True
+
+    return ast.sql(dialect="mysql") if changed else sql
+
+
 def _explicit_limit_from_question(question: str) -> Optional[int]:
     q = (question or "").lower()
     m = re.search(r"\blimit\s+(\d{1,4})\b", q)
@@ -55655,26 +55795,102 @@ def _normalize_symbolic_like_operators(sql: str) -> str:
     def _rewrite(match: re.Match[str]) -> str:
         expr = re.sub(r"\s*\.\s*", ".", str(match.group("expr") or "").strip())
         mode = str(match.group("mode") or "").strip()
-        literal = str(match.group("literal") or "")
+        groups = match.groupdict()
+        literal = str(groups.get("literal") or groups.get("literal_bare") or "")
         negated = bool(str(match.group("neg") or "").strip())
-        bool_text = match.groupdict().get("bool")
+        bool_text = groups.get("bool")
         want_true = str(bool_text or "1").strip() != "0"
         sql_op = "NOT LIKE" if (negated ^ (not want_true)) else "LIKE"
         return f"{expr} {sql_op} '{_apply_like_shape(mode, literal)}'"
 
     s = re.sub(
-        rf"(?P<expr>{col_ref_pat})\s+(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s+'(?P<literal>(?:''|[^'])*)'\s*(?:=\s*(?P<bool>[01]))?\b",
+        rf"(?P<expr>{col_ref_pat})\s+(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s+'(?P<literal>(?:''|[^'])*)'\s*(?:=\s*(?P<bool>[01]))?(?=\s|,|\)|;|$)",
         _rewrite,
         s,
         flags=re.I,
     )
     s = re.sub(
-        rf"(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s*\(\s*(?P<expr>{col_ref_pat})\s*,\s*'(?P<literal>(?:''|[^'])*)'\s*\)\s*(?:=\s*(?P<bool>[01]))?\b",
+        rf"(?P<expr>{col_ref_pat})\s+(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s+(?P<literal_bare>(?!['\"`])[^\s,);]+)\s*(?:=\s*(?P<bool>[01]))?(?=\s|,|\)|;|$)",
+        _rewrite,
+        s,
+        flags=re.I,
+    )
+    s = re.sub(
+        rf"(?P<neg>NOT_)?LIKE_(?P<mode>PREFIX|SUFFIX|CONTAINS)\s*\(\s*(?P<expr>{col_ref_pat})\s*,\s*'(?P<literal>(?:''|[^'])*)'\s*\)\s*(?:=\s*(?P<bool>[01]))?(?=\s|,|\)|;|$)",
         _rewrite,
         s,
         flags=re.I,
     )
     return s
+
+
+def _normalize_symbolic_comparison_operators(sql: str) -> str:
+    """
+    Translate leaked symbolic comparison operators into normal SQL.
+
+    Supported forms:
+    - col eq value   -> col = value
+    - col gt value   -> col > value
+    - col gte value  -> col >= value
+    - col lt value   -> col < value
+    - col lte value  -> col <= value
+
+    This pre-AST cleanup is intentionally narrow:
+    - only rewrites simple binary comparisons
+    - preserves quoted literals, numeric literals, NULL/TRUE/FALSE, SQL params,
+      and obvious function/subquery/value-list shapes
+    - auto-quotes bare string-like RHS tokens such as `1:18` or `M`
+    """
+    s = str(sql or "").strip()
+    if not s or not re.search(r"\b(?:eq|gt|gte|lt|lte)\b", s, flags=re.I):
+        return sql
+
+    col_ref_pat = (
+        r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:\s*\.\s*(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))?"
+    )
+    op_map = {
+        "eq": "=",
+        "gt": ">",
+        "gte": ">=",
+        "lt": "<",
+        "lte": "<=",
+    }
+
+    def _normalize_rhs(expr: str, rhs: str) -> str:
+        rhs_s = str(rhs or "").strip()
+        if not rhs_s:
+            return rhs_s
+        if rhs_s[0] in ("'", '"', "`"):
+            return rhs_s
+        if rhs_s.startswith(("(", "@", ":", "?")):
+            return rhs_s
+        rhs_upper = rhs_s.upper()
+        if rhs_upper in {"NULL", "TRUE", "FALSE", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"}:
+            return rhs_s
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", rhs_s):
+            return rhs_s
+        if re.fullmatch(col_ref_pat, rhs_s, flags=re.I):
+            return re.sub(r"\s*\.\s*", ".", rhs_s)
+        if re.match(r"[A-Za-z_][A-Za-z0-9_]*\s*\(", rhs_s):
+            return rhs_s
+        return "'" + rhs_s.replace("'", "''") + "'"
+
+    def _rewrite(match: re.Match[str]) -> str:
+        expr = re.sub(r"\s*\.\s*", ".", str(match.group("expr") or "").strip())
+        op = str(match.group("op") or "").strip().lower()
+        rhs = _normalize_rhs(expr, str(match.group("rhs") or ""))
+        sql_op = op_map.get(op)
+        if not sql_op or not expr or not rhs:
+            return match.group(0)
+        return f"{expr} {sql_op} {rhs}"
+
+    return re.sub(
+        rf"(?P<expr>{col_ref_pat})\s+(?P<op>eq|gt|gte|lt|lte)\s+(?P<rhs>(?:'[^']*(?:''[^']*)*'|\"[^\"]*\"|`[^`]+`|[^\s,);]+))(?!\s*\()(?=\s|,|\)|;|$)",
+        _rewrite,
+        s,
+        flags=re.I,
+    )
 
 
 def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
@@ -55696,6 +55912,7 @@ def _minimal_sqlglot_parse_cleanup(sql: str) -> str:
     s = re.sub(r";+\s*$", "", s).strip()
     s = _fix_bad_backticks(s)
     s = _normalize_symbolic_presence_operators(s)
+    s = _normalize_symbolic_comparison_operators(s)
     s = _normalize_symbolic_like_operators(s)
     s = _repair_misnested_offset_window_function(s)
     s = _drop_redundant_inner_window_where_in_derived_subquery(s)

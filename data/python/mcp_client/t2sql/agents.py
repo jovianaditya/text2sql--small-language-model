@@ -7348,6 +7348,292 @@ def _evaluate_semantic_contract(
 
     return failures
 
+
+def _evaluate_high_confidence_ir_filter_contract(
+    sql: str,
+    intent_ir: Dict[str, Any],
+    decision: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """
+    For simple single-table lookup queries, ensure SQL keeps the concrete
+    filter columns implied by a high-confidence IR.
+
+    This is intentionally narrow:
+    - lookup-only
+    - single-table subject scope
+    - concrete filters only
+    - compares required IR filter columns against columns used in SQL WHERE
+    """
+    if not sql or not intent_ir:
+        return []
+
+    decision = decision or {}
+    if bool(decision.get("is_set_operation_intent", False)):
+        return []
+
+    ir_qtype = str(intent_ir.get("qtype") or "").strip().lower()
+    router_qtype = str(decision.get("qtype") or "").strip().lower()
+    if ir_qtype != AGENT_ROUTER_QTYPE_LOOKUP and router_qtype != AGENT_ROUTER_QTYPE_LOOKUP:
+        return []
+
+    if str(decision.get("complexity") or "").strip().lower() not in {
+        "",
+        AGENT_ROUTER_COMPLEXITY_SIMPLE,
+    }:
+        return []
+
+    confidence = float(intent_ir.get("confidence", 0.0) or 0.0)
+    if confidence < float(AGENT_IR_MIN_CONFIDENCE):
+        return []
+
+    subject = str(intent_ir.get("subject_entity") or "").strip().lower()
+    if not subject:
+        return []
+
+    metrics = list(intent_ir.get("metrics") or [])
+    existence = list(intent_ir.get("existence") or [])
+    if metrics or existence:
+        return []
+
+    supported_ops = {
+        "eq",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "between",
+        "month_between",
+        "year_eq",
+        "weekday_eq",
+        "in",
+        "not_in",
+        "is_null_or_empty",
+        "is_not_null_or_empty",
+        "like_prefix",
+        "like_suffix",
+        "like_contains",
+        "not_like_prefix",
+        "not_like_suffix",
+        "not_like_contains",
+        "regexp",
+        "word_count_eq",
+        "len_eq",
+        "len_gt",
+        "len_gte",
+        "len_lt",
+        "len_lte",
+        "col_eq",
+        "col_gt",
+        "col_gte",
+        "col_lt",
+        "col_lte",
+    }
+
+    required_filter_columns = {
+        str(filter_obj.get("column") or "").strip().lower()
+        for filter_obj in (intent_ir.get("filters") or [])
+        if isinstance(filter_obj, dict)
+        and str(filter_obj.get("table") or "").strip().lower() == subject
+        and str(filter_obj.get("column") or "").strip()
+        and str(filter_obj.get("op") or "").strip().lower() in supported_ops
+    }
+    if not required_filter_columns:
+        return []
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return []
+
+    candidate_sql = re.sub(r";+\s*$", "", str(sql or "").strip())
+    if not candidate_sql:
+        return []
+
+    try:
+        parsed = sqlglot.parse_one(candidate_sql, read=SQL_PARSE_DIALECT)
+    except Exception:
+        return []
+
+    if parsed is None or parsed.__class__.__name__.lower() in {"union", "intersect", "except"}:
+        return []
+
+    sql_tables = {
+        str(getattr(tbl, "name", "") or "").strip().lower()
+        for tbl in parsed.find_all(exp.Table)
+        if str(getattr(tbl, "name", "") or "").strip()
+    }
+    if not sql_tables or len(sql_tables) > 1 or subject not in sql_tables:
+        return []
+
+    where_expr = getattr(parsed, "args", {}).get("where")
+    if where_expr is None:
+        return [f"missing_ir_filter_column:{col}" for col in sorted(required_filter_columns)]
+
+    actual_filter_columns = {
+        str(col.name or "").strip().lower()
+        for col in where_expr.find_all(exp.Column)
+        if str(getattr(col, "name", "") or "").strip()
+    }
+    missing_columns = sorted(required_filter_columns - actual_filter_columns)
+    return [f"missing_ir_filter_column:{col}" for col in missing_columns]
+
+
+def _rewrite_simple_ir_filter_column_drift(
+    sql: str,
+    intent_ir: Dict[str, Any],
+    decision: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    Narrow deterministic repair for simple single-table lookup queries where
+    the SQL preserved the filter shape but used the wrong same-table filter
+    column in WHERE.
+
+    Safety boundaries:
+    - lookup-only
+    - simple complexity
+    - high-confidence IR
+    - no metrics/existence
+    - exactly one subject-table IR filter column
+    - final SQL parses to a single-table subject query
+    - WHERE references exactly one unique column, which differs from the IR one
+    """
+    if not sql or not intent_ir:
+        return None
+
+    decision = decision or {}
+    if bool(decision.get("is_set_operation_intent", False)):
+        return None
+
+    ir_qtype = str(intent_ir.get("qtype") or "").strip().lower()
+    router_qtype = str(decision.get("qtype") or "").strip().lower()
+    if ir_qtype != AGENT_ROUTER_QTYPE_LOOKUP and router_qtype != AGENT_ROUTER_QTYPE_LOOKUP:
+        return None
+
+    if str(decision.get("complexity") or "").strip().lower() not in {
+        "",
+        AGENT_ROUTER_COMPLEXITY_SIMPLE,
+    }:
+        return None
+
+    confidence = float(intent_ir.get("confidence", 0.0) or 0.0)
+    if confidence < float(AGENT_IR_MIN_CONFIDENCE):
+        return None
+
+    subject = str(intent_ir.get("subject_entity") or "").strip().lower()
+    if not subject:
+        return None
+
+    if list(intent_ir.get("metrics") or []) or list(intent_ir.get("existence") or []):
+        return None
+
+    supported_ops = {
+        "eq",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "between",
+        "in",
+        "not_in",
+        "like_prefix",
+        "like_suffix",
+        "like_contains",
+        "not_like_prefix",
+        "not_like_suffix",
+        "not_like_contains",
+        "is_null_or_empty",
+        "is_not_null_or_empty",
+        "regexp",
+    }
+    subject_filters = [
+        filter_obj
+        for filter_obj in (intent_ir.get("filters") or [])
+        if isinstance(filter_obj, dict)
+        and str(filter_obj.get("table") or "").strip().lower() == subject
+        and str(filter_obj.get("column") or "").strip()
+        and str(filter_obj.get("op") or "").strip().lower() in supported_ops
+    ]
+    required_filter_columns = {
+        str(filter_obj.get("column") or "").strip().lower()
+        for filter_obj in subject_filters
+    }
+    if len(required_filter_columns) != 1 or len(subject_filters) != 1:
+        return None
+
+    target_filter_col = str(subject_filters[0].get("column") or "").strip()
+    target_filter_col_l = target_filter_col.lower()
+    if not target_filter_col_l:
+        return None
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return None
+
+    candidate_sql = re.sub(r";+\s*$", "", str(sql or "").strip())
+    if not candidate_sql:
+        return None
+
+    try:
+        parsed = sqlglot.parse_one(candidate_sql, read=SQL_PARSE_DIALECT)
+    except Exception:
+        return None
+
+    if parsed is None or parsed.__class__.__name__.lower() in {"union", "intersect", "except"}:
+        return None
+
+    sql_tables = {
+        str(getattr(tbl, "name", "") or "").strip().lower()
+        for tbl in parsed.find_all(exp.Table)
+        if str(getattr(tbl, "name", "") or "").strip()
+    }
+    if not sql_tables or len(sql_tables) > 1 or subject not in sql_tables:
+        return None
+
+    where_expr = getattr(parsed, "args", {}).get("where")
+    if not isinstance(where_expr, exp.Where) or where_expr.this is None:
+        return None
+
+    actual_filter_columns = {
+        str(col.name or "").strip().lower()
+        for col in where_expr.find_all(exp.Column)
+        if str(getattr(col, "name", "") or "").strip()
+    }
+    if len(actual_filter_columns) != 1:
+        return None
+
+    actual_filter_col_l = next(iter(actual_filter_columns))
+    if not actual_filter_col_l or actual_filter_col_l == target_filter_col_l:
+        return None
+
+    changed = False
+
+    def _replace_filter_column(node: "exp.Expression") -> "exp.Expression":
+        nonlocal changed
+        if isinstance(node, exp.Column) and str(node.name or "").strip().lower() == actual_filter_col_l:
+            new_node = node.copy()
+            new_node.set("this", exp.to_identifier(target_filter_col))
+            changed = True
+            return new_node
+        return node
+
+    rebuilt_where = where_expr.this.transform(_replace_filter_column)
+    if not changed:
+        return None
+
+    parsed.set("where", exp.Where(this=rebuilt_where))
+    rewritten_sql = parsed.sql(dialect=SQL_WRITE_DIALECT).strip()
+    if not rewritten_sql:
+        return None
+    if str(sql or "").strip().endswith(";") and not rewritten_sql.endswith(";"):
+        rewritten_sql += ";"
+
+    if _evaluate_high_confidence_ir_filter_contract(rewritten_sql, intent_ir, decision):
+        return None
+    return rewritten_sql
+
 def _deterministic_sql_acceptance_gate(
     sql: str,
     ctx: str,
@@ -11735,6 +12021,74 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             )
         needs_regeneration = True
         regeneration_model = LARGE_MODEL
+
+    ir_filter_contract_violations = _evaluate_high_confidence_ir_filter_contract(
+        final_sql,
+        state.get("intent_ir") or {},
+        decision,
+    )
+    if ir_filter_contract_violations and not needs_regeneration:
+        deterministic_ir_filter_sql = _rewrite_simple_ir_filter_column_drift(
+            final_sql,
+            state.get("intent_ir") or {},
+            decision,
+        )
+        if deterministic_ir_filter_sql and deterministic_ir_filter_sql != final_sql:
+            final_sql = str(deterministic_ir_filter_sql).strip()
+            corrections.append("Repaired simple IR filter-column drift")
+            ir_filter_contract_violations = _evaluate_high_confidence_ir_filter_contract(
+                final_sql,
+                state.get("intent_ir") or {},
+                decision,
+            )
+        if not ir_filter_contract_violations:
+            pass
+        elif not needs_regeneration:
+            ir_filter_detail = ", ".join(ir_filter_contract_violations)
+            _dbg_agent3_retry("IR Filter Contract", ir_filter_detail)
+            intent_ir_current = state.get("intent_ir") or {}
+            ir_metrics = list(intent_ir_current.get("metrics") or [])
+            ir_existence = list(intent_ir_current.get("existence") or [])
+            ir_subject = str(intent_ir_current.get("subject_entity") or "").strip().lower()
+            ir_filter_tables = {
+                str(filter_obj.get("table") or "").strip().lower()
+                for filter_obj in (intent_ir_current.get("filters") or [])
+                if isinstance(filter_obj, dict) and str(filter_obj.get("table") or "").strip()
+            }
+            required_ir_filter_columns = sorted(
+                {
+                    str(filter_obj.get("column") or "").strip()
+                    for filter_obj in (intent_ir_current.get("filters") or [])
+                    if isinstance(filter_obj, dict)
+                    and str(filter_obj.get("table") or "").strip().lower()
+                    == ir_subject
+                    and str(filter_obj.get("column") or "").strip()
+                },
+                key=lambda value: value.lower(),
+            )
+            extra_instruction = (
+                "STRICT REQUIREMENT: Keep the exact filter columns implied by the high-confidence intent analysis. "
+                "Do NOT swap to a similarly named column. "
+                + (
+                    f"Required filter columns: {', '.join(required_ir_filter_columns)}. "
+                    if required_ir_filter_columns
+                    else ""
+                )
+                + "Preserve the requested projections and final ordering; fix only the WHERE predicate columns."
+            )
+            needs_regeneration = True
+            if (
+                draft_model == SMALL_MODEL
+                and complexity == AGENT_ROUTER_COMPLEXITY_SIMPLE
+                and len(detected_tables) <= 1
+                and not ir_metrics
+                and not ir_existence
+                and ir_subject
+                and (not ir_filter_tables or ir_filter_tables == {ir_subject})
+            ):
+                regeneration_model = SMALL_MODEL
+            else:
+                regeneration_model = LARGE_MODEL
 
     # --- KASUS A: Schema Validation & Hallucination Check (HARD ERROR) ---
     if alien_cols and AGENT_REFINE_JOIN_KEYWORD not in sql_up and not needs_regeneration:
