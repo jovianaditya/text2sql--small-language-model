@@ -1147,8 +1147,54 @@ def offset_window_ordering_context_regex_patterns() -> list[str]:
         r"\bordered\s+by\b",
         r"\bbased\s+on\b[^.]{0,80}\border\b",
         r"\b(?:date|time|timestamp)[-\s]+order\b",
+        r"\bsorted\s+from\s+(?:the\s+)?(?:lowest|smallest|least)\s+to\s+(?:the\s+)?(?:highest|largest|greatest)\b",
+        r"\bsorted\s+from\s+(?:the\s+)?(?:highest|largest|greatest)\s+to\s+(?:the\s+)?(?:lowest|smallest|least)\b",
     ]
     return rule_list(("agent_semantics", "offset_window_sequence", "ordering_context_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def running_window_sequence_terms() -> list[str]:
+    defaults = ["running", "cumulative", "kumulatif", "akumulatif"]
+    return rule_list(("agent_semantics", "running_window_sequence", "running_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def window_enumeration_position_terms() -> list[str]:
+    defaults = ["position", "rank", "row number", "row_number", "sequence", "seq", "ordinal"]
+    return rule_list(("agent_semantics", "window_enumeration", "position_terms"), defaults)
+
+
+@lru_cache(maxsize=1)
+def window_enumeration_action_regex_patterns() -> list[str]:
+    defaults = [
+        r"\bnumber\s+the\s+(?:[a-z][a-z0-9_-]*\s+){0,3}[a-z][a-z0-9_-]*\b",
+        r"\b(?:assign|give)\b[^.]{0,80}\b(?:position|rank|row\s*number|sequence|ordinal)\b",
+        r"\bevery\s+row\s+gets\s+(?:its\s+own\s+)?(?:position|rank|row\s*number|sequence|ordinal)\b",
+    ]
+    return rule_list(("agent_semantics", "window_enumeration", "enumeration_action_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def window_enumeration_partition_scope_regex_patterns() -> list[str]:
+    defaults = [
+        r"\bfor\s+(?:each|every)\b",
+        r"\bper\b",
+        r"\bwithin\s+(?:each|the\s+same)\b",
+        r"\binside\s+each\b",
+    ]
+    return rule_list(("agent_semantics", "window_enumeration", "partition_scope_regex"), defaults)
+
+
+@lru_cache(maxsize=1)
+def window_enumeration_ordering_context_regex_patterns() -> list[str]:
+    defaults = [
+        r"\border(?:ed|ing)?\s+by\b",
+        r"\bsort(?:ed|ing)?\b",
+        r"\bfrom\s+(?:the\s+)?(?:earliest|oldest|latest|newest|highest|lowest|largest|smallest)\s+to\s+(?:the\s+)?(?:earliest|oldest|latest|newest|highest|lowest|largest|smallest)\b",
+        r"\bbreak\s+ties\b",
+    ]
+    return rule_list(("agent_semantics", "window_enumeration", "ordering_context_regex"), defaults)
 
 
 @lru_cache(maxsize=1)

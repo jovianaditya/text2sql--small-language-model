@@ -79,6 +79,7 @@ from .config import (
     AGENT_HALF_OPEN_UPPER_RANGE_PATTERNS,
     AGENT_SQL_NUMERIC_BETWEEN_PATTERN,
     SQL_PARSE_DIALECT,
+    SQL_WRITE_DIALECT,
 )
 from .rulebook import (
     existence_anti_phrases,
@@ -131,6 +132,11 @@ from .rulebook import (
     set_operation_union_all_terms,
     temporal_year_column_terms,
     threshold_count_object_stop_terms,
+    running_window_sequence_terms,
+    window_enumeration_action_regex_patterns,
+    window_enumeration_ordering_context_regex_patterns,
+    window_enumeration_partition_scope_regex_patterns,
+    window_enumeration_position_terms,
     winner_row_aggregate_guard_terms,
     winner_row_aggregate_metric_terms,
     winner_row_context_terms,
@@ -13063,6 +13069,12 @@ def _question_wants_winner_row(question: str) -> bool:
     if not q_core:
         q_core = q
 
+    # Running totals / row-number-all-rows asks are full window-enumeration
+    # tasks. They intentionally keep the whole ordered population, so they
+    # should not enter winner-row lanes that expect one surviving row per group.
+    if _question_has_window_enumeration_intent(question):
+        return False
+
     # "latest year + aggregate in that year" asks are grouped aggregate
     # questions, not winner-row selection. Keep them out of ROW_NUMBER/rn=1
     # repair lanes so dedicated latest-year aggregate owners can preserve the
@@ -13373,6 +13385,37 @@ def _question_wants_winner_row(question: str) -> bool:
 
     # Winner-row jika ada rank + (same_row ATAU context ATAU multi_attr)
     return strong_winner_sig
+
+
+def _question_has_window_enumeration_intent(question: str) -> bool:
+    """
+    Detect full-population window tasks such as row numbering and running totals.
+
+    These asks enumerate or accumulate across every row in an ordered scope,
+    which is semantically different from winner-row selection.
+    """
+    q = str(question or "").strip().lower()
+    if not q:
+        return False
+
+    if any_phrase_in_text(q, running_window_sequence_terms()):
+        return True
+
+    has_position_like_target = any_phrase_in_text(q, window_enumeration_position_terms())
+    action_patterns = [str(p).strip() for p in window_enumeration_action_regex_patterns() if str(p).strip()]
+    has_enumeration_action = any(re.search(pat, q, flags=re.I) for pat in action_patterns)
+    if not has_enumeration_action:
+        return False
+
+    partition_patterns = [
+        str(p).strip() for p in window_enumeration_partition_scope_regex_patterns() if str(p).strip()
+    ]
+    ordering_patterns = [
+        str(p).strip() for p in window_enumeration_ordering_context_regex_patterns() if str(p).strip()
+    ]
+    has_partition_scope = any(re.search(pat, q, flags=re.I) for pat in partition_patterns)
+    has_ordering_context = any(re.search(pat, q, flags=re.I) for pat in ordering_patterns)
+    return has_position_like_target or (has_partition_scope and has_ordering_context)
 
 
 def _rewrite_explicit_rank_aggregate_window(sql: str, question: str) -> str:
@@ -28074,11 +28117,183 @@ def _ast_repair_group_by_projection_validity(sql: str, question: str = "") -> Tu
                 if "restore_missing_derived_group_projection_ast" not in meta["fixes"]:
                     meta["fixes"].append("restore_missing_derived_group_projection_ast")
 
+    def _collect_top_level_output_alias_refs(node: Optional["exp.Expression"]) -> Set[str]:
+        refs: Set[str] = set()
+        if not isinstance(node, exp.Expression):
+            return refs
+        for col in node.find_all(exp.Column):
+            if str(col.table or "").strip("`"):
+                continue
+            alias_name = str(col.name or "").strip("`").lower()
+            if alias_name:
+                refs.add(alias_name)
+        return refs
+
+    referenced_output_aliases: Set[str] = set()
+    having_expr = sel.args.get("having")
+    if isinstance(having_expr, exp.Having):
+        referenced_output_aliases.update(_collect_top_level_output_alias_refs(having_expr.this))
+    else:
+        referenced_output_aliases.update(_collect_top_level_output_alias_refs(having_expr))
+
+    order_expr = sel.args.get("order")
+    if isinstance(order_expr, exp.Order):
+        for ordered in order_expr.expressions or []:
+            referenced_output_aliases.update(_collect_top_level_output_alias_refs(ordered))
+    else:
+        referenced_output_aliases.update(_collect_top_level_output_alias_refs(order_expr))
+
+    if referenced_output_aliases:
+        preserved_live_alias_ids: Set[int] = set()
+        for item in expressions_to_remove:
+            if not isinstance(item, exp.Alias):
+                continue
+            alias_name = str(item.alias or "").strip("`").lower()
+            if alias_name and alias_name in referenced_output_aliases:
+                preserved_live_alias_ids.add(id(item))
+
+        if preserved_live_alias_ids:
+            new_expressions = [
+                expr
+                for expr in (sel.expressions or [])
+                if id(expr) in preserved_live_alias_ids or expr not in expressions_to_remove
+            ]
+            meta["fixes"].append("preserve_live_output_aliases_ast")
+
     sel.set("expressions", new_expressions)
     meta["fixes"].append("repair_group_by_projection_validity_ast")
 
     out_sql = ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
     if sql.strip().endswith(";"):
+        out_sql = out_sql.rstrip(";") + ";"
+    return out_sql, meta
+
+
+def _ast_restore_missing_ordered_computed_alias_projection(
+    baseline_sql: str,
+    candidate_sql: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Restore a computed SELECT alias when a later pass drops it but top-level
+    ORDER BY still depends on that alias.
+
+    Narrow scope:
+    - AST-parseable top-level SELECT only
+    - non-grouped / non-HAVING queries only
+    - only restore aliases that existed in the baseline SQL
+    - only restore computed aliases (not plain column aliases)
+    - only when the candidate ORDER BY still references the alias
+    """
+    meta: Dict[str, Any] = {
+        "parse_ok": False,
+        "handled_scope": False,
+        "fixes": [],
+        "warnings": [],
+    }
+    baseline = str(baseline_sql or "").strip()
+    candidate = str(candidate_sql or "").strip()
+    if not baseline or not candidate:
+        return candidate_sql, meta
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception as e:
+        meta["error"] = f"sqlglot_unavailable:{e}"
+        return candidate_sql, meta
+
+    try:
+        baseline_ast = sqlglot.parse_one(baseline, read=SQL_PARSE_DIALECT or "mysql")
+        candidate_ast = sqlglot.parse_one(candidate, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception as e:
+        meta["error"] = f"parse_failed:{type(e).__name__}:{e}"
+        return candidate_sql, meta
+
+    meta["parse_ok"] = True
+    baseline_sel = baseline_ast if isinstance(baseline_ast, exp.Select) else baseline_ast.find(exp.Select)
+    candidate_sel = candidate_ast if isinstance(candidate_ast, exp.Select) else candidate_ast.find(exp.Select)
+    if not isinstance(baseline_sel, exp.Select) or not isinstance(candidate_sel, exp.Select):
+        meta["warnings"].append("unsupported_root")
+        return candidate_sql, meta
+
+    if (
+        baseline_sel.args.get("group") is not None
+        or candidate_sel.args.get("group") is not None
+        or baseline_sel.args.get("having") is not None
+        or candidate_sel.args.get("having") is not None
+    ):
+        meta["warnings"].append("grouped_query_skipped")
+        return candidate_sql, meta
+
+    order_expr = candidate_sel.args.get("order")
+    if not isinstance(order_expr, exp.Order) or not list(order_expr.expressions or []):
+        meta["warnings"].append("missing_order_by")
+        return candidate_sql, meta
+
+    meta["handled_scope"] = True
+
+    def _computed_alias_item(item: "exp.Expression") -> Tuple[str, Optional["exp.Expression"]]:
+        if not isinstance(item, exp.Alias):
+            return "", None
+        alias_name = str(item.alias or "").strip("`").lower()
+        expr_node = item.this
+        if not alias_name or expr_node is None:
+            return "", None
+        if isinstance(expr_node, (exp.Column, exp.Literal, exp.Star)):
+            return "", None
+        return alias_name, item
+
+    baseline_alias_items: Dict[str, Tuple[int, "exp.Expression"]] = {}
+    for idx, item in enumerate(baseline_sel.expressions or []):
+        alias_name, alias_item = _computed_alias_item(item)
+        if alias_name and alias_item is not None:
+            baseline_alias_items[alias_name] = (idx, alias_item)
+
+    if not baseline_alias_items:
+        meta["warnings"].append("no_computed_aliases_in_baseline")
+        return candidate_sql, meta
+
+    candidate_aliases = {
+        str(item.alias or "").strip("`").lower()
+        for item in (candidate_sel.expressions or [])
+        if isinstance(item, exp.Alias) and str(item.alias or "").strip()
+    }
+
+    referenced_aliases: Set[str] = set()
+    for ordered in order_expr.expressions or []:
+        for col in ordered.find_all(exp.Column):
+            if str(col.table or "").strip("`"):
+                continue
+            alias_name = str(col.name or "").strip("`").lower()
+            if alias_name:
+                referenced_aliases.add(alias_name)
+
+    missing_aliases = [
+        alias_name
+        for alias_name in referenced_aliases
+        if alias_name in baseline_alias_items and alias_name not in candidate_aliases
+    ]
+    if not missing_aliases:
+        return candidate_sql, meta
+
+    new_expressions = list(candidate_sel.expressions or [])
+    for alias_name, original_index, alias_item in sorted(
+        (
+            (alias_name, baseline_alias_items[alias_name][0], baseline_alias_items[alias_name][1])
+            for alias_name in missing_aliases
+        ),
+        key=lambda item: item[1],
+    ):
+        insert_at = min(max(0, int(original_index)), len(new_expressions))
+        new_expressions.insert(insert_at, alias_item.copy())
+
+    candidate_sel.set("expressions", new_expressions)
+    meta["fixes"].append(
+        "restore_missing_ordered_computed_alias_projection_ast:" + ",".join(sorted(missing_aliases))
+    )
+
+    out_sql = candidate_ast.sql(dialect=SQL_PARSE_DIALECT or "mysql")
+    if candidate.strip().endswith(";"):
         out_sql = out_sql.rstrip(";") + ";"
     return out_sql, meta
 
@@ -46560,6 +46775,139 @@ def _enforce_set_operation_operator_from_question(sql: str, question: str) -> st
     return "".join(out).rstrip() + trailing
 
 
+def _fix_set_operation_global_order_by_output_refs(sql: str) -> str:
+    """
+    Normalize top-level set-operation ORDER BY references to visible output
+    names.
+
+    MySQL does not allow branch-qualified table references in the global ORDER
+    BY of UNION / INTERSECT / EXCEPT queries. For example:
+      ... UNION ALL ... ORDER BY orders.orderNumber
+    must become:
+      ... UNION ALL ... ORDER BY orderNumber
+
+    Conservative guardrails:
+    - only top-level set-operation roots
+    - only rewrites simple qualified ORDER BY columns
+    - only when the target output name can be resolved from the first branch
+    """
+    s = (sql or "").strip()
+    if (
+        not s
+        or "ORDER BY" not in s.upper()
+        or not re.search(r"\b(?:UNION|INTERSECT|EXCEPT)\b", s, flags=re.I)
+    ):
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    body = s[:-1].rstrip() if trailing else s
+
+    try:
+        parsed = sqlglot.parse_one(body, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception:
+        return sql
+
+    set_op_types = tuple(
+        cls for cls in (
+            getattr(exp, "Union", None),
+            getattr(exp, "Intersect", None),
+            getattr(exp, "Except", None),
+        )
+        if cls is not None
+    )
+    if not set_op_types or not isinstance(parsed, set_op_types):
+        return sql
+
+    order_arg = getattr(parsed, "args", {}).get("order")
+    order_items = list(getattr(order_arg, "expressions", None) or [])
+    if not order_items:
+        return sql
+
+    def _first_branch_select(node: "exp.Expression") -> Optional["exp.Select"]:
+        cur = node
+        while isinstance(cur, set_op_types):
+            cur = getattr(cur, "this", None)
+        if isinstance(cur, exp.Subquery):
+            cur = getattr(cur, "this", None)
+        if isinstance(cur, exp.Select):
+            return cur
+        return cur.find(exp.Select) if cur is not None else None
+
+    first_select = _first_branch_select(parsed)
+    if first_select is None:
+        return sql
+
+    output_names: List[str] = []
+    source_to_output: Dict[str, str] = {}
+    ambiguous_sources: Set[str] = set()
+
+    for item in first_select.expressions or []:
+        expr_node = item.this if isinstance(item, exp.Alias) else item
+        alias_name = str(item.alias or "").strip("`") if isinstance(item, exp.Alias) else ""
+        if alias_name:
+            out_name = alias_name
+        elif isinstance(expr_node, exp.Column):
+            out_name = str(expr_node.name or "").strip("`")
+        else:
+            out_name = ""
+        if out_name:
+            output_names.append(out_name)
+
+        if isinstance(expr_node, exp.Column):
+            source_name = str(expr_node.name or "").strip("`")
+            if source_name:
+                key = source_name.lower()
+                target_name = out_name or source_name
+                prev = source_to_output.get(key)
+                if prev and prev.lower() != target_name.lower():
+                    ambiguous_sources.add(key)
+                else:
+                    source_to_output[key] = target_name
+
+    for amb in ambiguous_sources:
+        source_to_output.pop(amb, None)
+
+    changed = False
+    for ordered in order_items:
+        base = getattr(ordered, "this", None)
+        if not isinstance(base, exp.Column):
+            continue
+        qualifier = str(base.table or "").strip("`")
+        col_name = str(base.name or "").strip("`")
+        if not qualifier or not col_name:
+            continue
+
+        target_name = source_to_output.get(col_name.lower())
+        if not target_name:
+            exact_hits = [name for name in output_names if name.lower() == col_name.lower()]
+            if len(exact_hits) == 1:
+                target_name = exact_hits[0]
+        if not target_name:
+            continue
+
+        ordered.set("this", exp.column(target_name))
+        changed = True
+
+    if not changed:
+        return sql
+
+    try:
+        rebuilt = parsed.sql(dialect=SQL_WRITE_DIALECT or SQL_PARSE_DIALECT or "mysql").strip()
+    except Exception:
+        return sql
+    if not rebuilt:
+        return sql
+    if trailing and not rebuilt.endswith(";"):
+        rebuilt += ";"
+    return rebuilt
+
+
 def _question_has_set_operation_intent(question: str) -> bool:
     """
     Detect explicit set-operation intent without tying the logic to a schema or
@@ -49191,6 +49539,231 @@ def _restore_requested_temporal_group_order(sql: str, question: str) -> str:
         return sql
 
     return s0.rstrip() + f" ORDER BY {order_expr} {direction}" + trailing
+
+
+def _restore_requested_weekday_group_order(sql: str, question: str) -> str:
+    """
+    Restore explicit weekday-sequence ordering for grouped weekday-name rollups.
+
+    Conservative behavior:
+    - only applies to top-level grouped queries
+    - only when the question explicitly names a weekday sequence
+      (for example "Monday through Sunday")
+    - only when the SQL visibly groups/projects a weekday-name expression
+    - adds or rewrites the top-level ORDER BY to a deterministic weekday ordinal
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip().lower()
+    if not s or not q:
+        return sql
+
+    wants_monday_first = bool(
+        re.search(
+            r"\bmonday\s+(?:through|to)\s+sunday\b|\bmonday\s*-\s*sunday\b",
+            q,
+            flags=re.I,
+        )
+    )
+    wants_sunday_first = bool(
+        re.search(
+            r"\bsunday\s+(?:through|to)\s+saturday\b|\bsunday\s*-\s*saturday\b",
+            q,
+            flags=re.I,
+        )
+    )
+    if not wants_monday_first and not wants_sunday_first:
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    trailing = ";" if s.endswith(";") else ""
+    body = s[:-1].rstrip() if trailing else s
+
+    try:
+        ast = sqlglot.parse_one(body, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception:
+        return sql
+
+    sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return sql
+    if sel.args.get("group") is None:
+        return sql
+
+    def _expr_sql(expr_in: Optional["exp.Expression"]) -> str:
+        if not isinstance(expr_in, exp.Expression):
+            return ""
+        try:
+            return expr_in.sql(dialect=SQL_WRITE_DIALECT or SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            return ""
+
+    def _normalize_sql_text(text: str) -> str:
+        return re.sub(r"[\s`]+", "", str(text or "").lower())
+
+    weekday_source_expr = ""
+    weekday_aliases: Set[str] = set()
+
+    def _weekday_name_source(expr_in: Optional["exp.Expression"]) -> str:
+        expr_sql = _expr_sql(expr_in)
+        if not expr_sql:
+            return ""
+        m_dayname = re.search(r"(?is)\bDAYNAME\s*\(\s*(?P<inner>[^()]+?)\s*\)", expr_sql)
+        if m_dayname:
+            return str(m_dayname.group("inner") or "").strip()
+        m_date_format = re.search(
+            r"(?is)\bDATE_FORMAT\s*\(\s*(?P<inner>[^,]+?)\s*,\s*(['\"])(%W|%a)\2\s*\)",
+            expr_sql,
+        )
+        if m_date_format:
+            return str(m_date_format.group("inner") or "").strip()
+        return ""
+
+    for item in sel.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        alias_name = str(item.alias or "").strip("` ").lower() if isinstance(item, exp.Alias) else ""
+        source_expr = _weekday_name_source(base)
+        if source_expr:
+            weekday_source_expr = source_expr
+            if alias_name:
+                weekday_aliases.add(alias_name)
+            break
+
+    if not weekday_source_expr:
+        group_expr = sel.args.get("group")
+        for item in (group_expr.expressions or []) if isinstance(group_expr, exp.Group) else []:
+            resolved = item
+            if isinstance(item, exp.Column) and not str(item.table or "").strip():
+                alias_name = str(item.name or "").strip("` ").lower()
+                if alias_name:
+                    weekday_aliases.add(alias_name)
+            source_expr = _weekday_name_source(resolved)
+            if source_expr:
+                weekday_source_expr = source_expr
+                break
+
+    if not weekday_source_expr:
+        return sql
+
+    order_fn = "WEEKDAY" if wants_monday_first else "DAYOFWEEK"
+    preferred_order_sql = f"{order_fn}({weekday_source_expr})"
+    try:
+        preferred_order_expr = sqlglot.parse_one(preferred_order_sql, read=SQL_PARSE_DIALECT or "mysql")
+    except Exception:
+        return sql
+    if not isinstance(preferred_order_expr, exp.Expression):
+        return sql
+
+    preferred_norm = _normalize_sql_text(_expr_sql(preferred_order_expr))
+    weekday_expr_norm = _normalize_sql_text(f"DAYNAME({weekday_source_expr})")
+    weekday_datefmt_norm = _normalize_sql_text(f"DATE_FORMAT({weekday_source_expr},'%W')")
+    weekday_datefmt_short_norm = _normalize_sql_text(f"DATE_FORMAT({weekday_source_expr},'%a')")
+
+    group_pos = _find_top_level_clause(body, "group by")
+    from_pos = _find_top_level_clause(body, "from")
+    if group_pos < 0 or from_pos < 0:
+        return sql
+
+    having_pos = _find_top_level_clause(body, "having", group_pos + len("group by"))
+    order_pos = _find_top_level_clause(body, "order by", group_pos + len("group by"))
+    limit_pos = _find_top_level_clause(body, "limit", group_pos + len("group by"))
+    clause_stops = [p for p in (having_pos, order_pos, limit_pos, len(body)) if p >= 0]
+    group_end = min(clause_stops) if clause_stops else len(body)
+
+    group_clause = body[group_pos + len("group by"):group_end].strip()
+    if not group_clause:
+        return sql
+
+    def _is_weekday_related_text(item_sql: str) -> bool:
+        norm = _normalize_sql_text(item_sql)
+        if not norm:
+            return False
+        if preferred_norm and preferred_norm in norm:
+            return True
+        if weekday_expr_norm and weekday_expr_norm in norm:
+            return True
+        if weekday_datefmt_norm and weekday_datefmt_norm in norm:
+            return True
+        if weekday_datefmt_short_norm and weekday_datefmt_short_norm in norm:
+            return True
+        alias_norms = {
+            _normalize_sql_text(alias_name)
+            for alias_name in weekday_aliases
+            if str(alias_name or "").strip()
+        }
+        return norm in alias_norms
+
+    group_items = [str(item or "").strip() for item in _split_top_level_commas(group_clause) if str(item or "").strip()]
+    if not group_items:
+        return sql
+
+    new_group_items: List[str] = []
+    seen_group_norms: Set[str] = set()
+    has_preferred_group = False
+    for item in group_items:
+        norm = _normalize_sql_text(item)
+        if norm == preferred_norm:
+            has_preferred_group = True
+        if norm and norm in seen_group_norms:
+            continue
+        if norm:
+            seen_group_norms.add(norm)
+        new_group_items.append(item)
+    if not has_preferred_group:
+        new_group_items.append(preferred_order_sql)
+
+    order_clause = ""
+    order_end = group_end
+    existing_order_items: List[str] = []
+    if order_pos >= 0:
+        order_end_candidates = [p for p in (limit_pos, len(body)) if p > order_pos]
+        order_end = min(order_end_candidates) if order_end_candidates else len(body)
+        order_clause = body[order_pos + len("order by"):order_end].strip()
+        existing_order_items = [
+            str(item or "").strip()
+            for item in _split_top_level_commas(order_clause)
+            if str(item or "").strip()
+        ]
+
+    if existing_order_items:
+        first_norm = _normalize_sql_text(existing_order_items[0])
+        first_is_preferred = first_norm == _normalize_sql_text(f"{preferred_order_sql}ASC") or first_norm == preferred_norm
+    else:
+        first_is_preferred = False
+
+    if has_preferred_group and first_is_preferred and len(new_group_items) == len(group_items):
+        return sql
+
+    new_order_items: List[str] = [f"{preferred_order_sql} ASC"]
+    seen_order_norms: Set[str] = {_normalize_sql_text(f"{preferred_order_sql}ASC"), preferred_norm}
+    for item in existing_order_items:
+        if _is_weekday_related_text(item):
+            continue
+        norm = _normalize_sql_text(item)
+        if norm and norm in seen_order_norms:
+            continue
+        if norm:
+            seen_order_norms.add(norm)
+        new_order_items.append(item)
+
+    prefix = body[:group_pos + len("group by")]
+    between_group_and_order = body[group_end:order_pos] if order_pos >= 0 else body[group_end:group_end]
+    suffix = body[order_end:] if order_pos >= 0 else body[group_end:]
+
+    rebuilt = prefix + " " + ", ".join(new_group_items)
+    if between_group_and_order.strip():
+        rebuilt += " " + between_group_and_order.strip()
+    rebuilt += " ORDER BY " + ", ".join(new_order_items)
+    if suffix.strip():
+        rebuilt += " " + suffix.strip()
+    rebuilt = rebuilt.strip()
+    if trailing and not rebuilt.endswith(";"):
+        rebuilt += ";"
+    return rebuilt
 
 
 def _add_having_for_required_temporal_left_join(sql: str, question: str, ctx: str = "") -> str:
@@ -53213,6 +53786,127 @@ def _rewrite_correlated_offset_subquery_to_window(sql: str, question: str) -> st
         return sql
     if not re.search(r"\b(?:previous|prior|next|following)\b", q, flags=re.I):
         return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        sqlglot = None
+        exp = None
+    else:
+        try:
+            ast = sqlglot.parse_one(s.rstrip().rstrip(";"), read="mysql")
+        except Exception:
+            ast = None
+
+        if ast is not None:
+            sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+            if isinstance(sel, exp.Select):
+                from_expr = sel.args.get("from") or sel.args.get("from_")
+                base_src = getattr(from_expr, "this", None) if from_expr is not None else None
+                if (
+                    isinstance(base_src, exp.Table)
+                    and not sel.args.get("joins")
+                    and sel.args.get("group") is None
+                    and sel.args.get("having") is None
+                    and sel.args.get("distinct") is None
+                ):
+                    outer_alias = str(getattr(base_src, "alias_or_name", "") or "").strip()
+                    if not outer_alias:
+                        outer_alias = str(getattr(base_src, "name", "") or "").strip()
+                    top_order = ast.args.get("order") or sel.args.get("order")
+                    ordered_items = list(top_order.expressions or []) if isinstance(top_order, exp.Order) else []
+
+                    ordered_cols: List[Tuple[str, bool]] = []
+                    for ordered in ordered_items:
+                        if not isinstance(ordered, exp.Ordered):
+                            continue
+                        base = getattr(ordered, "this", None)
+                        if not isinstance(base, exp.Column):
+                            continue
+                        col_name = str(base.name or "").strip()
+                        if not col_name:
+                            continue
+                        ordered_cols.append((col_name, bool(getattr(ordered, "args", {}).get("desc"))))
+
+                    partition_col = ordered_cols[0][0] if ordered_cols else ""
+                    order_col = ""
+                    order_desc = False
+                    for col_name, desc in ordered_cols[1:]:
+                        if partition_col and col_name.lower() == partition_col.lower():
+                            continue
+                        order_col = col_name
+                        order_desc = desc
+                        break
+
+                    if (
+                        partition_col
+                        and order_col
+                        and re.search(r"\b(?:inside|within)\s+the\s+same\b|\bfor\s+(?:each|every)\b", q, flags=re.I)
+                    ):
+                        def _is_simple_outer_column(expr_in: "exp.Expression", col_name: str) -> bool:
+                            return (
+                                isinstance(expr_in, exp.Column)
+                                and str(expr_in.name or "").strip().lower() == col_name.lower()
+                            )
+
+                        target_index = -1
+                        target_alias = ""
+                        for idx, item in enumerate(sel.expressions or []):
+                            if not isinstance(item, exp.Alias):
+                                continue
+                            item_sql = item.sql(dialect="mysql")
+                            if "SELECT" not in item_sql.upper():
+                                continue
+                            alias_name = str(item.alias or "").strip()
+                            if not alias_name:
+                                continue
+                            if str(getattr(base_src, "name", "") or "").strip():
+                                table_name = str(getattr(base_src, "name", "") or "").strip()
+                                if not re.search(rf"(?is)\bFROM\s+`?{re.escape(table_name)}`?\b", item_sql):
+                                    continue
+                            target_index = idx
+                            target_alias = alias_name
+                            break
+
+                        has_visible_order_col = False
+                        for item in sel.expressions or []:
+                            base_expr = item.this if isinstance(item, exp.Alias) else item
+                            if _is_simple_outer_column(base_expr, order_col):
+                                has_visible_order_col = True
+                                break
+
+                        if target_index >= 0 and target_alias and has_visible_order_col:
+                            offset_func = "LAG" if re.search(r"\b(?:previous|prior)\b", q, flags=re.I) else "LEAD"
+                            order_expr = exp.column(order_col, table=outer_alias or None)
+                            partition_expr = exp.column(partition_col, table=outer_alias or None)
+                            rewritten_exprs = [item.copy() for item in (sel.expressions or [])]
+                            rewritten_exprs[target_index] = exp.alias_(
+                                exp.Window(
+                                    this=getattr(exp, offset_func.title())(this=order_expr.copy()),
+                                    partition_by=exp.Partition(expressions=[partition_expr.copy()]),
+                                    order=exp.Order(
+                                        expressions=[
+                                            exp.Ordered(
+                                                this=order_expr.copy(),
+                                                desc=order_desc,
+                                            )
+                                        ]
+                                    ),
+                                ),
+                                target_alias,
+                                quoted=False,
+                            )
+                            sel.set("expressions", rewritten_exprs)
+                            try:
+                                rebuilt = ast.sql(dialect="mysql")
+                            except Exception:
+                                rebuilt = ""
+                            if rebuilt:
+                                if s.endswith(";") and not rebuilt.endswith(";"):
+                                    rebuilt += ";"
+                                return rebuilt
+
     if not re.search(r"\bSELECT\s+MAX\s*\(|\bSELECT\s+MIN\s*\(", s, flags=re.I):
         return sql
 

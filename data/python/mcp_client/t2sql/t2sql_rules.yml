@@ -990,6 +990,8 @@ agent_semantics:
       - "\\bbased\\s+on\\b[^.]{0,80}\\border\\b"
       - "\\b(?:date|time|timestamp)[-\\s]+order\\b"
       - "\\bsorted\\s+from\\s+(?:the\\s+)?(?:earliest|oldest|latest|newest)\\s+to\\s+(?:the\\s+)?(?:earliest|oldest|latest|newest)\\b"
+      - "\\bsorted\\s+from\\s+(?:the\\s+)?(?:lowest|smallest|least)\\s+to\\s+(?:the\\s+)?(?:highest|largest|greatest)\\b"
+      - "\\bsorted\\s+from\\s+(?:the\\s+)?(?:highest|largest|greatest)\\s+to\\s+(?:the\\s+)?(?:lowest|smallest|least)\\b"
   running_window_sequence:
     running_terms:
       - running
@@ -1012,6 +1014,29 @@ agent_semantics:
       - items
       - result
       - results
+  window_enumeration:
+    position_terms:
+      - position
+      - rank
+      - row number
+      - row_number
+      - sequence
+      - seq
+      - ordinal
+    enumeration_action_regex:
+      - "\\bnumber\\s+the\\s+(?:[a-z][a-z0-9_-]*\\s+){0,3}[a-z][a-z0-9_-]*\\b"
+      - "\\b(?:assign|give)\\b[^.]{0,80}\\b(?:position|rank|row\\s*number|sequence|ordinal)\\b"
+      - "\\bevery\\s+row\\s+gets\\s+(?:its\\s+own\\s+)?(?:position|rank|row\\s*number|sequence|ordinal)\\b"
+    partition_scope_regex:
+      - "\\bfor\\s+(?:each|every)\\b"
+      - "\\bper\\b"
+      - "\\bwithin\\s+(?:each|the\\s+same)\\b"
+      - "\\binside\\s+each\\b"
+    ordering_context_regex:
+      - "\\border(?:ed|ing)?\\s+by\\b"
+      - "\\bsort(?:ed|ing)?\\b"
+      - "\\bfrom\\s+(?:the\\s+)?(?:earliest|oldest|latest|newest|highest|lowest|largest|smallest)\\s+to\\s+(?:the\\s+)?(?:earliest|oldest|latest|newest|highest|lowest|largest|smallest)\\b"
+      - "\\bbreak\\s+ties\\b"
   case_bucketing:
     bucket_language_regex:
       - "\\b(?:bucket|classify|categori[sz]e|group(?:ed|ing)?\\s+into|bands?|ranges?|distribution)\\b"

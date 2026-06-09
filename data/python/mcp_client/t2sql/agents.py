@@ -489,7 +489,9 @@ from .helpers_main import (validate_identifiers, _regex_requirement_ok,
     _find_tables_with_implicit_columns, _extract_fk_from_context, _ordered_token_is_sort_only_context)
 from .helpers_core import (
     has_join,
+    _to_singular,
     _ast_guardrails,
+    _ast_restore_missing_ordered_computed_alias_projection,
     _fix_winner_row_window_order_priority,
     _fix_winner_row_metric_order_priority,
     _question_wants_latest_year_scope_with_aggregate,
@@ -497,6 +499,7 @@ from .helpers_core import (
     _rewrite_grouped_winner_row_ranked_aggregate,
     _rewrite_joined_ranked_subquery_to_outer_winner,
     _rewrite_malformed_window_winner_clause,
+    _question_has_window_enumeration_intent,
     _question_wants_winner_row,
     _question_wants_anti_existence,
     _question_wants_dual_fact_rollup,
@@ -519,6 +522,7 @@ from .helpers_core import (
     _drop_unrequested_difference_operand_columns,
     _drop_unrequested_missing_filter_columns,
     _drop_raw_column_covered_by_function,
+    _extract_requested_output_segment,
     _repair_misplaced_select_distinct,
     _enforce_requested_order_direction,
     _parse_allowed_identifiers,
@@ -553,6 +557,7 @@ from .rulebook import (
     ordering_temporal_intent_terms,
     offset_window_ordering_context_regex_patterns,
     offset_window_sequence_terms,
+    running_window_sequence_terms,
     projection_null_fill_action_terms,
     projection_null_fill_conditional_terms,
     projection_null_fill_fallback_terms,
@@ -658,6 +663,9 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         and not wants_projection_null_fill
     )
     wants_offset_window = _question_has_offset_window_sequence_intent(question)
+    wants_running_window = any_phrase_in_text(q_lower, running_window_sequence_terms())
+    wants_window_enumeration = _question_has_window_enumeration_intent(question)
+    wants_row_enumeration = wants_window_enumeration and not wants_running_window
     explicit_rank_window_contract = bool(
         re.search(
             r"\b(?:rank|ranking|ranked|row\s+number|row_number|dense\s*rank|dense_rank)\b",
@@ -679,6 +687,8 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         # Previous/next row context is an offset-window task, not a
         # winner-row selection. Keeping these separate avoids unnecessary
         # ROW_NUMBER/rn retry gates on otherwise valid LAG/LEAD projections.
+        wants_winner_row = False
+    if wants_winner_row and _question_has_window_enumeration_intent(question):
         wants_winner_row = False
     # Same-group/window-partition requirements belong to window-aggregate
     # families. True winner-row questions should be governed by their
@@ -706,7 +716,9 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
     )
     if same_group_avg_comparison_filter:
         repair_same_group_avg_partition_col = _resolve_required_window_partition_column(question, ctx)
-    if (
+    if wants_row_enumeration or wants_running_window:
+        required_window_partition_col = _resolve_required_window_partition_column(question, ctx)
+    elif (
         not wants_winner_row
         and not all_other_same_group_avg
         and not same_group_avg_comparison_filter
@@ -721,6 +733,8 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         "requires_include_zero": wants_include_zero,
         "requires_final_order": wants_final_order,
         "requires_offset_window": wants_offset_window,
+        "requires_row_enumeration": wants_row_enumeration,
+        "requires_running_window": wants_running_window,
         "requires_same_group_avg_difference": wants_same_group_avg_difference,
         "requires_boundary_regex": wants_boundary_regex,
         "requires_regex": wants_regex,
@@ -981,8 +995,79 @@ def _split_top_level_csv(text: str) -> List[str]:
     return items
 
 
+def _extract_window_partition_phrase(question: str) -> str:
+    """
+    Resolve the natural-language grouping phrase for window families.
+
+    Keep the broad "for each/per ..." fallback limited to row-enumeration and
+    running-window asks so ordinary grouped reports do not get misclassified as
+    requiring PARTITION BY semantics.
+    """
+    q = (question or "").strip().lower()
+    if not q:
+        return ""
+
+    same_group_hint = _extract_same_group_phrase(question)
+    if same_group_hint:
+        return same_group_hint
+
+    if not (
+        _question_has_window_enumeration_intent(question)
+        or any_phrase_in_text(q, running_window_sequence_terms())
+    ):
+        return ""
+
+    running_window_patterns = [
+        r"\bfor\s+that\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:in|by|on|ordered|sorted|order|date|time|when|where|and|then|,|\.|$))",
+        r"\bfor\s+(?:the\s+)?same\s+([a-z][a-z0-9_ ]{1,40}?)(?=\s+\b(?:in|by|on|ordered|sorted|order|date|time|when|where|and|then|,|\.|$))",
+    ]
+    row_container_stop_terms = {
+        "record",
+        "records",
+        "row",
+        "rows",
+        "entry",
+        "entries",
+        "item",
+        "items",
+        "result",
+        "results",
+    }
+
+    def _normalize_hint_phrase(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "").strip())
+
+    def _hint_is_row_container(text: str) -> bool:
+        tokens = [_to_singular(tok) for tok in _semantic_phrase_tokens(text)]
+        return bool(tokens) and all(tok in row_container_stop_terms for tok in tokens)
+
+    for pattern in running_window_patterns:
+        match = re.search(pattern, q, flags=re.I)
+        if not match:
+            continue
+        hint = _normalize_hint_phrase(match.group(1) or "")
+        if hint and not _hint_is_row_container(hint):
+            return hint
+
+    boundary_terms = (
+        r"when|where|after|before|ordered|sorted|with|and|then|that|"
+        r"which|who|whose|including|excluding|counting|except|return|show|list|display|provide|compute"
+    )
+    patterns = [
+        rf"\bfor\s+(?:each|every)\s+([a-z][a-z0-9_ ]{{1,40}}?)(?=\s+\bin\b\s+[a-z]|\s+\b(?:{boundary_terms})\b|[.,;]|$)",
+        rf"\bper\s+([a-z][a-z0-9_ ]{{1,40}}?)(?=\s+\bin\b\s+[a-z]|\s+\b(?:{boundary_terms})\b|[.,;]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, q, flags=re.I)
+        if match:
+            hint = _normalize_hint_phrase(match.group(1) or "")
+            if hint and not _hint_is_row_container(hint):
+                return hint
+    return ""
+
+
 def _resolve_required_window_partition_column(question: str, ctx: str = "", sql: str = "") -> str:
-    hint = _extract_same_group_phrase(question)
+    hint = _extract_window_partition_phrase(question)
     if not hint:
         return ""
 
@@ -1083,6 +1168,75 @@ def _has_required_window_partition(sql: str, partition_col: str) -> bool:
             flags=re.I | re.S,
         )
     )
+
+
+def _has_partitioned_user_variable_sequence_shape(sql: str, partition_col: str) -> bool:
+    s = str(sql or "").strip()
+    partition = str(partition_col or "").strip()
+    if not s or not partition:
+        return False
+
+    partition_ref = rf"(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?{re.escape(partition)}`?"
+    has_increment = bool(re.search(r"@\w+\s*:=\s*@\w+\s*\+\s*1\b", s, flags=re.I))
+    has_partition_compare = bool(
+        re.search(rf"@\w+\s*=\s*{partition_ref}", s, flags=re.I)
+        or re.search(rf"{partition_ref}\s*=\s*@\w+", s, flags=re.I)
+    )
+    has_partition_assignment = bool(re.search(rf"@\w+\s*:=\s*{partition_ref}", s, flags=re.I))
+    has_order_context = bool(re.search(rf"\bORDER\s+BY\b[^;]*{partition_ref}", s, flags=re.I | re.S))
+    return has_increment and has_partition_compare and has_partition_assignment and has_order_context
+
+
+def _has_partitioned_row_enumeration_shape(sql: str, partition_col: str) -> bool:
+    s = str(sql or "").strip()
+    partition = str(partition_col or "").strip()
+    if not s or not partition:
+        return False
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        parsed = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT)
+        for window in parsed.find_all(exp.Window):
+            func = getattr(window, "this", None)
+            if not isinstance(func, (exp.RowNumber, exp.Rank, exp.DenseRank)):
+                continue
+            window_sql = window.sql(dialect=SQL_WRITE_DIALECT)
+            if not re.search(r"\bORDER\s+BY\b", window_sql, flags=re.I):
+                continue
+            if _has_required_window_partition(window_sql, partition):
+                return True
+    except Exception:
+        pass
+
+    return _has_partitioned_user_variable_sequence_shape(s, partition)
+
+
+def _has_partitioned_running_window_shape(sql: str, partition_col: str) -> bool:
+    s = str(sql or "").strip()
+    partition = str(partition_col or "").strip()
+    if not s or not partition:
+        return False
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        parsed = sqlglot.parse_one(s, read=SQL_PARSE_DIALECT)
+        for window in parsed.find_all(exp.Window):
+            func = getattr(window, "this", None)
+            if not isinstance(func, exp.AggFunc):
+                continue
+            window_sql = window.sql(dialect=SQL_WRITE_DIALECT)
+            if not re.search(r"\bORDER\s+BY\b", window_sql, flags=re.I):
+                continue
+            if _has_required_window_partition(window_sql, partition):
+                return True
+    except Exception:
+        return False
+
+    return False
 
 
 def _rewrite_required_window_partition(sql: str, partition_col: str) -> str:
@@ -3936,6 +4090,8 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
     corrections: List[str] = []
     violations: List[str] = []
     required_window_partition_col = str(contract.get("required_window_partition_col") or "").strip()
+    requires_row_enumeration = bool(contract.get("requires_row_enumeration"))
+    requires_running_window = bool(contract.get("requires_running_window"))
     repair_same_group_avg_partition_col = str(
         contract.get("repair_same_group_avg_partition_col") or ""
     ).strip()
@@ -4056,23 +4212,30 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
             corrections.append(
                 f"Semantic contract: normalized same-table aggregate comparison by {required_window_partition_col}"
             )
-        fixed = _rewrite_grouped_aggregate_to_window_partition(
-            out_sql,
-            required_window_partition_col,
-            question,
-        )
-        if fixed != out_sql:
-            out_sql = fixed
-            corrections.append(
-                f"Semantic contract: rewrote grouped aggregate to window PARTITION BY {required_window_partition_col}"
+        if not requires_row_enumeration and not requires_running_window:
+            fixed = _rewrite_grouped_aggregate_to_window_partition(
+                out_sql,
+                required_window_partition_col,
+                question,
             )
+            if fixed != out_sql:
+                out_sql = fixed
+                corrections.append(
+                    f"Semantic contract: rewrote grouped aggregate to window PARTITION BY {required_window_partition_col}"
+                )
         fixed = _rewrite_required_window_partition(out_sql, required_window_partition_col)
         if fixed != out_sql:
             out_sql = fixed
             corrections.append(
                 f"Semantic contract: enforced window PARTITION BY {required_window_partition_col}"
             )
-        if not _has_required_window_partition(out_sql, required_window_partition_col):
+        if requires_row_enumeration:
+            if not _has_partitioned_row_enumeration_shape(out_sql, required_window_partition_col):
+                violations.append("missing_partitioned_row_enumeration")
+        elif requires_running_window:
+            if not _has_partitioned_running_window_shape(out_sql, required_window_partition_col):
+                violations.append("missing_partitioned_running_window")
+        elif not _has_required_window_partition(out_sql, required_window_partition_col):
             violations.append("missing_required_window_partition")
 
     if bool(contract.get("requires_same_group_avg_difference")):
@@ -4152,6 +4315,10 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         active_contracts.append("final_order")
     if bool(contract.get("requires_offset_window")):
         active_contracts.append("offset_window")
+    if requires_row_enumeration:
+        active_contracts.append("row_enumeration")
+    if requires_running_window:
+        active_contracts.append("running_window")
     if bool(contract.get("requires_same_group_avg_difference")):
         active_contracts.append("same_group_avg_difference")
     if bool(contract.get("requires_scalar_extrema_date_filter")):
@@ -4178,6 +4345,33 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
     _dbg_print_two("[REFINER - CONTRACT]", detail)
 
     return out_sql, corrections, list(dict.fromkeys(violations))
+
+
+def _merge_contract_violations_into_gate(
+    gate: Optional[Dict[str, Any]],
+    violations: List[str],
+) -> Dict[str, Any]:
+    """
+    Treat unresolved semantic-contract violations as gate failures.
+
+    This keeps regeneration candidates from being marked accepted when they are
+    structurally parseable but still violate high-signal question semantics
+    already derived by the system.
+    """
+    merged = dict(gate or {})
+    violation_list = [str(v) for v in (violations or []) if str(v).strip()]
+    if not violation_list:
+        return merged
+
+    semantic_failures = [str(v) for v in (merged.get("semantic_failures") or []) if str(v).strip()]
+    semantic_failures.extend(violation_list)
+    merged["semantic_failures"] = list(dict.fromkeys(semantic_failures))
+
+    reasons = [str(r) for r in (merged.get("reasons") or []) if str(r).strip()]
+    reasons.append("semantic_contract_mismatch")
+    merged["reasons"] = list(dict.fromkeys(reasons))
+    merged["accepted"] = False
+    return merged
 
 # ======================================================================
 # ======================= AGENT 0 - QUESTION GUARD =====================
@@ -6048,6 +6242,15 @@ def router_agent(state: RAGState) -> RAGState:
             )
             and has_explicit_sort_sequence
         )
+    if (
+        is_ordinal_ranking
+        and not re.search(ordinal_pattern, question_lower)
+        and _question_has_window_enumeration_intent(question_lower)
+    ):
+        # "break ties ... first" can place the token "first" near "row" in
+        # full-population numbering prompts. Keep those out of ordinal winner
+        # routing unless the question explicitly says "second highest", etc.
+        is_ordinal_ranking = False
     
     # WINDOW AGGREGATE DETECTION: "within the same X" / "in the same X" pattern
     # This pattern requires COUNT(*) OVER (PARTITION BY X), NOT GROUP BY
@@ -6546,6 +6749,10 @@ def router_agent(state: RAGState) -> RAGState:
         # LAG/LEAD-style "previous/next row" questions may contain words such
         # as "row" and "order", but they do not ask to pick a single winner
         # row per group. Keep them in the offset-window family.
+        is_winner_row = False
+    if is_winner_row and _question_has_window_enumeration_intent(question_lower):
+        # ROW_NUMBER-for-all-rows and running-total asks keep the full ordered
+        # population. They should not be routed into top-1-per-group repair.
         is_winner_row = False
     
     # Keep simple single-table scalar subquery in 3B lane:
@@ -7349,6 +7556,107 @@ def _evaluate_semantic_contract(
     return failures
 
 
+def _evaluate_set_operation_output_contract(
+    sql: str,
+    question: str,
+    parsed: Any,
+    sel: Any,
+    exp_mod: Any,
+) -> List[str]:
+    failures: List[str] = []
+    if not _question_has_set_operation_intent(question):
+        return failures
+
+    requested_output_text = str(_extract_requested_output_segment(question) or "").strip().lower()
+    if not requested_output_text:
+        return failures
+
+    set_op_types = tuple(
+        cls
+        for cls in (
+            getattr(exp_mod, "Union", None),
+            getattr(exp_mod, "Intersect", None),
+            getattr(exp_mod, "Except", None),
+        )
+        if cls is not None
+    )
+    if not set_op_types:
+        return failures
+
+    def _is_star_projection(item: Any) -> bool:
+        expr_node = item.this if isinstance(item, exp_mod.Alias) else item
+        return isinstance(expr_node, exp_mod.Star)
+
+    def _unwrap_constant_label_expr(node: Any) -> Any:
+        cur = node
+        while cur is not None and isinstance(cur, (exp_mod.Paren, exp_mod.Cast)):
+            cur = getattr(cur, "this", None)
+        return cur
+
+    def _is_constant_label_projection(item: Any) -> bool:
+        expr_node = item.this if isinstance(item, exp_mod.Alias) else item
+        expr_node = _unwrap_constant_label_expr(expr_node)
+        return isinstance(expr_node, exp_mod.Literal) and bool(getattr(expr_node, "is_string", False))
+
+    def _flatten_set_operation_branches(node: Any) -> List[Any]:
+        if node is None:
+            return []
+        if isinstance(node, exp_mod.Subquery):
+            return _flatten_set_operation_branches(getattr(node, "this", None))
+        if isinstance(node, set_op_types):
+            left = _flatten_set_operation_branches(getattr(node, "this", None))
+            right = _flatten_set_operation_branches(getattr(node, "expression", None))
+            return left + right
+        if isinstance(node, exp_mod.Select):
+            return [node]
+        inner_select = node.find(exp_mod.Select) if hasattr(node, "find") else None
+        return [inner_select] if inner_select is not None else []
+
+    set_root = parsed if isinstance(parsed, set_op_types) else None
+    outer_select = parsed if isinstance(parsed, exp_mod.Select) else sel
+    if set_root is None and isinstance(outer_select, exp_mod.Select):
+        from_arg = outer_select.args.get("from") or outer_select.args.get("from_")
+        from_src = getattr(from_arg, "this", None)
+        if isinstance(from_src, exp_mod.Subquery):
+            inner_expr = getattr(from_src, "this", None)
+            if isinstance(inner_expr, set_op_types):
+                set_root = inner_expr
+
+    if set_root is None:
+        return failures
+
+    branches = _flatten_set_operation_branches(set_root)
+    if not branches:
+        return failures
+
+    if isinstance(outer_select, exp_mod.Select) and any(
+        _is_star_projection(item) for item in (outer_select.expressions or [])
+    ):
+        failures.append("setop_select_star_projection")
+
+    branch_counts: List[int] = []
+    label_requested = bool(re.search(r"\blabel\b", requested_output_text, flags=re.I))
+    branch_label_flags: List[bool] = []
+    saw_branch_star = False
+
+    for branch in branches:
+        branch_exprs = list(branch.expressions or [])
+        branch_counts.append(len(branch_exprs))
+        if any(_is_star_projection(item) for item in branch_exprs):
+            saw_branch_star = True
+        if label_requested:
+            branch_label_flags.append(any(_is_constant_label_projection(item) for item in branch_exprs))
+
+    if saw_branch_star:
+        failures.append("setop_branch_select_star")
+    if len({count for count in branch_counts if count > 0}) > 1:
+        failures.append("setop_branch_arity_mismatch")
+    if label_requested and branch_label_flags and not all(branch_label_flags):
+        failures.append("setop_missing_branch_label")
+
+    return failures
+
+
 def _evaluate_high_confidence_ir_filter_contract(
     sql: str,
     intent_ir: Dict[str, Any],
@@ -7665,6 +7973,7 @@ def _deterministic_sql_acceptance_gate(
         "join_risk_warnings": [],
         "semantic_contract": _extract_semantic_contract(question),
         "semantic_failures": [],
+        "set_operation_failures": [],
         "ast_fixes": [],
         "ast_warnings": [],
     }
@@ -8424,6 +8733,17 @@ def _deterministic_sql_acceptance_gate(
             verdict["semantic_failures"] = semantic_failures
             verdict["reasons"].append("semantic_contract_mismatch")
 
+        set_operation_failures = _evaluate_set_operation_output_contract(
+            sql=candidate_sql,
+            question=question,
+            parsed=parsed,
+            sel=sel,
+            exp_mod=exp,
+        )
+        if set_operation_failures:
+            verdict["set_operation_failures"] = set_operation_failures
+            verdict["reasons"].append("set_operation_output_mismatch")
+
     except Exception as e:
         verdict["parse_error"] = f"acceptance_gate_error:{e}"
         verdict["reasons"].append("acceptance_gate_internal_error")
@@ -8492,6 +8812,12 @@ def _build_gate_retry_instruction(base_instruction: str, gate: Dict[str, Any]) -
         lines.append(
             "- Semantic contract mismatch: "
             f"{semantic_failures}. Match ORDER/LIMIT/aggregate requirements from the question."
+        )
+    set_operation_failures = gate.get("set_operation_failures") or []
+    if set_operation_failures:
+        lines.append(
+            "- Set-operation output blockers: "
+            f"{set_operation_failures}. Use explicit compatible branch projections and return the requested labeled output columns."
         )
     semantic_contract = gate.get("semantic_contract") or {}
     if semantic_contract:
@@ -11637,6 +11963,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     
     # 1. HEURISTIC PIPELINE (Versi Bersih/Safe Mode)
     final_sql = normalize_sql_pipeline(draft_sql, question, ctx)
+    normalized_sql_snapshot = str(final_sql).strip()
     corrections = ["Applied Heuristic Pipeline"]
 
     def _log_offset_window_tiebreak_debug(stage: str, before_sql: str, after_sql: Optional[str]) -> None:
@@ -11681,6 +12008,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if pruned_func_covered_sql and pruned_func_covered_sql != final_sql:
         final_sql = str(pruned_func_covered_sql).strip()
         corrections.append("Dropped raw columns covered by function expressions")
+    restored_ordered_alias_sql, restored_ordered_alias_meta = _ast_restore_missing_ordered_computed_alias_projection(
+        normalized_sql_snapshot,
+        final_sql,
+    )
+    if restored_ordered_alias_meta.get("parse_ok", False) and restored_ordered_alias_meta.get("fixes"):
+        final_sql = str(restored_ordered_alias_sql).strip()
+        corrections.append(
+            f"AST restored ordered computed alias projection: {restored_ordered_alias_meta.get('fixes')}"
+        )
 
     # 1b. AST guardrails (sqlglot) for structural safety checks/fixes.
     # This pass is conservative: if AST parse fails, we keep legacy behavior.
@@ -11787,6 +12123,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     if repaired_grouped_projection and repaired_grouped_projection != final_sql:
         final_sql = str(repaired_grouped_projection).strip()
         corrections.append("Applied grouped-summary projection repair")
+    restored_late_ordered_alias_sql, restored_late_ordered_alias_meta = _ast_restore_missing_ordered_computed_alias_projection(
+        normalized_sql_snapshot,
+        final_sql,
+    )
+    if restored_late_ordered_alias_meta.get("parse_ok", False) and restored_late_ordered_alias_meta.get("fixes"):
+        final_sql = str(restored_late_ordered_alias_sql).strip()
+        corrections.append(
+            f"AST restored ordered computed alias projection late: {restored_late_ordered_alias_meta.get('fixes')}"
+        )
 
     sql_up = final_sql.upper()
 
@@ -11998,6 +12343,24 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "STRICT REQUIREMENT: The question asks for a window calculation within the same group, "
                 "so you MUST use a window function with the correct PARTITION BY column. "
                 f"Use `PARTITION BY {required_partition_col}` and do NOT partition by an unrelated display column."
+            )
+        elif "missing_partitioned_row_enumeration" in contract_violations:
+            required_partition_col = _resolve_required_window_partition_column(question, ctx, final_sql)
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question asks to number every row within each group, not to pick a single winner row. "
+                "You MUST keep all rows and compute a per-group sequence using an ordered partitioned ranking pattern "
+                "(for example `ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY ...)`) "
+                "or an equivalent per-group reset pattern. "
+                f"Use `PARTITION BY {required_partition_col}` for the row sequence, keep the requested position column, "
+                "and do NOT collapse the result with GROUP BY or filter to rn = 1."
+            )
+        elif "missing_partitioned_running_window" in contract_violations:
+            required_partition_col = _resolve_required_window_partition_column(question, ctx, final_sql)
+            extra_instruction = (
+                "STRICT REQUIREMENT: The question asks for a running or cumulative value across every row in each group. "
+                "You MUST use an ordered window aggregate such as `SUM(...) OVER (PARTITION BY group_col ORDER BY ...)`. "
+                f"Use `PARTITION BY {required_partition_col}`, keep the row-level columns requested in the output, "
+                "and do NOT replace the running calculation with GROUP BY aggregation."
             )
         elif "missing_offset_window" in contract_violations:
             extra_instruction = (
@@ -13399,7 +13762,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
             candidate_sql = normalize_sql_pipeline(str(new_sql_local).strip(), question, ctx)
             semantic_contract_local = _derive_semantic_contract(question, ctx)
-            candidate_sql, _, _ = _apply_semantic_contract(candidate_sql, question, ctx)
+            candidate_sql, _, regen_contract_violations = _apply_semantic_contract(candidate_sql, question, ctx)
             repaired_candidate_winner_order = _fix_winner_row_window_order_priority(candidate_sql, question)
             if repaired_candidate_winner_order and repaired_candidate_winner_order != candidate_sql:
                 candidate_sql = str(repaired_candidate_winner_order).strip()
@@ -13449,6 +13812,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 question=question,
                 strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
             )
+            gate_local = _merge_contract_violations_into_gate(
+                gate_local,
+                regen_contract_violations,
+            )
             candidate_sql = str(gate_local.get("sql") or candidate_sql).strip()
             repaired_gated_output_order = _repair_offset_window_final_output_order(
                 candidate_sql,
@@ -13462,6 +13829,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     ctx=ctx,
                     question=question,
                     strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+                )
+                gate_local = _merge_contract_violations_into_gate(
+                    gate_local,
+                    regen_contract_violations,
                 )
                 candidate_sql = str(gate_local.get("sql") or candidate_sql).strip()
             repaired_gated_window_tiebreak = _append_offset_window_tiebreak_from_final_order(
@@ -13481,6 +13852,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     ctx=ctx,
                     question=question,
                     strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
+                )
+                gate_local = _merge_contract_violations_into_gate(
+                    gate_local,
+                    regen_contract_violations,
                 )
                 candidate_sql = str(gate_local.get("sql") or candidate_sql).strip()
             if not candidate_sql.endswith(";"):
@@ -13591,15 +13966,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                     "parse_error": (current_attempt or {}).get("gate_parse_error") if current_attempt else "",
                 },
             )
-            fallback_7b = _regen_once(
+            fallback_large = _regen_once(
                 LARGE_MODEL,
                 escalation_instruction,
-                "fallback_7b",
+                "fallback_large",
                 strict_schema=True,
             )
-            if fallback_7b:
-                attempts.append(fallback_7b)
-                current_attempt = fallback_7b
+            if fallback_large:
+                attempts.append(fallback_large)
+                current_attempt = fallback_large
 
         if attempts:
             regeneration_attempts_summary = [
@@ -13674,6 +14049,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         )
 
     final_gate = _deterministic_sql_acceptance_gate(final_sql, ctx=ctx, question=question)
+    _, _, final_contract_violations = _apply_semantic_contract(final_sql, question, ctx)
+    final_gate = _merge_contract_violations_into_gate(final_gate, final_contract_violations)
     final_sql = str(final_gate.get("sql") or final_sql).strip()
 
     final_parse_only_reasons = {str(r) for r in (final_gate.get("reasons") or []) if str(r).strip()}

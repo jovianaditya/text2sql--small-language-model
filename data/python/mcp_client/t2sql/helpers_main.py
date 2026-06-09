@@ -169,6 +169,7 @@ from .helpers_core import (
     _rewrite_explicit_single_table_scope,
     _append_requested_secondary_order_key,
     _restore_requested_temporal_group_order,
+    _restore_requested_weekday_group_order,
     _rewrite_include_zero_winner_row_identifier_source,
     _drop_tuple_in_filter_from_include_zero_ranked_winner,
     _drop_tuple_in_filter_from_single_table_ranked_winner,
@@ -221,7 +222,7 @@ from .helpers_core import (
     _guardrail_fix_like_regex_anchors, _canonicalize_structural_regex, _canonicalize_boundary_regex, _guardrail_fix_mysql_regexp_literals,
     _rewrite_regex_filter_to_case_bucket, _rewrite_half_open_between_bounds,
     # phase 6
-    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _strip_redundant_distinct_in_in_not_in_subqueries, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _parse_from_join_aliases,
+    _expand_missing_null_to_null_or_empty, _expand_present_not_null_to_not_empty, _rewrite_in_list_null_literal_as_is_null, _ensure_reasonable_distinct, _question_wants_count_distinct, _ensure_reasonable_count_distinct, _drop_redundant_group_by_for_distinct_lookup, _strip_redundant_distinct_in_in_not_in_subqueries, _rewrite_case_split_to_union, _normalize_simple_set_operation_branches, _rewrite_union_case_label_to_literal_branches, _rewrite_concat_label_union, _strip_unneeded_count_distinct, _question_wants_union_distinct_set_operation, _question_wants_union_all_set_operation, _enforce_set_operation_operator_from_question, _fix_set_operation_global_order_by_output_refs, _parse_from_join_aliases,
     _sqlglot_parse_gate,
     _ast_guardrails,
     # phase 7
@@ -12102,6 +12103,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s = _rewrite_union_case_label_to_literal_branches(s, question)
     s = _rewrite_concat_label_union(s, question)
     s = _enforce_set_operation_operator_from_question(s, question)
+    s = _fix_set_operation_global_order_by_output_refs(s)
     s = _strip_unneeded_count_distinct(s, question)
     s = _drop_unrequested_missing_value_subset_filters(s, question, ctx)
     if DEBUG_WR: print(f"[REFINER - PH6] after missing-value subset filter drop fix: {s}")
@@ -12273,6 +12275,7 @@ def _postprocess_sql(sql: str, question: str, ctx: str = "", ast_parseable: bool
     s = _enforce_requested_order_direction(s, question)
     s = _remove_top_level_order_by_if_not_requested(s, question)
     s = _restore_requested_temporal_group_order(s, question)
+    s = _restore_requested_weekday_group_order(s, question)
     s = _prefer_requested_count_desc_final_order(s, question)
     s = _drop_unrequested_grouped_limit(s, question)
     s = _maybe_add_limit(question, s)
