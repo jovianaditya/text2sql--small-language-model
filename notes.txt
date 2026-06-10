@@ -83,6 +83,11 @@ docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && pytho
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P4 --testset t2sql/test/qa_classicmodels_test_medium.yml --output results_test_medium_p4.xlsx --medium --warmup-models small" 2>&1 | tee test_medium_p4.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P4 --testset t2sql/test/qa_classicmodels_test_hard.yml --output results_test_hard_p4.xlsx --hard --warmup-models small" 2>&1 | tee test_hard_p4.log
 
+# TESTING P5 (STARCODER2)
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P5 --testset t2sql/test/qa_classicmodels_test_easy.yml --output results_test_easy_p5.xlsx --easy --warmup-models small" 2>&1 | tee test_easy_p5.log
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P5 --testset t2sql/test/qa_classicmodels_test_medium.yml --output results_test_medium_p5.xlsx --medium --warmup-models small" 2>&1 | tee test_medium_p5.log
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P5 --testset t2sql/test/qa_classicmodels_test_hard.yml --output results_test_hard_p5.xlsx --hard --warmup-models small" 2>&1 | tee test_hard_p5.log
+
 # tmux
 # new session
 tmux new -s thesis

@@ -256,6 +256,9 @@ LARGE_MODEL_P3    = os.getenv("LARGE_MODEL_P3", "granite-code:8b-instruct").stri
 ROUTING_MODEL_P4  = os.getenv("ROUTING_MODEL_P4", ROUTING_MODEL).strip()
 SMALL_MODEL_P4    = os.getenv("SMALL_MODEL_P4", "stable-code:3b-instruct").strip()
 LARGE_MODEL_P4    = os.getenv("LARGE_MODEL_P4", "deepseek-coder:6.7b-instruct").strip()
+ROUTING_MODEL_P5  = os.getenv("ROUTING_MODEL_P5", "starcoder:1b").strip()
+SMALL_MODEL_P5    = os.getenv("SMALL_MODEL_P5", "starcoder2:3b").strip()
+LARGE_MODEL_P5    = os.getenv("LARGE_MODEL_P5", "starcoder2:7b").strip()
 # Optional post-failure Human-in-the-Loop review for REPL execution failures.
 HITL_ENABLED      = bool(int(os.getenv("HITL_ENABLED", "1")))
 HITL_LOG_FILENAME_PREFIX = os.getenv("HITL_LOG_FILENAME_PREFIX", "hitl_review_log").strip()

@@ -55,6 +55,9 @@ from .config import (
     ROUTING_MODEL_P4,
     SMALL_MODEL_P4,
     LARGE_MODEL_P4,
+    ROUTING_MODEL_P5,
+    SMALL_MODEL_P5,
+    LARGE_MODEL_P5,
     OLLAMA_KEEP_ALIVE,
     EXECUTION_EMPTY_RESULT_CLASSIFY,
     format_heuristic_observability,
@@ -104,7 +107,7 @@ def resolve_scenario_config(scenario: str | None) -> tuple[str, dict]:
     """
     Resolve thesis evaluation scenario presets.
 
-    P1/P2/P3/P4:
+    P1/P2/P3/P4/P5:
       - current full system
       - differs only by router/small/large model family
     """
@@ -140,6 +143,12 @@ def resolve_scenario_config(scenario: str | None) -> tuple[str, dict]:
             "routing_model": ROUTING_MODEL_P4,
             "small_model": SMALL_MODEL_P4,
             "large_model": LARGE_MODEL_P4,
+        },
+        "P5": {
+            **base_flags,
+            "routing_model": ROUTING_MODEL_P5,
+            "small_model": SMALL_MODEL_P5,
+            "large_model": LARGE_MODEL_P5,
         },
     }
     if name not in presets:
@@ -1944,11 +1953,12 @@ Examples:
     )
     parser.add_argument(
         "--scenario",
-        choices=["P1", "P2", "P3", "P4", "p1", "p2", "p3", "p4"],
+        choices=["P1", "P2", "P3", "P4", "P5", "p1", "p2", "p3", "p4", "p5"],
         default="P1",
         help=(
             "Evaluation scenario preset: "
-            "P1=qwen2.5, P2=qwen2.5-coder, P3=qwen3, P4=llama."
+            "P1=qwen2.5, P2=qwen2.5-coder, P3=granite-code, "
+            "P4=stable-code+deepseek-coder, P5=starcoder+starcoder2."
         ),
     )
     parser.add_argument(

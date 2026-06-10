@@ -526,6 +526,7 @@ from .helpers_core import (
     _repair_misplaced_select_distinct,
     _enforce_requested_order_direction,
     _parse_allowed_identifiers,
+    _parse_from_join_aliases,
     _remove_top_level_order_by_if_not_requested,
     _SQL_KEYWORDS,
 )
@@ -12235,6 +12236,10 @@ def refine_sql_agent(state: RAGState) -> RAGState:
         # Skip if it's a keyword (subquery case: FROM (SELECT...))
         if candidate not in AGENT_REFINE_PRIMARY_FROM_SKIP_TOKENS:
             primary_tbl = candidate
+    if not primary_tbl:
+        primary_tbl = str(state.get("primary_table") or "").strip().lower()
+    if not primary_tbl and len(detected_tables) == 1:
+        primary_tbl = str(detected_tables[0] or "").strip().lower()
     
     if primary_tbl: reserved.add(primary_tbl)
 
@@ -12492,14 +12497,16 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                             break
                     
                     if can_be_solved_by_join:
+                        primary_alias = (primary_tbl[:1] or "t1")
+                        join_alias = (potential_table[:1] or "t2")
                         extra_instruction = (
                             f"CRITICAL ERROR: You selected columns {aliens_in_main} from table '{primary_tbl}', "
                             f"but these columns do NOT exist in '{primary_tbl}'. They exist in '{potential_table}'. "
                             f"You MUST use JOIN to access columns from multiple tables.\n"
                             f"CORRECT PATTERN:\n"
-                            f"SELECT {potential_table[0]}.{aliens_in_main[0]}, {primary_tbl[0]}.column, AGG()\n"
-                            f"FROM {potential_table} {potential_table[0]}\n"
-                            f"JOIN {primary_tbl} {primary_tbl[0]} ON ...\n"
+                            f"SELECT {join_alias}.{aliens_in_main[0]}, {primary_alias}.column, AGG()\n"
+                            f"FROM {potential_table} {join_alias}\n"
+                            f"JOIN {primary_tbl} {primary_alias} ON ...\n"
                             f"GROUP BY ..."
                         )
                         needs_regeneration = True
