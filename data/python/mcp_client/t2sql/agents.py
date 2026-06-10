@@ -497,6 +497,7 @@ from .helpers_core import (
     _question_wants_latest_year_scope_with_aggregate,
     _rewrite_missing_temporal_exclusion_from_null_filter,
     _rewrite_grouped_winner_row_ranked_aggregate,
+    _rewrite_single_table_tuple_in_winner_row,
     _rewrite_joined_ranked_subquery_to_outer_winner,
     _rewrite_malformed_window_winner_clause,
     _question_has_window_enumeration_intent,
@@ -708,7 +709,7 @@ def _derive_semantic_contract(question: str, ctx: str = "") -> Dict[str, bool]:
         any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_AVERAGE_INTENT_PATTERNS)
         and any(re.search(pat, q_lower, flags=re.I) for pat in HELPERS_SAME_GROUP_INTENT_PATTERNS)
         and re.search(
-            r"\b(?:higher|greater|more|above|over|lower|less|below|under)\s+than\s+(?:the\s+)?(?:avg|average|mean)\b"
+            r"\b(?:higher|greater|more|above|over|lower|less|below|under)\s+(?:than\s+)?(?:the\s+)?(?:avg|average|mean)\b"
             r"|\b(?:avg|average|mean)\b[^.]{0,80}\b(?:higher|greater|more|above|over|lower|less|below|under)\b"
             r"|\bwhose\b[^.]{0,80}\b(?:higher|greater|more|above|over|lower|less|below|under)\b[^.]{0,80}\b(?:avg|average|mean)\b",
             q_lower,
@@ -2704,7 +2705,16 @@ def _build_requested_final_order_mapping(
             alias_sql = alias_match.group(1).strip() if alias_match else ""
             alias = alias_sql.strip("`")
             expr = item_clean[:alias_match.start()].strip() if alias_match else item_clean
-            if re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", expr, flags=re.I):
+            alias_l = alias.strip("`").lower()
+            if re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", expr, flags=re.I) and alias_l in {
+                "",
+                "rn",
+                "rnum",
+                "row_num",
+                "row_number",
+                "rank_num",
+                "rank_helper",
+            }:
                 # Internal ranking helper aliases such as rn are implementation
                 # detail for derived ranked subqueries and must not be reused
                 # as user-facing final ORDER BY keys.
@@ -3091,6 +3101,7 @@ def _repair_single_table_offset_window_contract_shape(
     This runs after semantic-contract partition enforcement so we can safely:
     - restore the required partition key to the output projection
     - mirror stable trailing ORDER BY keys into the window ORDER BY
+    - drop stray top-level GROUP BY from row-preserving offset windows
     """
     s = str(sql or "").strip()
     q = str(question or "").strip()
@@ -3233,10 +3244,29 @@ def _repair_single_table_offset_window_contract_shape(
         except Exception:
             return ""
 
+    group_arg = sel.args.get("group")
+    has_top_level_having = sel.args.get("having") is not None
+    has_plain_top_level_aggregate = False
+    for item in sel.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        if not isinstance(base, exp.Expression):
+            continue
+        if isinstance(base, exp.Window):
+            continue
+        if any(True for _ in base.find_all(exp.Window)):
+            continue
+        if any(True for _ in base.find_all(exp.AggFunc)):
+            has_plain_top_level_aggregate = True
+            break
+
+    changed = False
+    if group_arg is not None and not has_top_level_having and not has_plain_top_level_aggregate:
+        sel.set("group", None)
+        changed = True
+
     partition_expr = exp.column(part_col, table=table_alias or None)
     partition_norm = _expr_norm(partition_expr)
 
-    changed = False
     existing_norms: Set[str] = set()
     for item in sel.expressions or []:
         base = item.this if isinstance(item, exp.Alias) else item
@@ -3667,35 +3697,6 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
     if trailing_semicolon:
         s = s[:-1].rstrip()
 
-    select_match = re.match(r"(?is)^\s*SELECT\b", s)
-    from_pos = _find_top_level_kw(s, "from")
-    where_pos = _find_top_level_kw(s, "where", from_pos + len("from")) if from_pos >= 0 else -1
-    if not select_match or from_pos < 0 or where_pos < 0 or where_pos <= from_pos:
-        return sql
-
-    select_clause = s[select_match.end():from_pos].strip()
-    from_clause = s[from_pos + len("from"):where_pos].strip()
-    where_clause = s[where_pos + len("where"):].strip()
-
-    from_match = re.fullmatch(
-        r"""\(?\s*`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)?
-            (?:\s+(?:AS\s+)?(?P<outer_alias>[A-Za-z_][A-Za-z0-9_]*))?\s*""",
-        from_clause,
-        flags=re.I | re.X,
-    )
-    if not from_match:
-        return sql
-
-    metric_match = re.match(
-        r"""(?is)^\s*
-            (?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)
-            \s*(?P<op>>=|<=|<>|!=|=|>|<)\s*\(""",
-        where_clause,
-        flags=re.I | re.X,
-    )
-    if not metric_match:
-        return sql
-
     def _find_matching_paren(text: str, open_idx: int) -> int:
         depth = 0
         in_sq = False
@@ -3722,6 +3723,209 @@ def _rewrite_same_table_correlated_aggregate_comparison(sql: str, partition_col:
                         return i
             i += 1
         return -1
+
+    # Near-miss family:
+    # SELECT ... FROM (
+    #   SELECT ..., AVG(metric) OVER (PARTITION BY grp) AS avg_metric
+    #   FROM t
+    #   WHERE metric > AVG(metric) OVER (PARTITION BY grp)
+    # ) AS x
+    # WHERE x.metric > x.avg_metric
+    #
+    # The inner window predicate is invalid in MySQL and redundant once the
+    # outer comparison is present, so drop only that inner WHERE.
+    outer_from_pos = _find_top_level_kw(s, "from")
+    if outer_from_pos >= 0:
+        outer_from_clause = s[outer_from_pos + len("from"):].lstrip()
+        if outer_from_clause.startswith("("):
+            inner_open = outer_from_pos + len("from") + s[outer_from_pos + len("from"):].find("(")
+            inner_close = _find_matching_paren(s, inner_open)
+            if inner_close > inner_open:
+                inner_sql = s[inner_open + 1:inner_close].strip()
+                outer_after = s[inner_close + 1:].strip()
+                outer_where_pos = _find_top_level_kw(outer_after, "where")
+                if (
+                    re.match(r"(?is)^SELECT\b", inner_sql)
+                    and outer_where_pos >= 0
+                    and re.search(r"\bAVG\s*\(", inner_sql, flags=re.I)
+                    and re.search(r"\bOVER\s*\(", inner_sql, flags=re.I)
+                ):
+                    inner_where_pos = _find_top_level_kw(inner_sql, "where")
+                    if inner_where_pos > 0:
+                        inner_order_pos = _find_top_level_kw(inner_sql, "order by", inner_where_pos + len("where"))
+                        inner_limit_pos = _find_top_level_kw(inner_sql, "limit", inner_where_pos + len("where"))
+                        inner_tail_pos_candidates = [p for p in (inner_order_pos, inner_limit_pos, len(inner_sql)) if p >= 0]
+                        inner_where_end = min(inner_tail_pos_candidates) if inner_tail_pos_candidates else len(inner_sql)
+                        inner_where_body = inner_sql[inner_where_pos + len("where"):inner_where_end].strip()
+                        if re.search(r"\bOVER\s*\(", inner_where_body, flags=re.I):
+                            outer_where_body = outer_after[outer_where_pos + len("where"):].strip()
+                            partition_pat = re.escape(str(partition_col or "").strip("`"))
+                            has_partitioned_avg = bool(
+                                re.search(
+                                    rf"\bAVG\s*\([^)]*\)\s*OVER\s*\(\s*PARTITION\s+BY\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?`?{partition_pat}`?\b",
+                                    inner_sql,
+                                    flags=re.I,
+                                )
+                            )
+                            has_outer_avg_compare = bool(
+                                re.search(
+                                    r"(?is)\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?\s*(?:>=|<=|<>|!=|=|>|<)\s*"
+                                    r"[A-Za-z_][A-Za-z0-9_]*\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?",
+                                    outer_where_body,
+                                )
+                            )
+                            if has_partitioned_avg and has_outer_avg_compare:
+                                rebuilt_inner = (inner_sql[:inner_where_pos].rstrip() + " " + inner_sql[inner_where_end:].lstrip()).strip()
+                                rebuilt = s[:inner_open + 1] + rebuilt_inner + s[inner_close:]
+                                return rebuilt.rstrip() + trailing_semicolon
+
+    select_match = re.match(r"(?is)^\s*SELECT\b", s)
+    from_pos = _find_top_level_kw(s, "from")
+    where_pos = _find_top_level_kw(s, "where", from_pos + len("from")) if from_pos >= 0 else -1
+    if not select_match or from_pos < 0 or where_pos < 0 or where_pos <= from_pos:
+        return sql
+
+    select_clause = s[select_match.end():from_pos].strip()
+    from_clause = s[from_pos + len("from"):where_pos].strip()
+    where_clause = s[where_pos + len("where"):].strip()
+
+    from_match = re.fullmatch(
+        r"""\(?\s*`?(?P<table>[A-Za-z_][A-Za-z0-9_]*)`?\s*\)?
+            (?:\s+(?:AS\s+)?(?P<outer_alias>[A-Za-z_][A-Za-z0-9_]*))?\s*""",
+        from_clause,
+        flags=re.I | re.X,
+    )
+    if not from_match:
+        return sql
+
+    outer_alias = (from_match.group("outer_alias") or "").strip("`") or str(from_match.group("table") or "").strip("`")
+    outer_table = str(from_match.group("table") or "").strip("`")
+    if not outer_alias or not outer_table:
+        return sql
+
+    order_pos = _find_top_level_kw(s, "order by", where_pos + len("where"))
+    limit_pos = _find_top_level_kw(s, "limit", where_pos + len("where"))
+    where_end_candidates = [p for p in (order_pos, limit_pos, len(s)) if p >= 0]
+    where_end = min(where_end_candidates) if where_end_candidates else len(s)
+    where_clause_core = s[where_pos + len("where"):where_end].strip()
+    trailing_tail = s[where_end:].strip()
+
+    def _split_top_level_and(text: str) -> List[str]:
+        items: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        in_sq = False
+        in_dq = False
+        in_bt = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "'" and not in_dq and not in_bt:
+                if in_sq and i + 1 < len(text) and text[i + 1] == "'":
+                    buf.append(ch)
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                in_sq = not in_sq
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_sq and not in_bt:
+                in_dq = not in_dq
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == "`" and not in_sq and not in_dq:
+                in_bt = not in_bt
+                buf.append(ch)
+                i += 1
+                continue
+            if not in_sq and not in_dq and not in_bt:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif depth == 0 and text[i:i + 3].lower() == "and":
+                    prev_ch = text[i - 1] if i > 0 else " "
+                    next_ch = text[i + 3] if i + 3 < len(text) else " "
+                    if not (prev_ch.isalnum() or prev_ch == "_") and not (next_ch.isalnum() or next_ch == "_"):
+                        item = "".join(buf).strip()
+                        if item:
+                            items.append(item)
+                        buf = []
+                        i += 3
+                        continue
+            buf.append(ch)
+            i += 1
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    def _strip_qual(expr_text: str) -> str:
+        raw = str(expr_text or "").strip().strip("`")
+        if "." in raw:
+            raw = raw.split(".")[-1].strip("`")
+        return raw
+
+    direct_window_cmp_pat = re.compile(
+        r"""(?is)^\s*
+        (?P<lhs>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
+        (?P<op>>=|<=|<>|!=|=|>|<)\s*
+        (?P<agg>AVG|SUM|MIN|MAX|COUNT)\s*\(\s*
+        (?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
+        \)\s*OVER\s*\(\s*PARTITION\s+BY\s+
+        (?P<partition>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*\)\s*$
+        """,
+        re.X,
+    )
+
+    direct_terms = _split_top_level_and(where_clause_core)
+    rebuilt_terms: List[str] = []
+    direct_rewrite_applied = False
+    direct_partition_norm = str(partition_col or "").strip("`").lower()
+    safe_sub_alias = "sq" if outer_alias.lower() != "sq" else "sq_inner"
+    for term in direct_terms:
+        m_direct = direct_window_cmp_pat.match(term)
+        if not m_direct:
+            rebuilt_terms.append(term)
+            continue
+        partition_name = _strip_qual(m_direct.group("partition") or "")
+        metric_name = _strip_qual(m_direct.group("metric") or "")
+        lhs_expr = str(m_direct.group("lhs") or "").strip()
+        lhs_name = _strip_qual(lhs_expr)
+        if not partition_name or not metric_name or not lhs_name:
+            rebuilt_terms.append(term)
+            continue
+        if direct_partition_norm and partition_name.lower() != direct_partition_norm:
+            rebuilt_terms.append(term)
+            continue
+        lhs_render = lhs_expr if "." in lhs_expr.replace("`", "") else f"{outer_alias}.{lhs_name}"
+        replacement = (
+            f"{lhs_render} {str(m_direct.group('op') or '').strip()} "
+            f"(SELECT {str(m_direct.group('agg') or '').upper()}({safe_sub_alias}.{metric_name}) "
+            f"FROM {outer_table} AS {safe_sub_alias} "
+            f"WHERE {safe_sub_alias}.{partition_name} = {outer_alias}.{partition_name})"
+        )
+        rebuilt_terms.append(replacement)
+        direct_rewrite_applied = True
+
+    if direct_rewrite_applied:
+        rebuilt_where = " AND ".join(rebuilt_terms)
+        rebuilt_sql = s[:where_pos].rstrip() + f" WHERE {rebuilt_where}"
+        if trailing_tail:
+            rebuilt_sql += f" {trailing_tail}"
+        return rebuilt_sql.rstrip() + trailing_semicolon
+
+    metric_match = re.match(
+        r"""(?is)^\s*
+            (?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)
+            \s*(?P<op>>=|<=|<>|!=|=|>|<)\s*\(""",
+        where_clause,
+        flags=re.I | re.X,
+    )
+    if not metric_match:
+        return sql
 
     subquery_open = metric_match.end() - 1
     subquery_close = _find_matching_paren(where_clause, subquery_open)
@@ -3936,6 +4140,18 @@ def _has_same_group_avg_difference_shape(sql: str) -> bool:
     s = str(sql or "")
     if not s:
         return False
+    if re.search(
+        r"""(?is)
+        (?:`?[A-Za-z_][A-Za-z0-9_]*`?(?:\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?)?)
+        \s*-\s*
+        AVG\s*\([^)]*\)\s*OVER\s*\([^)]*\)
+        \s*/\s*
+        (?:COUNT|SUM|AVG|MIN|MAX)\s*\(
+        """,
+        s,
+        flags=re.I | re.X,
+    ):
+        return False
     return bool(
         re.search(
             r"""(?is)
@@ -4031,6 +4247,19 @@ def _rewrite_same_group_avg_projection_to_difference(sql: str, question: str) ->
         """,
         re.X,
     )
+    malformed_gap_pattern = re.compile(
+        r"""(?is)^\s*
+        \(?\s*
+        (?P<base>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<base_col>[A-Za-z_][A-Za-z0-9_]*)`?)
+        \s*-\s*
+        AVG\s*\(\s*(?P<avg_metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<avg_col>[A-Za-z_][A-Za-z0-9_]*)`?)\s*\)
+        \s*OVER\s*\(\s*PARTITION\s+BY\s+(?P<partition>.*?)\s*\)
+        \s*/\s*
+        COUNT\s*\(\s*\*\s*\)\s*OVER\s*\([^)]*\)
+        \s*\)?\s*$
+        """,
+        re.X,
+    )
     offset_item_pattern = re.compile(
         r"""(?is)^\s*
         (?P<func>LAG|LEAD)\s*\(\s*(?P<metric>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?(?P<metric_col>[A-Za-z_][A-Za-z0-9_]*)`?)\s*\)
@@ -4048,6 +4277,18 @@ def _rewrite_same_group_avg_projection_to_difference(sql: str, question: str) ->
         if not expr:
             rewritten_items.append(raw)
             continue
+        m_malformed = malformed_gap_pattern.match(expr)
+        if m_malformed:
+            base_col = (m_malformed.group("base_col") or "").strip("`").lower()
+            avg_col = (m_malformed.group("avg_col") or "").strip("`").lower()
+            partition_expr = (m_malformed.group("partition") or "").strip()
+            base_metric_ref = plain_metric_refs.get(base_col, (m_malformed.group("base") or "").strip())
+            if base_col and avg_col and base_col == avg_col and base_metric_ref and partition_expr:
+                avg_window_expr = f"AVG({base_metric_ref}) OVER (PARTITION BY {partition_expr})"
+                diff_expr = f"{base_metric_ref} - {avg_window_expr}"
+                rewritten_items.append(f"{diff_expr} AS {alias}" if alias else diff_expr)
+                changed = True
+                continue
         m_avg = avg_item_pattern.match(expr)
         partition_expr = ""
         metric_col = ""
@@ -4077,6 +4318,94 @@ def _rewrite_same_group_avg_projection_to_difference(sql: str, question: str) ->
 
     rebuilt_select = ", ".join(rewritten_items)
     return s[:select_prefix.end()] + rebuilt_select + " " + s[from_pos:].lstrip()
+
+
+def _collapse_redundant_offset_self_join(sql: str, question: str) -> str:
+    """
+    Drop a redundant same-table self join around a single-table LAG/LEAD query.
+
+    Scope is intentionally narrow:
+    - exactly one self join
+    - one top-level SELECT
+    - at least one LAG/LEAD window
+    - projected/ordered/grouped predicates never reference the joined-right alias
+    """
+    s = str(sql or "").strip()
+    q = str(question or "").strip()
+    if not s or not q or not _question_has_offset_window_sequence_intent(q):
+        return sql
+    if not re.search(r"\b(?:LAG|LEAD)\s*\(", s, flags=re.I):
+        return sql
+    if not re.search(r"\bJOIN\b", s, flags=re.I):
+        return sql
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return sql
+
+    try:
+        ast = sqlglot.parse_one(s, read="mysql")
+    except Exception:
+        return sql
+
+    sel = ast.find(exp.Select)
+    if not isinstance(sel, exp.Select):
+        return sql
+
+    joins = [j for j in (sel.args.get("joins") or []) if isinstance(j, exp.Join)]
+    if len(joins) != 1:
+        return sql
+
+    from_arg = sel.args.get("from") or sel.args.get("from_")
+    left_src = getattr(from_arg, "this", None) if from_arg is not None else None
+    right_src = getattr(joins[0], "this", None)
+    if not isinstance(left_src, exp.Table) or not isinstance(right_src, exp.Table):
+        return sql
+
+    left_table = str(left_src.name or "").strip("`").lower()
+    right_table = str(right_src.name or "").strip("`").lower()
+    left_alias = str(left_src.alias_or_name or left_src.name or "").strip("`").lower()
+    right_alias = str(right_src.alias_or_name or right_src.name or "").strip("`").lower()
+    if not left_table or not right_table or left_table != right_table or not left_alias or not right_alias or left_alias == right_alias:
+        return sql
+
+    if sel.args.get("where") is not None or sel.args.get("having") is not None or sel.args.get("group") is not None:
+        return sql
+
+    window_refs_left = False
+    for win in sel.find_all(exp.Window):
+        if not isinstance(getattr(win, "this", None), (getattr(exp, "Lag", ()), getattr(exp, "Lead", ()))):
+            continue
+        window_refs_left = any(
+            str(col.table or "").strip("`").lower() == left_alias
+            for col in win.find_all(exp.Column)
+        )
+        if any(str(col.table or "").strip("`").lower() == right_alias for col in win.find_all(exp.Column)):
+            return sql
+    if not window_refs_left:
+        return sql
+
+    referenced_outside_join: Set[str] = set()
+    for item in sel.expressions or []:
+        for col in item.find_all(exp.Column):
+            alias_l = str(col.table or "").strip("`").lower()
+            if alias_l:
+                referenced_outside_join.add(alias_l)
+    for order_expr in (sel.args.get("order").expressions or []) if sel.args.get("order") is not None else []:
+        for col in order_expr.find_all(exp.Column):
+            alias_l = str(col.table or "").strip("`").lower()
+            if alias_l:
+                referenced_outside_join.add(alias_l)
+    if right_alias in referenced_outside_join:
+        return sql
+
+    sel.set("joins", [])
+    out = ast.sql(dialect="mysql")
+    if s.endswith(";") and not out.endswith(";"):
+        out += ";"
+    return out or sql
 
 
 def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[str, List[str], List[str]]:
@@ -4113,6 +4442,12 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
     if fixed != out_sql:
         out_sql = fixed
         corrections.append("Semantic contract: repaired near-miss output alias reference")
+
+    if requires_running_window or _question_has_offset_window_sequence_intent(question):
+        fixed = _collapse_redundant_offset_self_join(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: dropped redundant offset self join")
 
     fixed = _rewrite_character_slice_grouping(out_sql, question, ctx)
     if fixed != out_sql:
@@ -4159,6 +4494,10 @@ def _apply_semantic_contract(sql: str, question: str, ctx: str = "") -> Tuple[st
         if fixed != out_sql:
             out_sql = fixed
             corrections.append("Semantic contract: lifted child-ranked join to parent winner-row")
+        fixed = _rewrite_single_table_tuple_in_winner_row(out_sql, question)
+        if fixed != out_sql:
+            out_sql = fixed
+            corrections.append("Semantic contract: rewrote tuple-IN winner-row filter")
         fixed = _rewrite_malformed_window_winner_clause(out_sql, question)
         if fixed != out_sql:
             out_sql = fixed

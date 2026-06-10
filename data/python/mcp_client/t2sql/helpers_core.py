@@ -5112,6 +5112,8 @@ def _prune_parent_key_only_joins(sql: str) -> str:
         return sql
     if re.search(r"\b(?:from|join)\s*\(", sql, flags=re.I):
         return sql
+    if re.search(r"\(\s*SELECT\b", sql, flags=re.I):
+        return sql
 
     try:
         fk_raw = get_fk_relationships() or {}
@@ -5172,61 +5174,68 @@ def _prune_parent_key_only_joins(sql: str) -> str:
 
     out = sql
     changed = False
-    for m_join in reversed(list(join_pat.finditer(out))):
-        join_type = (m_join.group("jtype") or "").upper()
-        if "LEFT" in join_type or "RIGHT" in join_type or "FULL" in join_type:
-            continue
-        table_raw = (m_join.group("table") or "").replace("`", "")
-        parent_table = table_raw.split(".")[-1].strip().lower()
-        parent_alias = (m_join.group("alias") or parent_table).strip()
-        if not parent_table or not parent_alias:
-            continue
+    while True:
+        local_change = False
+        for m_join in reversed(list(join_pat.finditer(out))):
+            join_type = (m_join.group("jtype") or "").upper()
+            if "LEFT" in join_type or "RIGHT" in join_type or "FULL" in join_type:
+                continue
+            table_raw = (m_join.group("table") or "").replace("`", "")
+            parent_table = table_raw.split(".")[-1].strip().lower()
+            parent_alias = (m_join.group("alias") or parent_table).strip()
+            if not parent_table or not parent_alias:
+                continue
 
-        on_parts = _split_top_level_and(m_join.group("on") or "")
-        if len(on_parts) != 1:
-            continue
-        m_eq = eq_pat.match(on_parts[0])
-        if not m_eq:
-            continue
+            on_parts = _split_top_level_and(m_join.group("on") or "")
+            if len(on_parts) != 1:
+                continue
+            m_eq = eq_pat.match(on_parts[0])
+            if not m_eq:
+                continue
 
-        a1, c1, a2, c2 = m_eq.group(1), m_eq.group(2), m_eq.group(3), m_eq.group(4)
-        parent_key = str(get_id_column(parent_table) or "").strip("`")
-        if not parent_key:
-            continue
+            a1, c1, a2, c2 = m_eq.group(1), m_eq.group(2), m_eq.group(3), m_eq.group(4)
+            parent_key = str(get_id_column(parent_table) or "").strip("`")
+            if not parent_key:
+                continue
 
-        child_alias = ""
-        child_fk = ""
-        if a1.lower() == parent_alias.lower() and c1.lower() == parent_key.lower():
-            child_alias, child_fk = a2, c2
-        elif a2.lower() == parent_alias.lower() and c2.lower() == parent_key.lower():
-            child_alias, child_fk = a1, c1
-        else:
-            continue
+            child_alias = ""
+            child_fk = ""
+            if a1.lower() == parent_alias.lower() and c1.lower() == parent_key.lower():
+                child_alias, child_fk = a2, c2
+            elif a2.lower() == parent_alias.lower() and c2.lower() == parent_key.lower():
+                child_alias, child_fk = a1, c1
+            else:
+                continue
 
-        child_table = _table_for(child_alias)
-        if not child_table:
-            continue
-        if fk_map.get(child_table, {}).get(child_fk.lower()) != parent_table:
-            continue
+            child_table = _table_for(child_alias)
+            if not child_table:
+                continue
+            if fk_map.get(child_table, {}).get(child_fk.lower()) != parent_table:
+                continue
 
-        outside = out[:m_join.start("full")] + out[m_join.end("full"):]
-        outside_clean = _strip_string_literals(outside).replace("`", "")
-        parent_refs = re.findall(
-            rf"\b{re.escape(parent_alias)}\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
-            outside_clean,
-            flags=re.I,
-        )
-        if not parent_refs:
-            out = out[:m_join.start("full")] + " " + out[m_join.end("full"):]
+            outside = out[:m_join.start("full")] + out[m_join.end("full"):]
+            outside_clean = _strip_string_literals(outside).replace("`", "")
+            parent_refs = re.findall(
+                rf"\b{re.escape(parent_alias)}\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+                outside_clean,
+                flags=re.I,
+            )
+            if not parent_refs:
+                out = out[:m_join.start("full")] + " " + out[m_join.end("full"):]
+                changed = True
+                local_change = True
+                break
+            if any(ref.lower() != parent_key.lower() for ref in parent_refs):
+                continue
+
+            prefix = _replace_parent_key_refs(out[:m_join.start("full")], parent_alias, parent_key, child_alias, child_fk)
+            tail = _replace_parent_key_refs(out[m_join.end("full"):], parent_alias, parent_key, child_alias, child_fk)
+            out = prefix + " " + tail
             changed = True
-            continue
-        if any(ref.lower() != parent_key.lower() for ref in parent_refs):
-            continue
-
-        prefix = _replace_parent_key_refs(out[:m_join.start("full")], parent_alias, parent_key, child_alias, child_fk)
-        tail = _replace_parent_key_refs(out[m_join.end("full"):], parent_alias, parent_key, child_alias, child_fk)
-        out = prefix + " " + tail
-        changed = True
+            local_change = True
+            break
+        if not local_change:
+            break
 
     return re.sub(r"\s{2,}", " ", out).strip() if changed else sql
 
@@ -13812,6 +13821,8 @@ def _add_rank_value_nonnull_filter_from_question(sql: str, question: str) -> str
         return sql
     if not re.search(r"\b(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(", sql, flags=re.I):
         return sql
+    if _question_wants_winner_row(question):
+        return sql
     if _question_wants_include_zero(question, ""):
         return sql
 
@@ -17036,8 +17047,9 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
     rhs_key_expr = tuple_match.group("rhs_key") if tuple_match is not None else membership_match.group("rhs_key")
     if lhs_key_norm not in group_norms and _expr_norm(rhs_key_expr or "") not in group_norms:
         return sql
-    if lhs_date_norm not in group_norms and _expr_norm(rhs_date_col) not in group_norms:
-        return sql
+    # A valid winner-row near-miss commonly groups only by the partition key
+    # and uses MAX/MIN(date) as the tuple tie-breaker. Requiring the date
+    # expression itself in GROUP BY would reject that canonical pattern.
 
     select_items = _split_top_level_commas(select_part)
     if not select_items:
@@ -17227,6 +17239,25 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
     output_aliases: Set[str] = set()
     output_exprs: Set[str] = set()
 
+    def _is_valid_base_table_column(expr_text: str) -> bool:
+        parsed = _parse_qualified_col(expr_text)
+        if not parsed:
+            return False
+        _qual, col_name = parsed
+        col_l = str(col_name or "").strip("`").lower()
+        if not col_l:
+            return False
+        try:
+            analyzer = get_schema_analyzer()
+            table_cols = {
+                str(c or "").strip("`").lower()
+                for c in (analyzer.get_table_columns(base_table.lower()) or [])
+                if str(c or "").strip()
+            }
+        except Exception:
+            table_cols = set()
+        return bool(table_cols and col_l in table_cols)
+
     def _add_output(pair: Tuple[str, str]) -> None:
         expr, alias = pair
         expr_norm = _expr_norm(expr)
@@ -17259,7 +17290,11 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
     _add_output(metric_pair)
     _add_output(date_pair)
 
-    if stable_pair is not None and _expr_norm(stable_pair[0]) not in core_exprs:
+    if (
+        stable_pair is not None
+        and _expr_norm(stable_pair[0]) not in core_exprs
+        and _is_valid_base_table_column(stable_pair[0])
+    ):
         rank_items.append(f"{stable_pair[0]} ASC")
 
     inner_select = [f"{expr} AS {alias}" for expr, alias in output_pairs]
@@ -17270,7 +17305,10 @@ def _rewrite_single_table_tuple_in_winner_row(sql: str, question: str) -> str:
     remaining_conj = [c.strip() for i, c in enumerate(conjuncts) if i != tuple_idx and c.strip()]
     inner_where = f"\n  WHERE {' AND '.join(remaining_conj)}" if remaining_conj else ""
     outer_select = ", ".join(f"t.{alias}" for _, alias in output_pairs)
-    tail_clause = f"\n{tail_part}" if tail_part else ""
+    tail_keep = tail_part
+    if re.match(r"(?is)^\s*LIMIT\s+\d+(?:\s*,\s*\d+)?\s*$", tail_keep or ""):
+        tail_keep = ""
+    tail_clause = f"\n{tail_keep}" if tail_keep else ""
 
     return (
         f"SELECT {outer_select}\n"
@@ -20237,11 +20275,8 @@ def _add_missing_grouped_metric_threshold_having(sql: str, question: str, ctx: s
     for start, end, op, val in threshold_matches:
         prefix = q[max(0, start - 96):start]
         suffix = q[end:end + 96]
-        if (
-            _question_prefix_has_row_level_property_cue(prefix)
-            and _select_has_matching_case_threshold(val)
-        ):
-            continue
+        prefix_has_count_intent = bool(count_prefix_pat.search(prefix))
+        prefix_has_row_property_cue = _question_prefix_has_row_level_property_cue(prefix)
         suffix_has_count_object = bool(
             count_term_alt
             and re.search(
@@ -20250,8 +20285,20 @@ def _add_missing_grouped_metric_threshold_having(sql: str, question: str, ctx: s
                 flags=re.I,
             )
         )
+        if (
+            _select_has_matching_case_threshold(val)
+            and prefix_has_count_intent
+            and prefix_has_row_property_cue
+            and not suffix_has_count_object
+        ):
+            continue
+        if (
+            prefix_has_row_property_cue
+            and _select_has_matching_case_threshold(val)
+        ):
+            continue
         matched_count_here = bool(
-            count_prefix_pat.search(prefix)
+            prefix_has_count_intent
             or (suffix_has_count_object and count_verb_pat.search(prefix))
         )
         if count_threshold is None:
@@ -23318,10 +23365,13 @@ def _rewrite_conditional_avg_to_count_with_overall_avg(sql: str, question: str) 
         alias_idx += 1
         avg_alias = f"average_value_{alias_idx}"
 
+    conditional_avg_expr = f"AVG(CASE WHEN {conditional_cond} THEN {conditional_then} ELSE NULL END)"
+    conditional_count_expr = f"SUM(CASE WHEN {conditional_cond} THEN 1 ELSE 0 END)"
+
     rebuilt_items: List[str] = []
     for idx, item in enumerate(select_items):
         if idx == conditional_idx:
-            rebuilt_items.append(f"SUM(CASE WHEN {conditional_cond} THEN 1 ELSE 0 END) AS {count_alias}")
+            rebuilt_items.append(f"{conditional_count_expr} AS {count_alias}")
             rebuilt_items.append(f"AVG({conditional_then}) AS {avg_alias}")
             continue
 
@@ -23342,8 +23392,59 @@ def _rewrite_conditional_avg_to_count_with_overall_avg(sql: str, question: str) 
         "SELECT " + ", ".join(str(item or "").strip() for item in rebuilt_items if str(item or "").strip()),
         "FROM " + str(parsed.get("from_core") or "").strip(),
     ]
-    if (parsed.get("where") or "").strip():
-        out_lines.append(str(parsed["where"]).strip())
+
+    where_clause = str(parsed.get("where") or "").strip()
+    if where_clause.lower().startswith("where "):
+        where_body = where_clause[6:].strip()
+
+        def _strip_outer_parens(text: str) -> str:
+            cur = str(text or "").strip()
+            while cur.startswith("(") and cur.endswith(")"):
+                inner = cur[1:-1].strip()
+                if not inner:
+                    break
+                if _split_top_level_commas(inner) == [inner] and not _has_top_level_or(inner):
+                    cur = inner
+                    continue
+                break
+            return cur
+
+        cond_norm = _normalize_sql_expr_for_match(conditional_cond)
+
+        def _matches_conditional_prefilter(term: str) -> bool:
+            term_clean = _strip_outer_parens(term)
+            term_norm = _normalize_sql_expr_for_match(term_clean)
+            if term_norm == cond_norm:
+                return True
+
+            cmp_pat = re.compile(
+                r"""(?is)^\s*
+                (?P<left>(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?)\s*
+                (?P<op>>=|<=|=|>|<)\s*
+                (?P<right>\d+(?:\.\d+)?)\s*$
+                """
+            )
+            m_term = cmp_pat.match(term_clean)
+            m_cond = cmp_pat.match(_strip_outer_parens(conditional_cond))
+            if not m_term or not m_cond:
+                return False
+            left_term = str(m_term.group("left") or "").split(".")[-1].strip("`").lower()
+            left_cond = str(m_cond.group("left") or "").split(".")[-1].strip("`").lower()
+            op_term = str(m_term.group("op") or "").strip()
+            op_cond = str(m_cond.group("op") or "").strip()
+            right_term = str(m_term.group("right") or "").strip()
+            right_cond = str(m_cond.group("right") or "").strip()
+            return bool(left_term and left_term == left_cond and op_term == op_cond and right_term == right_cond)
+
+        kept_where_terms = [
+            term.strip()
+            for term in _split_top_level_and(where_body)
+            if term.strip() and not _matches_conditional_prefilter(term)
+        ]
+        if kept_where_terms:
+            out_lines.append("WHERE " + " AND ".join(kept_where_terms))
+    elif where_clause:
+        out_lines.append(where_clause)
     if (parsed.get("groupby") or "").strip():
         out_lines.append("GROUP BY " + str(parsed.get("groupby") or "").strip())
     if (parsed.get("having") or "").strip():
@@ -23352,6 +23453,148 @@ def _rewrite_conditional_avg_to_count_with_overall_avg(sql: str, question: str) 
         out_lines.append(str(parsed["tail"]).strip())
 
     fixed = "\n".join(out_lines).strip()
+
+    def _drop_spurious_conditional_having(sql_text: str) -> str:
+        threshold_numbers = {
+            float(num)
+            for num in re.findall(r"\b\d+(?:\.\d+)?\b", conditional_cond)
+        }
+        if not threshold_numbers:
+            return sql_text
+
+        threshold_sqls = {
+            str(int(num)) if float(num).is_integer() else str(num)
+            for num in threshold_numbers
+        }
+        conditional_avg_norm = _normalize_sql_expr_for_match(conditional_avg_expr)
+        conditional_count_norm = _normalize_sql_expr_for_match(conditional_count_expr)
+
+        def _fallback_drop(sql_fallback: str) -> str:
+            parsed = _parse_flat_groupby_clauses(sql_fallback) or _parse_select_from_groupby(sql_fallback)
+            if not parsed:
+                return sql_fallback
+            if not str(parsed.get("groupby") or "").strip():
+                return sql_fallback
+
+            having_text = str(parsed.get("having") or "").strip()
+            if not having_text:
+                return sql_fallback
+            if having_text.lower().startswith("having "):
+                having_text = having_text[7:].strip()
+            if not having_text:
+                return sql_fallback
+
+            kept_terms: List[str] = []
+            removed_any = False
+            for raw_term in _split_top_level_and(having_text):
+                term = str(raw_term or "").strip()
+                if not term:
+                    continue
+                m_cmp = re.match(
+                    r"(?is)^\s*(?P<lhs>.+?)\s*(?P<op>>=|<=|=|>|<)\s*(?P<rhs>\d+(?:\.\d+)?)\s*$",
+                    term,
+                )
+                if m_cmp:
+                    lhs_norm = _normalize_sql_expr_for_match(m_cmp.group("lhs") or "")
+                    rhs_sql = str(m_cmp.group("rhs") or "").strip()
+                    if (
+                        rhs_sql in threshold_sqls
+                        and lhs_norm in {
+                            conditional_avg_norm,
+                            conditional_count_norm,
+                            _normalize_sql_expr_for_match(count_alias),
+                        }
+                    ):
+                        removed_any = True
+                        continue
+                kept_terms.append(term)
+
+            if not removed_any or not kept_terms:
+                return sql_fallback
+            if not any(re.search(r"\bCOUNT\s*\(", term, flags=re.I) for term in kept_terms):
+                return sql_fallback
+
+            rebuilt = [
+                "SELECT " + str(parsed.get("select") or "").strip(),
+                "FROM " + str(parsed.get("from_core") or "").strip(),
+            ]
+            if str(parsed.get("where") or "").strip():
+                rebuilt.append(str(parsed.get("where") or "").strip())
+            rebuilt.append("GROUP BY " + str(parsed.get("groupby") or "").strip())
+            rebuilt.append("HAVING " + " AND ".join(kept_terms))
+            if str(parsed.get("tail") or "").strip():
+                rebuilt.append(str(parsed.get("tail") or "").strip())
+            return "\n".join(rebuilt).strip()
+
+        try:
+            import sqlglot
+            from sqlglot import exp
+        except Exception:
+            return _fallback_drop(sql_text)
+
+        try:
+            ast = sqlglot.parse_one(sql_text, read=SQL_PARSE_DIALECT or "mysql")
+        except Exception:
+            return _fallback_drop(sql_text)
+
+        sel = ast if isinstance(ast, exp.Select) else ast.find(exp.Select)
+        if not isinstance(sel, exp.Select):
+            return sql_text
+
+        if sel.args.get("group") is None:
+            return sql_text
+
+        having_arg = sel.args.get("having")
+        if not isinstance(having_arg, exp.Having) or having_arg.this is None:
+            return sql_text
+
+        def _flatten_and(expr: "exp.Expression") -> List["exp.Expression"]:
+            if isinstance(expr, exp.And):
+                return _flatten_and(expr.this) + _flatten_and(expr.expression)
+            return [expr]
+
+        def _matches_threshold_literal(expr_node: "exp.Expression") -> bool:
+            if isinstance(expr_node, exp.Literal) and not expr_node.is_string:
+                try:
+                    return float(str(expr_node.this)) in threshold_numbers
+                except Exception:
+                    return False
+            return False
+
+        def _matches_spurious_metric(expr_node: "exp.Expression") -> bool:
+            expr_norm = _normalize_sql_expr_for_match(expr_node.sql(dialect="mysql"))
+            if expr_norm in {conditional_avg_norm, conditional_count_norm}:
+                return True
+            if isinstance(expr_node, exp.Column):
+                col_name = str(expr_node.name or "").strip("`").lower()
+                return col_name == count_alias.lower()
+            return False
+
+        def _is_spurious_conditional_threshold(expr_node: "exp.Expression") -> bool:
+            if not isinstance(expr_node, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
+                return False
+            left = expr_node.this
+            right = expr_node.expression
+            return (
+                (_matches_spurious_metric(left) and _matches_threshold_literal(right))
+                or (_matches_spurious_metric(right) and _matches_threshold_literal(left))
+            )
+
+        conjuncts = _flatten_and(having_arg.this)
+        kept = [term.copy() for term in conjuncts if not _is_spurious_conditional_threshold(term)]
+        if len(kept) == len(conjuncts) or not kept:
+            return sql_text
+
+        if not any(any(True for _ in term.find_all(exp.Count)) for term in kept):
+            return sql_text
+
+        merged = kept[0]
+        for term in kept[1:]:
+            merged = exp.And(this=merged, expression=term)
+        sel.set("having", exp.Having(this=merged))
+        return ast.sql(dialect="mysql")
+
+    fixed = _drop_spurious_conditional_having(fixed)
     if s.endswith(";") and not fixed.endswith(";"):
         fixed += ";"
     return fixed
@@ -41165,7 +41408,8 @@ def _rewrite_row_level_nonnull_to_group_existence(sql: str, question: str) -> st
     q = (question or "").lower()
     has_exist_intent = bool(re.search(r"\b(?:at\s+least\s+one|any|one\s+or\s+more)\b", q))
     has_nonnull_intent = bool(re.search(r"\b(?:not\s+null|non[-\s]?null)\b", q))
-    if not (has_exist_intent and has_nonnull_intent):
+    has_percentage_intent = bool(re.search(r"\b(?:percent|percentage)\b", q))
+    if not ((has_exist_intent and has_nonnull_intent) or has_percentage_intent):
         return sql
 
     s = sql.strip().rstrip(";").strip()
@@ -41196,7 +41440,7 @@ def _rewrite_row_level_nonnull_to_group_existence(sql: str, question: str) -> st
     nonnull_conds: List[str] = []
     keep_conds: List[str] = []
 
-    colref = r"`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*`?[A-Za-z_][A-Za-z0-9_]*`?"
+    colref = r"(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?[A-Za-z_][A-Za-z0-9_]*`?"
     nonnull_pat = re.compile(
         rf"""(?is)^\s*\(?\s*(?P<col>{colref})\s+IS\s+NOT\s+NULL\s*\)?\s*$"""
     )
@@ -41244,6 +41488,46 @@ def _rewrite_row_level_nonnull_to_group_existence(sql: str, question: str) -> st
 
     if not nonnull_conds:
         return sql
+
+    if has_percentage_intent:
+        parsed = _parse_flat_groupby_clauses(s) or _parse_select_from_groupby(s)
+        select_text = str((parsed or {}).get("select") or "")
+        rest = (rest_after_where or "").strip()
+        if not rest:
+            return sql
+
+        def _norm_pred(text: str) -> str:
+            return re.sub(r"[\s`]+", "", str(text or "").lower())
+
+        def _nonnull_cond_colref(text: str) -> str:
+            m_col = re.search(
+                r"(?is)(?:not\s*\()?\s*(?:`?[A-Za-z_][A-Za-z0-9_]*`?\s*\.\s*)?`?([A-Za-z_][A-Za-z0-9_]*)`?\s+(?:is\s+not\s+null|is\s+null)",
+                str(text or "").strip(),
+            )
+            return str(m_col.group(1) or "").strip().lower() if m_col else ""
+
+        normalized_select = _norm_pred(select_text)
+        has_denominator = "count(*)" in normalized_select
+        has_matching_conditional_metric = any(
+            (
+                bool(
+                    re.search(
+                        rf"casewhen.*{re.escape(_nonnull_cond_colref(cond))}.*then1else(?:null|0)end",
+                        normalized_select,
+                        flags=re.I,
+                    )
+                )
+                if _nonnull_cond_colref(cond)
+                else False
+            )
+            for cond in nonnull_conds
+        )
+        if has_denominator and has_matching_conditional_metric:
+            where_part = f" WHERE {' AND '.join(keep_conds)}" if keep_conds else ""
+            fixed = f"{head}{where_part} {rest}".strip()
+            if not fixed.endswith(";"):
+                fixed += ";"
+            return fixed
 
     existence_parts = [
         f"SUM(CASE WHEN {c} THEN 1 ELSE 0 END) > 0" for c in nonnull_conds
@@ -44244,14 +44528,28 @@ def _rewrite_missing_temporal_exclusion_from_null_filter(sql: str, question: str
     include_idx = -1
     temporal_alias = ""
     temporal_col = ""
-    for idx, cond in enumerate(conjuncts):
-        match = re.match(
+
+    def _extract_single_year_scope(cond_text: str) -> Optional[Tuple[str, str, str]]:
+        cond_s = str(cond_text or "").strip()
+        eq_match = re.match(
             r"""(?is)^\s*YEAR\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*=\s*((?:19|20)\d{2})\s*$""",
-            str(cond or "").strip(),
+            cond_s,
         )
-        if not match:
+        if eq_match:
+            return eq_match.group(1), eq_match.group(2), eq_match.group(3)
+        in_match = re.match(
+            r"""(?is)^\s*YEAR\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\.\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*IN\s*\(\s*((?:19|20)\d{2})\s*\)\s*$""",
+            cond_s,
+        )
+        if in_match:
+            return in_match.group(1), in_match.group(2), in_match.group(3)
+        return None
+
+    for idx, cond in enumerate(conjuncts):
+        extracted = _extract_single_year_scope(str(cond or "").strip())
+        if not extracted:
             continue
-        alias_name, col_name, year_value = match.group(1), match.group(2), match.group(3)
+        alias_name, col_name, year_value = extracted
         if year_value != include_year:
             continue
         table_name = explicit_aliases.get(alias_name.lower()) or ""
