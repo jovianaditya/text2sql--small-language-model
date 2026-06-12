@@ -261,6 +261,16 @@ def _model_log_label(model_name: str) -> str:
     return f"{_model_lane_label(model_raw)} ({model_raw})"
 
 
+def _resolve_forced_model(state: Optional[Dict[str, Any]] = None) -> str:
+    """Return a scenario-pinned model name when the run forces one model."""
+    if not isinstance(state, dict):
+        return ""
+    scenario_cfg = state.get("scenario_config") or {}
+    if not isinstance(scenario_cfg, dict):
+        return ""
+    return str(scenario_cfg.get("forced_model") or "").strip()
+
+
 def _build_confidence_retry_instruction(confidence_result: dict) -> str:
     """Build LLM instruction with confidence feedback for retry."""
     warnings = confidence_result.get("warnings", [])
@@ -302,20 +312,22 @@ def _attempt_confidence_retry(
     make_prompt_fn,
     prompt_kwargs: Optional[Dict[str, Any]] = None,
     decision: Optional[Dict[str, Any]] = None,
+    retry_model: Optional[str] = None,
 ) -> dict:
     """
-    Attempt one retry with the large-model lane when confidence is below threshold.
+    Attempt one retry with the configured retry lane when confidence is below threshold.
     Returns dict with: used, sql, confidence, accepted
     """
     from .generation import regenerate_with_extra_constraint
+    model_name = str(retry_model or LARGE_MODEL).strip() or str(LARGE_MODEL).strip()
     
     _dbg_print_two(
         "[REFINER - CONFIDENCE]",
-        f"Attempting retry with {_model_log_label(LARGE_MODEL)}..."
+        f"Attempting retry with {_model_log_label(model_name)}..."
     )
     
     instruction = _build_confidence_retry_instruction(confidence_result)
-    llm_7b = build_llm_repair(model=LARGE_MODEL)
+    llm_7b = build_llm_repair(model=model_name)
     
     new_sql, _ = regenerate_with_extra_constraint(
         llm_7b,
@@ -5469,12 +5481,31 @@ def router_agent(state: RAGState) -> RAGState:
     # ═══════════════════════════════════════════════════════════════════
     # STEP 1: IDENTIFIKASI TABEL (Pattern-Based Exclusion)
     # ═══════════════════════════════════════════════════════════════════
+    analyzer = get_schema_analyzer()
     allowed_identifiers = _parse_allowed_identifiers(ctx)
+    schema_scope_only = False
+    if not allowed_identifiers:
+        schema_scope_only = True
+        schema_scope_allowed: Dict[str, Set[str]] = {}
+        for table_name in sorted(get_all_tables() or []):
+            table_key = str(table_name or "").strip()
+            if not table_key:
+                continue
+            try:
+                schema_cols = {
+                    str(col or "").strip()
+                    for col in (analyzer.get_table_columns(table_key.lower()) or [])
+                    if str(col or "").strip()
+                }
+            except Exception:
+                schema_cols = set()
+            schema_scope_allowed[table_key] = schema_cols
+        allowed_identifiers = schema_scope_allowed
+
     whitelisted_tables = allowed_identifiers.keys()
     whitelisted_lower = {t.lower() for t in whitelisted_tables}
 
     # Use full schema columns as fallback when context cards are column-pruned.
-    analyzer = get_schema_analyzer()
     allowed_cols_by_lower: Dict[str, Set[str]] = {}
     for t, cols in allowed_identifiers.items():
         allowed_cols_by_lower.setdefault(t.lower(), set()).update(c.lower() for c in cols)
@@ -5494,7 +5525,11 @@ def router_agent(state: RAGState) -> RAGState:
     relevant_tables = []
     id_terms_pattern = _router_id_terms_pattern()
     for tbl in whitelisted_tables:
-        if f"- {tbl}:" not in ctx and f"- `{tbl}`:" not in ctx:
+        if (
+            not schema_scope_only
+            and f"- {tbl}:" not in ctx
+            and f"- `{tbl}`:" not in ctx
+        ):
             continue
 
         table_singular = get_singular_form(tbl.lower())
@@ -9343,9 +9378,10 @@ def _attempt_last_chance_rescue_7b(
     strict_join_key: bool = False,
     router_decision: Optional[Dict[str, Any]] = None,
     state: Optional[Dict[str, Any]] = None,
+    rescue_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    One-shot rescue with 7B when final gate fails critically.
+    One-shot rescue with the configured rescue model when final gate fails critically.
     Returns a payload with the rescued SQL and gate verdict.
     """
     result: Dict[str, Any] = {
@@ -9360,10 +9396,11 @@ def _attempt_last_chance_rescue_7b(
         return result
 
     result["used"] = True
-    llm_rescue = build_llm_repair(model=LARGE_MODEL)
+    model_name = str(rescue_model or LARGE_MODEL).strip() or str(LARGE_MODEL).strip()
+    llm_rescue = build_llm_repair(model=model_name)
     _dbg_print_two(
         "[REFINER] Last-chance rescue",
-        f"Regenerating with {_model_log_label(LARGE_MODEL)}"
+        f"Regenerating with {_model_log_label(model_name)}"
     )
 
     rescue_instruction = _build_gate_retry_instruction(
@@ -11459,6 +11496,21 @@ def draft_sql_agent(state: RAGState) -> RAGState:
         router_tables = state.get("router_tables") or []
         ctx_allowed_ids = _parse_allowed_identifiers(ctx)
         ctx_table_count = len(ctx_allowed_ids)
+        if ctx_table_count <= 0:
+            fallback_ctx_tables = {
+                str(table or "").strip().lower()
+                for table in (mentioned_tables or [])
+                if str(table or "").strip()
+            }
+            fallback_ctx_tables.update(
+                str(table or "").strip().lower()
+                for table in (router_tables or [])
+                if str(table or "").strip()
+            )
+            primary_table = str(state.get("primary_table") or "").strip().lower()
+            if primary_table:
+                fallback_ctx_tables.add(primary_table)
+            ctx_table_count = len(fallback_ctx_tables)
         dynamic_min_conf = float(AGENT_IR_MIN_CONFIDENCE)
         ir_gate_reasons: List[str] = []
         ir_confidence = float(intent_ir.get("confidence", 0.0) or 0.0)
@@ -11945,7 +11997,7 @@ def draft_sql_agent(state: RAGState) -> RAGState:
 
     prompt = make_generation_prompt(draft_ctx, question, decision, prompt_state)
     if prompt_state is not state:
-        for sync_key in ("ir_hint_passed", "ir_hint_group_filters_present"):
+        for sync_key in ("ir_hint_passed", "ir_hint_logged", "ir_hint_group_filters_present"):
             if sync_key in prompt_state:
                 state[sync_key] = prompt_state[sync_key]
 
@@ -12282,6 +12334,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     question = state.get("question", "")
     ctx = state.get("context", "")
+    forced_model = _resolve_forced_model(state)
     draft_sql = (state.get("draft_sql") or "").strip()
     draft_source = (state.get("draft_source") or "").strip().lower()
     retrieval_context_mode = str(state.get("retrieval_context_mode") or "primary")
@@ -12291,8 +12344,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     regeneration_attempts_summary: List[str] = []
 
     # DYNAMIC MODEL SELECTION berdasarkan draft quality
-    draft_model = state.get("target_model") or SMALL_MODEL  # Track model asal
-    target_model = LARGE_MODEL  # Default untuk regeneration
+    draft_model = state.get("target_model") or forced_model or SMALL_MODEL  # Track model asal
+    target_model = forced_model or LARGE_MODEL  # Default untuk regeneration
     
     llm = build_llm_repair(model=target_model)
     
@@ -12597,7 +12650,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
     # 3. DECISION MATRIX
     needs_regeneration = False
-    regeneration_model = LARGE_MODEL  # Default 7B untuk regeneration
+    regeneration_model = forced_model or LARGE_MODEL  # Default rescue lane for regeneration
     extra_instruction = ""
 
     # --- KASUS 0: IDENTIFIER VALIDATION (HARD ERROR) ---
@@ -13974,6 +14027,9 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # 4. EXECUTE REGENERATION (validation-aware, AST-stabilized)
     final_model = state.get("target_model", "")  # Default to initial model
     if needs_regeneration:
+        if forced_model:
+            regeneration_model = forced_model
+
         def _allowed_identifiers_hint(max_tables: int = 3, max_cols: int = 10) -> str:
             allowed_map = _parse_allowed_identifiers(ctx)
             if not allowed_map:
@@ -14293,6 +14349,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
 
         # Escalate to 7B only when 3B primary+retry still fail.
         if (
+            not forced_model
+            and
             regeneration_model == SMALL_MODEL
             and (not current_attempt or not current_attempt.get("gate_accepted", False))
         ):
@@ -14416,6 +14474,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     rescue_7b_used = False
     if not final_gate.get("accepted", False) and _is_critical_gate_failure(final_gate):
         _dbg_safety_block("Agent3", f"{final_gate.get('reasons')}")
+        rescue_model = forced_model or LARGE_MODEL
         rescue = _attempt_last_chance_rescue_7b(
             question=question,
             ctx=ctx,
@@ -14424,14 +14483,15 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             strict_join_key=AGENT_REGEN_PRECHECK_ENABLED,
             router_decision=decision,
             state=state,
+            rescue_model=rescue_model,
         )
         rescue_7b_used = bool(rescue.get("used", False))
         if rescue_7b_used:
             final_sql = str(rescue.get("sql") or final_sql).strip()
             final_gate = rescue.get("gate") or final_gate
             if rescue.get("accepted", False):
-                final_model = LARGE_MODEL
-                corrections.append(f"Last-chance rescue succeeded ({_model_log_label(LARGE_MODEL)})")
+                final_model = rescue_model
+                corrections.append(f"Last-chance rescue succeeded ({_model_log_label(rescue_model)})")
             else:
                 corrections.append(
                     f"Last-chance rescue failed: {rescue.get('error')} | reasons={final_gate.get('reasons')}"
@@ -14476,6 +14536,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
     # Confidence-based retry (1x max) if below threshold
     confidence_retry_used = False
     if confidence_result["confidence"] < AGENT_CONFIDENCE_THRESHOLD:
+        confidence_retry_model = forced_model or LARGE_MODEL
         retry_result = _attempt_confidence_retry(
             question=question,
             ctx=ctx,
@@ -14487,6 +14548,7 @@ def refine_sql_agent(state: RAGState) -> RAGState:
                 "state": state,
             },
             decision=decision,
+            retry_model=confidence_retry_model,
         )
         confidence_retry_used = retry_result.get("used", False)
         if retry_result.get("accepted", False):
@@ -14496,8 +14558,8 @@ def refine_sql_agent(state: RAGState) -> RAGState:
             final_gate_pass = bool(retry_result.get("gate_pass", final_gate_pass))
             final_gate_reasons = list(retry_result.get("gate_reasons") or final_gate_reasons)
             final_gate_reason_tags = list(retry_result.get("gate_reason_tags") or _categorize_gate_reasons(final_gate_reasons))
-            corrections.append(f"Confidence retry succeeded ({_model_log_label(LARGE_MODEL)})")
-            final_model = LARGE_MODEL
+            corrections.append(f"Confidence retry succeeded ({_model_log_label(confidence_retry_model)})")
+            final_model = confidence_retry_model
         else:
             retry_reason = str(retry_result.get("reason") or "not_accepted").strip()
             corrections.append(f"Confidence retry attempted ({retry_reason})")

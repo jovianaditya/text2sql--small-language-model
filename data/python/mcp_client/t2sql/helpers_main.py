@@ -5162,20 +5162,15 @@ def _context_scope_allows_intent_ir_hint(
     gate_reasons: Set[str],
 ) -> bool:
     context_allowed = _parse_allowed_identifiers(str((state or {}).get("context") or ""))
-    if len(context_allowed) <= 1:
-        return True
-
-    # Retrieval can include FK-neighbor noise for simple lookups. Trust it only
-    # when the router has compacted the executable scope to exactly one table
-    # and the IR payload itself does not reference anything outside that table.
-    if "router_complex_prefers_llm" in (gate_reasons or set()):
-        return False
-
     router_tables = {
         str(table or "").strip().lower()
         for table in ((state or {}).get("router_tables") or [])
         if str(table or "").strip()
     }
+    primary_table = str((state or {}).get("primary_table") or "").strip().lower()
+
+    if "router_complex_prefers_llm" in (gate_reasons or set()):
+        return False
 
     hard_router_reasons = {
         str(reason or "").strip()
@@ -5185,7 +5180,41 @@ def _context_scope_allows_intent_ir_hint(
     if hard_router_reasons and hard_router_reasons != {"router_hard:window_aggregate"}:
         return False
 
-    primary_table = str((state or {}).get("primary_table") or "").strip().lower()
+    if len(context_allowed) <= 1:
+        effective_router_tables = set(router_tables)
+        if not effective_router_tables and primary_table:
+            effective_router_tables.add(primary_table)
+        if not effective_router_tables:
+            effective_router_tables.update(
+                str(table or "").strip().lower()
+                for table in ((intent_ir or {}).get("mentioned_tables") or [])
+                if str(table or "").strip()
+            )
+
+        if len(effective_router_tables) != 1:
+            return False
+
+        router_table = next(iter(effective_router_tables))
+        payload_tables = _intent_ir_payload_tables(
+            intent_ir or {},
+            router_table=router_table,
+            context_allowed=context_allowed,
+        )
+        if bool(payload_tables) and payload_tables.issubset({router_table}):
+            return True
+
+        if (
+            primary_table
+            and router_table == primary_table
+            and _intent_ir_is_low_risk_single_table_lookup(intent_ir or {})
+        ):
+            return _intent_ir_confirms_primary_table_scope(
+                intent_ir or {},
+                primary_table,
+                context_allowed=context_allowed,
+            )
+        return False
+
     if primary_table and router_tables and primary_table not in router_tables:
         return False
 
@@ -10351,15 +10380,17 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
     if state:
         if intent_hint:
             state["ir_hint_passed"] = True
-            ir_conf = float((state.get("intent_ir") or {}).get("confidence", 0.0) or 0.0)
-            ir_reasons = state.get("ir_gate_reasons") or state.get("ir_base_gate_reasons") or []
-            print(
-                f"[IR-HINT] Intent IR passed as soft hint to LLM "
-                f"(confidence={ir_conf:.2f}, "
-                f"gate_reasons={ir_reasons or ['planner_fallback']}, "
-                f"group_filters_present={group_filters_hint_present})"
-            )
-            print(f"[IR-HINT] Content:{intent_hint}")
+            if not bool(state.get("ir_hint_logged", False)):
+                ir_conf = float((state.get("intent_ir") or {}).get("confidence", 0.0) or 0.0)
+                ir_reasons = state.get("ir_gate_reasons") or state.get("ir_base_gate_reasons") or []
+                print(
+                    f"[IR-HINT] Intent IR passed as soft hint to LLM "
+                    f"(confidence={ir_conf:.2f}, "
+                    f"gate_reasons={ir_reasons or ['planner_fallback']}, "
+                    f"group_filters_present={group_filters_hint_present})"
+                )
+                print(f"[IR-HINT] Content:{intent_hint}")
+                state["ir_hint_logged"] = True
         else:
             ir_data = state.get("intent_ir") or {}
             ir_conf = float(ir_data.get("confidence", 0.0) or 0.0)

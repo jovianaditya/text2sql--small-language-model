@@ -186,6 +186,46 @@ def apply_scenario_models(scenario_config: dict) -> dict:
         "large_model": large_model,
     }
 
+
+def apply_scenario_overrides(
+    scenario_config: dict,
+    *,
+    rag_mode: str | None = None,
+    force_model: str | None = None,
+    adaptive_model_mode: str | None = None,
+    intent_ir_mode: str | None = None,
+) -> dict:
+    """
+    Apply runtime CLI overrides to a resolved scenario config.
+
+    Standard behavior:
+    - `--force-model` pins draft/refine to one model.
+    - If a forced model is provided and adaptive mode is not specified
+      explicitly, adaptive routing is disabled automatically.
+    """
+    updated = dict(scenario_config or {})
+
+    rag_mode_norm = str(rag_mode or "").strip().lower()
+    forced_model = str(force_model or "").strip()
+    adaptive_mode = str(adaptive_model_mode or "").strip().lower()
+    ir_mode = str(intent_ir_mode or "").strip().lower()
+
+    if rag_mode_norm:
+        updated["rag_enabled"] = rag_mode_norm == "on"
+
+    if forced_model:
+        updated["forced_model"] = forced_model
+        if not adaptive_mode:
+            updated["adaptive_model_enabled"] = False
+
+    if adaptive_mode:
+        updated["adaptive_model_enabled"] = adaptive_mode == "on"
+
+    if ir_mode:
+        updated["intent_ir_enabled"] = ir_mode == "on"
+
+    return updated
+
 def parse_difficulty_filter(filter_spec: str | None) -> tuple[str, set[int] | None]:
     """
     Parse difficulty filter specification.
@@ -1585,6 +1625,10 @@ async def run_batch_eval(
     output_path: str | None = None,
     paths: list[str] | None = None,
     scenario: str = "P1",
+    rag_mode: str | None = None,
+    force_model: str | None = None,
+    adaptive_model_mode: str | None = None,
+    intent_ir_mode: str | None = None,
     execute_groundtruth: bool = True,
     skip_warmup: bool = False,
     warmup_models_spec: str | None = None,
@@ -1614,6 +1658,13 @@ async def run_batch_eval(
     run_status = "SUCCESS"
 
     scenario_name, scenario_config = resolve_scenario_config(scenario)
+    scenario_config = apply_scenario_overrides(
+        scenario_config,
+        rag_mode=rag_mode,
+        force_model=force_model,
+        adaptive_model_mode=adaptive_model_mode,
+        intent_ir_mode=intent_ir_mode,
+    )
     active_models = apply_scenario_models(scenario_config)
     scenario_config.update(active_models)
     print(f"Scenario: {scenario_name} -> {scenario_config}")
@@ -1962,6 +2013,42 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--force-model",
+        default="",
+        help=(
+            "Force draft/refine to a specific model name. "
+            "If set, adaptive model selection is disabled unless "
+            "--adaptive-model on is provided explicitly."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-model",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "Override scenario adaptive model selection. "
+            "Use 'off' to disable router-based small/large switching."
+        ),
+    )
+    parser.add_argument(
+        "--intent-ir",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "Override scenario intent-IR usage. "
+            "Use 'off' to disable the deterministic intent IR lane."
+        ),
+    )
+    parser.add_argument(
+        "--rag",
+        choices=["on", "off"],
+        default=None,
+        help=(
+            "Override retrieval-augmented context usage. "
+            "Use 'off' to skip ingest and retrieval stages."
+        ),
+    )
+    parser.add_argument(
         "--no-groundtruth-exec",
         action="store_true",
         help="Skip executing groundtruth SQL (only check if predicted SQL runs)"
@@ -2081,6 +2168,10 @@ Examples:
             output_path=args.output,
             execute_groundtruth=not args.no_groundtruth_exec,
             scenario=str(args.scenario or "P1").upper(),
+            rag_mode=args.rag,
+            force_model=str(args.force_model or "").strip() or None,
+            adaptive_model_mode=args.adaptive_model,
+            intent_ir_mode=args.intent_ir,
             skip_warmup=args.skip_warmup,
             warmup_models_spec=args.warmup_models,
             difficulty_filters=difficulty_filters if difficulty_filters else None,

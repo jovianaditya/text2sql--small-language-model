@@ -385,7 +385,6 @@ def _compute_retrieval_evidence_strength(snapshot: Dict[str, Any]) -> Dict[str, 
         },
     }
 
-
 def _build_expanded_cards_from_schema(
     expanded_allowed: Dict[str, List[str]],
     *,
@@ -2037,15 +2036,15 @@ def _single_table_lock_is_high_confidence(
     )
 
 def retrieve_node(state: RAGState) -> RAGState:
+    q = (state["question"] or "").strip()
+    q_l = q.lower()
+    qtype = _get_qtype(state)
+
     # -----------------------------
     # 0) Build vector store (DENSE)
     # -----------------------------
     # Asumsi: build_vector_store() diatur untuk membaca *_dense.jsonl
     col = build_vector_store()
-
-    q = (state["question"] or "").strip()
-    q_l = q.lower()
-    qtype = _get_qtype(state)
 
     primary_lookup_table = _detect_primary_entity_table(q) if qtype == AGENT_ROUTER_QTYPE_LOOKUP else None
     prefer_name_table = (
@@ -2072,7 +2071,7 @@ def retrieve_node(state: RAGState) -> RAGState:
     sparse_tokens = _tokenize_bm25_query(sparse_query_clean)
 
     # Panggil search dengan path yang sudah difilter
-    sparse_field_urns = jsonl_sparse_search(
+    sparse_field_urns: List[str] = jsonl_sparse_search(
         sparse_query_clean,
         sparse_target_paths, # <--- Updated variable
         max_hits=SPARSE_MAX_HITS
@@ -2081,17 +2080,22 @@ def retrieve_node(state: RAGState) -> RAGState:
     # --- get sparse metas sekali, lalu pakai untuk pretty + flags ---
     sparse_docs_pretty: List[str] = []
     sparse_metas: List[Dict[str, Any]] = []
+    sparse_docs_by_id: Dict[str, str] = {}
+    sparse_metas_by_id: Dict[str, Dict[str, Any]] = {}
 
     if sparse_field_urns:
         try:
-            got = col.get(ids=sparse_field_urns, include=["metadatas"])
+            got = col.get(ids=sparse_field_urns, include=["documents", "metadatas"])
             ids = got.get("ids") or []
+            docs = got.get("documents") or []
             metas = got.get("metadatas") or []
+            if docs and isinstance(docs[0], list): docs = docs[0]
             if metas and isinstance(metas[0], list): metas = metas[0]
-            meta_by_id = {i: (m or {}) for i, m in zip(ids, metas)}
+            sparse_docs_by_id = {i: str(d or "") for i, d in zip(ids, docs)}
+            sparse_metas_by_id = {i: (m or {}) for i, m in zip(ids, metas)}
 
             for doc_id in sparse_field_urns:
-                md = meta_by_id.get(doc_id, {}) or {}
+                md = sparse_metas_by_id.get(doc_id, {}) or {}
                 sparse_metas.append(md)
                 tbl = _meta_table(md) or "?"
                 c = _meta_column(md) or "?"
@@ -2099,6 +2103,8 @@ def retrieve_node(state: RAGState) -> RAGState:
         except Exception as e:
             sparse_docs_pretty = list(sparse_field_urns or [])
             sparse_metas = []
+            sparse_docs_by_id = {}
+            sparse_metas_by_id = {}
             if RETRIEVE_DEBUG: print(f"[WARN] Sparse meta fetch failed: {e!r}")
 
     # Get preferred display-name column for lookup contexts (schema-agnostic).
@@ -2119,6 +2125,10 @@ def retrieve_node(state: RAGState) -> RAGState:
     # 2) Dense query
     # -----------------------------
     query_text = build_dynamic_probe(q, qtype=qtype)
+    dense_docs: List[str] = []
+    dense_metas: List[Dict[str, Any]] = []
+    dense_dists: List[float] = []
+    dense_ids: List[str] = []
     res = col.query(
         query_texts=[query_text],
         n_results=dense_k,

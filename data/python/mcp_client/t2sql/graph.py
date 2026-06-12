@@ -27,7 +27,9 @@ def _after_guard(state) -> str:
     if not state.get("router_decision", {}).get("is_valid_question", True):
         return "rejected"
     cfg = _scenario_config(state)
-    return "ingest" if cfg.get("rag_enabled", True) else "draft_sql"
+    if cfg.get("rag_enabled", True):
+        return "ingest"
+    return "router" if cfg.get("multi_agent_enabled", True) else "draft_sql"
 
 def _after_ingest(state) -> str:
     cfg = _scenario_config(state)
@@ -58,6 +60,7 @@ def build_app():
         _after_guard,
         {
             "ingest": "ingest",
+            "router": "router",
             "draft_sql": "draft_sql",
             "rejected": END,
         }
