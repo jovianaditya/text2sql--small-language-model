@@ -1,12 +1,14 @@
 #!/bin/sh
 set -e
 
-# Ambil env; fallback bila kosong
-RAW="${OLLAMA_MODELS:-snowflake-arctic-embed2:568m,qwen2.5:7b-instruct,qwen2.5:3b-instruct,qwen2.5:1.5b-instruct}"
+# Ambil env custom; jangan pakai OLLAMA_MODELS karena itu env bawaan Ollama untuk path folder model
+RAW="${OLLAMA_PULL_MODELS:-snowflake-arctic-embed2:568m,qwen2.5:7b-instruct,qwen2.5:3b-instruct,qwen2.5:1.5b-instruct}"
 
 # Normalisasi: hapus kutip jika ada, ganti pemisah koma/spasi ganda jadi newline
-# (juga aman untuk CRLF karena tr -d '\r')
-MODEL_LIST=$(printf '%s' "$RAW" | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" -e 's/[[:space:]]\+/,/g' | tr ',' '\n')
+MODEL_LIST=$(printf '%s' "$RAW" \
+  | tr -d '\r' \
+  | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" -e 's/[[:space:]]\+/,/g' \
+  | tr ',' '\n')
 
 echo "Menjalankan ollama serve di background..."
 ollama serve &
@@ -17,33 +19,38 @@ until ollama list >/dev/null 2>&1; do
   echo "Ollama belum siap, tunggu sebentar lagi..."
   sleep 2
 done
+
 echo "Ollama sudah tersedia."
-echo "Daftar model (RAW) : '$RAW'"
-printf ' - %s\n' $MODEL_LIST
+echo "Daftar model (RAW): '$RAW'"
+echo "$MODEL_LIST" | while IFS= read -r MODEL_NAME; do
+  [ -z "$MODEL_NAME" ] && continue
+  echo " - $MODEL_NAME"
+done
 
 pull_with_retry() {
   name="$1"
   tries=3
   i=1
-  while [ $i -le $tries ]; do
+
+  while [ "$i" -le "$tries" ]; do
     echo "Pull $name (attempt $i/$tries)..."
+
     if ollama pull "$name"; then
       return 0
     fi
+
     echo "Pull $name gagal. Retry 5s..."
     sleep 5
     i=$((i+1))
   done
+
   echo "WARNING: Gagal pull $name setelah $tries percobaan. Lanjut ke model berikutnya."
   return 1
 }
 
-# Loop per baris (satu model per baris)
 echo "$MODEL_LIST" | while IFS= read -r MODEL_NAME; do
-  # skip baris kosong
   [ -z "$MODEL_NAME" ] && continue
 
-  # cek kolom pertama dari 'ollama list' (nama model)
   if ollama list | awk '{print $1}' | grep -Fqw "$MODEL_NAME"; then
     echo "Model $MODEL_NAME sudah tersedia."
   elif ollama list | awk '{print $1}' | grep -Fqw "${MODEL_NAME}:latest"; then
