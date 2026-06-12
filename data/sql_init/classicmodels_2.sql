@@ -321,7 +321,7 @@ INSERT INTO offices (officeCode, city, phone, addressLine1, addressLine2, state,
 SELECT v.officeCode, v.city, v.phone, v.addressLine1, v.addressLine2, v.state, v.country, v.postalCode, v.territory
 FROM (
   SELECT '88' AS officeCode, 'San Diego' AS city, '+1 619 555 0188' AS phone, '88 Harbor Rd' AS addressLine1, 'Suite 4' AS addressLine2, 'CA' AS state, 'USA' AS country, '92101' AS postalCode, 'NA' AS territory
-  UNION ALL SELECT '89', 'Dublin', '+353 1 555 0189', '89 Liffey Quay', NULL, NULL, 'Ireland', 'D01', 'EMEA'
+  UNION ALL SELECT '89', 'Dublin', '+1 353 555 0189', '89 Liffey Quay', NULL, NULL, 'Ireland', 'D01', 'EMEA'
   UNION ALL SELECT '90', 'Kuala Lumpur', '+60 3 5550 0190', '90 KL Sentral', 'Level 11', NULL, 'Malaysia', '50470', 'APAC'
 ) v
 LEFT JOIN offices o ON o.officeCode = v.officeCode

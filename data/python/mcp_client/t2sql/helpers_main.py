@@ -5544,6 +5544,8 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         return ""
 
     gate_reasons = set(state.get("ir_gate_reasons") or [])
+    if "having_like_threshold_unresolved" in gate_reasons:
+        return ""
 
     subject = str(intent_ir.get("subject_entity") or "").strip()
     qtype = str(intent_ir.get("qtype") or "").strip()
@@ -10408,6 +10410,7 @@ def make_generation_prompt(ctx: str, question: str, router_decision: dict = None
                 else f"low_confidence({ir_conf:.2f}<0.50)" if ir_conf < 0.50
                 else "empty_ir_payload" if "empty_ir_payload" in base_reasons
                 else "planner_incompatible" if "planner_incompatible" in base_reasons
+                else "having_like_threshold_unresolved" if "having_like_threshold_unresolved" in gate_reasons
                 else "multi_table_context" if context_scope_skipped
                 else "aggregate_without_valid_metrics" if str(ir_data.get("qtype") or "").lower() == "aggregate"
                 else "no_structural_fields"
