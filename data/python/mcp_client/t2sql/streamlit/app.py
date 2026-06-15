@@ -300,7 +300,15 @@ def _render_nav_panel() -> str:
         """
         <div class="sidebar-brand-card">
             <div class="sidebar-brand-row">
-                <div class="sidebar-brand-icon">◉</div>
+                <div class="sidebar-brand-icon" aria-hidden="true">
+                    <svg viewBox="0 0 28 28" role="img" focusable="false">
+                        <ellipse cx="14" cy="7" rx="8" ry="4" />
+                        <path d="M6 7v9c0 2.2 3.6 4 8 4s8-1.8 8-4V7" />
+                        <path d="M6 11c0 2.2 3.6 4 8 4s8-1.8 8-4" />
+                        <path d="M10 20l-2.2 2.2L10 24.4" />
+                        <path d="M18 20l2.2 2.2L18 24.4" />
+                    </svg>
+                </div>
                 <div>
                     <div class="sidebar-brand-name">Text-to-SQL</div>
                     <div class="sidebar-brand-note">Prototype</div>
@@ -337,9 +345,10 @@ def _render_nav_panel() -> str:
             """
             <div class="tips-accordion-body">
                 <ul>
-                    <li>Ask your question in natural language and mention the fields you want to see.</li>
-                    <li>For more accurate results, specify the columns or details you want displayed, such as customer name, order date, total amount, or status.</li>
-                    <li>You can write casually or formally. The system will still turn it into SQL and fetch a preview result.</li>
+                    <li>Ask a clear question in natural language.</li>
+                    <li>Add details such as filters, date ranges, sorting order, or result limits when needed.</li>
+                    <li>Specify output columns only when you need particular fields.</li>
+                    <li>Write casually or formally. The system can interpret both styles.</li>
                 </ul>
             </div>
             """,
@@ -351,22 +360,28 @@ def _render_nav_panel() -> str:
 def _render_about() -> None:
     st.markdown(
         """
-        <div class="workspace-kicker">Query Workspace</div>
-        <div class="workspace-title">About this workspace</div>
-        <div class="workspace-subtitle">A streamlined interface for asking data questions without writing SQL.</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        """
-        <div class="content-panel about-panel">
-            <div class="panel-title">How it works</div>
-            <div class="panel-copy">Type a business question, review the preview table, and download the full CSV when you need the complete result set.</div>
-            <div class="panel-copy">The app keeps the experience simple for non-technical users while still running through the existing Text-to-SQL pipeline and MCP database execution flow.</div>
+        <div class="about-page">
+            <div class="workspace-kicker">Query Workspace</div>
+            <div class="workspace-title">About this workspace</div>
+            <div class="workspace-subtitle">A Text-to-SQL workspace for turning natural language questions into executable database queries.</div>
+            <div class="content-panel about-panel">
+                <div class="panel-title">How this project works</div>
+                <div class="panel-copy">This project uses centralized metadata from DataHub as the source of truth for schema context, table relationships, and business descriptions.</div>
+                <div class="panel-copy">A retrieval and multi-agent planning flow uses that metadata to generate SQL, validate identifiers, and keep query generation grounded in the available database structure.</div>
+                <div class="panel-copy">SQL execution runs through the Model Context Protocol (MCP) layer, which handles database calls and returns preview or full-result payloads to the app.</div>
+                <div class="panel-copy">The project is built with open-source tools and containerized with Docker, making the environment easier to reproduce across machines.</div>
+                <div class="panel-copy">The Streamlit interface lets users ask questions, inspect preview results, export full query output, and provide feedback on the system result.</div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+def _section_heading_html(text: str, extra_classes: str = "") -> str:
+    classes = "section-heading"
+    if extra_classes.strip():
+        classes = f"{classes} {extra_classes.strip()}"
+    return f"<div class=\"{classes}\" style=\"font-size: 18px; line-height: 1.25; font-weight: 850; letter-spacing: 0;\">{html.escape(text)}</div>"
 
 
 def _render_home() -> None:
@@ -381,10 +396,11 @@ def _render_home() -> None:
             unsafe_allow_html=True,
         )
     with header_right:
-        st.markdown('<div class="field-label">Database</div>', unsafe_allow_html=True)
-        selected_database = _selected_database()
+        with st.container(key="database_picker"):
+            st.markdown('<div class="field-label">Database</div>', unsafe_allow_html=True)
+            selected_database = _selected_database()
 
-    st.markdown('<div class="section-heading">Question</div>', unsafe_allow_html=True)
+    st.markdown(_section_heading_html("Question"), unsafe_allow_html=True)
     prompt_col, button_col = st.columns([0.78, 0.22], vertical_alignment="center")
     with prompt_col:
         st.text_area(
@@ -437,7 +453,7 @@ def _render_home() -> None:
 
 
 def _render_empty_result() -> None:
-    st.markdown('<div class="section-heading result-heading">Query Result</div>', unsafe_allow_html=True)
+    st.markdown(_section_heading_html("Query Result", "result-heading"), unsafe_allow_html=True)
     st.markdown(
         """
         <div class="content-panel result-panel empty-panel">
@@ -455,7 +471,7 @@ def _render_result(result: dict[str, Any]) -> None:
     df = _payload_frame(execution)
     total_rows = execution.get("total_rows", len(df)) if isinstance(execution, dict) else len(df)
 
-    st.markdown('<div class="section-heading result-heading">Query Result</div>', unsafe_allow_html=True)
+    st.markdown(_section_heading_html("Query Result", "result-heading"), unsafe_allow_html=True)
     st.markdown('<div class="content-panel result-panel">', unsafe_allow_html=True)
     sql_text = str(result.get("sql") or state.get("final_sql") or "").strip()
     database = str(result.get("database") or "").strip()
@@ -542,7 +558,7 @@ def _render_feedback_form(result: dict[str, Any]) -> None:
 
 def _render_history() -> None:
     history = st.session_state.get("history", [])
-    st.markdown('<div class="section-heading history-heading">Recent Questions</div>', unsafe_allow_html=True)
+    st.markdown(_section_heading_html("Recent Questions", "history-heading"), unsafe_allow_html=True)
     if not history:
         st.markdown('<div class="history-empty">Recent questions will appear here.</div>', unsafe_allow_html=True)
         return
