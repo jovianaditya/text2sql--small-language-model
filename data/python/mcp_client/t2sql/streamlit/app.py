@@ -8,6 +8,7 @@ import sys
 import time
 import traceback
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,25 @@ def _payload_frame(payload: dict[str, Any] | None) -> pd.DataFrame:
     if not isinstance(columns, list) or not isinstance(rows, list):
         return pd.DataFrame()
     return pd.DataFrame(rows, columns=columns)
+
+
+def _styled_result_frame(df: pd.DataFrame) -> Any:
+    return (
+        df.style
+        .set_properties(
+            **{
+                "background-color": "#11141a",
+                "color": "#eef6ff",
+                "border-color": "rgba(255, 255, 255, 0.10)",
+            }
+        )
+        .set_table_styles(
+            [
+                {"selector": "th", "props": [("background-color", "#1c2028"), ("color", "#cbd5e1")]},
+                {"selector": "td", "props": [("background-color", "#11141a"), ("color", "#eef6ff")]},
+            ]
+        )
+    )
 
 
 async def _execute_query(sql: str, database: str | None = None) -> dict[str, Any]:
@@ -439,6 +459,7 @@ def _render_home() -> None:
                 "status": result.get("status", ""),
                 "elapsed": result.get("elapsed", 0.0),
                 "database": selected_database,
+                "submitted_at": datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%d %b %Y, %H:%M WIB"),
             },
         )
         st.session_state["history"] = st.session_state["history"][:8]
@@ -465,6 +486,17 @@ def _render_empty_result() -> None:
     )
 
 
+def _friendly_result_error_message(result: dict[str, Any]) -> str:
+    status = str(result.get("status") or "").strip().lower()
+    if status in {"needs review", "not executable", "execution failed", "pipeline error"}:
+        return (
+            "We couldn't produce a reliable result for this question. "
+            "Please try rephrasing it with clearer columns, filters, or sorting details. "
+            "You can also use Give Feedback to help review this result."
+        )
+    return str(result.get("error") or "The query could not be completed.")
+
+
 def _render_result(result: dict[str, Any]) -> None:
     execution = result.get("execution") or {}
     state = result.get("state") or {}
@@ -472,7 +504,6 @@ def _render_result(result: dict[str, Any]) -> None:
     total_rows = execution.get("total_rows", len(df)) if isinstance(execution, dict) else len(df)
 
     st.markdown(_section_heading_html("Query Result", "result-heading"), unsafe_allow_html=True)
-    st.markdown('<div class="content-panel result-panel">', unsafe_allow_html=True)
     sql_text = str(result.get("sql") or state.get("final_sql") or "").strip()
     database = str(result.get("database") or "").strip()
     full_csv = b""
@@ -481,7 +512,7 @@ def _render_result(result: dict[str, Any]) -> None:
         with st.spinner("Preparing full CSV..."):
             full_csv, export_error = _full_csv_payload(sql_text, database)
     if result.get("success") and not df.empty:
-        st.dataframe(df, use_container_width=True, hide_index=False)
+        st.dataframe(_styled_result_frame(df), use_container_width=True, hide_index=False)
         preview_rows = len(df.index)
         if total_rows > preview_rows:
             st.markdown(
@@ -491,8 +522,7 @@ def _render_result(result: dict[str, Any]) -> None:
     elif result.get("success"):
         st.info("Query executed successfully, but returned no rows.")
     else:
-        st.error(result.get("error") or "The query could not be completed.")
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.error(_friendly_result_error_message(result))
 
     action_col, metric_col_1, metric_col_2 = st.columns([0.36, 0.32, 0.32], vertical_alignment="top")
     with action_col:
@@ -504,7 +534,7 @@ def _render_result(result: dict[str, Any]) -> None:
             use_container_width=True,
             disabled=not full_csv,
         )
-        if st.button("Review Result", key="review_result_button", use_container_width=True):
+        if st.button("Give Feedback", key="review_result_button", use_container_width=True):
             st.session_state["feedback_open"] = True
             st.session_state["feedback_message"] = ""
         if export_error:
@@ -525,7 +555,7 @@ def _render_feedback_form(result: dict[str, Any]) -> None:
     if not st.session_state.get("feedback_open"):
         return
 
-    st.markdown('<div class="feedback-heading">Review Result</div>', unsafe_allow_html=True)
+    st.markdown('<div class="feedback-heading">Give Feedback</div>', unsafe_allow_html=True)
     with st.form("result_feedback_form", clear_on_submit=True):
         review_type = st.selectbox(
             "Review type",
@@ -563,22 +593,32 @@ def _render_history() -> None:
         st.markdown('<div class="history-empty">Recent questions will appear here.</div>', unsafe_allow_html=True)
         return
 
-    for item in history[:4]:
+    for idx, item in enumerate(history[:4]):
         safe_question = html.escape(str(item.get("question", "")))
         safe_status = html.escape(str(item.get("status", "")))
         elapsed = float(item.get("elapsed") or 0.0)
-        st.markdown(
-            f"""
-            <div class="history-row">
-                <div class="history-row-text">
-                    <div class="history-row-question">{safe_question}</div>
-                    <div class="history-row-meta">{safe_status} · {elapsed:.2f}s</div>
-                </div>
-                <div class="history-row-icons">⌁ &nbsp;&nbsp;›</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        submitted_at = str(item.get("submitted_at") or "").strip()
+        safe_submitted_at = html.escape(submitted_at)
+
+        with st.container(key=f"history_row_{idx}"):
+            text_col, time_col, delete_col = st.columns([0.84, 0.12, 0.04], gap="small", vertical_alignment="center")
+            with text_col:
+                st.markdown(
+                    f'''
+                    <div class="history-row-text">
+                        <div class="history-row-question">{safe_question}</div>
+                        <div class="history-row-meta">{safe_status} · {elapsed:.2f}s</div>
+                    </div>
+                    ''',
+                    unsafe_allow_html=True,
+                )
+            with time_col:
+                if safe_submitted_at:
+                    st.markdown(f'<div class="history-row-time">{safe_submitted_at}</div>', unsafe_allow_html=True)
+            with delete_col:
+                if st.button("×", key=f"delete_history_{idx}", help="Remove this recent question"):
+                    st.session_state["history"].pop(idx)
+                    st.rerun()
 
 
 def main() -> None:
@@ -593,6 +633,8 @@ def main() -> None:
             _render_about()
         else:
             _render_home()
+
+    st.markdown('<div class="app-watermark">© 2026 Jovian Aditya Wiranata</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
