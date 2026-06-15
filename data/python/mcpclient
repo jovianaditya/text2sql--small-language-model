@@ -25,10 +25,13 @@ RUN pip install --no-cache-dir \
     langgraph \
     langchain-ollama \
     sqlglot \
-    openpyxl
+    openpyxl \
+    streamlit \
+    pandas
 
 # Install Jupyter
 RUN pip install --no-cache-dir notebook ipykernel
 EXPOSE 8888
+EXPOSE 8501
 
 CMD ["jupyter", "notebook", "--ip=*", "--port=8888", "--no-browser", "--allow-root"]
