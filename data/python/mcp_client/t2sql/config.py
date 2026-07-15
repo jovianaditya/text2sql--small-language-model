@@ -241,6 +241,7 @@ OLLAMA_URL        = _env_get_with_alias(
     ["OLLAMA_BASE_URL"],
 ).strip()
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "180s")  # keep_alive 90s, model stays loaded for batch eval
+OLLAMA_SEED       = int(os.getenv("OLLAMA_SEED", "42"))
 ROUTING_MODEL     = os.getenv("ROUTING_MODEL", "qwen2.5:1.5b-instruct").strip()
 SMALL_MODEL       = os.getenv("SMALL_MODEL", "qwen2.5:3b-instruct").strip()
 LARGE_MODEL       = os.getenv("LARGE_MODEL", "qwen2.5:7b-instruct").strip()

@@ -21,6 +21,7 @@ from .config import (
     LARGE_MODEL,
     OLLAMA_URL,
     OLLAMA_KEEP_ALIVE,
+    OLLAMA_SEED,
     RETRIEVE_DEBUG,
     RETRIEVAL_EXPAND_ON_FAIL_ENABLED,
     RETRIEVAL_EXPAND_TRIGGER_REASONS,
@@ -5199,6 +5200,7 @@ def _llm_judge_sql_intent(question: str) -> Tuple[bool, str]:
         model=ROUTING_MODEL,  # qwen2.5:1.5b-instruct
         base_url=OLLAMA_URL,
         temperature=AGENT_GUARD_LLM_TEMPERATURE,
+        seed=OLLAMA_SEED,
         format="json",
         keep_alive=OLLAMA_KEEP_ALIVE,
         num_ctx=AGENT_GUARD_LLM_NUM_CTX,  # Small context for fast inference
