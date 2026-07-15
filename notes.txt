@@ -106,6 +106,7 @@ docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && pytho
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --force-model qwen2.5:7b-instruct --testset t2sql/test/qa_classicmodels_test_hard.yml --output results_test_hard_p1_7bonly.xlsx --hard --warmup-models 7b" 2>&1 | tee test_hard_p1_7bonly.log
 
 # TESTING ONLY 3B MODEL
+docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --force-model qwen2.5:3b-instruct --testset t2sql/test/qa_classicmodels_test_easy.yml --output results_test_easy_p1_3bonly.xlsx --easy --warmup-models 3b" 2>&1 | tee test_easy_p1_3bonly.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --force-model qwen2.5:3b-instruct --testset t2sql/test/qa_classicmodels_test_medium.yml --output results_test_medium_p1_3bonly.xlsx --medium --warmup-models 3b" 2>&1 | tee test_medium_p1_3bonly.log
 docker exec -e AGENT_PROMPT_TELEMETRY=1 -it mcp_client bash -c "cd /app && python -m t2sql.testing_evaluation --scenario P1 --force-model qwen2.5:3b-instruct --testset t2sql/test/qa_classicmodels_test_hard.yml --output results_test_hard_p1_3bonly.xlsx --hard --warmup-models 3b" 2>&1 | tee test_hard_p1_3bonly.log
 
