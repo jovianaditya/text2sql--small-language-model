@@ -3206,27 +3206,6 @@ def _detect_dimensions(
         elif id_col:
             add_dim(IRDimension(table=subject, column=id_col))
 
-    # Aggregate dimensions become prompt/planner inputs. Canonicalize them by
-    # their first textual mention so process-level set/hash ordering cannot
-    # change an otherwise identical ablation run.
-    if aggregate_like and len(dims) > 1:
-        def _aggregate_dimension_order(dimension: IRDimension) -> Tuple[int, str, str, int, str, str]:
-            positions = [
-                pos
-                for variant in _column_variants(dimension.table, dimension.column)
-                if (pos := _phrase_pos(q, variant)) >= 0
-            ]
-            return (
-                min(positions) if positions else len(q) + 1,
-                dimension.table.lower(),
-                dimension.column.lower(),
-                0 if dimension.visible else 1,
-                dimension.transform.lower(),
-                dimension.alias.lower(),
-            )
-
-        dims.sort(key=_aggregate_dimension_order)
-
     return dims
 
 

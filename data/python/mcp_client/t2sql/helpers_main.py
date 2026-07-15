@@ -7517,6 +7517,16 @@ def _build_intent_ir_hint(state: "RAGState") -> str:
         display_qtype = AGENT_ROUTER_QTYPE_SET_OPERATION
 
     dims = _hint_display_dimensions()
+    dims = sorted(
+        dims,
+        key=lambda dimension: (
+            str(dimension.get("table") or "").strip().casefold(),
+            str(dimension.get("column") or "").strip().casefold(),
+            str(dimension.get("transform") or "").strip().casefold(),
+            str(dimension.get("alias") or "").strip().casefold(),
+            not bool(dimension.get("visible", True)),
+        ),
+    )
 
     def _output_shape_anchor(
         phrase: str = "",
