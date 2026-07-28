@@ -14,11 +14,6 @@ __pycache__/
 *$py.class
 *.ipynb_checkpoints
 
-**/results*.xlsx
-**/run_*.log
-**/evaluation_*.log
-**/test_*.log
-**/intent_ir_compare_*.log
 **/.codex
 **/hitl_review_log_*.json
 **/t2sql_result_*.csv
