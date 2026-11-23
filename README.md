@@ -1,6 +1,6 @@
-# t2sql — Context-Governed Text-to-SQL Agent for Low-Resource Enterprise Deployment
+# SLM T2SQL — A Reproducible and Adaptive Metadata-Aware Text-to-SQL System Using Small Language Models for Resource-Constrained Self-Service BI 
 
-**t2sql** is a self-hosted, CPU-only Text-to-SQL agent that turns natural-language questions into
+**SLM T2SQL** is a self-hosted, CPU-only Text-to-SQL agent that turns natural-language questions into
 verified SQL against a relational database — using **small language models (1.5B–8B) served locally
 with Ollama**, instead of a large hosted LLM.
 
@@ -17,6 +17,8 @@ dedicated, read-only MCP execution service.
 > from those logs.
 
 ---
+https://ieeexplore.ieee.org/document/11709604
+<img width="1573" height="1194" alt="image" src="https://github.com/user-attachments/assets/b58cc475-9990-4c9c-b993-e1a28b987566" />
 
 ## Table of contents
 
