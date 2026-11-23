@@ -11,10 +11,7 @@ and explicit join/identifier policies — and only then asks the model to draft 
 query is validated (AST checks, `EXPLAIN`, identifier allow-listing) before it is executed through a
 dedicated, read-only MCP execution service.
 
-> Companion conference paper: *Conference Paper — Jovian Aditya Wiranata* (design rationale and
-> full evaluation of this system). The code and the committed evaluation logs in
-> [`results_and_logs/`](results_and_logs/) are the source of truth; the tables below are derived
-> from those logs.
+<img width="2559" height="1234" alt="T2SQL Prototype (1)" src="https://github.com/user-attachments/assets/c9a6dbe3-8727-46f6-8122-9e8b9b2ee74d" />
 
 ---
 https://ieeexplore.ieee.org/document/11709604
