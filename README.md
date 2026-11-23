@@ -39,6 +39,12 @@ https://ieeexplore.ieee.org/document/11709604
 
 ## Key features
 
+- **Adaptive multi-model selection.** No question is hard-wired to one model. The 1.5B router
+  first lets the deterministic Intent-IR lane answer *without any drafting LLM*; otherwise simple
+  questions (including simple multi-table joins) stay on 3B, and 7B is used only when explicit
+  complexity signals fire (wide joins, winner-row subqueries, window aggregates, set operations,
+  …), plus one bounded 7B recovery attempt if a 3B draft fails validation. On the held-out test
+  set this kept 100% of easy, 63% of medium, and 20% of hard questions on the cheap 3B model.
 - **Small models only.** Routing (1.5B), drafting (3B), and escalation (7B) models all run on CPU
   via Ollama — no GPU, no external API, no data leaving the machine.
 - **Hybrid metadata retrieval.** Schema and business-context metadata is exported from
@@ -92,6 +98,26 @@ by policy documents that mirror the code:
 | [`RETRIEVAL_POLICY.md`](data/python/mcp_client/t2sql/RETRIEVAL_POLICY.md) | How the per-question context is built |
 | [`JOIN_POLICY.md`](data/python/mcp_client/t2sql/JOIN_POLICY.md) | FROM/JOIN selection, INNER vs LEFT JOIN guidance |
 | [`CONFIG_BOUNDARY.md`](data/python/mcp_client/t2sql/CONFIG_BOUNDARY.md) | The 4-layer configuration boundary |
+
+### How model selection works (adaptive multi-model)
+
+Model choice is made per question, in three stages:
+
+1. **IR gate first.** The router computes a *fallback candidate* (3B or 7B) without committing to
+   an LLM call. If the deterministic Intent-IR lane passes its gate, the answer is produced
+   without any drafting LLM at all.
+2. **Router escalation.** Otherwise the router evaluates explicit complexity signals
+   (`escalation_reasons` in `agents.py`: multi-table joins wider than
+   `AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES`, winner-row subqueries, cross-table exclusion,
+   window aggregates, explicit rank functions, complex subqueries, set operations, rollup/top-N
+   patterns, …). Any signal → 7B; none → 3B. Simple multi-table joins deliberately stay on 3B.
+3. **Bounded recovery.** If a 3B draft fails validation, the runtime escalates once to 7B for
+   JSON/identifier recovery — skipped entirely in forced single-model runs (`--force-model`).
+
+Every signal is individually toggleable via `AGENT_ROUTER_ESCALATE_ON_*` env flags, and the
+chosen route (IR / 3B / 7B) is logged per question (`Route Split` and `Model Usage` lines in the
+evaluation logs). See [`ROUTING_POLICY.md`](data/python/mcp_client/t2sql/ROUTING_POLICY.md) for
+the full lane decision table and worked examples.
 
 **Execution boundary.** The agent never talks to MySQL directly. A separate FastMCP process
 (`data/python/mcp_server/mcp_server.py`) exposes `query_db` (safe 5×5 preview), `query_db_full`
@@ -434,6 +460,19 @@ escalates. IR hints passed for 100% / 53% / 10% of easy/medium/hard respectively
    need new rule content.
 7. **Shadow-database assumption.** TS checks assume shadow DBs are structurally identical to the
    base schema (`classicmodels_2/3` in `data/sql_init/`); schema drift between them is not detected.
+8. **Silent mis-escalation in adaptive routing.** Model selection is rule-based, not learned: a
+   detector false-negative keeps a hard question on 3B (lower EX, no error raised — only the
+   bounded recovery gate catches *invalid* drafts, not *valid-but-wrong* SQL), while a false
+   positive burns 7B latency on a simple question. The `escalation_reasons` entries in the logs
+   are the audit trail for this.
+9. **Non-deterministic latency from recovery escalation.** A failed 3B draft pays a second, 7B
+   generation pass, so response times vary (hard-set average 113.7 s vs ~33 s on easy). Interactive
+   users should expect this variance; set timeouts accordingly.
+10. **Routing flag drift.** With seven `AGENT_ROUTER_ESCALATE_ON_*` toggles plus
+    `AGENT_ROUTER_ALLOW_SIMPLE_MULTI_TABLE_3B` and `AGENT_ROUTER_SIMPLE_MULTI_TABLE_MAX_TABLES`,
+    an environment can silently run different routing than documented —
+    `ROUTING_POLICY.md` explicitly warns that overridden env knobs change runtime behavior. Keep
+    non-default overrides in `.env` and note them in your deployment docs.
 
 ## Security notes
 
